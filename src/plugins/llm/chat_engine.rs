@@ -1,35 +1,54 @@
 //! The conversation engine: called per inbound message, under the channel
 //! lock, off the pipeline task. Decides capture and trigger, assembles the
-//! context, calls the completion port, delivers (and splits) the reply, and
-//! records the bot's own turn.
+//! context, calls the completion port, delivers (and splits) the reply,
+//! records the bot's own turn, and keeps the window compacted.
 //!
 //! Failure policy: every storage/provider failure here is logged and
 //! swallowed - a broken history or a down provider must not crash the bot
-//! or spam users; the pipeline has already moved on.
+//! or spam users; the pipeline has already moved on. Service-visible
+//! failures (completion, compaction) additionally reach the guild's
+//! configured service channel, with error notices rate-limited so an
+//! outage cannot spam it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 use crate::kernel::{
-    models::{MessageId, MessagePayload, Origin, OutboundMessage},
+    models::{ChannelId, Embed, GuildId, MessageId, MessagePayload, Origin, OutboundMessage},
     services::KernelServices,
     spi_ports::GuildStorage,
 };
 
 use super::completion_port::{CompletionRequest, LlmCompletionPort};
 use super::conversation::{self, ConversationRecord, RecordRole};
-use super::model::{ChannelConfig, ConversationState, NAMESPACE, channel_state_key};
+use super::model::{
+    ChannelConfig, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, channel_state_key,
+    records_namespace, unix_now,
+};
 use super::providers::LlmSettings;
+
+/// Identifies one channel for service-notice cooldowns: platform, guild,
+/// channel.
+type ChannelKey = (String, u64, u64);
+
+/// Minimum interval between error notices for the same channel: a down
+/// provider must not turn every triggering message into an admin ping.
+const NOTICE_COOLDOWN: Duration = Duration::from_secs(300);
 
 pub struct ChatEngine {
     settings: Arc<LlmSettings>,
     completion: Arc<dyn LlmCompletionPort>,
+    /// Last error-notice time per channel (see [`NOTICE_COOLDOWN`]).
+    notices: Mutex<HashMap<ChannelKey, Instant>>,
 }
 
 impl ChatEngine {
     #[must_use]
     pub fn new(settings: Arc<LlmSettings>, completion: Arc<dyn LlmCompletionPort>) -> Self {
-        Self { settings, completion }
+        Self { settings, completion, notices: Mutex::new(HashMap::new()) }
     }
 
     /// Processes one inbound message of an assigned channel. Always
@@ -51,11 +70,17 @@ impl ChatEngine {
         let Some(state) = self.load_state(storage, channel_id).await else {
             return;
         };
-        let mut live = self.load_live_records(storage, state.cutoff_seq).await;
+        let mut live = self.load_live_records(storage, channel_id, state.cutoff_seq).await;
 
         let reply_to = payload.reply_to.map(MessageId::get);
-        if conversation::should_capture(config.capture_mode, payload.mentions_bot, reply_to, &live)
-        {
+        let mut live_records: Vec<ConversationRecord> =
+            live.iter().map(|(_, record)| record.clone()).collect();
+        if conversation::should_capture(
+            config.capture_mode,
+            payload.mentions_bot,
+            reply_to,
+            &live_records,
+        ) {
             let record = ConversationRecord {
                 message_id: origin.message_id.map(MessageId::get),
                 role: RecordRole::User,
@@ -64,19 +89,26 @@ impl ChatEngine {
                 reply_to,
                 captured_at: unix_now(),
             };
-            match Self::append_record(storage, &record).await {
-                Ok(()) => live.push(record),
+            match Self::append_record(storage, channel_id, &record).await {
+                Ok(seq) => {
+                    live.push((seq, record.clone()));
+                    // The triggering message must be part of the context.
+                    live_records.push(record);
+                }
                 Err(err) => {
                     tracing::warn!(channel = channel_id, %err, "failed to capture message into history");
                 }
             }
         }
 
-        if !conversation::should_trigger(payload.mentions_bot, reply_to, &live) {
-            return;
+        if conversation::should_trigger(payload.mentions_bot, reply_to, &live_records) {
+            self.answer(origin, config, &state, &live_records, services).await;
         }
 
-        self.answer(origin, config, &state, &live, services).await;
+        // Compaction runs after the reply (the triggering turn used the
+        // pre-compaction context) and after every capture, so all-messages
+        // channels compact too - not just chatty ones.
+        self.maybe_compact(origin, config, &state, &live, services).await;
     }
 
     /// Completes and delivers the answer for a triggering message. The
@@ -108,6 +140,17 @@ impl ChatEngine {
             Ok(response) => response,
             Err(err) => {
                 tracing::warn!(channel = channel_id, model = %config.model, %err, "LLM completion failed - no reply sent");
+                if let Some(storage) = &services.guild_storage {
+                    self.notify_service(
+                        services,
+                        origin,
+                        storage,
+                        "LLM completion failed",
+                        format!("Model `{}`: {err}\nNo reply was sent.", config.model),
+                        true,
+                    )
+                    .await;
+                }
                 return;
             }
         };
@@ -150,7 +193,7 @@ impl ChatEngine {
             captured_at: unix_now(),
         };
         if let Some(storage) = &services.guild_storage
-            && let Err(err) = Self::append_record(storage, &assistant).await
+            && let Err(err) = Self::append_record(storage, channel_id, &assistant).await
         {
             tracing::warn!(channel = channel_id, %err, "failed to record bot turn into history");
         }
@@ -184,39 +227,244 @@ impl ChatEngine {
         }
     }
 
+    /// The channel's live window: `(seq, record)` pairs after the cutoff,
+    /// ascending. Malformed records are skipped (with a warning) instead of
+    /// failing the whole window.
     async fn load_live_records(
         &self,
         storage: &Arc<dyn GuildStorage>,
+        channel_id: u64,
         after_seq: u64,
-    ) -> Vec<ConversationRecord> {
-        let total = storage.count_after(NAMESPACE, after_seq).await.unwrap_or(0);
+    ) -> Vec<(u64, ConversationRecord)> {
+        let records_ns = records_namespace(channel_id);
+        let total = storage.count_after(&records_ns, after_seq).await.unwrap_or(0);
         if total == 0 {
             return Vec::new();
         }
         let limit = u32::try_from(total).unwrap_or(u32::MAX);
-        let stored = storage.list_after(NAMESPACE, after_seq, limit).await.unwrap_or_default();
+        let stored = storage.list_after(&records_ns, after_seq, limit).await.unwrap_or_default();
         stored
             .into_iter()
             .filter_map(|record| {
                 serde_json::from_value::<ConversationRecord>(record.payload)
                     .inspect_err(|_| tracing::warn!("skipping malformed conversation record"))
                     .ok()
+                    .map(|parsed| (record.seq, parsed))
             })
             .collect()
     }
 
     async fn append_record(
         storage: &Arc<dyn GuildStorage>,
+        channel_id: u64,
         record: &ConversationRecord,
-    ) -> Result<(), crate::kernel::models::StorageError> {
+    ) -> Result<u64, crate::kernel::models::StorageError> {
         let payload = serde_json::to_value(record)
             .map_err(|err| crate::kernel::models::StorageError::Serialization(err.to_string()))?;
-        storage.append(NAMESPACE, payload).await.map(|_| ())
+        storage.append(&records_namespace(channel_id), payload).await
     }
-}
 
-fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_secs())
+    /// Folds the oldest live messages into the summary once the window
+    /// outgrows `history_depth`: everything but `compaction_keep_tail`
+    /// newest records is summarized (via the compaction model) and the
+    /// cutoff advances past them. Runs AFTER the reply - the triggering
+    /// turn used the pre-compaction context. The commit is one document
+    /// write: crash mid-way leaves the old state intact. Compaction is
+    /// never a sliding window - the prompt prefix stays byte-stable
+    /// between compactions, so provider prompt caches stay warm.
+    async fn maybe_compact(
+        &self,
+        origin: &Origin,
+        config: &ChannelConfig,
+        state: &ConversationState,
+        live: &[(u64, ConversationRecord)],
+        services: &KernelServices,
+    ) {
+        if !config.compaction_enabled {
+            return;
+        }
+        let channel_id = origin.channel_id.get();
+        let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
+        if live.len() <= depth {
+            return;
+        }
+        let keep_tail = usize::try_from(self.settings.compaction_keep_tail).unwrap_or(usize::MAX);
+        if keep_tail == 0 || keep_tail >= live.len() {
+            tracing::warn!(
+                channel = channel_id,
+                keep_tail = self.settings.compaction_keep_tail,
+                live = live.len(),
+                "compaction would make no progress - skipping"
+            );
+            return;
+        }
+
+        let (chunk, _tail) = live.split_at(live.len() - keep_tail);
+        let chunk_end_seq = chunk.last().map_or(0, |(seq, _)| *seq);
+        let chunk_records: Vec<ConversationRecord> =
+            chunk.iter().map(|(_, record)| record.clone()).collect();
+        let prompt = config
+            .compaction_prompt
+            .clone()
+            .unwrap_or_else(|| self.settings.default_compaction_prompt.clone());
+        let model = config
+            .compaction_model
+            .clone()
+            .or_else(|| self.settings.compaction_model.clone())
+            .unwrap_or_else(|| config.model.clone());
+
+        let request = CompletionRequest {
+            model,
+            messages: conversation::compaction_input(
+                &prompt,
+                state.summary.as_deref(),
+                &chunk_records,
+            ),
+            // Summarization needs no sampling tuning - provider defaults.
+            params: GenParams::default(),
+        };
+        let response = match self.completion.complete(request).await {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!(channel = channel_id, %err, "LLM compaction failed - window keeps growing");
+                if let Some(storage) = &services.guild_storage {
+                    self.notify_service(
+                        services,
+                        origin,
+                        storage,
+                        "LLM compaction failed",
+                        format!("{err}\nThe context window keeps growing until this succeeds."),
+                        true,
+                    )
+                    .await;
+                }
+                return;
+            }
+        };
+
+        let new_state = ConversationState {
+            summary: Some(response.content),
+            cutoff_seq: chunk_end_seq,
+            cutoff_at: Some(unix_now()),
+        };
+        if let Some(storage) = &services.guild_storage {
+            self.commit_compaction(
+                origin,
+                storage,
+                new_state,
+                chunk_records.len(),
+                keep_tail,
+                services,
+            )
+            .await;
+        }
+    }
+
+    /// Persists the compacted state atomically (one document write) and
+    /// reports the outcome to the service channel.
+    async fn commit_compaction(
+        &self,
+        origin: &Origin,
+        storage: &Arc<dyn GuildStorage>,
+        new_state: ConversationState,
+        folded: usize,
+        keep_tail: usize,
+        services: &KernelServices,
+    ) {
+        let channel_id = origin.channel_id.get();
+        match storage
+            .set(
+                NAMESPACE,
+                &channel_state_key(channel_id),
+                serde_json::to_value(&new_state).unwrap_or(serde_json::Value::Null),
+            )
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    channel = channel_id,
+                    folded,
+                    cutoff = new_state.cutoff_seq,
+                    "conversation compacted"
+                );
+                self.notify_service(
+                    services,
+                    origin,
+                    storage,
+                    "Conversation compacted",
+                    format!(
+                        "Folded {folded} messages into the summary; the live window now starts \
+                         fresh with {keep_tail} messages kept."
+                    ),
+                    false,
+                )
+                .await;
+            }
+            Err(err) => {
+                tracing::warn!(channel = channel_id, %err, "failed to persist compacted state");
+                self.notify_service(
+                    services,
+                    origin,
+                    storage,
+                    "LLM compaction failed",
+                    format!("Could not persist the summary: {err}"),
+                    true,
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Best-effort report to the guild's configured service channel;
+    /// without one this is tracing only. Error notices are rate-limited
+    /// per channel ([`NOTICE_COOLDOWN`]), success notices are not.
+    async fn notify_service(
+        &self,
+        services: &KernelServices,
+        origin: &Origin,
+        storage: &Arc<dyn GuildStorage>,
+        title: &str,
+        description: String,
+        is_error: bool,
+    ) {
+        if is_error && !self.error_notice_allowed(origin) {
+            return;
+        }
+        let raw = match storage.get(NAMESPACE, SERVICE_CHANNEL_KEY).await {
+            Ok(Some(raw)) => raw,
+            Ok(None) => return, // no service channel: logs only
+            Err(err) => {
+                tracing::warn!(%err, "service channel config unreadable");
+                return;
+            }
+        };
+        let Some(service_channel) = raw.as_str().and_then(|value| value.parse::<u64>().ok()) else {
+            tracing::warn!("service channel config is malformed");
+            return;
+        };
+        let output =
+            services.chat_output_factory.channel_output(origin, ChannelId(service_channel));
+        let notice = OutboundMessage::embed(Embed { title: title.to_owned(), description });
+        if let Err(err) = output.send(notice).await {
+            tracing::warn!(%err, "failed to deliver service notice");
+        }
+    }
+
+    fn error_notice_allowed(&self, origin: &Origin) -> bool {
+        let key: ChannelKey = (
+            origin.platform.as_str().to_owned(),
+            origin.guild_id.map_or(0, GuildId::get),
+            origin.channel_id.get(),
+        );
+        let mut notices = self.notices.lock();
+        match notices.get(&key) {
+            Some(last) if last.elapsed() < NOTICE_COOLDOWN => false,
+            _ => {
+                notices.insert(key, Instant::now());
+                true
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +532,15 @@ mod tests {
                 counter: AtomicU64::new(100),
             })
         }
+
+        fn message_link(
+            &self,
+            _origin: &Origin,
+            channel_id: ChannelId,
+            message_id: MessageId,
+        ) -> Option<String> {
+            Some(format!("link://{}/{}", channel_id.get(), message_id.get()))
+        }
     }
 
     struct RecordingStream {
@@ -313,7 +570,11 @@ mod tests {
     }
 
     fn ctx(responses: Vec<Result<String, LlmError>>) -> TestCtx {
-        let settings = Arc::new(LlmSettings::default());
+        ctx_with(LlmSettings::default(), responses)
+    }
+
+    fn ctx_with(settings: LlmSettings, responses: Vec<Result<String, LlmError>>) -> TestCtx {
+        let settings = Arc::new(settings);
         let fake = Arc::new(FakeCompletion {
             responses: Mutex::new(responses),
             requests: Mutex::new(Vec::new()),
@@ -385,7 +646,7 @@ mod tests {
         let payload = serde_json::to_value(record).expect("record expected to serialize");
         storage
             .guild_scoped(Platform::Discord, GuildId(1))
-            .append(NAMESPACE, payload)
+            .append(&records_namespace(2), payload)
             .await
             .expect("append expected to succeed");
     }
@@ -393,7 +654,7 @@ mod tests {
     async fn stored_records(ctx: &TestCtx) -> Vec<ConversationRecord> {
         ctx.storage
             .guild_scoped(Platform::Discord, GuildId(1))
-            .list_after(NAMESPACE, 0, 100)
+            .list_after(&records_namespace(2), 0, 100)
             .await
             .expect("records readable")
             .into_iter()
@@ -402,6 +663,16 @@ mod tests {
                     .expect("record expected to deserialize")
             })
             .collect()
+    }
+
+    fn seed_service_channel(ctx: &TestCtx) {
+        ctx.storage.seed(
+            Platform::Discord,
+            GuildId(1),
+            NAMESPACE,
+            SERVICE_CHANNEL_KEY,
+            serde_json::json!("9"),
+        );
     }
 
     #[tokio::test]
@@ -600,5 +871,118 @@ mod tests {
 
         assert!(fake.requests().is_empty());
         assert!(output.messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn compaction_runs_after_reply_when_window_outgrows_depth() {
+        let settings = LlmSettings { compaction_keep_tail: 2, ..LlmSettings::default() };
+        let ctx =
+            ctx_with(settings, vec![Ok("summary text".to_owned()), Ok("the answer".to_owned())]);
+        let config = ChannelConfig { history_depth: 3, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+        append_record(&ctx.storage, &user_record(1, "a1", "m1")).await;
+        append_record(&ctx.storage, &user_record(2, "a2", "m2")).await;
+        append_record(&ctx.storage, &user_record(3, "a3", "m3")).await;
+
+        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+
+        // Chat completion first, compaction second; the chunk holds only the
+        // oldest two records (keep_tail = 2 keeps the newest pair).
+        let requests = ctx.fake.requests();
+        assert_eq!(requests.len(), 2);
+        let transcript = requests
+            .get(1)
+            .and_then(|request| request.messages.get(1))
+            .map(|message| message.content.clone())
+            .expect("compaction transcript expected");
+        assert!(transcript.contains("a1: m1"));
+        assert!(transcript.contains("a2: m2"));
+        assert!(!transcript.contains("a3: m3"));
+
+        let state_raw = ctx
+            .storage
+            .guild_scoped(Platform::Discord, GuildId(1))
+            .get(NAMESPACE, &channel_state_key(2))
+            .await
+            .expect("state readable")
+            .expect("compacted state expected");
+        let state: ConversationState =
+            serde_json::from_value(state_raw).expect("state expected to deserialize");
+        assert_eq!(state.summary.as_deref(), Some("summary text"));
+        assert_eq!(state.cutoff_seq, 2);
+        assert!(state.cutoff_at.is_some());
+
+        // The reply went out and all records (seeded + capture + assistant)
+        // are kept.
+        assert_eq!(ctx.begins.lock().clone(), vec!["the answer".to_owned()]);
+        assert_eq!(stored_records(&ctx).await.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_keeps_state_and_reports_to_service_channel() {
+        let settings = LlmSettings { compaction_keep_tail: 2, ..LlmSettings::default() };
+        let ctx = ctx_with(
+            settings,
+            vec![Err(LlmError::Request("summarizer down".to_owned())), Ok("the answer".to_owned())],
+        );
+        let config = ChannelConfig { history_depth: 3, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+        seed_service_channel(&ctx);
+        append_record(&ctx.storage, &user_record(1, "a1", "m1")).await;
+        append_record(&ctx.storage, &user_record(2, "a2", "m2")).await;
+        append_record(&ctx.storage, &user_record(3, "a3", "m3")).await;
+
+        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+
+        // The reply went out; the compaction failure left the state intact.
+        assert_eq!(ctx.begins.lock().clone(), vec!["the answer".to_owned()]);
+        let state_raw = ctx
+            .storage
+            .guild_scoped(Platform::Discord, GuildId(1))
+            .get(NAMESPACE, &channel_state_key(2))
+            .await
+            .expect("state readable");
+        assert_eq!(state_raw, None);
+        assert!(ctx.output.messages().iter().any(|message| message.contains("compaction failed")));
+    }
+
+    #[tokio::test]
+    async fn error_notices_are_rate_limited_per_channel() {
+        let ctx = ctx(vec![Err(LlmError::Request("down".to_owned())); 5]);
+        seed_config(&ctx.storage, &assigned_config());
+        seed_service_channel(&ctx);
+
+        for _ in 0..3 {
+            ctx.engine
+                .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+                .await;
+        }
+
+        // Three failed completions - one rate-limited error embed.
+        assert_eq!(ctx.output.messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn compaction_disabled_lets_the_window_grow() {
+        let settings = LlmSettings { compaction_keep_tail: 2, ..LlmSettings::default() };
+        let ctx = ctx_with(settings, vec![Ok("the answer".to_owned())]);
+        let config =
+            ChannelConfig { history_depth: 1, compaction_enabled: false, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+        append_record(&ctx.storage, &user_record(1, "a1", "m1")).await;
+
+        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+
+        // Only the chat completion ran; no state was ever written.
+        assert_eq!(ctx.fake.requests().len(), 1);
+        let state_raw = ctx
+            .storage
+            .guild_scoped(Platform::Discord, GuildId(1))
+            .get(NAMESPACE, &channel_state_key(2))
+            .await
+            .expect("state readable");
+        assert_eq!(state_raw, None);
+        // Seeded record + capture + the assistant turn.
+        assert_eq!(stored_records(&ctx).await.len(), 3);
     }
 }

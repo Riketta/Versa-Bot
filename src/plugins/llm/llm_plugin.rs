@@ -16,7 +16,8 @@ use crate::kernel::{
 
 use super::chat_engine::ChatEngine;
 use super::commands::{
-    AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler, UnassignLlmHandler,
+    AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler, CutoffLlmHandler,
+    StatusLlmHandler, UnassignLlmHandler,
 };
 use super::model::{ChannelConfig, NAMESPACE, channel_config_key};
 
@@ -107,6 +108,22 @@ impl PluginPort for LlmPlugin {
             self.descriptor("llm_admin_clear", "Stop reporting LLM service notices", Vec::new()),
             Arc::new(ClearServiceChannelHandler),
         );
+        self.registry.register(
+            self.descriptor(
+                "llm_cutoff",
+                "Reset this channel's conversation context (history is kept)",
+                Vec::new(),
+            ),
+            Arc::new(CutoffLlmHandler),
+        );
+        self.registry.register(
+            self.descriptor(
+                "llm_status",
+                "Show this channel's chat configuration and context state",
+                Vec::new(),
+            ),
+            Arc::new(StatusLlmHandler),
+        );
         Ok(())
     }
 }
@@ -172,10 +189,12 @@ mod tests {
         spi_ports::{ChatOutputPort, GUILD_SETTINGS, StoragePort},
     };
     use crate::plugins::llm::model::{
-        ChannelConfig, NAMESPACE, SERVICE_CHANNEL_KEY, channel_config_key,
+        ChannelConfig, ConversationState, NAMESPACE, SERVICE_CHANNEL_KEY, channel_config_key,
+        channel_state_key, records_namespace,
     };
     use crate::plugins::llm::{
-        ChatEngine, CompletionRequest, CompletionResponse, LlmCompletionPort, LlmError, LlmSettings,
+        ChatEngine, CompletionRequest, CompletionResponse, ConversationRecord, LlmCompletionPort,
+        LlmError, LlmSettings, RecordRole,
     };
     use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
 
@@ -273,7 +292,17 @@ mod tests {
         let mut names: Vec<String> =
             fixture.registry.descriptors().into_iter().map(|d| d.name).collect();
         names.sort();
-        assert_eq!(names, ["llm_admin", "llm_admin_clear", "llm_assign", "llm_unassign"]);
+        assert_eq!(
+            names,
+            [
+                "llm_admin",
+                "llm_admin_clear",
+                "llm_assign",
+                "llm_cutoff",
+                "llm_status",
+                "llm_unassign"
+            ]
+        );
         for descriptor in fixture.registry.descriptors() {
             assert_eq!(descriptor.plugin_id, "llm");
             assert!(descriptor.guild_only, "every llm command is guild-only");
@@ -515,5 +544,97 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(fixture.output.messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cutoff_clears_summary_and_advances_past_all_records() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&fixture.storage);
+
+        fixture
+            .storage
+            .guild_scoped(Platform::Discord, GuildId(1))
+            .append(
+                &records_namespace(2),
+                serde_json::to_value(ConversationRecord {
+                    message_id: Some(10),
+                    role: RecordRole::User,
+                    author: Some("alice".to_owned()),
+                    content: "old".to_owned(),
+                    reply_to: None,
+                    captured_at: 0,
+                })
+                .expect("record expected to serialize"),
+            )
+            .await
+            .expect("append expected to succeed");
+        fixture.storage.seed(
+            Platform::Discord,
+            GuildId(1),
+            NAMESPACE,
+            &channel_state_key(2),
+            serde_json::json!({"summary": "old gist", "cutoff_seq": 0}),
+        );
+
+        CutoffLlmHandler
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("cutoff expected to succeed");
+
+        let state_raw = fixture
+            .services
+            .guild_storage
+            .as_ref()
+            .expect("guild storage expected")
+            .get(NAMESPACE, &channel_state_key(2))
+            .await
+            .expect("state readable")
+            .expect("state expected");
+        let state: ConversationState =
+            serde_json::from_value(state_raw).expect("state expected to deserialize");
+        assert_eq!(state.summary, None);
+        assert_eq!(state.cutoff_seq, 1);
+        assert!(state.cutoff_at.is_some());
+        assert!(fixture.output.messages().iter().any(|m| m.contains("Context cleared")));
+    }
+
+    #[tokio::test]
+    async fn status_reports_model_context_and_summary() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&fixture.storage);
+        fixture.storage.seed(
+            Platform::Discord,
+            GuildId(1),
+            NAMESPACE,
+            &channel_state_key(2),
+            serde_json::json!({"summary": "the gist", "cutoff_seq": 0, "cutoff_at": 1_717_000_000}),
+        );
+
+        StatusLlmHandler
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("status expected to succeed");
+
+        let messages = fixture.output.messages();
+        assert!(messages.iter().any(|m| m.contains("LLM status")));
+        assert!(messages.iter().any(|m| m.contains("local/gemma")));
+        assert!(messages.iter().any(|m| m.contains("the gist")));
+        // The record log is empty - the context-start line degrades honestly.
+        assert!(messages.iter().any(|m| m.contains("no messages after the cutoff")));
+    }
+
+    #[tokio::test]
+    async fn status_on_unassigned_channel_replies_so() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+
+        StatusLlmHandler
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("status expected to succeed");
+
+        assert!(fixture.output.messages().iter().any(|m| m.contains("not assigned")));
     }
 }

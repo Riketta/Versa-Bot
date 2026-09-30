@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use super::{ChatOutputPort, ChatStreamPort};
-use crate::kernel::models::{ChannelId, Origin};
+use crate::kernel::models::{ChannelId, MessageId, Origin};
 
 /// Driven port the kernel calls per event to obtain outbound ports bound to
 /// that event's origin. Implemented by the driving adapter (e.g. the Discord
@@ -25,4 +25,15 @@ pub trait ChatOutputFactoryPort: Send + Sync + 'static {
     /// channel-less events) yield a non-deliverable port; a plain
     /// `chat_output` remains available for those origins.
     fn stream_output(&self, origin: &Origin) -> Arc<dyn ChatStreamPort>;
+
+    /// Platform URL pointing at a message inside the origin event's guild
+    /// (Discord: a clickable message link), or `None` when the platform has
+    /// no such concept or the origin carries no guild. Cosmetic data - the
+    /// adapter owns URL formats, plugins stay platform-blind.
+    fn message_link(
+        &self,
+        origin: &Origin,
+        channel_id: ChannelId,
+        message_id: MessageId,
+    ) -> Option<String>;
 }

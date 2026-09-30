@@ -2,6 +2,8 @@
 //! context assembly, and reply splitting. Pure functions - no I/O - so the
 //! rules stay unit-testable in isolation from storage and providers.
 
+use std::fmt::Write as _;
+
 use serde::{Deserialize, Serialize};
 
 use super::completion_port::{ChatMessage, ChatRole};
@@ -124,6 +126,39 @@ pub fn assemble_context(
         messages.push(message);
     }
     messages
+}
+
+/// Builds the compaction request's messages: the compaction prompt, then a
+/// transcript combining the previous summary (if any) with the chunk being
+/// folded in - the model returns the cumulative replacement summary.
+pub fn compaction_input(
+    prompt: &str,
+    previous_summary: Option<&str>,
+    records: &[ConversationRecord],
+) -> Vec<ChatMessage> {
+    let mut transcript = String::new();
+    if let Some(previous) = previous_summary {
+        transcript.push_str("Previous summary:\n");
+        transcript.push_str(previous);
+        transcript.push_str("\n\n");
+    }
+    transcript.push_str("New messages:\n");
+    for record in records {
+        match record.role {
+            RecordRole::User => writeln!(
+                transcript,
+                "{}: {}",
+                record.author.as_deref().unwrap_or("user"),
+                record.content
+            ),
+            RecordRole::Assistant => writeln!(transcript, "assistant: {}", record.content),
+        }
+        .expect("writing to a String expected to be infallible");
+    }
+    vec![
+        ChatMessage { role: ChatRole::System, content: prompt.to_owned() },
+        ChatMessage { role: ChatRole::User, content: transcript },
+    ]
 }
 
 /// Splits a reply into platform-sized chunks on line boundaries: a line
@@ -272,7 +307,11 @@ mod tests {
             ..ChannelConfig::assigned("m".to_owned())
         };
         let settings = LlmSettings::default();
-        let state = ConversationState { summary: Some("the gist".to_owned()), cutoff_seq: 4 };
+        let state = ConversationState {
+            summary: Some("the gist".to_owned()),
+            cutoff_seq: 4,
+            cutoff_at: Some(1_717_000_000),
+        };
 
         let messages = assemble_context(&config, &settings, &state, &[]);
 
@@ -297,6 +336,36 @@ mod tests {
         let messages = assemble_context(&config, &settings, &state, &records);
 
         assert_eq!(messages.get(2).map(|m| m.content.as_str()), Some("<alice> hello"));
+    }
+
+    #[test]
+    fn compaction_input_carries_prompt_previous_summary_and_transcript() {
+        let records = vec![
+            user_record(10, "alice", "hello"),
+            assistant_record(11, "hi alice"),
+            ConversationRecord {
+                message_id: Some(12),
+                role: RecordRole::User,
+                author: None,
+                content: "who is there".to_owned(),
+                reply_to: None,
+                captured_at: 0,
+            },
+        ];
+
+        let messages = compaction_input("summarize", Some("old gist"), &records);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages.first().map(|m| (m.role, m.content.as_str())),
+            Some((ChatRole::System, "summarize"))
+        );
+        let transcript = messages.get(1).map(|m| m.content.clone()).expect("transcript expected");
+        assert!(transcript.contains("Previous summary:\nold gist"));
+        assert!(transcript.contains("New messages:\n"));
+        assert!(transcript.contains("alice: hello\n"));
+        assert!(transcript.contains("assistant: hi alice\n"));
+        assert!(transcript.contains("user: who is there\n"));
     }
 
     #[test]

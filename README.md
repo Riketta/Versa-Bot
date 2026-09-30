@@ -53,7 +53,9 @@ a slash command from any other reply path.
   already wire channels up - `/llm_assign model` assigns the chat bot to the
   channel it is run in, `/llm_unassign` removes it, `/llm_admin` and
   `/llm_admin_clear` manage the guild's service channel for LLM errors and
-  notices (all Manage Server, guild-only). Per-channel configuration -
+  notices, `/llm_cutoff` resets the channel's conversation context (history
+  is kept) and `/llm_status` shows the channel's configuration and context
+  state (all Manage Server, guild-only). Per-channel configuration -
   model, sampling parameters, system prompt, compaction, streaming - is
   stored guild-partitioned and takes effect as the conversation engine
   lands (see Roadmap).
@@ -210,7 +212,8 @@ src/
 
 ## Roadmap
 
-- LLM chat plugin conversation engine: capture/trigger rules, provider
-  adapters (OpenAI-compatible first), compaction, streaming, random replies;
-  `/llm_set`, `/llm_prompt`, `/llm_cutoff`, `/llm_status` commands
+- LLM chat plugin engine runtime wiring: the `[llm]` config section
+  (providers, models, compaction defaults), streaming loop, random replies;
+  `/llm_set`, `/llm_prompt` commands (capture/trigger, context assembly,
+  compaction and the OpenAI-compatible provider layer are implemented)
 - Further platform adapters (Telegram, Matrix, ...)

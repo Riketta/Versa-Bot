@@ -317,6 +317,22 @@ impl ChatOutputFactoryPort for SerenityChatOutputFactory {
             channel_id: SerenityChannelId::new(origin.channel_id.get()),
         })
     }
+
+    /// Discord message links are constructible from ids alone - no API call.
+    fn message_link(
+        &self,
+        origin: &Origin,
+        channel_id: ChannelId,
+        message_id: MessageId,
+    ) -> Option<String> {
+        let guild_id = origin.guild_id?;
+        Some(format!(
+            "https://discord.com/channels/{}/{}/{}",
+            guild_id.get(),
+            channel_id.get(),
+            message_id.get()
+        ))
+    }
 }
 
 struct SerenityChatOutput {

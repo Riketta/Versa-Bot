@@ -280,6 +280,15 @@ impl ChatOutputFactoryPort for RecordingChatOutputFactory {
         // that reports failure loudly instead of silently pretending success.
         Arc::new(NoopChatStream) as Arc<dyn crate::kernel::spi_ports::ChatStreamPort>
     }
+
+    fn message_link(
+        &self,
+        _origin: &crate::kernel::models::Origin,
+        _channel_id: crate::kernel::models::ChannelId,
+        _message_id: crate::kernel::models::MessageId,
+    ) -> Option<String> {
+        None
+    }
 }
 
 /// [`ChatStreamPort`] test double: refuses to stream, so a plugin that

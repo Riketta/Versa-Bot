@@ -50,7 +50,7 @@ pub struct CompletionResponse {
     pub content: String,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum LlmError {
     #[error("invalid model reference `{0}` - expected `provider/model`")]
     InvalidModelRef(String),

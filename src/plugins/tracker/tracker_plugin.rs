@@ -315,6 +315,15 @@ mod tests {
         fn stream_output(&self, _origin: &Origin) -> Arc<dyn ChatStreamPort> {
             Arc::new(NoStream) as Arc<dyn ChatStreamPort>
         }
+
+        fn message_link(
+            &self,
+            _origin: &Origin,
+            _channel_id: ChannelIdModel,
+            _message_id: MessageId,
+        ) -> Option<String> {
+            None
+        }
     }
 
     struct NoStream;

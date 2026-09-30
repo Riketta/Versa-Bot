@@ -26,6 +26,16 @@ pub fn channel_state_key(channel_id: u64) -> String {
     format!("channel:{channel_id}:state")
 }
 
+/// Record namespace of one channel's conversation log: the plugin slug,
+/// sub-partitioned per channel. Guild isolation comes from the storage
+/// handle; this adds channel isolation, so one channel's context can never
+/// pick up another channel's messages (the doc namespace stays unpartitioned
+/// - config/state/service-channel keys are channel-addressed by key).
+#[must_use]
+pub fn records_namespace(channel_id: u64) -> String {
+    format!("{NAMESPACE}:c:{channel_id}")
+}
+
 /// Which inbound messages enter a channel's conversation history. The bot's
 /// own turns are always recorded (at send time, not off the gateway).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +158,17 @@ pub struct ConversationState {
     /// summary (or were cut off by `/llm_cutoff`); the live window starts
     /// strictly after it. Records are never deleted.
     pub cutoff_seq: u64,
+    /// Unix seconds when the cutoff last moved (compaction or cutoff);
+    /// `None` while the full history is the live window.
+    #[serde(default)]
+    pub cutoff_at: Option<u64>,
+}
+
+/// Unix seconds right now - capture timestamps and cutoff markers.
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 #[cfg(test)]
@@ -199,5 +220,17 @@ mod tests {
         assert_eq!(channel_config_key(42), "channel:42");
         assert_eq!(channel_state_key(42), "channel:42:state");
         assert_ne!(channel_config_key(42), channel_state_key(42));
+        // Record namespaces are plugin-prefixed and channel-partitioned.
+        assert_eq!(records_namespace(42), "llm:c:42");
+        assert_ne!(records_namespace(42), records_namespace(43));
+    }
+
+    #[test]
+    fn state_deserializes_without_cutoff_at() {
+        let state: ConversationState =
+            serde_json::from_value(serde_json::json!({"summary": null, "cutoff_seq": 7}))
+                .expect("state expected to deserialize");
+        assert_eq!(state.cutoff_seq, 7);
+        assert_eq!(state.cutoff_at, None);
     }
 }
