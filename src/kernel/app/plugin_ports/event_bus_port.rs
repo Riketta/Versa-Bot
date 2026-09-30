@@ -15,6 +15,10 @@ pub trait EventHandler<E: Event + 'static>: Send + Sync {
 /// Cardinality: a single active adapter, a single instance per kernel, shared
 /// with plugins via injection (the adapter is `Clone`; each plugin receives
 /// its own clone at construction).
+///
+/// Runtime contract: handlers run inline on the publishing task, in
+/// subscription order - they must stay fast and non-blocking; implementations
+/// must isolate panicking handlers instead of letting the unwind escape.
 pub trait EventBusPort: Send + Sync + 'static {
     fn publish(&self, event: Arc<dyn Event>);
 

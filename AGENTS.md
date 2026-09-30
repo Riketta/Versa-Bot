@@ -94,6 +94,8 @@ Middleware plugins match on event kind (`CommandPlugin` -> `CommandInvoked`, `Au
 `EventBusPort` never carries raw inbound events. But a middleware plugin that processed an inbound event MAY publish a DERIVED domain event onto the bus.
 E.g. `UserActivityTrackerPlugin` receives `MemberJoined` via the pipeline, logs to the audit channel via `ChatOutputPort`, and publishes `UserJoinedGuild`; `AuditLogPlugin` (a `PluginPort`-only bus subscriber, not in the pipeline) reacts. So the bridge between inbound happenings and bus-only plugins is plugin behavior, not kernel or adapter logic.
 
+**Bus runtime contract:** `EventBusPort` handlers run inline on the publishing task, in subscription order - keep them fast and non-blocking. A panicking handler is caught, logged, and skipped: a broken subscriber cannot crash the publisher, the pipeline, or other subscribers. Delivery isolation, cross-task ordering, and backpressure (e.g. an external broker) are deferred until a real consumer needs them.
+
 **Event-scoped outbound ports:**
 
 Outbound ports injected into the pipeline are bound to the current event's origin - a plugin's `ChatOutputPort::send` lands in the source channel/guild. The driving adapter (or kernel) constructs these scoped ports per event. This is how a plugin knows where to reply without a returned response.

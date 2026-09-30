@@ -15,6 +15,7 @@ use versa_bot::kernel::{
     services::KernelService,
     spi_ports::{ChatOutputFactoryPort, StoragePort},
 };
+use versa_bot::plugins::audit::AuditLogPlugin;
 use versa_bot::plugins::auth::AuthPlugin;
 use versa_bot::plugins::command::CommandPlugin;
 use versa_bot::plugins::tracker::UserActivityTrackerPlugin;
@@ -66,6 +67,9 @@ async fn main() {
         event_bus.clone(),
         Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
     ));
+    // Bus-only plugin: in `plugins` for lifecycle, never in the middleware
+    // chain - it reacts to derived events, not to raw inbound ones.
+    let audit = Arc::new(AuditLogPlugin::new(event_bus.clone()));
 
     let kernel = Arc::new(
         KernelService::builder()
@@ -73,6 +77,7 @@ async fn main() {
                 Arc::clone(&auth) as Arc<dyn PluginPort>,
                 Arc::clone(&command) as Arc<dyn PluginPort>,
                 Arc::clone(&tracker) as Arc<dyn PluginPort>,
+                Arc::clone(&audit) as Arc<dyn PluginPort>,
             ])
             .middleware(vec![
                 Arc::clone(&auth) as Arc<dyn MiddlewarePluginPort>,

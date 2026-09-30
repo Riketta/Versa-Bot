@@ -43,6 +43,10 @@ a slash command from any other reply path.
   assignment is self-service: `/assign_tracker` run in a channel makes it
   the audit channel, `/unassign_tracker` turns tracking off (both require
   the Manage Server permission, enforced by Discord itself).
+- Audit trail (`audit_log` plugin): the event bus's first consumer - logs
+  membership changes published on the bus as structured `audit` tracing
+  events (stdout + Sentry/GlitchTip), with origin fields, no per-guild
+  configuration needed.
 - Guild-partitioned document storage: plugins persist JSON documents scoped
   to `(platform, guild)` - reading another guild's data is impossible by
   construction. SQLite (default) and PostgreSQL.
@@ -126,7 +130,7 @@ src/
 │   │   ├── plugin_ports/   # plugin contracts (PluginPort, commands, bus)
 │   │   └── services/       # KernelService (pipeline runner, lifecycle)
 │   └── models/             # event taxonomy, IDs, errors
-├── plugins/           # features: auth, command dispatcher, tracker, status (WIP)
+├── plugins/           # features: auth, command dispatcher, tracker, audit trail, status (WIP)
 ├── infrastructure/    # adapters
 │   ├── inbound_adapters/   # Discord gateway + scoped output factory
 │   ├── outbound_adapters/  # storage (sqlx), Discord command registrar

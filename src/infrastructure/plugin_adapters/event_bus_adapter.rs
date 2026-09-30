@@ -11,8 +11,12 @@ type ErasedHandler = Arc<dyn Fn(&dyn Event) + Send + Sync>;
 
 /// The single active `EventBusPort` adapter: in-memory, topic-keyed by event
 /// `TypeId`. One instance per kernel, `Clone`d into every plugin at
-/// construction. Handlers run inline on the publishing task - full pub/sub
-/// semantics (isolation, ordering, backpressure) are a separate topic.
+/// construction. Runtime contract: handlers run inline on the publishing
+/// task, in subscription order - keep them fast and non-blocking. A
+/// panicking handler is caught, logged, and skipped: a broken subscriber
+/// cannot crash the publisher, the pipeline, or other subscribers. Delivery
+/// isolation, cross-task ordering, and backpressure (external broker) are
+/// deliberately deferred until a real consumer needs them.
 #[derive(Clone, Default)]
 pub struct InMemoryEventBus {
     subscribers: Arc<RwLock<HashMap<TypeId, Vec<ErasedHandler>>>>,
@@ -33,7 +37,18 @@ impl EventBusPort for InMemoryEventBus {
         };
 
         for handler in handlers {
-            handler(event.as_ref());
+            // Panic isolation: handlers get only read access to the event,
+            // so recovering from a unwind cannot leave the bus or the event
+            // in a corrupted state.
+            let delivery =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(event.as_ref())));
+            if let Err(panic) = delivery {
+                tracing::error!(
+                    event = event.name(),
+                    panic = panic_message(&panic),
+                    "event bus handler panicked"
+                );
+            }
         }
     }
 
@@ -45,6 +60,17 @@ impl EventBusPort for InMemoryEventBus {
         });
 
         self.subscribers.write().entry(TypeId::of::<E>()).or_default().push(erased);
+    }
+}
+
+/// Best-effort panic payload extraction (payloads are opaque `Any`).
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = panic.downcast_ref::<&'static str>() {
+        (*message).to_owned()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_owned()
     }
 }
 
@@ -85,6 +111,33 @@ mod tests {
         fn handle(&self, _event: &PingPublished) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    struct PanickingHandler;
+
+    impl EventHandler<PingPublished> for PanickingHandler {
+        fn handle(&self, _event: &PingPublished) {
+            panic!("subscriber exploded");
+        }
+    }
+
+    /// Contract: a broken subscriber must not crash the publisher or other
+    /// subscribers - the panic is caught, logged, and skipped.
+    #[test]
+    fn panicking_handler_is_isolated() {
+        let bus = InMemoryEventBus::new();
+        bus.subscribe(Arc::new(PanickingHandler));
+        let counter = Arc::new(AtomicUsize::new(0));
+        bus.subscribe(Arc::new(CountingHandler(Arc::clone(&counter))));
+
+        bus.publish(Arc::new(PingPublished));
+        bus.publish(Arc::new(PingPublished));
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "healthy subscriber must be unaffected by the panicking one"
+        );
     }
 
     #[test]
