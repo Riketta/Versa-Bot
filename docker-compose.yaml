@@ -10,9 +10,7 @@
 services:
   versa-bot:
     # Built by CI on every push to main and v* tags (see README "Docker").
-    image: ghcr.io/owner/versa-bot:latest
-    # Forgejo instance registry alternative:
-    # image: git.versalita.net/owner/versa-bot:latest
+    image: ghcr.io/riketta/versa-bot:latest
     container_name: versa-bot
     restart: unless-stopped
     # Injected into the container and available for ${...} substitution.
