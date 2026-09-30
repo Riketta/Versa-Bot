@@ -161,6 +161,21 @@ Set `RUST_LOG` to tune log verbosity (default `info`).
   activity tracker.
 - `cargo clippy --all-targets` - the deny-level lints must stay clean.
 
+### CI
+
+`.github/workflows/ci.yml` (GitHub Actions -> GHCR) and
+`.forgejo/workflows/ci.yaml` (Forgejo -> the instance registry) run the
+same pipeline on pushes to `main` and on `v*` tags:
+
+1. `cargo fmt --all -- --check`
+2. `cargo clippy --all-targets --locked` - deny-level lints gate
+3. `cargo test --locked`
+4. Docker image build + push (see [Docker](#docker)) - only after 1-3 pass
+
+The compiler is pinned to `rust:1.98` in CI and in the Dockerfile. Every
+cargo gate runs `--locked`, so keep `Cargo.lock` in sync with dependency
+changes.
+
 ### Project layout
 
 ```text

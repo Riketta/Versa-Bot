@@ -31,6 +31,14 @@ Initially it will be used with Discord, but later it should be possible to use f
 
 `README.md` is user-facing documentation and must stay in sync with reality. When a change adds or alters features, configuration, commands, project layout, or setup steps, update the README in the same change. The README describes what the bot does today; the Roadmap section is the only forward-looking part.
 
+## Build & CI
+
+Both forges run the same pipeline (`.github/workflows/ci.yml` -> GHCR, `.forgejo/workflows/ci.yaml` -> the instance registry) on pushes to `main` and `v*` tags: `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked`, `cargo test --locked`, then the Docker image build (`cargo build --release --locked` inside the Dockerfile), gated on the test job. The toolchain is pinned to `rust:1.98` in CI and in the Dockerfile - the same compiler everywhere.
+
+- The clippy gate is deny-level lints only, deliberately NOT `-D warnings`: the codebase carries tolerated pedantic/doc warnings. Do not switch to `-D warnings` until a zero-warning cleanup pass lands.
+- Every cargo gate runs `--locked` (tests, clippy, and the image build alike): a stale `Cargo.lock` must fail fast in the test job, not in packaging. Dependency changes ship with an updated lockfile.
+- Docker BuildKit cache mounts persist on the Forgejo host builder (docker-socket packaging job) but do not survive between GitHub hosted runners - image builds there recompile dependencies whenever source changes. Accepted for now.
+
 ## Hexagonal Micro-Kernel Architecture
 
 TODO: add `MiddlewarePipelineRunner` trait to kernel (not port!).
