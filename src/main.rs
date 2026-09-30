@@ -60,8 +60,12 @@ async fn main() {
     let command =
         Arc::new(CommandPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>));
     // The bus is kernel-owned; each plugin receives its own clone at
-    // construction (same instance, per the cardinality rule).
-    let tracker = Arc::new(UserActivityTrackerPlugin::new(event_bus.clone()));
+    // construction (same instance, per the cardinality rule). The registry is
+    // shared the same way: the tracker declares its commands in `init()`.
+    let tracker = Arc::new(UserActivityTrackerPlugin::new(
+        event_bus.clone(),
+        Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
+    ));
 
     let kernel = Arc::new(
         KernelService::builder()

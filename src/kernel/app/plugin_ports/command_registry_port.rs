@@ -7,13 +7,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::kernel::services::KernelServices;
+use crate::kernel::{models::RequestContext, services::KernelServices};
 
 /// A registered command's executable half. Implemented by the owning plugin;
-/// runs inside the pipeline with event-scoped services.
+/// runs inside the pipeline with the event itself (origin: channel, guild,
+/// user - for channel-anchored commands like assign-in-place), its string
+/// arguments, and event-scoped services.
 #[async_trait]
 pub trait CommandHandler: Send + Sync {
-    async fn invoke(&self, args: &CommandArgs, services: &KernelServices) -> anyhow::Result<()>;
+    async fn invoke(
+        &self,
+        event: &RequestContext,
+        args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()>;
 }
 
 /// String arguments of a resolved command invocation.

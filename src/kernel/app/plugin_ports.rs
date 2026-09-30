@@ -4,7 +4,7 @@ mod middleware_plugin_port;
 mod plugin_port;
 
 pub use command_registry_port::{
-    CommandArgs, CommandDescriptor, CommandHandler, CommandRegistryPort,
+    CommandArgs, CommandDescriptor, CommandHandler, CommandRegistryPort, Permission,
 };
 pub use event_bus_port::EventBusPort;
 pub use event_bus_port::EventHandler;

@@ -62,7 +62,7 @@ impl MiddlewarePluginPort for CommandPlugin {
         };
 
         let args = CommandArgs(command.args.clone());
-        if let Err(err) = handler.invoke(&args, services).await {
+        if let Err(err) = handler.invoke(event, &args, services).await {
             tracing::error!(command = %command.name, %err, "command handler failed");
         }
 
@@ -75,7 +75,12 @@ struct PingHandler;
 
 #[async_trait]
 impl CommandHandler for PingHandler {
-    async fn invoke(&self, _args: &CommandArgs, services: &KernelServices) -> anyhow::Result<()> {
+    async fn invoke(
+        &self,
+        _event: &RequestContext,
+        _args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
         services.chat_output.send(OutboundMessage::text("Pong!")).await?;
         Ok(())
     }
@@ -100,6 +105,7 @@ mod tests {
     impl CommandHandler for StaticHandler {
         async fn invoke(
             &self,
+            _event: &RequestContext,
             _args: &CommandArgs,
             services: &KernelServices,
         ) -> anyhow::Result<()> {
@@ -227,6 +233,7 @@ mod tests {
     impl CommandHandler for EchoTextHandler {
         async fn invoke(
             &self,
+            _event: &RequestContext,
             args: &CommandArgs,
             services: &KernelServices,
         ) -> anyhow::Result<()> {

@@ -37,18 +37,25 @@ impl DiscordCommandRegistrar {
                     })
                     .collect();
 
-                if options.is_empty() {
-                    serde_json::json!({
-                        "name": descriptor.name,
-                        "description": descriptor.description,
-                    })
-                } else {
-                    serde_json::json!({
-                        "name": descriptor.name,
-                        "description": descriptor.description,
-                        "options": options,
-                    })
+                let mut command = serde_json::Map::new();
+                command.insert("name".to_owned(), serde_json::json!(descriptor.name));
+                command.insert("description".to_owned(), serde_json::json!(descriptor.description));
+                // Platform-native permission gating: Discord itself hides the
+                // command from members lacking the permission. Kernel-side
+                // per-command ACL checks are the auth plugin's territory.
+                if let Some(bits) = descriptor
+                    .required_permission
+                    .as_ref()
+                    .and_then(|permission| discord_permission_bits(&permission.name))
+                {
+                    command
+                        .insert("default_member_permissions".to_owned(), serde_json::json!(bits));
                 }
+                if !options.is_empty() {
+                    command.insert("options".to_owned(), serde_json::json!(options));
+                }
+
+                serde_json::Value::Object(command)
             })
             .collect();
 
@@ -57,5 +64,17 @@ impl DiscordCommandRegistrar {
             .await
             .map_err(|err| OutboundError::Send(err.to_string()))?;
         Ok(())
+    }
+}
+
+/// Maps kernel permission names onto Discord permission bits (API v10 expects
+/// `default_member_permissions` as a string). Unknown names are ignored:
+/// the descriptor stays declarative, enforcement beyond Discord's own gating
+/// is not this adapter's business.
+fn discord_permission_bits(name: &str) -> Option<&'static str> {
+    match name {
+        "administrator" => Some("8"), // ADMINISTRATOR
+        "manage_guild" => Some("32"), // MANAGE_GUILD
+        _ => None,
     }
 }

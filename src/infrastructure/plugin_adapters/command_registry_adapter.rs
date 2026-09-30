@@ -40,6 +40,7 @@ impl CommandRegistryPort for InMemoryCommandRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::models::RequestContext;
     use crate::kernel::plugin_ports::CommandArgs;
     use crate::kernel::services::KernelServices;
 
@@ -49,6 +50,7 @@ mod tests {
     impl CommandHandler for NoopHandler {
         async fn invoke(
             &self,
+            _event: &RequestContext,
             _args: &CommandArgs,
             _services: &KernelServices,
         ) -> anyhow::Result<()> {

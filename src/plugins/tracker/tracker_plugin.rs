@@ -4,8 +4,13 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::kernel::{
-    models::{ChannelId, Event, EventKind, EventPayload, OutboundMessage, RequestContext},
-    plugin_ports::{EventBusPort, MiddlewarePluginPort, Next, PluginPort},
+    models::{
+        ChannelId, Event, EventKind, EventPayload, OutboundMessage, PluginError, RequestContext,
+    },
+    plugin_ports::{
+        CommandArgs, CommandDescriptor, CommandHandler, CommandRegistryPort, EventBusPort,
+        MiddlewarePluginPort, Next, Permission, PluginPort,
+    },
     services::KernelServices,
 };
 
@@ -39,20 +44,53 @@ pub struct TrackerConfig {
 /// Passive middleware: always `Continue` - tracking observes, never gates.
 /// Policy contrasts with auth: a malformed config here fails *open* (skip
 /// the log line) because observability must not break the event flow.
+///
+/// The audit channel is assigned per guild via `/assign_tracker` (run in the
+/// channel to assign) and cleared via `/unassign_tracker`; both are declared
+/// by this plugin in `init()` - meaning lives here, not in the dispatcher.
 pub struct UserActivityTrackerPlugin<B: EventBusPort> {
     bus: B,
+    registry: Arc<dyn CommandRegistryPort>,
 }
 
 impl<B: EventBusPort> UserActivityTrackerPlugin<B> {
     #[must_use]
-    pub fn new(bus: B) -> Self {
-        Self { bus }
+    pub fn new(bus: B, registry: Arc<dyn CommandRegistryPort>) -> Self {
+        Self { bus, registry }
     }
 }
 
 impl<B: EventBusPort> PluginPort for UserActivityTrackerPlugin<B> {
     fn name(&self) -> &'static str {
         "tracker"
+    }
+
+    fn init(&self) -> Result<(), PluginError> {
+        self.registry.register(
+            CommandDescriptor {
+                plugin_id: self.name().to_owned(),
+                name: "assign_tracker".to_owned(),
+                aliases: None,
+                description: "Log member joins/leaves in this channel".to_owned(),
+                arguments: Vec::new(),
+                // Platform-interpreted: the Discord adapter publishes this as
+                // `default_member_permissions` (Manage Server).
+                required_permission: Some(Permission { name: "manage_guild".to_owned() }),
+            },
+            Arc::new(AssignTrackerHandler),
+        );
+        self.registry.register(
+            CommandDescriptor {
+                plugin_id: self.name().to_owned(),
+                name: "unassign_tracker".to_owned(),
+                aliases: None,
+                description: "Stop logging member joins/leaves in this guild".to_owned(),
+                arguments: Vec::new(),
+                required_permission: Some(Permission { name: "manage_guild".to_owned() }),
+            },
+            Arc::new(UnassignTrackerHandler),
+        );
+        Ok(())
     }
 }
 
@@ -132,6 +170,78 @@ impl<B: EventBusPort> MiddlewarePluginPort for UserActivityTrackerPlugin<B> {
     }
 }
 
+/// `/assign_tracker`: the channel the command is run in becomes the guild's
+/// audit channel (last write wins - one channel per guild). Requires a guild
+/// origin; the reply lands back in that channel via the event-scoped port.
+struct AssignTrackerHandler;
+
+#[async_trait]
+impl CommandHandler for AssignTrackerHandler {
+    async fn invoke(
+        &self,
+        event: &RequestContext,
+        _args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
+        let Some(storage) = &services.guild_storage else {
+            services
+                .chat_output
+                .send(OutboundMessage::text("This command only works inside a server."))
+                .await?;
+            return Ok(());
+        };
+
+        storage
+            .set(
+                NAMESPACE,
+                CONFIG_KEY,
+                serde_json::json!({
+                    "audit_channel_id": event.origin.channel_id.get().to_string()
+                }),
+            )
+            .await?;
+
+        services
+            .chat_output
+            .send(OutboundMessage::text(
+                "Tracker assigned: member joins and leaves will be logged in this channel.",
+            ))
+            .await?;
+        Ok(())
+    }
+}
+
+/// `/unassign_tracker`: clears the guild's tracker config (idempotent).
+struct UnassignTrackerHandler;
+
+#[async_trait]
+impl CommandHandler for UnassignTrackerHandler {
+    async fn invoke(
+        &self,
+        _event: &RequestContext,
+        _args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
+        let Some(storage) = &services.guild_storage else {
+            services
+                .chat_output
+                .send(OutboundMessage::text("This command only works inside a server."))
+                .await?;
+            return Ok(());
+        };
+
+        storage.delete(NAMESPACE, CONFIG_KEY).await?;
+
+        services
+            .chat_output
+            .send(OutboundMessage::text(
+                "Tracker unassigned: member joins and leaves are no longer logged.",
+            ))
+            .await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,8 +253,11 @@ mod tests {
         plugin_ports::EventHandler,
         spi_ports::{ChatOutputFactoryPort, ChatOutputPort, GUILD_SETTINGS, StoragePort},
     };
-    use crate::test_support::InMemoryStorage;
-    use crate::{infrastructure::plugin_adapters::InMemoryEventBus, kernel::models::OutboundError};
+    use crate::test_support::{InMemoryStorage, RecordingChatOutput};
+    use crate::{
+        infrastructure::plugin_adapters::{InMemoryCommandRegistry, InMemoryEventBus},
+        kernel::models::OutboundError,
+    };
     use parking_lot::Mutex;
     use std::sync::Arc;
 
@@ -233,6 +346,7 @@ mod tests {
 
     struct Fixture {
         sent: Arc<Sent>,
+        output: Arc<RecordingChatOutput>,
         joined: Arc<Recorder<UserJoinedGuild>>,
         left: Arc<Recorder<UserLeftGuild>>,
     }
@@ -247,23 +361,16 @@ mod tests {
         bus.subscribe(Arc::clone(&left) as Arc<dyn EventHandler<UserLeftGuild>>);
 
         let sent = Arc::new(Sent::default());
+        let output = RecordingChatOutput::new();
         let services = KernelServices {
-            chat_output: Arc::new(DummyOutput) as Arc<dyn ChatOutputPort>,
+            chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::new(ChannelRecordingFactory { sent: Arc::clone(&sent) }),
             guild_storage: storage
                 .map(|storage| storage.guild_scoped(Platform::Discord, GuildId(1))),
         };
 
-        (UserActivityTrackerPlugin::new(bus), services, Fixture { sent, joined, left })
-    }
-
-    struct DummyOutput;
-
-    #[async_trait]
-    impl ChatOutputPort for DummyOutput {
-        async fn send(&self, _message: OutboundMessage) -> Result<(), OutboundError> {
-            panic!("origin-bound chat_output must not be used by the tracker");
-        }
+        let plugin = UserActivityTrackerPlugin::new(bus, Arc::new(InMemoryCommandRegistry::new()));
+        (plugin, services, Fixture { sent, output, joined, left })
     }
 
     // --- tests ---
@@ -383,6 +490,110 @@ mod tests {
         assert_eq!(
             fixture.sent.messages.lock().clone(),
             vec![(777, "📥 **user 3** joined the guild".to_owned())]
+        );
+    }
+
+    /// `/assign_tracker` run in a channel stores that channel and confirms.
+    #[tokio::test]
+    async fn assign_handler_stores_current_channel_and_replies() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let (_plugin, services, fixture) = fixture(Some(Arc::clone(&storage)));
+        let mut event = member_event(EventKind::MemberJoined, Some(1), "someone");
+        event.origin.channel_id = ChannelIdModel(777);
+
+        AssignTrackerHandler
+            .invoke(&event, &CommandArgs::default(), &services)
+            .await
+            .expect("assign expected to succeed");
+
+        let stored = storage
+            .guild_scoped(Platform::Discord, GuildId(1))
+            .get(NAMESPACE, CONFIG_KEY)
+            .await
+            .expect("storage get expected to succeed");
+        assert_eq!(stored, Some(serde_json::json!({ "audit_channel_id": "777" })));
+        assert_eq!(fixture.output.messages().len(), 1);
+    }
+
+    /// Last write wins: assigning another channel replaces the previous one.
+    #[tokio::test]
+    async fn assign_handler_replaces_previous_channel() {
+        let storage = configured_storage("777");
+        let (_plugin, services, _fixture) = fixture(Some(Arc::clone(&storage)));
+        let mut event = member_event(EventKind::MemberJoined, Some(1), "someone");
+        event.origin.channel_id = ChannelIdModel(888);
+
+        AssignTrackerHandler
+            .invoke(&event, &CommandArgs::default(), &services)
+            .await
+            .expect("assign expected to succeed");
+
+        let stored = storage
+            .guild_scoped(Platform::Discord, GuildId(1))
+            .get(NAMESPACE, CONFIG_KEY)
+            .await
+            .expect("storage get expected to succeed");
+        assert_eq!(stored, Some(serde_json::json!({ "audit_channel_id": "888" })));
+    }
+
+    /// `/unassign_tracker` clears the config; tracking goes silent afterwards.
+    #[tokio::test]
+    async fn unassign_handler_clears_config() {
+        let storage = configured_storage("777");
+        let (plugin, services, fixture) = fixture(Some(Arc::clone(&storage)));
+        let event = member_event(EventKind::MemberJoined, Some(1), "someone");
+
+        UnassignTrackerHandler
+            .invoke(&event, &CommandArgs::default(), &services)
+            .await
+            .expect("unassign expected to succeed");
+
+        let stored = storage
+            .guild_scoped(Platform::Discord, GuildId(1))
+            .get(NAMESPACE, CONFIG_KEY)
+            .await
+            .expect("storage get expected to succeed");
+        assert_eq!(stored, None);
+        assert_eq!(fixture.output.messages().len(), 1);
+
+        // Tracking is off now: a join produces no audit message and no event.
+        let mut join = member_event(EventKind::MemberJoined, Some(1), "someone");
+        let _ = plugin.pre(&mut join, &services).await;
+        assert!(fixture.sent.messages.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn commands_in_direct_messages_reply_guild_only() {
+        let (_plugin, services, fixture) = fixture(None);
+        let event = member_event(EventKind::MemberJoined, None, "someone");
+
+        AssignTrackerHandler
+            .invoke(&event, &CommandArgs::default(), &services)
+            .await
+            .expect("assign expected to succeed");
+
+        assert_eq!(fixture.output.messages(), ["This command only works inside a server."]);
+    }
+
+    /// The plugin declares its own commands during `init()`; the dispatcher
+    /// and the Discord registrar consume the descriptors meaning-free.
+    #[test]
+    fn init_registers_tracker_commands() {
+        let registry = Arc::new(InMemoryCommandRegistry::new());
+        let plugin = UserActivityTrackerPlugin::new(InMemoryEventBus::new(), registry.clone());
+
+        plugin.init().expect("init expected to succeed");
+
+        let descriptors = registry.descriptors();
+        assert_eq!(descriptors.len(), 2);
+        assert!(descriptors.iter().all(|d| d.plugin_id == "tracker"));
+        let names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"assign_tracker"));
+        assert!(names.contains(&"unassign_tracker"));
+        assert!(
+            descriptors
+                .iter()
+                .all(|d| d.required_permission.as_ref().is_some_and(|p| p.name == "manage_guild"))
         );
     }
 

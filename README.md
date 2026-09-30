@@ -32,11 +32,11 @@ a slash command from any other reply path.
 - Per-guild authorization (`auth` plugin): user and role allow-lists;
   unconfigured guilds are open by default; a malformed policy fails closed.
 - User activity tracker (`tracker` plugin): logs member joins/leaves to the
-  guild's configured audit channel and publishes `UserJoinedGuild` /
-  `UserLeftGuild` domain events on the plugin bus for other plugins to
-  react to. Per-guild settings live in plugin storage (namespace `tracker`,
-  key `config`: `{ "audit_channel_id": "<channel id>" }`); absent config
-  means tracking is off for that guild.
+  guild's audit channel and publishes `UserJoinedGuild` / `UserLeftGuild`
+  domain events on the plugin bus for other plugins to react to. Channel
+  assignment is self-service: `/assign_tracker` run in a channel makes it
+  the audit channel, `/unassign_tracker` turns tracking off (both require
+  the Manage Server permission, enforced by Discord itself).
 - Guild-partitioned document storage: plugins persist JSON documents scoped
   to `(platform, guild)` - reading another guild's data is impossible by
   construction. SQLite (default) and PostgreSQL.
