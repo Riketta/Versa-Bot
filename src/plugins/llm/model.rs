@@ -97,6 +97,10 @@ pub struct ChannelConfig {
     /// Reply splitting limit override; `None` = plugin-wide default.
     #[serde(default)]
     pub max_length: Option<usize>,
+    /// Template for rendering user turns into the context; `{sender}` and
+    /// `{message}` are substituted. `None` = `{sender}: {message}`.
+    #[serde(default)]
+    pub turn_template: Option<String>,
 }
 
 impl ChannelConfig {
@@ -116,6 +120,7 @@ impl ChannelConfig {
             streaming: false,
             random_chance_percent: default_random_chance(),
             max_length: None,
+            turn_template: None,
         }
     }
 }

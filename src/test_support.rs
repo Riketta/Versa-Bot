@@ -10,10 +10,7 @@ use serde_json::Value;
 
 use crate::kernel::{
     models::{GuildId, OutboundError, OutboundMessage, Platform, StorageError},
-    spi_ports::{
-        ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, GuildStorage, StoragePort,
-        StoredRecord,
-    },
+    spi_ports::{ChatOutputFactoryPort, ChatOutputPort, GuildStorage, StoragePort, StoredRecord},
 };
 
 type Row = (String, i64, String, String);

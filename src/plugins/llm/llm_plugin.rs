@@ -1,29 +1,55 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use parking_lot::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
+
 use crate::kernel::{
-    models::PluginError,
+    models::{EventKind, EventPayload, GuildId, Origin, PluginError, RequestContext},
     plugin_ports::{
-        ArgDescriptor, ArgKind, CommandDescriptor, CommandRegistryPort, Permission, PluginPort,
+        ArgDescriptor, ArgKind, CommandDescriptor, CommandRegistryPort, MiddlewarePluginPort, Next,
+        Permission, PluginPort,
     },
+    services::KernelServices,
 };
 
+use super::chat_engine::ChatEngine;
 use super::commands::{
     AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler, UnassignLlmHandler,
 };
+use super::model::{ChannelConfig, NAMESPACE, channel_config_key};
 
-/// LLM chat plugin. This is the lifecycle/identity half (`PluginPort`): it
-/// owns the per-channel configuration and service-channel commands so guild
-/// admins can wire channels up. The conversation engine - capture rules,
-/// completion, compaction, random replies - joins the middleware pipeline in
-/// the following steps and rides the same plugin object.
+/// Identifies one channel's processing lock: platform, guild, channel.
+type ChannelKey = (String, u64, u64);
+
+/// LLM chat plugin: lifecycle + admin commands (`PluginPort`) and the
+/// conversation intake (`MiddlewarePluginPort`).
+///
+/// The `pre` hook never runs the engine inline - LLM calls are slow and the
+/// pipeline must not wait on them. Assigned-channel messages spawn a task
+/// that runs the engine under the channel's lock (tokio's mutex is fair, so
+/// execution follows pipeline order, and records keep conversation order).
+/// The hook itself only matches the event and reads the channel config.
 pub struct LlmPlugin {
     registry: Arc<dyn CommandRegistryPort>,
+    engine: Arc<ChatEngine>,
+    channel_locks: Arc<Mutex<HashMap<ChannelKey, Arc<AsyncMutex<()>>>>>,
 }
 
 impl LlmPlugin {
     #[must_use]
-    pub fn new(registry: Arc<dyn CommandRegistryPort>) -> Self {
-        Self { registry }
+    pub fn new(registry: Arc<dyn CommandRegistryPort>, engine: Arc<ChatEngine>) -> Self {
+        Self { registry, engine, channel_locks: Arc::new(Mutex::new(HashMap::new())) }
+    }
+
+    fn channel_lock(&self, origin: &Origin) -> Arc<AsyncMutex<()>> {
+        let key: ChannelKey = (
+            origin.platform.as_str().to_owned(),
+            origin.guild_id.map_or(0, GuildId::get),
+            origin.channel_id.get(),
+        );
+        Arc::clone(self.channel_locks.lock().entry(key).or_default())
     }
 
     fn descriptor(
@@ -85,10 +111,57 @@ impl PluginPort for LlmPlugin {
     }
 }
 
+#[async_trait]
+impl MiddlewarePluginPort for LlmPlugin {
+    async fn pre(&self, event: &mut RequestContext, services: &KernelServices) -> Next {
+        let (origin, payload) = match (&event.kind, &event.payload) {
+            (EventKind::MessageReceived, EventPayload::Message(payload)) => {
+                (event.origin.clone(), payload.clone())
+            }
+            _ => return Next::Continue,
+        };
+
+        // LLM chat is guild-only by design: per-channel config cannot exist
+        // outside a guild.
+        if origin.guild_id.is_none() {
+            return Next::Continue;
+        }
+        let Some(storage) = &services.guild_storage else {
+            return Next::Continue;
+        };
+
+        let raw = match storage.get(NAMESPACE, &channel_config_key(origin.channel_id.get())).await {
+            Ok(Some(raw)) => raw,
+            Ok(None) => return Next::Continue, // channel not assigned
+            Err(err) => {
+                tracing::warn!(namespace = NAMESPACE, %err, "llm channel config unreadable");
+                return Next::Continue;
+            }
+        };
+        let Ok(config) = serde_json::from_value::<ChannelConfig>(raw) else {
+            tracing::warn!(namespace = NAMESPACE, "llm channel config is malformed - skipping");
+            return Next::Continue;
+        };
+
+        // Off the pipeline task; capture/trigger decisions happen inside,
+        // under the channel lock, on fresh records.
+        let lock = self.channel_lock(&origin);
+        let engine = Arc::clone(&self.engine);
+        let services = services.clone();
+        tokio::spawn(async move {
+            let _guard = lock.lock().await;
+            engine.handle_message(&origin, &payload, &config, &services).await;
+        });
+
+        Next::Continue
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::infrastructure::plugin_adapters::InMemoryCommandRegistry;
+    use crate::kernel::models::MessagePayload;
     use crate::kernel::{
         models::{
             ChannelId as ChannelIdModel, CommandPayload, EventKind, EventPayload, GuildId,
@@ -98,8 +171,47 @@ mod tests {
         services::KernelServices,
         spi_ports::{ChatOutputPort, GUILD_SETTINGS, StoragePort},
     };
-    use crate::plugins::llm::model::{NAMESPACE, SERVICE_CHANNEL_KEY, channel_config_key};
+    use crate::plugins::llm::model::{
+        ChannelConfig, NAMESPACE, SERVICE_CHANNEL_KEY, channel_config_key,
+    };
+    use crate::plugins::llm::{
+        ChatEngine, CompletionRequest, CompletionResponse, LlmCompletionPort, LlmError, LlmSettings,
+    };
     use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
+
+    struct StubCompletion;
+
+    #[async_trait]
+    impl LlmCompletionPort for StubCompletion {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            Ok(CompletionResponse { content: "stub reply".to_owned() })
+        }
+    }
+
+    fn message_event(channel_id: u64, mentions_bot: bool) -> RequestContext {
+        RequestContext {
+            kind: EventKind::MessageReceived,
+            origin: Origin {
+                platform: Platform::Discord,
+                guild_id: Some(GuildId(1)),
+                channel_id: ChannelIdModel(channel_id),
+                user_id: UserId(3),
+                message_id: Some(MessageId(4)),
+                reply_token: None,
+            },
+            payload: EventPayload::Message(MessagePayload {
+                content: "hello".to_owned(),
+                author_name: Some("alice".to_owned()),
+                author_roles: Vec::new(),
+                author_permissions: 0,
+                reply_to: None,
+                mentions_bot,
+            }),
+        }
+    }
 
     fn command_event(guild: Option<u64>) -> RequestContext {
         RequestContext {
@@ -137,7 +249,11 @@ mod tests {
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
         };
-        let plugin = LlmPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>);
+        let engine = Arc::new(ChatEngine::new(
+            Arc::new(LlmSettings::default()),
+            Arc::new(StubCompletion) as Arc<dyn LlmCompletionPort>,
+        ));
+        let plugin = LlmPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>, engine);
         (plugin, Fixture { registry, storage, services, output })
     }
 
@@ -337,5 +453,67 @@ mod tests {
     #[test]
     fn llm_namespace_is_not_the_reserved_guild_namespace() {
         assert_ne!(NAMESPACE, GUILD_SETTINGS);
+    }
+
+    fn seed_config_in(storage: &InMemoryStorage) {
+        storage.seed(
+            Platform::Discord,
+            GuildId(1),
+            NAMESPACE,
+            &channel_config_key(2),
+            serde_json::to_value(ChannelConfig::assigned("local/gemma".to_owned()))
+                .expect("config expected to serialize"),
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_spawns_engine_for_assigned_channels() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&fixture.storage);
+
+        let mut event = message_event(2, true);
+        let next = plugin.pre(&mut event, &fixture.services).await;
+        assert!(matches!(next, Next::Continue));
+
+        // The engine runs on a spawned task - yield until its output lands.
+        for _ in 0..1000 {
+            if !fixture.output.messages().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(fixture.output.messages().iter().any(|m| m.contains("stub reply")));
+    }
+
+    #[tokio::test]
+    async fn pre_ignores_unassigned_channels() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+
+        let mut event = message_event(3, true); // no config doc for channel 3
+        let next = plugin.pre(&mut event, &fixture.services).await;
+        assert!(matches!(next, Next::Continue));
+
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert!(fixture.output.messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pre_ignores_non_message_events() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&fixture.storage);
+
+        let mut event = command_event(Some(1));
+        let next = plugin.pre(&mut event, &fixture.services).await;
+        assert!(matches!(next, Next::Continue));
+
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert!(fixture.output.messages().is_empty());
     }
 }

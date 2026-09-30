@@ -23,7 +23,9 @@ use versa_bot::kernel::{
 use versa_bot::plugins::audit::AuditLogPlugin;
 use versa_bot::plugins::auth::AuthPlugin;
 use versa_bot::plugins::command::CommandPlugin;
-use versa_bot::plugins::llm::LlmPlugin;
+use versa_bot::plugins::llm::{
+    ChatEngine, LlmCompletionPort, LlmPlugin, LlmSettings, OpenAiCompatibleAdapter,
+};
 use versa_bot::plugins::status::{StatusRotatorPlugin, StatusSettings};
 use versa_bot::plugins::tracker::UserActivityTrackerPlugin;
 
@@ -69,9 +71,19 @@ async fn main() -> ExitCode {
         event_bus.clone(),
         Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
     ));
-    // LLM chat plugin: lifecycle + admin commands live now; its conversation
-    // engine joins the middleware chain as those steps land.
-    let llm = Arc::new(LlmPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>));
+    // LLM chat plugin: the conversation engine is live. The provider layer
+    // starts empty until the [llm] config section is wired here - channels
+    // can already be assigned; completions fail with a clear error until
+    // providers are declared.
+    let llm_settings = Arc::new(LlmSettings::default());
+    let llm_adapter = OpenAiCompatibleAdapter::from_settings(Arc::clone(&llm_settings))
+        .expect("llm provider settings expected to configure cleanly");
+    let llm_engine = Arc::new(ChatEngine::new(
+        llm_settings,
+        Arc::new(llm_adapter) as Arc<dyn LlmCompletionPort>,
+    ));
+    let llm =
+        Arc::new(LlmPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>, llm_engine));
     // Bus-only plugin: in `plugins` for lifecycle, never in the middleware
     // chain - it reacts to derived events, not to raw inbound ones.
     let audit = Arc::new(AuditLogPlugin::new(event_bus.clone()));
@@ -117,6 +129,7 @@ async fn main() -> ExitCode {
                 Arc::clone(&auth) as Arc<dyn MiddlewarePluginPort>,
                 Arc::clone(&command) as Arc<dyn MiddlewarePluginPort>,
                 Arc::clone(&tracker) as Arc<dyn MiddlewarePluginPort>,
+                Arc::clone(&llm) as Arc<dyn MiddlewarePluginPort>,
             ])
             .event_bus(event_bus)
             .chat_output_factory(Arc::new(SerenityChatOutputFactory::new(build_http(
