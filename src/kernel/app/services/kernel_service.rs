@@ -9,7 +9,7 @@ use crate::kernel::{
     models::{GuildId, Origin, PluginError, RequestContext},
     plugin_ports::{EventBusPort, MiddlewarePluginPort, Next, PluginPort},
     services::KernelServices,
-    spi_ports::ChatOutputFactoryPort,
+    spi_ports::{ChatOutputFactoryPort, StoragePort},
 };
 
 /// The kernel: assembles the middleware chain and runs it, but never knows
@@ -24,6 +24,7 @@ pub struct KernelService<E: EventBusPort> {
     #[allow(dead_code)]
     event_bus: E,
     chat_output_factory: Arc<dyn ChatOutputFactoryPort>,
+    storage: Arc<dyn StoragePort>,
 }
 
 #[bon]
@@ -34,12 +35,14 @@ impl<E: EventBusPort> KernelService<E> {
         middleware: Vec<Arc<dyn MiddlewarePluginPort>>,
         event_bus: E,
         chat_output_factory: Arc<dyn ChatOutputFactoryPort>,
+        storage: Arc<dyn StoragePort>,
     ) -> Self {
         Self {
             plugins,
             middleware,
             event_bus,
             chat_output_factory,
+            storage,
         }
     }
 
@@ -79,11 +82,14 @@ impl<E: EventBusPort> KernelService<E> {
         }
     }
 
-    /// Event-scoped service context: outbound ports bound to the event's
-    /// origin.
+    /// Event-scoped service context: outbound ports and storage bound to the
+    /// event's origin. DMs get no guild storage handle at all.
     fn scoped_services(&self, origin: &Origin) -> KernelServices {
         KernelServices {
             chat_output: self.chat_output_factory.chat_output(origin),
+            guild_storage: origin
+                .guild_id
+                .map(|guild_id| self.storage.guild_scoped(origin.platform, guild_id)),
         }
     }
 }
@@ -154,10 +160,12 @@ impl<E: EventBusPort> KernelService<E> {
 mod tests {
     use super::*;
     use crate::kernel::{
-        models::{EventKind, OutboundError, OutboundMessage},
-        spi_ports::ChatOutputPort,
+        models::{EventKind, OutboundError, OutboundMessage, Platform, StorageError},
+        spi_ports::{ChatOutputPort, GuildStorage},
     };
     use parking_lot::Mutex;
+    use serde_json::Value;
+    use std::collections::HashMap;
 
     struct FakeChatOutput {
         messages: Arc<Mutex<Vec<String>>>,
@@ -180,6 +188,66 @@ mod tests {
             Arc::new(FakeChatOutput {
                 messages: Arc::clone(&self.messages),
             })
+        }
+    }
+
+    /// In-memory `StoragePort`: guild-partitioned rows, so the isolation
+    /// property can be asserted through the whole pipeline.
+    #[derive(Default)]
+    struct TestStorage {
+        documents: Arc<Mutex<HashMap<(String, i64, String, String), Value>>>,
+    }
+
+    impl StoragePort for TestStorage {
+        fn guild_scoped(&self, platform: Platform, guild_id: GuildId) -> Arc<dyn GuildStorage> {
+            Arc::new(ScopedView {
+                documents: Arc::clone(&self.documents),
+                key_prefix: (platform.as_str().to_owned(), guild_id.get() as i64),
+            })
+        }
+    }
+
+    struct ScopedView {
+        documents: Arc<Mutex<HashMap<(String, i64, String, String), Value>>>,
+        key_prefix: (String, i64),
+    }
+
+    #[async_trait]
+    impl GuildStorage for ScopedView {
+        async fn get(&self, namespace: &str, key: &str) -> Result<Option<Value>, StorageError> {
+            let (platform, guild_id) = self.key_prefix.clone();
+            Ok(self
+                .documents
+                .lock()
+                .get(&(platform, guild_id, namespace.to_owned(), key.to_owned()))
+                .cloned())
+        }
+
+        async fn set(&self, namespace: &str, key: &str, value: Value) -> Result<(), StorageError> {
+            let (platform, guild_id) = self.key_prefix.clone();
+            self.documents.lock().insert(
+                (platform, guild_id, namespace.to_owned(), key.to_owned()),
+                value,
+            );
+            Ok(())
+        }
+
+        async fn delete(&self, namespace: &str, key: &str) -> Result<(), StorageError> {
+            let (platform, guild_id) = self.key_prefix.clone();
+            self.documents
+                .lock()
+                .remove(&(platform, guild_id, namespace.to_owned(), key.to_owned()));
+            Ok(())
+        }
+
+        async fn list_keys(&self, namespace: &str) -> Result<Vec<String>, StorageError> {
+            Ok(self
+                .documents
+                .lock()
+                .keys()
+                .filter(|(_, _, ns, _)| ns == namespace)
+                .map(|(_, _, _, key)| key.clone())
+                .collect())
         }
     }
 
@@ -213,6 +281,37 @@ mod tests {
         }
     }
 
+    /// Reads its own namespace from the event-scoped guild storage and
+    /// replies with it - proves the handle reaches plugins guild-bound.
+    struct GreeterPlugin;
+
+    impl PluginPort for GreeterPlugin {
+        fn name(&self) -> &'static str {
+            "greeter"
+        }
+    }
+
+    #[async_trait]
+    impl MiddlewarePluginPort for GreeterPlugin {
+        async fn pre(&self, _event: &mut RequestContext, services: &KernelServices) -> Next {
+            let Some(storage) = &services.guild_storage else {
+                return Next::Continue;
+            };
+            let greeting = storage
+                .get("greeter", "greeting")
+                .await
+                .ok()
+                .flatten()
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                .unwrap_or_else(|| "hello".to_owned());
+            let _ = services
+                .chat_output
+                .send(OutboundMessage::text(greeting))
+                .await;
+            Next::Stop
+        }
+    }
+
     struct SilentPlugin;
 
     impl PluginPort for SilentPlugin {
@@ -238,7 +337,7 @@ mod tests {
 
     fn test_origin() -> Origin {
         Origin {
-            platform: crate::kernel::models::Platform::Discord,
+            platform: Platform::Discord,
             guild_id: Some(GuildId(1)),
             channel_id: crate::kernel::models::ChannelId(2),
             user_id: crate::kernel::models::UserId(3),
@@ -247,6 +346,7 @@ mod tests {
     }
 
     fn test_kernel(
+        storage: Arc<dyn StoragePort>,
         plugins: Vec<Arc<dyn PluginPort>>,
         middleware: Vec<Arc<dyn MiddlewarePluginPort>>,
     ) -> (KernelService<TestEventBus>, Arc<Mutex<Vec<String>>>) {
@@ -258,6 +358,7 @@ mod tests {
             .chat_output_factory(Arc::new(FakeChatOutputFactory {
                 messages: Arc::clone(&messages),
             }))
+            .storage(storage)
             .build();
         (kernel, messages)
     }
@@ -270,6 +371,7 @@ mod tests {
             started: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         let (kernel, messages) = test_kernel(
+            Arc::new(TestStorage::default()),
             vec![Arc::clone(&pong) as Arc<dyn PluginPort>],
             vec![Arc::clone(&pong) as Arc<dyn MiddlewarePluginPort>],
         );
@@ -284,6 +386,7 @@ mod tests {
     #[tokio::test]
     async fn unhandled_event_yields_no_output() {
         let (kernel, messages) = test_kernel(
+            Arc::new(TestStorage::default()),
             vec![Arc::new(SilentPlugin)],
             vec![Arc::new(SilentPlugin) as Arc<dyn MiddlewarePluginPort>],
         );
@@ -303,6 +406,7 @@ mod tests {
         });
 
         let (kernel, _messages) = test_kernel(
+            Arc::new(TestStorage::default()),
             vec![Arc::clone(&pong) as Arc<dyn PluginPort>],
             vec![Arc::clone(&pong) as Arc<dyn MiddlewarePluginPort>],
         );
@@ -314,5 +418,40 @@ mod tests {
             1,
             "dual-registered plugin must start exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn pipeline_hands_plugin_guild_scoped_storage() {
+        let storage = Arc::new(TestStorage::default());
+        // Guild 1 is greeted by config; guild 2 has none and gets the default.
+        storage
+            .guild_scoped(Platform::Discord, GuildId(1))
+            .set(
+                "greeter",
+                "greeting",
+                Value::String("privit".to_owned()),
+            )
+            .await
+            .unwrap();
+
+        let (kernel, messages) = test_kernel(
+            storage,
+            vec![Arc::new(GreeterPlugin)],
+            vec![Arc::new(GreeterPlugin) as Arc<dyn MiddlewarePluginPort>],
+        );
+
+        kernel
+            .handle(RequestContext::message_received(test_origin(), "hi"))
+            .await;
+
+        let other_guild = Origin {
+            guild_id: Some(GuildId(2)),
+            ..test_origin()
+        };
+        kernel
+            .handle(RequestContext::message_received(other_guild, "hi"))
+            .await;
+
+        assert_eq!(messages.lock().as_slice(), ["privit", "hello"]);
     }
 }

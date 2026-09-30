@@ -8,13 +8,14 @@ use serenity::all::Http;
 use versa_bot::infrastructure::{
     inbound_adapters::{DiscordGatewayAdapter, SerenityChatOutputFactory},
     observability,
+    outbound_adapters::SqlxStorage,
     plugin_adapters::InMemoryEventBus,
     Configuration,
 };
 use versa_bot::kernel::{
     plugin_ports::{MiddlewarePluginPort, PluginPort},
     services::KernelService,
-    spi_ports::ChatOutputFactoryPort,
+    spi_ports::{ChatOutputFactoryPort, StoragePort},
 };
 use versa_bot::plugins::command::CommandPlugin;
 
@@ -41,6 +42,12 @@ async fn main() {
         config.discord.proxy,
     )));
 
+    let storage = Arc::new(
+        SqlxStorage::connect(&config.storage.url)
+            .await
+            .expect("storage expected to connect and migrate"),
+    );
+
     let command = Arc::new(CommandPlugin::new("!"));
 
     let kernel = Arc::new(
@@ -49,6 +56,7 @@ async fn main() {
             .middleware(vec![Arc::clone(&command) as Arc<dyn MiddlewarePluginPort>])
             .event_bus(InMemoryEventBus::new())
             .chat_output_factory(Arc::clone(&chat_output_factory) as Arc<dyn ChatOutputFactoryPort>)
+            .storage(Arc::clone(&storage) as Arc<dyn StoragePort>)
             .build(),
     );
 
@@ -62,6 +70,16 @@ async fn main() {
         .event_handler(DiscordGatewayAdapter::new(Arc::clone(&kernel)))
         .await
         .expect("failed to create client");
+
+    // Ctrl-C: stop the gateway so `start` returns, then plugins stop in
+    // reverse order below.
+    let shard_manager = client.shard_manager.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("shutdown signal received");
+            shard_manager.shutdown_all().await;
+        }
+    });
 
     if let Err(err) = client.start().await {
         tracing::error!(?err, "client error");

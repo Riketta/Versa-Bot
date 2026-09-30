@@ -9,4 +9,4 @@ pub use chat_output_factory_port::ChatOutputFactoryPort;
 pub use chat_output_port::ChatOutputPort;
 pub use platform_query_port::PlatformQueryPort;
 pub use presence_port::PresencePort;
-pub use storage_ports::{GuildStoragePort, PluginStoragePort};
+pub use storage_ports::{GUILD_SETTINGS, GuildStorage, StoragePort};

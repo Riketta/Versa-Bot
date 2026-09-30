@@ -4,6 +4,11 @@ debug = true
 token = "YOUR_TOKEN"
 # proxy = ""
 
+[storage]
+# SQLite for development; PostgreSQL in production, e.g.
+# url = "postgres://user:password@host/versa_bot"
+url = "sqlite://versabot.db"
+
 # Sentry-protocol endpoint: Sentry SaaS or self-hosted GlitchTip.
 # The address to report to is the DSN host - no separate URL needed.
 # Remove the section (or leave dsn empty) to disable reporting entirely.

@@ -95,6 +95,7 @@ mod tests {
     fn test_services(messages: Arc<Mutex<Vec<String>>>) -> KernelServices {
         KernelServices {
             chat_output: Arc::new(FakeChatOutput { messages }),
+            guild_storage: None,
         }
     }
 

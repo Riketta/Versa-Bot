@@ -9,6 +9,16 @@ pub enum Platform {
     Discord,
 }
 
+impl Platform {
+    /// Stable storage/telemetry key for the platform.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Discord => "discord",
+        }
+    }
+}
+
 /// Where an inbound event came from. Scopes event-driven outbound ports:
 /// a `ChatOutputPort` built from an origin sends to `channel_id` inside
 /// `guild_id`, so a plugin replies without a returned response.
