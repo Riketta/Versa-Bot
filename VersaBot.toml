@@ -1,0 +1,12 @@
+debug = true
+
+[discord]
+token = "YOUR_TOKEN"
+# proxy = ""
+
+# Sentry-protocol endpoint: Sentry SaaS or self-hosted GlitchTip.
+# The address to report to is the DSN host - no separate URL needed.
+# Remove the section (or leave dsn empty) to disable reporting entirely.
+# [sentry]
+# dsn = "http://your-key@localhost:9000/1"
+# environment = "development"

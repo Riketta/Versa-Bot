@@ -1,0 +1,58 @@
+[package]
+name = "versa-bot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.91"
+bon = "3.9.1"
+bytes = "1.12.1"
+config = {
+  version = "0.15.25",
+  default-features = false,
+  features = [
+    "async",
+    "convert-case",
+    "toml",
+  ]
+}
+parking_lot = "0.12.5"
+poise = "0.6.2"
+reqwest = { version = "0.12", features = ["socks"] }
+sea-orm = { version = "2.0.1", features = ["sqlx-postgres"] }
+sentry = { version = "0.49", default-features = false, features = [
+  "ureq",
+  "rustls",
+  "backtrace",
+  "contexts",
+  "panic",
+  "tracing",
+] }
+sentry-tracing = "0.49"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serenity = {
+  version = "0.12.5",
+  features = ["client", "gateway", "model", "rustls_backend"]
+}
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
+tokio-util = "0.7.19"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+twilight-cache-inmemory = "0.17.1"
+twilight-gateway = "0.17.1"
+twilight-http = "0.17.1"
+twilight-mention = "0.17.0"
+twilight-model = "0.17.1"
+twilight-util = "0.17.0"
+
+[lints.clippy]
+cargo = { level = "warn", priority = -1 }
+cargo_common_metadata = "allow"
+indexing_slicing = "deny"
+multiple_crate_versions = "allow"
+pedantic = { level = "warn", priority = -1 }
+string_slice = "deny"
+# unwrap_used = "deny"
