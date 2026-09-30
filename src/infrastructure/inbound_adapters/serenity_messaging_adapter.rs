@@ -10,8 +10,8 @@ use serenity::async_trait;
 use crate::kernel::{
     api_ports::RequestHandlerPort,
     models::{
-        ChannelId, CommandPayload, EventKind, EventPayload, GuildId, MemberPayload, MessageId,
-        Origin, OutboundError, OutboundMessage, Platform, RequestContext, UserId,
+        ChannelId, CommandPayload, Embed, EventKind, EventPayload, GuildId, MemberPayload,
+        MessageId, Origin, OutboundError, OutboundMessage, Platform, RequestContext, UserId,
     },
     spi_ports::{ChatOutputFactoryPort, ChatOutputPort},
 };
@@ -256,12 +256,18 @@ struct SerenityChatOutput {
 #[async_trait]
 impl ChatOutputPort for SerenityChatOutput {
     async fn send(&self, message: OutboundMessage) -> Result<(), OutboundError> {
+        // Plain channel sends are always public - the ephemeral hint has no
+        // meaning here and is ignored.
+        let mut create = CreateMessage::new();
+        if !message.content.is_empty() {
+            create = create.content(message.content);
+        }
+        if !message.embeds.is_empty() {
+            create = create.embeds(message.embeds.iter().map(discord_embed).collect());
+        }
+
         self.http
-            .send_message(
-                self.channel_id,
-                Vec::new(),
-                &CreateMessage::new().content(message.content),
-            )
+            .send_message(self.channel_id, Vec::new(), &create)
             .await
             .map_err(|err| OutboundError::Send(err.to_string()))?;
         Ok(())
@@ -276,16 +282,40 @@ struct InteractionFollowupOutput {
 #[async_trait]
 impl ChatOutputPort for InteractionFollowupOutput {
     async fn send(&self, message: OutboundMessage) -> Result<(), OutboundError> {
+        let mut body = serde_json::Map::new();
+        if !message.content.is_empty() {
+            body.insert("content".to_owned(), serde_json::json!(message.content));
+        }
+        if !message.embeds.is_empty() {
+            let embeds: Vec<serde_json::Value> = message
+                .embeds
+                .iter()
+                .map(|embed| {
+                    serde_json::json!({
+                        "title": embed.title,
+                        "description": embed.description,
+                    })
+                })
+                .collect();
+            body.insert("embeds".to_owned(), serde_json::json!(embeds));
+        }
+        if message.ephemeral {
+            // EPHEMERAL flag (1 << 6): visible to the invoking user only.
+            body.insert("flags".to_owned(), serde_json::json!(64));
+        }
+
         self.http
-            .create_followup_message(
-                &self.token,
-                &serde_json::json!({ "content": message.content }),
-                Vec::new(),
-            )
+            .create_followup_message(&self.token, &serde_json::Value::Object(body), Vec::new())
             .await
             .map_err(|err| OutboundError::Send(err.to_string()))?;
         Ok(())
     }
+}
+
+fn discord_embed(embed: &Embed) -> serenity::all::CreateEmbed {
+    serenity::all::CreateEmbed::new()
+        .title(embed.title.clone())
+        .description(embed.description.clone())
 }
 
 #[cfg(test)]

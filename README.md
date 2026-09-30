@@ -31,6 +31,8 @@ a slash command from any other reply path.
   declarations (`/ping` ships as the demo command).
 - Per-guild authorization (`auth` plugin): user and role allow-lists;
   unconfigured guilds are open by default; a malformed policy fails closed.
+  A denied slash command is answered with an ephemeral error embed, visible
+  only to the invoker, naming the rejected permission group (users / roles).
 - User activity tracker (`tracker` plugin): logs member joins/leaves to the
   guild's audit channel and publishes `UserJoinedGuild` / `UserLeftGuild`
   domain events on the plugin bus for other plugins to react to. Channel

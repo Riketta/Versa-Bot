@@ -104,7 +104,7 @@ impl GuildStorage for ScopedView {
 /// [`ChatOutputPort`] that records every send for assertions.
 #[derive(Default)]
 pub struct RecordingChatOutput {
-    messages: Mutex<Vec<String>>,
+    messages: Mutex<Vec<OutboundMessage>>,
 }
 
 impl RecordingChatOutput {
@@ -113,16 +113,38 @@ impl RecordingChatOutput {
         Arc::new(Self::default())
     }
 
+    /// Flat text projection of every send (content plus embed title/description)
+    /// for simple string assertions.
     #[must_use]
     pub fn messages(&self) -> Vec<String> {
+        self.messages.lock().iter().map(text_of).collect()
+    }
+
+    /// Every send in full, for asserting flags and embeds.
+    #[must_use]
+    pub fn sent(&self) -> Vec<OutboundMessage> {
         self.messages.lock().clone()
     }
+}
+
+fn text_of(message: &OutboundMessage) -> String {
+    if message.embeds.is_empty() {
+        return message.content.clone();
+    }
+
+    let embeds = message
+        .embeds
+        .iter()
+        .map(|embed| format!("{}: {}", embed.title, embed.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if message.content.is_empty() { embeds } else { format!("{}\n{}", message.content, embeds) }
 }
 
 #[async_trait]
 impl ChatOutputPort for RecordingChatOutput {
     async fn send(&self, message: OutboundMessage) -> Result<(), OutboundError> {
-        self.messages.lock().push(message.content);
+        self.messages.lock().push(message);
         Ok(())
     }
 }

@@ -11,7 +11,7 @@ pub use event::{
 };
 pub use ids::{ChannelId, GuildId, MessageId, UserId};
 pub use outbound_error::OutboundError;
-pub use outbound_message::OutboundMessage;
+pub use outbound_message::{Embed, OutboundMessage};
 pub use plugin_error::PluginError;
 pub use request_context::RequestContext;
 pub use storage_error::StorageError;

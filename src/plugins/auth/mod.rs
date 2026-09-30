@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::kernel::{
-    models::{EventKind, EventPayload, RequestContext},
+    models::{Embed, EventKind, EventPayload, OutboundMessage, RequestContext},
     plugin_ports::{MiddlewarePluginPort, Next, PluginPort},
     services::KernelServices,
 };
@@ -81,6 +81,19 @@ impl MiddlewarePluginPort for AuthPlugin {
             guild_id = ?event.origin.guild_id,
             "event denied by auth"
         );
+
+        // Transactional events (slash commands) owe the invoker a visible
+        // answer; make it ephemeral so a denial never exposes the policy or
+        // spams the channel. Plain messages are not interactions - ephemeral
+        // is impossible there and a public reply would be a spam vector -
+        // so they stay silent.
+        if event.origin.reply_token.is_some() {
+            let denial = OutboundMessage::embed(self.denial_embed(&config, event)).ephemeral();
+            if let Err(err) = services.chat_output.send(denial).await {
+                tracing::warn!(%err, "failed to deliver auth denial");
+            }
+        }
+
         // Deliberate rejection: `Stop`, so this plugin's `post` still runs
         // (audit hook) while downstream plugins never see the event.
         Next::Stop
@@ -89,16 +102,53 @@ impl MiddlewarePluginPort for AuthPlugin {
 
 impl AuthPlugin {
     fn is_allowed(&self, config: &AuthConfig, event: &RequestContext) -> bool {
-        if config.allowed_users.iter().any(|id| *id == event.origin.user_id.get().to_string()) {
-            return true;
-        }
+        self.user_listed(config, event) || self.role_listed(config, event)
+    }
 
+    fn user_listed(&self, config: &AuthConfig, event: &RequestContext) -> bool {
+        config.allowed_users.iter().any(|id| *id == event.origin.user_id.get().to_string())
+    }
+
+    fn role_listed(&self, config: &AuthConfig, event: &RequestContext) -> bool {
         let author_roles = match &event.payload {
             EventPayload::Message(message) => &message.author_roles,
             EventPayload::Command(command) => &command.author_roles,
             _ => return false,
         };
         author_roles.iter().any(|role| config.allowed_roles.contains(role))
+    }
+
+    /// Why the event was denied, in terms of the policy groups: which
+    /// permission group rejected the user, or that a role is missing.
+    fn denial_embed(&self, config: &AuthConfig, event: &RequestContext) -> Embed {
+        let mut reasons: Vec<String> = Vec::new();
+        if !config.allowed_users.is_empty() && !self.user_listed(config, event) {
+            reasons.push("Not authorized for the `users` permissions group.".to_owned());
+        }
+        if !config.allowed_roles.is_empty() && !self.role_listed(config, event) {
+            reasons.push(
+                "Missing role: none of your roles are in the `roles` permissions group.".to_owned(),
+            );
+        }
+        if reasons.is_empty() {
+            // A policy with empty groups denies everyone.
+            reasons.push(
+                "The access policy currently allows no one - ask a guild admin to configure it."
+                    .to_owned(),
+            );
+        }
+
+        let what = match &event.payload {
+            EventPayload::Command(command) => {
+                format!("Command `/{}` is not allowed here.", command.name)
+            }
+            _ => "This action is not allowed here.".to_owned(),
+        };
+
+        Embed {
+            title: "⛔ Not authorized".to_owned(),
+            description: format!("{what}\n{}", reasons.join("\n")),
+        }
     }
 }
 
@@ -214,6 +264,75 @@ mod tests {
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
         assert!(output.messages().is_empty());
+    }
+
+    /// A denied slash command (transactional origin) answers the invoker
+    /// with an ephemeral embed naming the rejected permission group.
+    #[tokio::test]
+    async fn denied_command_answers_ephemerally_with_user_group_reason() {
+        let storage = configured_storage(&["999"], &[]);
+        let (services, output) = test_services(&storage);
+        let plugin = AuthPlugin;
+        let mut event = command_event(3, &[]);
+        event.origin.reply_token = Some("token".to_owned());
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
+
+        let sent = output.sent();
+        assert_eq!(sent.len(), 1);
+        let denial = sent.first().expect("denial expected");
+        assert!(denial.ephemeral, "denial must be visible to the invoker only");
+        let text = output.messages().into_iter().next().expect("denial expected");
+        assert!(text.contains("⛔ Not authorized"));
+        assert!(text.contains("Command `/ping` is not allowed here."));
+        assert!(text.contains("Not authorized for the `users` permissions group."));
+        assert!(!text.contains("Missing role"));
+    }
+
+    #[tokio::test]
+    async fn denied_command_with_roles_config_reports_missing_role() {
+        let storage = configured_storage(&[], &["42"]);
+        let (services, output) = test_services(&storage);
+        let plugin = AuthPlugin;
+        let mut event = command_event(3, &["7"]);
+        event.origin.reply_token = Some("token".to_owned());
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
+
+        let text = output.messages().into_iter().next().expect("denial expected");
+        assert!(
+            text.contains("Missing role: none of your roles are in the `roles` permissions group.")
+        );
+        assert!(!text.contains("Not authorized for the"));
+    }
+
+    #[tokio::test]
+    async fn denied_command_lists_every_rejected_group() {
+        let storage = configured_storage(&["999"], &["42"]);
+        let (services, output) = test_services(&storage);
+        let plugin = AuthPlugin;
+        let mut event = command_event(3, &["7"]);
+        event.origin.reply_token = Some("token".to_owned());
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
+
+        let text = output.messages().into_iter().next().expect("denial expected");
+        assert!(text.contains("Not authorized for the `users` permissions group."));
+        assert!(text.contains("Missing role"));
+    }
+
+    #[tokio::test]
+    async fn denied_command_with_empty_policy_points_at_configuration() {
+        let storage = configured_storage(&[], &[]);
+        let (services, output) = test_services(&storage);
+        let plugin = AuthPlugin;
+        let mut event = command_event(3, &[]);
+        event.origin.reply_token = Some("token".to_owned());
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
+
+        let text = output.messages().into_iter().next().expect("denial expected");
+        assert!(text.contains("allows no one"));
     }
 
     #[tokio::test]
