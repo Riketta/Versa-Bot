@@ -260,6 +260,11 @@ struct SerenityChatOutput {
 #[async_trait]
 impl ChatOutputPort for SerenityChatOutput {
     async fn send(&self, message: OutboundMessage) -> Result<(), OutboundError> {
+        // Discord rejects messages with neither content nor embeds (400).
+        if message.is_empty() {
+            tracing::warn!(channel = %self.channel_id, "dropping empty outbound message");
+            return Ok(());
+        }
         // Plain channel sends are always public - the ephemeral hint has no
         // meaning here and is ignored.
         let mut create = CreateMessage::new();
@@ -286,6 +291,10 @@ struct InteractionFollowupOutput {
 #[async_trait]
 impl ChatOutputPort for InteractionFollowupOutput {
     async fn send(&self, message: OutboundMessage) -> Result<(), OutboundError> {
+        if message.is_empty() {
+            tracing::warn!("dropping empty interaction followup (no content, no embeds)");
+            return Ok(());
+        }
         let mut body = serde_json::Map::new();
         if !message.content.is_empty() {
             body.insert("content".to_owned(), serde_json::json!(message.content));

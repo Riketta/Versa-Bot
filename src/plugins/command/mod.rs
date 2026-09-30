@@ -39,7 +39,6 @@ impl PluginPort for CommandPlugin {
             CommandDescriptor {
                 plugin_id: self.name().to_owned(),
                 name: "ping".to_owned(),
-                aliases: None,
                 description: "Replies with Pong!".to_owned(),
                 arguments: Vec::new(),
                 required_permission: None,
@@ -144,7 +143,6 @@ mod tests {
             CommandDescriptor {
                 plugin_id: "test".to_owned(),
                 name: command.to_owned(),
-                aliases: None,
                 description: "test".to_owned(),
                 arguments: Vec::new(),
                 required_permission: None,
@@ -185,7 +183,6 @@ mod tests {
             CommandDescriptor {
                 plugin_id: "test".to_owned(),
                 name: "echo".to_owned(),
-                aliases: None,
                 description: "test".to_owned(),
                 arguments: Vec::new(),
                 required_permission: None,

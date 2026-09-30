@@ -1,6 +1,7 @@
 # Checked-in configuration template. Copy it to `versabot.toml`
 # (gitignored) and fill in the real values.
 
+# Verbose (debug-level) logging; RUST_LOG overrides it entirely.
 debug = true
 
 [discord]

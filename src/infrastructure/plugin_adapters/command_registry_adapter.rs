@@ -62,7 +62,6 @@ mod tests {
         CommandDescriptor {
             plugin_id: "test".to_owned(),
             name: name.to_owned(),
-            aliases: None,
             description: "test command".to_owned(),
             arguments: Vec::new(),
             required_permission: None,

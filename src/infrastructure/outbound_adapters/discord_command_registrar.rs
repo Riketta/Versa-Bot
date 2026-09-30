@@ -45,12 +45,23 @@ fn application_command_json(descriptor: &CommandDescriptor) -> serde_json::Value
             option.insert("description".to_owned(), serde_json::json!(argument.description));
             option.insert("type".to_owned(), serde_json::json!(option_type(argument.kind)));
             option.insert("required".to_owned(), serde_json::json!(argument.required));
+            // Discord accepts `choices` only on string options - a plugin bug
+            // must not fail the whole bulk sync at boot, so other kinds are
+            // logged and dropped.
             if let Some(choices) = &argument.choices {
-                let rendered: Vec<serde_json::Value> = choices
-                    .iter()
-                    .map(|choice| serde_json::json!({ "name": choice, "value": choice }))
-                    .collect();
-                option.insert("choices".to_owned(), serde_json::json!(rendered));
+                if argument.kind == ArgKind::String {
+                    let rendered: Vec<serde_json::Value> = choices
+                        .iter()
+                        .map(|choice| serde_json::json!({ "name": choice, "value": choice }))
+                        .collect();
+                    option.insert("choices".to_owned(), serde_json::json!(rendered));
+                } else {
+                    tracing::warn!(
+                        command = %descriptor.name,
+                        argument = %argument.name,
+                        "choices ignored: Discord supports them only on string arguments"
+                    );
+                }
             }
             serde_json::Value::Object(option)
         })
@@ -62,12 +73,22 @@ fn application_command_json(descriptor: &CommandDescriptor) -> serde_json::Value
     // Platform-native permission gating: Discord itself hides the command
     // from members lacking the permission. Kernel-side per-command ACL
     // checks are the auth plugin's territory.
-    if let Some(bits) = descriptor
+    match descriptor
         .required_permission
         .as_ref()
-        .and_then(|permission| permission_bits(&permission.name))
+        .map(|permission| (permission.name.as_str(), permission_bits(&permission.name)))
     {
-        command.insert("default_member_permissions".to_owned(), serde_json::json!(bits));
+        Some((_, Some(bits))) => {
+            command.insert("default_member_permissions".to_owned(), serde_json::json!(bits));
+        }
+        // A typo'd permission name must not silently publish an ungated
+        // command - make the gap visible until kernel-side ACL exists.
+        Some((name, None)) => tracing::warn!(
+            command = %descriptor.name,
+            permission = name,
+            "required_permission has no Discord mapping - published without a platform gate"
+        ),
+        None => {}
     }
     command.insert("dm_permission".to_owned(), serde_json::json!(!descriptor.guild_only));
     if !options.is_empty() {
@@ -114,7 +135,6 @@ mod tests {
         let descriptor = CommandDescriptor {
             plugin_id: "auth".to_owned(),
             name: "auth".to_owned(),
-            aliases: None,
             description: "Manage access".to_owned(),
             arguments: vec![
                 ArgDescriptor {
@@ -157,7 +177,6 @@ mod tests {
         let descriptor = CommandDescriptor {
             plugin_id: "command".to_owned(),
             name: "ping".to_owned(),
-            aliases: None,
             description: "Pong".to_owned(),
             arguments: Vec::new(),
             required_permission: None,
@@ -169,5 +188,42 @@ mod tests {
         assert_eq!(field(&json, "dm_permission").as_bool(), Some(true));
         assert!(json.get("options").is_none());
         assert!(json.get("default_member_permissions").is_none());
+    }
+
+    /// Discord accepts `choices` only on string options: the adapter must
+    /// drop them elsewhere instead of failing the whole sync at boot.
+    #[test]
+    fn choices_are_attached_only_to_string_arguments() {
+        let descriptor = CommandDescriptor {
+            plugin_id: "test".to_owned(),
+            name: "x".to_owned(),
+            description: "test".to_owned(),
+            arguments: vec![
+                ArgDescriptor {
+                    name: "action".to_owned(),
+                    description: "what".to_owned(),
+                    required: true,
+                    kind: ArgKind::String,
+                    choices: Some(vec!["a".to_owned()]),
+                },
+                ArgDescriptor {
+                    name: "user".to_owned(),
+                    description: "who".to_owned(),
+                    required: false,
+                    kind: ArgKind::User,
+                    choices: Some(vec!["b".to_owned()]),
+                },
+            ],
+            required_permission: None,
+            guild_only: false,
+        };
+
+        let json = application_command_json(&descriptor);
+        let options = field(&json, "options").as_array().expect("options expected");
+
+        let action = options.first().expect("action option expected");
+        assert!(action.get("choices").is_some());
+        let user = options.get(1).expect("user option expected");
+        assert!(user.get("choices").is_none());
     }
 }

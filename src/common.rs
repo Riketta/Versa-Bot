@@ -1,5 +1,3 @@
-mod result_ext;
-
 /// Best-effort panic payload extraction (payloads are opaque `Any`). Shared
 /// by the execution boundaries that isolate plugin panics (event bus,
 /// middleware pipeline).

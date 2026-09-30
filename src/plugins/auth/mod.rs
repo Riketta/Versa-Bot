@@ -74,7 +74,6 @@ impl PluginPort for AuthPlugin {
             CommandDescriptor {
                 plugin_id: self.name().to_owned(),
                 name: "auth".to_owned(),
-                aliases: None,
                 description: "Manage who can use the bot in this guild".to_owned(),
                 arguments: vec![
                     ArgDescriptor {
@@ -124,8 +123,17 @@ impl MiddlewarePluginPort for AuthPlugin {
             return Next::Continue;
         };
 
-        let Some(raw) = storage.get(NAMESPACE, CONFIG_KEY).await.ok().flatten() else {
-            return Next::Continue;
+        let raw = match storage.get(NAMESPACE, CONFIG_KEY).await {
+            Ok(Some(raw)) => raw,
+            // Unconfigured = open by default (documented policy).
+            Ok(None) => return Next::Continue,
+            // Unreadable = fail closed, same as a malformed policy: a storage
+            // failure must never widen access, for any guild.
+            Err(err) => {
+                tracing::error!(namespace = NAMESPACE, %err, "auth config unreadable - failing closed");
+                self.answer_denial(services, event, self.policy_unavailable_embed(event)).await;
+                return Next::Stop;
+            }
         };
 
         let Ok(config) = serde_json::from_value::<AuthConfig>(raw) else {
@@ -539,5 +547,29 @@ mod tests {
     #[test]
     fn auth_namespace_is_not_the_reserved_guild_namespace() {
         assert_ne!(NAMESPACE, GUILD_SETTINGS);
+    }
+
+    /// A storage failure must fail closed (deny, like a malformed policy),
+    /// never silently fail open - and transactional events owe the invoker
+    /// the ephemeral "policy unavailable" notice.
+    #[tokio::test]
+    async fn unreadable_policy_fails_closed() {
+        let output = RecordingChatOutput::new();
+        let services = KernelServices {
+            chat_output: Arc::clone(&output) as Arc<dyn crate::kernel::spi_ports::ChatOutputPort>,
+            chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
+            guild_storage: Some(
+                crate::test_support::FailingStorage.guild_scoped(Platform::Discord, GuildId(1)),
+            ),
+        };
+        let plugin = test_plugin();
+        let mut event = command_event(3, &[]);
+        event.origin.reply_token = Some("token".to_owned());
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
+        let messages = output.messages();
+        assert_eq!(messages.len(), 1, "denial embed expected");
+        assert!(messages.first().is_some_and(|m| m.contains("unreadable")));
+        assert!(output.sent().first().is_some_and(|m| m.ephemeral));
     }
 }

@@ -79,6 +79,7 @@ Prerequisites: Rust 1.88+ (edition 2024).
    The real `versabot.toml` is gitignored and looks like this:
 
    ```toml
+   # Verbose (debug-level) logging; RUST_LOG overrides it entirely.
    debug = true
 
    [discord]

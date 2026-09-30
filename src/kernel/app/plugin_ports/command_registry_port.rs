@@ -49,7 +49,6 @@ pub trait CommandRegistryPort: Send + Sync {
 pub struct CommandDescriptor {
     pub plugin_id: String,
     pub name: String,
-    pub aliases: Option<Vec<String>>,
     pub description: String,
     pub arguments: Vec<ArgDescriptor>,
     pub required_permission: Option<Permission>,

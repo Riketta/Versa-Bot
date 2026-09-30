@@ -39,4 +39,26 @@ impl OutboundMessage {
         self.ephemeral = true;
         self
     }
+
+    /// True when neither content nor embeds would be rendered. Adapters must
+    /// not send such messages - Discord rejects them with a 400.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.content.is_empty() && self.embeds.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emptiness_is_content_and_embeds() {
+        assert!(OutboundMessage::default().is_empty());
+        assert!(!OutboundMessage::text("hi").is_empty());
+        assert!(
+            !OutboundMessage::embed(Embed { title: "t".to_owned(), description: "d".to_owned() })
+                .is_empty()
+        );
+    }
 }

@@ -70,7 +70,6 @@ impl<B: EventBusPort> PluginPort for UserActivityTrackerPlugin<B> {
             CommandDescriptor {
                 plugin_id: self.name().to_owned(),
                 name: "assign_tracker".to_owned(),
-                aliases: None,
                 description: "Log member joins/leaves in this channel".to_owned(),
                 arguments: Vec::new(),
                 // Platform-interpreted: the Discord adapter publishes this as
@@ -84,7 +83,6 @@ impl<B: EventBusPort> PluginPort for UserActivityTrackerPlugin<B> {
             CommandDescriptor {
                 plugin_id: self.name().to_owned(),
                 name: "unassign_tracker".to_owned(),
-                aliases: None,
                 description: "Stop logging member joins/leaves in this guild".to_owned(),
                 arguments: Vec::new(),
                 required_permission: Some(Permission { name: "manage_guild".to_owned() }),
@@ -117,9 +115,15 @@ impl<B: EventBusPort> MiddlewarePluginPort for UserActivityTrackerPlugin<B> {
             return Next::Continue;
         };
 
-        // Unconfigured = tracking off for this guild.
-        let Some(raw) = storage.get(NAMESPACE, CONFIG_KEY).await.ok().flatten() else {
-            return Next::Continue;
+        // Unconfigured = tracking off for this guild. A storage failure is
+        // not "unconfigured": audit loss must at least be visible in the log.
+        let raw = match storage.get(NAMESPACE, CONFIG_KEY).await {
+            Ok(Some(raw)) => raw,
+            Ok(None) => return Next::Continue,
+            Err(err) => {
+                tracing::warn!(namespace = NAMESPACE, %err, "tracker config unreadable - audit skipped");
+                return Next::Continue;
+            }
         };
         let Ok(config) = serde_json::from_value::<TrackerConfig>(raw) else {
             tracing::warn!(namespace = NAMESPACE, "tracker config is malformed - skipping");

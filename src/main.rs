@@ -1,3 +1,4 @@
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,12 +27,13 @@ use versa_bot::plugins::status::{StatusRotatorPlugin, StatusSettings};
 use versa_bot::plugins::tracker::UserActivityTrackerPlugin;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     let config = load_config().expect("config expected to exist and be valid");
 
     // Sentry/GlitchTip endpoint is DSN-driven; absent DSN means stdout only.
     // The guard must outlive the whole run - bound at `main`'s top level.
     let _sentry_guard = observability::init(
+        config.debug,
         config.sentry.as_ref().map(|s| s.dsn.as_str()),
         config.sentry.as_ref().and_then(|s| s.environment.as_deref()),
     );
@@ -95,7 +97,7 @@ async fn main() {
         Arc::new(ConfigWatchJob { watcher: Arc::clone(&watcher) }),
     );
 
-    let mut plugins: Vec<Arc<dyn PluginPort>> = vec![
+    let plugins: Vec<Arc<dyn PluginPort>> = vec![
         Arc::clone(&auth) as Arc<dyn PluginPort>,
         Arc::clone(&command) as Arc<dyn PluginPort>,
         Arc::clone(&tracker) as Arc<dyn PluginPort>,
@@ -161,11 +163,19 @@ async fn main() {
         }
     });
 
-    if let Err(err) = client.start().await {
-        tracing::error!(?err, "client error");
-    }
-
+    let start_result = client.start().await;
     kernel.shutdown();
+
+    // Non-zero exit on gateway failure so orchestrator restart policies
+    // (Docker restart=on-failure, systemd Restart=on-failure) see the crash;
+    // the clean Ctrl-C path exits 0.
+    match start_result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            tracing::error!(?err, "gateway client failed");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn load_config() -> anyhow::Result<Configuration> {

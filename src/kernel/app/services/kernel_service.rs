@@ -1,4 +1,8 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use async_trait::async_trait;
 use bon::bon;
@@ -27,6 +31,9 @@ pub struct KernelService<E: EventBusPort> {
     event_bus: E,
     chat_output_factory: Arc<dyn ChatOutputFactoryPort>,
     storage: Arc<dyn StoragePort>,
+    /// One-shot guard: the explicit `shutdown()` and the `Drop` fallback
+    /// together must stop plugins exactly once.
+    shutdown_started: AtomicBool,
 }
 
 #[bon]
@@ -39,7 +46,14 @@ impl<E: EventBusPort> KernelService<E> {
         chat_output_factory: Arc<dyn ChatOutputFactoryPort>,
         storage: Arc<dyn StoragePort>,
     ) -> Self {
-        Self { plugins, middleware, event_bus, chat_output_factory, storage }
+        Self {
+            plugins,
+            middleware,
+            event_bus,
+            chat_output_factory,
+            storage,
+            shutdown_started: AtomicBool::new(false),
+        }
     }
 
     /// Kernel entrypoint: two-phase plugin lifecycle - `init` on all plugins
@@ -69,8 +83,14 @@ impl<E: EventBusPort> KernelService<E> {
         Ok(())
     }
 
-    /// Ordered stop of all plugins, reverse registration order.
+    /// Ordered stop of all plugins, reverse registration order. Idempotent:
+    /// an explicit `shutdown()` followed by `Drop` stops every plugin exactly
+    /// once, so `PluginPort::stop` implementations are never double-invoked
+    /// by the kernel.
     pub fn shutdown(&self) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
         for plugin in self.plugins.iter().rev() {
             if let Err(err) = plugin.stop() {
                 tracing::error!(plugin = plugin.name(), %err, "plugin stop failed");
@@ -273,6 +293,11 @@ mod tests {
     impl PluginPort for RecorderPlugin {
         fn name(&self) -> &'static str {
             self.name
+        }
+
+        fn stop(&self) -> Result<(), PluginError> {
+            self.log.lock().push(format!("stop:{}", self.name));
+            Ok(())
         }
     }
 
@@ -481,5 +506,30 @@ mod tests {
             ],
             "healthy plugin's post must run despite the broken one panicking first"
         );
+    }
+
+    /// The explicit `shutdown()` plus the `Drop` fallback must stop plugins
+    /// exactly once - `PluginPort::stop` is not required to be re-entrant.
+    #[test]
+    fn shutdown_is_idempotent() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let plugin = Arc::new(RecorderPlugin {
+            name: "p",
+            log: Arc::clone(&log),
+            panic_in_pre: false,
+            panic_in_post: false,
+        });
+
+        let (kernel, _output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![Arc::clone(&plugin) as Arc<dyn PluginPort>],
+            vec![],
+        );
+
+        kernel.shutdown();
+        drop(kernel); // Drop runs shutdown again - a no-op by the guard.
+
+        let entries = log.lock().clone();
+        assert_eq!(entries, vec!["stop:p".to_owned()], "plugins must be stopped exactly once");
     }
 }

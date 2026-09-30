@@ -3,16 +3,19 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 /// Installs the global tracing subscriber: stdout fmt layer plus an optional
 /// Sentry/GlitchTip layer. The Sentry endpoint is any Sentry-protocol DSN
 /// (GlitchTip included), so "address" is just the DSN host - nothing else to
-/// configure. Without a DSN the app logs to stdout only.
+/// configure. Without a DSN the app logs to stdout only. `RUST_LOG` overrides
+/// everything; when unset, `debug` picks the fallback verbosity.
 ///
 /// Returns the Sentry client guard; the caller must keep it alive for the
 /// whole process lifetime, otherwise events are dropped on shutdown.
 #[must_use]
 pub fn init(
+    debug: bool,
     sentry_dsn: Option<&str>,
     sentry_environment: Option<&str>,
 ) -> Option<sentry::ClientInitGuard> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let fallback = if debug { "debug" } else { "info" };
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(fallback));
     let registry =
         tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer());
 

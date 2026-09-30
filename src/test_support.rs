@@ -149,6 +149,37 @@ impl ChatOutputPort for RecordingChatOutput {
     }
 }
 
+/// [`StoragePort`] whose reads and writes always fail - fixture for
+/// unreadable-policy paths (auth fail-closed, tracker audit-loss logging).
+pub struct FailingStorage;
+
+struct FailingView;
+
+#[async_trait]
+impl GuildStorage for FailingView {
+    async fn get(&self, _namespace: &str, _key: &str) -> Result<Option<Value>, StorageError> {
+        Err(StorageError::Database("simulated storage failure".to_owned()))
+    }
+
+    async fn set(&self, _namespace: &str, _key: &str, _value: Value) -> Result<(), StorageError> {
+        Err(StorageError::Database("simulated storage failure".to_owned()))
+    }
+
+    async fn delete(&self, _namespace: &str, _key: &str) -> Result<(), StorageError> {
+        Err(StorageError::Database("simulated storage failure".to_owned()))
+    }
+
+    async fn list_keys(&self, _namespace: &str) -> Result<Vec<String>, StorageError> {
+        Err(StorageError::Database("simulated storage failure".to_owned()))
+    }
+}
+
+impl StoragePort for FailingStorage {
+    fn guild_scoped(&self, _platform: Platform, _guild_id: GuildId) -> Arc<dyn GuildStorage> {
+        Arc::new(FailingView)
+    }
+}
+
 /// [`ChatOutputFactoryPort`] handing out the same [`RecordingChatOutput`] for
 /// every origin and channel - channel-agnostic, so assertions can stay flat.
 pub struct RecordingChatOutputFactory {
