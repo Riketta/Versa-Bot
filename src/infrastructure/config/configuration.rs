@@ -5,7 +5,7 @@ use super::sentry::SentryConfig;
 use super::status::StatusConfig;
 use super::storage::StorageConfig;
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct Configuration {
     pub debug: bool,
     pub discord: DiscordConfig,

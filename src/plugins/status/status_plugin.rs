@@ -11,18 +11,36 @@ use crate::kernel::{
     spi_ports::PresencePort,
 };
 
-/// Rotates the bot's presence through a configured status list on a fixed
-/// interval (`PluginPort`-only - it is not part of the inbound pipeline).
+/// The plugin's hot-reloadable settings: rotation interval and status list.
+/// `statuses` empty means the rotation is disabled.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusSettings {
+    pub interval: Duration,
+    pub statuses: Vec<String>,
+}
+
+impl StatusSettings {
+    /// Disabled state: empty list; the interval is a placeholder.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self { interval: Duration::ZERO, statuses: Vec::new() }
+    }
+}
+
+/// Rotates the bot's presence through a status list on a fixed interval
+/// (`PluginPort`-only - it is not part of the inbound pipeline).
 ///
-/// Both the list and the interval come from the bot configuration
-/// (`[status]` section): presence is a global concern, not a per-guild one.
-/// An empty list disables the plugin - `start` schedules nothing. The job
-/// runs on the kernel scheduler (first run immediate); `stop` cancels it.
+/// Settings come from the bot configuration (`[status]` section): presence
+/// is a global concern, not a per-guild one. The plugin starts disabled
+/// when the list is empty and re-applies on configuration changes
+/// ([`Self::update`]): identical settings are a no-op, an empty list stops
+/// the rotation, otherwise the job is rescheduled with the new interval and
+/// list. The job runs on the kernel scheduler (first run immediate); `stop`
+/// cancels it.
 pub struct StatusRotatorPlugin {
     scheduler: Arc<dyn SchedulerPort>,
     presence: Arc<dyn PresencePort>,
-    interval: Duration,
-    statuses: Vec<String>,
+    settings: Mutex<StatusSettings>,
     job: Mutex<Option<JobHandle>>,
 }
 
@@ -31,10 +49,47 @@ impl StatusRotatorPlugin {
     pub fn new(
         scheduler: Arc<dyn SchedulerPort>,
         presence: Arc<dyn PresencePort>,
-        interval: Duration,
-        statuses: Vec<String>,
+        settings: StatusSettings,
     ) -> Self {
-        Self { scheduler, presence, interval, statuses, job: Mutex::new(None) }
+        Self { scheduler, presence, settings: Mutex::new(settings), job: Mutex::new(None) }
+    }
+
+    /// Applies new settings: identical ones are a no-op (unrelated config
+    /// changes must not reset the rotation), otherwise the running job is
+    /// cancelled and rescheduled - or stopped on an empty list.
+    pub fn update(&self, settings: StatusSettings) {
+        {
+            let mut current = self.settings.lock();
+            if *current == settings {
+                return;
+            }
+            *current = settings.clone();
+        }
+
+        tracing::info!(
+            statuses = settings.statuses.len(),
+            interval_secs = settings.interval.as_secs(),
+            "applying new status rotation settings"
+        );
+        if let Some(handle) = self.job.lock().take() {
+            handle.cancel();
+        }
+        self.schedule_rotation(settings);
+    }
+
+    fn schedule_rotation(&self, settings: StatusSettings) {
+        if settings.statuses.is_empty() {
+            tracing::info!("status rotator has no statuses - disabled");
+            return;
+        }
+
+        let job = Arc::new(StatusJob {
+            presence: Arc::clone(&self.presence),
+            statuses: settings.statuses,
+            index: AtomicUsize::new(0),
+        });
+        let handle = self.scheduler.schedule(self.name(), settings.interval, job);
+        *self.job.lock() = Some(handle);
     }
 }
 
@@ -44,18 +99,8 @@ impl PluginPort for StatusRotatorPlugin {
     }
 
     fn start(&self) -> Result<(), PluginError> {
-        if self.statuses.is_empty() {
-            tracing::info!("status rotator has no statuses - disabled");
-            return Ok(());
-        }
-
-        let job = Arc::new(StatusJob {
-            presence: Arc::clone(&self.presence),
-            statuses: self.statuses.clone(),
-            index: AtomicUsize::new(0),
-        });
-        let handle = self.scheduler.schedule(self.name(), self.interval, job);
-        *self.job.lock() = Some(handle);
+        let settings = self.settings.lock().clone();
+        self.schedule_rotation(settings);
         Ok(())
     }
 
@@ -166,6 +211,13 @@ mod tests {
 
     // --- fixtures ---
 
+    fn settings(interval_secs: u64, statuses: &[&str]) -> StatusSettings {
+        StatusSettings {
+            interval: Duration::from_secs(interval_secs),
+            statuses: statuses.iter().map(|status| (*status).to_owned()).collect(),
+        }
+    }
+
     fn plugin(
         scheduler: &Arc<FakeScheduler>,
         presence: &Arc<FakePresence>,
@@ -174,8 +226,7 @@ mod tests {
         StatusRotatorPlugin::new(
             Arc::clone(scheduler) as Arc<dyn SchedulerPort>,
             Arc::clone(presence) as Arc<dyn PresencePort>,
-            Duration::from_secs(30),
-            statuses.into_iter().map(ToOwned::to_owned).collect(),
+            settings(30, &statuses),
         )
     }
 
@@ -253,5 +304,61 @@ mod tests {
         job.run().await;
 
         assert!(presence.statuses().is_empty());
+    }
+
+    /// Hot reload: identical settings must be a no-op - unrelated config
+    /// changes must not reset the running rotation.
+    #[tokio::test]
+    async fn update_to_same_settings_is_noop() {
+        let scheduler = FakeScheduler::new();
+        let presence = FakePresence::new();
+        let plugin = plugin(&scheduler, &presence, vec!["a"]);
+        plugin.start().expect("start expected to succeed");
+
+        plugin.update(settings(30, &["a"]));
+
+        assert_eq!(scheduler.scheduled().len(), 1);
+        assert_eq!(scheduler.cancel_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// Hot reload: new interval and list cancel the old job and reschedule.
+    #[tokio::test]
+    async fn update_reschedules_with_new_interval_and_statuses() {
+        let scheduler = FakeScheduler::new();
+        let presence = FakePresence::new();
+        let plugin = plugin(&scheduler, &presence, vec!["a"]);
+        plugin.start().expect("start expected to succeed");
+
+        plugin.update(settings(60, &["x"]));
+
+        assert_eq!(
+            scheduler.scheduled(),
+            vec![
+                ("status_rotator".to_owned(), Duration::from_secs(30)),
+                ("status_rotator".to_owned(), Duration::from_secs(60)),
+            ]
+        );
+        assert_eq!(scheduler.cancel_count.load(Ordering::SeqCst), 1);
+
+        let job = scheduler.job.lock().clone().expect("job expected");
+        job.run().await;
+        assert_eq!(presence.statuses(), ["x"]);
+    }
+
+    /// Hot reload: removing `[status]` (empty list) stops the rotation;
+    /// re-adding it later re-enables it.
+    #[tokio::test]
+    async fn update_to_empty_stops_and_readd_reenables() {
+        let scheduler = FakeScheduler::new();
+        let presence = FakePresence::new();
+        let plugin = plugin(&scheduler, &presence, vec!["a"]);
+        plugin.start().expect("start expected to succeed");
+
+        plugin.update(StatusSettings::disabled());
+        assert_eq!(scheduler.cancel_count.load(Ordering::SeqCst), 1);
+        let scheduled_after_disable = scheduler.scheduled().len();
+
+        plugin.update(settings(30, &["a"]));
+        assert_eq!(scheduler.scheduled().len(), scheduled_after_disable + 1);
     }
 }

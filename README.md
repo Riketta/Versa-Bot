@@ -59,6 +59,11 @@ a slash command from any other reply path.
 - Fault isolation: a panicking plugin cannot crash the bot - pipeline hooks
   and event-bus subscribers are caught and logged (plugin + event), the
   event is dropped, and the rest of the chain or bus keeps working.
+- Configuration hot reload: the configuration (file + env overrides) is
+  re-read every few seconds; changes to hot-reloadable sections apply
+  without a restart - e.g. editing `[status]` re-applies the rotation live
+  (identical settings are ignored, removing the section stops it). Startup
+  -only settings (token, storage, Sentry) are not affected.
 - Graceful shutdown on Ctrl-C (plugins stop in reverse order).
 
 ## Getting started
@@ -152,6 +157,5 @@ src/
 
 ## Roadmap
 
-- Configuration hot-reload
 - LLM chat plugin; message history
 - Further platform adapters (Telegram, Matrix, ...)

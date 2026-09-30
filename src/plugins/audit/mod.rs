@@ -153,7 +153,7 @@ mod tests {
         }
     }
 
-    /// init() must subscribe both membership event types: publishing on the
+    /// `init()` must subscribe both membership event types: publishing on the
     /// same bus afterwards reaches the audit handler.
     #[test]
     fn init_subscribes_membership_audit() {

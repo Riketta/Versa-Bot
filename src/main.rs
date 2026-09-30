@@ -1,36 +1,33 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use config::{Config, Environment, File};
 use serenity::all::{ClientBuilder, GatewayIntents, Http, HttpBuilder};
 
 use versa_bot::infrastructure::{
-    Configuration,
+    Configuration, PollingConfigWatcher,
     inbound_adapters::{DiscordGatewayAdapter, SerenityChatOutputFactory},
     observability,
     outbound_adapters::{DiscordCommandRegistrar, SerenityPresence, SqlxStorage},
     plugin_adapters::{InMemoryCommandRegistry, InMemoryEventBus, TokioScheduler},
 };
 use versa_bot::kernel::{
-    plugin_ports::{CommandRegistryPort, MiddlewarePluginPort, PluginPort, SchedulerPort},
+    plugin_ports::{CommandRegistryPort, Job, MiddlewarePluginPort, PluginPort, SchedulerPort},
     services::KernelService,
-    spi_ports::{ChatOutputFactoryPort, PresencePort, StoragePort},
+    spi_ports::{
+        ChatOutputFactoryPort, ConfigChangeHandler, ConfigPort, PresencePort, StoragePort,
+    },
 };
 use versa_bot::plugins::audit::AuditLogPlugin;
 use versa_bot::plugins::auth::AuthPlugin;
 use versa_bot::plugins::command::CommandPlugin;
-use versa_bot::plugins::status::StatusRotatorPlugin;
+use versa_bot::plugins::status::{StatusRotatorPlugin, StatusSettings};
 use versa_bot::plugins::tracker::UserActivityTrackerPlugin;
 
 #[tokio::main]
 async fn main() {
-    let config = Config::builder()
-        .add_source(File::with_name("versabot").required(false))
-        .add_source(Environment::with_prefix("VERSABOT").separator("__"))
-        .build()
-        .expect("config expected to exist")
-        .try_deserialize::<Configuration>()
-        .expect("config expected to be valid");
+    let config = load_config().expect("config expected to exist and be valid");
 
     // Sentry/GlitchTip endpoint is DSN-driven; absent DSN means stdout only.
     // The guard must outlive the whole run - bound at `main`'s top level.
@@ -78,29 +75,33 @@ async fn main() {
     let (presence, gateway_context) = SerenityPresence::new();
     let presence = Arc::new(presence);
 
+    // Status rotator: always registered - `[status]` changes are applied at
+    // runtime; an absent/invalid section just means it starts disabled.
+    let status_plugin = Arc::new(StatusRotatorPlugin::new(
+        Arc::clone(&scheduler) as Arc<dyn SchedulerPort>,
+        Arc::clone(&presence) as Arc<dyn PresencePort>,
+        status_settings(&config),
+    ));
+
+    // Config hot reload: a polling watcher re-reads file+env configuration
+    // and applies hot-reloadable sections without a restart. The task dies
+    // with the process on shutdown - no explicit cancellation needed.
+    let watcher = Arc::new(PollingConfigWatcher::new(load_config));
+    watcher.seed(config.clone());
+    watcher.subscribe(Arc::new(StatusSettingsReloader { plugin: Arc::clone(&status_plugin) }));
+    scheduler.schedule(
+        "config_watcher",
+        Duration::from_secs(5),
+        Arc::new(ConfigWatchJob { watcher: Arc::clone(&watcher) }),
+    );
+
     let mut plugins: Vec<Arc<dyn PluginPort>> = vec![
         Arc::clone(&auth) as Arc<dyn PluginPort>,
         Arc::clone(&command) as Arc<dyn PluginPort>,
         Arc::clone(&tracker) as Arc<dyn PluginPort>,
         Arc::clone(&audit) as Arc<dyn PluginPort>,
+        Arc::clone(&status_plugin) as Arc<dyn PluginPort>,
     ];
-
-    // Optional [status] section: global presence rotation. Invalid values
-    // (zero interval, empty list) disable it with a warning.
-    match &config.status {
-        Some(status) if status.interval_seconds > 0 && !status.statuses.is_empty() => {
-            plugins.push(Arc::new(StatusRotatorPlugin::new(
-                Arc::clone(&scheduler) as Arc<dyn SchedulerPort>,
-                Arc::clone(&presence) as Arc<dyn PresencePort>,
-                Duration::from_secs(status.interval_seconds),
-                status.statuses.clone(),
-            )) as Arc<dyn PluginPort>);
-        }
-        Some(_) => tracing::warn!(
-            "config section [status] ignored: interval_seconds must be > 0 and statuses must not be empty"
-        ),
-        None => {}
-    }
 
     let kernel = Arc::new(
         KernelService::builder()
@@ -165,6 +166,58 @@ async fn main() {
     }
 
     kernel.shutdown();
+}
+
+fn load_config() -> anyhow::Result<Configuration> {
+    let config = Config::builder()
+        .add_source(File::with_name("versabot").required(false))
+        .add_source(Environment::with_prefix("VERSABOT").separator("__"))
+        .build()?;
+    Ok(config.try_deserialize()?)
+}
+
+/// Extracts the status rotator's settings from a configuration snapshot;
+/// absent or invalid `[status]` maps to the disabled state.
+fn status_settings(config: &Configuration) -> StatusSettings {
+    match &config.status {
+        Some(status) if status.interval_seconds > 0 && !status.statuses.is_empty() => {
+            StatusSettings {
+                interval: Duration::from_secs(status.interval_seconds),
+                statuses: status.statuses.clone(),
+            }
+        }
+        Some(_) => {
+            tracing::warn!(
+                "config section [status] ignored: interval_seconds must be > 0 and statuses must not be empty"
+            );
+            StatusSettings::disabled()
+        }
+        None => StatusSettings::disabled(),
+    }
+}
+
+/// Applies `[status]` changes to the rotator; the plugin itself ignores
+/// identical settings, so unrelated config edits don't reset the rotation.
+struct StatusSettingsReloader {
+    plugin: Arc<StatusRotatorPlugin>,
+}
+
+impl ConfigChangeHandler<Configuration> for StatusSettingsReloader {
+    fn on_change(&self, config: Arc<Configuration>) {
+        self.plugin.update(status_settings(&config));
+    }
+}
+
+/// Scheduler job: one watcher poll per tick.
+struct ConfigWatchJob {
+    watcher: Arc<PollingConfigWatcher<Configuration>>,
+}
+
+#[async_trait]
+impl Job for ConfigWatchJob {
+    async fn run(&self) {
+        self.watcher.poll();
+    }
 }
 
 fn build_http(token: &str, proxy: Option<String>, application_id: Option<u64>) -> Http {

@@ -1,13 +1,21 @@
-use async_trait::async_trait;
+//! Kernel-owned configuration service: exposes configuration hot-reload to
+//! plugins. Generic over the configuration type - the kernel never depends
+//! on the concrete infrastructure config; the composition root wires the
+//! concrete instance.
 
-#[async_trait]
-pub trait ConfigPort: Send + Sync {
-    // fn get<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<T>;
-    // fn get_or_default<T: serde::de::DeserializeOwned + Default>(&self, key: &str) -> T;
-    // /// Subscribe to config change notifications for a given key prefix.
-    // async fn on_change(&self, prefix: &str, handler: Arc<dyn ConfigChangeHandler>);
+use std::sync::Arc;
+
+/// Kernel-owned service port: subscribes to configuration changes.
+pub trait ConfigPort<C: Send + Sync + 'static>: Send + Sync + 'static {
+    /// Registers a handler invoked on every configuration change. Handlers
+    /// run inline on the watcher (keep them fast and non-blocking) and are
+    /// panic-isolated like bus subscribers. A change is delivered only when
+    /// the new snapshot differs from the previous one.
+    fn subscribe(&self, handler: Arc<dyn ConfigChangeHandler<C>>);
 }
 
-pub trait ConfigChangeHandler: Send + Sync {
-    fn handle(&self, key: &str, new_value: &serde_json::Value);
+/// Reacts to a configuration change, receiving the new snapshot. The
+/// subscriber decides which parts are relevant and how to apply them.
+pub trait ConfigChangeHandler<C: Send + Sync + 'static>: Send + Sync {
+    fn on_change(&self, config: Arc<C>);
 }
