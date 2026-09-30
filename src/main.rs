@@ -24,8 +24,8 @@ use versa_bot::plugins::audit::AuditLogPlugin;
 use versa_bot::plugins::auth::AuthPlugin;
 use versa_bot::plugins::command::CommandPlugin;
 use versa_bot::plugins::llm::{
-    ChatEngine, LlmCompletionPort, LlmPlugin, LlmSettings, ModelSettings, OpenAiCompatibleAdapter,
-    ProviderSettings, RandRandom, RandomPort, ReasoningStyle,
+    ChatEngine, DeckRandom, LlmCompletionPort, LlmPlugin, LlmSettings, ModelSettings,
+    OpenAiCompatibleAdapter, ProviderSettings, RandomPort, ReasoningStyle,
 };
 use versa_bot::plugins::status::{StatusRotatorPlugin, StatusSettings};
 use versa_bot::plugins::tracker::UserActivityTrackerPlugin;
@@ -83,15 +83,16 @@ async fn main() -> ExitCode {
     // LLM chat plugin: the conversation engine is live. `[llm]` is
     // startup-only - provider clients and API keys are built once here, so
     // changes require a restart (same class as token/storage). Random
-    // replies use the plain RNG adapter; swapping in the deck-style
-    // generator is a one-argument change.
+    // replies draw from per-channel decks ("fake random"): hits balance out
+    // over each 100-draw cycle instead of statistically clumping; the plain
+    // RNG adapter (`RandRandom`) is the drop-in swap.
     let llm_settings = Arc::new(config.llm.as_ref().map(llm_settings_from).unwrap_or_default());
     let llm_adapter = OpenAiCompatibleAdapter::from_settings(Arc::clone(&llm_settings))
         .expect("config [llm] section expected to be valid (api_key_env set, proxies parseable)");
     let llm_engine = Arc::new(ChatEngine::new(
         llm_settings,
         Arc::new(llm_adapter) as Arc<dyn LlmCompletionPort>,
-        Arc::new(RandRandom) as Arc<dyn RandomPort>,
+        Arc::new(DeckRandom::new()) as Arc<dyn RandomPort>,
     ));
     let llm =
         Arc::new(LlmPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>, llm_engine));

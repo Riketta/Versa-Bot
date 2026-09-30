@@ -313,7 +313,9 @@ not fit moves whole to the next message. With `streaming` on, the
 answer is created once and edited in place (throttled by
 `stream_interval_ms`, bounded number of edits) until the final full
 text. Chime-ins are cooldown-guarded (5 minutes per channel) and only
-fire on messages the bot actually captured.
+fire on messages the bot actually captured; the chance draws from a
+per-channel deck, so hits balance out over each 100-draw cycle instead
+of clumping.
 
 **Failures.** Users see silence, never error spam: when the provider
 is unreachable or rejects a request, the triggering channel gets no
