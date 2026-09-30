@@ -26,9 +26,10 @@ pub struct AuthConfig {
 /// Per-guild bot access control - the first short-circuiting middleware.
 ///
 /// Policy:
-/// - Gates bot *invocation* only (`MessageReceived`). Passive events
-///   (member join/leave, presence) flow to their plugins regardless - auth
-///   is about who may command the bot, not about what happens in the guild.
+/// - Gates bot *invocation* only (`MessageReceived` and `CommandInvoked`).
+///   Passive events (member join/leave, presence) flow to their plugins
+///   regardless - auth is about who may command the bot, not about what
+///   happens in the guild.
 /// - A user passes when listed in `allowed_users`, or when any of their
 ///   roles (provided by the driving adapter, best effort) appears in
 ///   `allowed_roles`. Otherwise the event is stopped silently.
@@ -53,7 +54,10 @@ impl PluginPort for AuthPlugin {
 #[async_trait]
 impl MiddlewarePluginPort for AuthPlugin {
     async fn pre(&self, event: &mut RequestContext, services: &KernelServices) -> Next {
-        if event.kind != EventKind::MessageReceived {
+        if !matches!(
+            event.kind,
+            EventKind::MessageReceived | EventKind::CommandInvoked
+        ) {
             return Next::Continue;
         }
 
@@ -99,11 +103,12 @@ impl AuthPlugin {
             return true;
         }
 
-        let EventPayload::Message(message) = &event.payload else {
-            return false;
+        let author_roles = match &event.payload {
+            EventPayload::Message(message) => &message.author_roles,
+            EventPayload::Command(command) => &command.author_roles,
+            _ => return false,
         };
-        message
-            .author_roles
+        author_roles
             .iter()
             .any(|role| config.allowed_roles.contains(role))
     }
@@ -114,7 +119,8 @@ mod tests {
     use super::*;
     use crate::kernel::{
         models::{
-            ChannelId, GuildId, MemberPayload, MessageId, MessagePayload, Origin, Platform, UserId,
+            ChannelId, CommandPayload, GuildId, MemberPayload, MessageId, MessagePayload, Origin,
+            Platform, UserId,
         },
         spi_ports::{GUILD_SETTINGS, StoragePort},
     };
@@ -129,6 +135,19 @@ mod tests {
             channel_id: ChannelId(2),
             user_id: UserId(user_id),
             message_id: Some(MessageId(4)),
+            reply_token: None,
+        }
+    }
+
+    fn command_event(user_id: u64, roles: &[&str]) -> RequestContext {
+        RequestContext {
+            kind: EventKind::CommandInvoked,
+            origin: origin(user_id),
+            payload: EventPayload::Command(CommandPayload {
+                name: "ping".to_owned(),
+                args: Vec::new(),
+                author_roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+            }),
         }
     }
 
@@ -274,8 +293,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_messages_pass_through() {
+    async fn commands_are_gated_like_messages() {
         let storage = configured_storage(&["999"], &[]);
+        let (services, output) = test_services(&storage);
+        let plugin = AuthPlugin;
+        let mut event = command_event(3, &[]);
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
+        assert!(output.messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn command_with_allowed_role_passes() {
+        let storage = configured_storage(&[], &["42"]);
+        let (services, output) = test_services(&storage);
+        let plugin = AuthPlugin;
+        let mut event = command_event(3, &["42"]);
+
+        assert!(matches!(
+            plugin.pre(&mut event, &services).await,
+            Next::Continue
+        ));
+        assert!(output.messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_messages_pass_through() {
+        let _storage = configured_storage(&["999"], &[]);
         let output = RecordingChatOutput::new();
         let chat_output: Arc<dyn crate::kernel::spi_ports::ChatOutputPort> =
             Arc::clone(&output) as Arc<dyn crate::kernel::spi_ports::ChatOutputPort>;

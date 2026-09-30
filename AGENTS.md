@@ -8,7 +8,7 @@ This project is complex chat bot framework that should:
 - Support config files with hot-reloading.
 - Have database (using repository pattern and some ORM (maybe just `sqlx`) with SQLite and PostgreSQL support) that will allow to store guild specific settings and plugin specific settings (probably via JSON documents). Storage and it's API should be designed the way arbitrary plugins can store own arbitrary data and configs (on per guild basis).
 - Support plugin system using middleware pattern to handle all kinds of Discord events (messages, user events, etc.), and event bus to let plugins exchange data with each other. Plugins will not be external (like DLLs) but source code extensions: `src/plugins/admin/*`).
-- Support chat command system. So plugins can register their own chat commands with arguments.
+- Support chat command system based on native platform commands (e.g. Discord slash commands). Plugins register their own commands with arguments via `CommandRegistryPort`; the platform adapter publishes them to the platform and normalizes invocations onto the taxonomy.
 - Some default plugins:
   - Authorization and roles for per guild bot access control.
   - Administration tools so guild administrators can manage bot like they want.
@@ -23,7 +23,9 @@ Bot will work as a service: a lot of different not connected with each other Dis
 It will be implemented as hexagonal architecture (ports & adapters) micro-kernel core. It will be initially implemented as walking skeleton.
 Bot will be used as a Docker container.
 
-Initially it will be used with Discord, but later it should be possible to use framework with Telegram, Matrix, Jabber, IRC or any other chat. So chat related port should assume wild compatibility with various chats.
+Initially it will be used with Discord, but later it should be possible to use framework with Telegram, Matrix, Jabber, IRC or any other chat.
+
+**Platform strategy (calibrated):** universal feature parity across chats is explicitly NOT a goal. The kernel and the taxonomy are platform-blind; core plugins work off the taxonomy and degrade gracefully where a platform lacks a concept (e.g. no roles -> user allow-lists only). Platform-specific features live in adapters or clearly scoped platform plugins without pretending to be universal. Platform types never enter the kernel or core plugins - because of economics, not purity: platform branching inside every plugin scales with (plugins x platforms), while new-adapter integration scales with 1.
 
 ## Hexagonal Micro-Kernel Architecture
 
@@ -73,9 +75,11 @@ The pipeline is **event-driven, not request/response**: there is no `ResponseCon
 
 **Inbound event model:**
 
-`RequestContext` is a chat-agnostic inbound EVENT, not just a message - it carries multiple kinds (`MessageReceived`, `MemberJoined`, `MemberLeft`, `PresenceUpdate`, ...) plus the origin context (guild, channel, source platform) needed to scope outbound ports.
+`RequestContext` is a chat-agnostic inbound EVENT, not just a message - it carries multiple kinds (`MessageReceived`, `MemberJoined`, `CommandInvoked`, ...) plus the origin context (guild, channel, source platform, optional opaque reply token for transactional events like interactions) needed to scope outbound ports.
 The driving adapter (`DiscordGatewayAdapter`) normalizes ALL Discord gateway events into this taxonomy (structural ACL & DTOs) and pushes each through the pipeline.
-Middleware plugins match on event kind (`CommandPlugin` -> `MessageReceived`, `UserActivityTrackerPlugin` -> `MemberJoined`); others ignore kinds they don't care about. "Wild compatibility with various chats" comes from the common taxonomy - each platform adapter maps its native events onto it.
+Middleware plugins match on event kind (`CommandPlugin` -> `CommandInvoked`, `AuthPlugin` -> invocation kinds, `UserActivityTrackerPlugin` -> `MemberJoined`); others ignore kinds they don't care about. Cross-platform reach comes from the common taxonomy - each platform adapter maps its native events onto it.
+
+**Commands:** native platform commands (Discord slash) are the primary UX - no prefix parsing in core. Plugins declare `CommandDescriptor`s via `CommandRegistryPort` during `init()` (meaning lives in the owning plugin); the kernel aggregates them meaning-free; the Discord adapter publishes descriptors as global application commands and normalizes `InteractionCreate` onto `CommandInvoked` (deferring the interaction at ingestion to satisfy the ~3s deadline). Command replies reuse the event-scoped `ChatOutputPort`: when the origin carries an interaction reply token, the factory binds it to the interaction followup endpoint - plugins cannot tell the difference. Prefix parsing, if a platform ever needs it, is that platform's adapter concern synthesizing `CommandInvoked`.
 
 **Pipeline <-> bus bridge:**
 

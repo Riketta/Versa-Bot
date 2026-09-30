@@ -1,9 +1,47 @@
-pub trait CommandRegistryPort: Send + Sync {
-    // fn register(&self, descriptor: CommandDescriptor) -> Result<()>;
-    // fn unregister(&self, plugin_id: &str, command_name: &str) -> Result<()>;
-    // fn list_commands(&self, plugin_id: Option<&str>) -> Vec<CommandDescriptor>;
+//! Plugin-facing contract for the command registry: plugins register command
+//! descriptors (meaning) during `init()`; the kernel aggregates them without
+//! interpreting them. Platform command registration (e.g. Discord slash
+//! sync) consumes the registry from the adapter side.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
+use crate::kernel::services::KernelServices;
+
+/// A registered command's executable half. Implemented by the owning plugin;
+/// runs inside the pipeline with event-scoped services.
+#[async_trait]
+pub trait CommandHandler: Send + Sync {
+    async fn invoke(&self, args: &CommandArgs, services: &KernelServices) -> anyhow::Result<()>;
 }
 
+/// String arguments of a resolved command invocation.
+#[derive(Debug, Clone, Default)]
+pub struct CommandArgs(pub Vec<(String, String)>);
+
+impl CommandArgs {
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(arg_name, _)| arg_name == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Meaning-free aggregation of plugin commands. Single instance per kernel,
+/// shared with plugins at construction (same pattern as the event bus).
+pub trait CommandRegistryPort: Send + Sync {
+    /// Registers (or replaces) a command by its descriptor's name.
+    fn register(&self, descriptor: CommandDescriptor, handler: Arc<dyn CommandHandler>);
+
+    fn lookup(&self, name: &str) -> Option<Arc<dyn CommandHandler>>;
+
+    fn descriptors(&self) -> Vec<CommandDescriptor>;
+}
+
+#[derive(Debug, Clone)]
 pub struct CommandDescriptor {
     pub plugin_id: String,
     pub name: String,
@@ -20,7 +58,7 @@ pub struct ArgDescriptor {
     pub required: bool,
 }
 
-/// Placeholder until `AuthPlugin` lands.
+/// Placeholder until `AuthPlugin` grows per-command permission checks.
 #[derive(Debug, Clone)]
 pub struct Permission {
     pub name: String,

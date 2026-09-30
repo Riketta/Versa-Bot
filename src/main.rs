@@ -1,19 +1,17 @@
 use std::sync::Arc;
 
 use config::{Config, Environment, File};
-use serenity::all::{ClientBuilder, GatewayIntents, HttpBuilder};
-
-use serenity::all::Http;
+use serenity::all::{ClientBuilder, GatewayIntents, Http, HttpBuilder};
 
 use versa_bot::infrastructure::{
     inbound_adapters::{DiscordGatewayAdapter, SerenityChatOutputFactory},
     observability,
-    outbound_adapters::SqlxStorage,
-    plugin_adapters::InMemoryEventBus,
+    outbound_adapters::{DiscordCommandRegistrar, SqlxStorage},
+    plugin_adapters::{InMemoryCommandRegistry, InMemoryEventBus},
     Configuration,
 };
 use versa_bot::kernel::{
-    plugin_ports::{MiddlewarePluginPort, PluginPort},
+    plugin_ports::{CommandRegistryPort, MiddlewarePluginPort, PluginPort},
     services::KernelService,
     spi_ports::{ChatOutputFactoryPort, StoragePort},
 };
@@ -37,11 +35,15 @@ async fn main() {
         config.sentry.as_ref().and_then(|s| s.environment.as_deref()),
     );
 
-    let http = build_http(&config.discord.token, config.discord.proxy.clone());
-    let chat_output_factory = Arc::new(SerenityChatOutputFactory::new(build_http(
-        &config.discord.token,
-        config.discord.proxy,
-    )));
+    // Application id: required by Discord HTTP calls that are not authorized
+    // by the bot token alone (command registration, interaction followups).
+    let bootstrap = build_http(&config.discord.token, config.discord.proxy.clone(), None);
+    let app_id = bootstrap
+        .get_current_application_info()
+        .await
+        .expect("application info expected to be reachable")
+        .id
+        .get();
 
     let storage = Arc::new(
         SqlxStorage::connect(&config.storage.url)
@@ -49,9 +51,13 @@ async fn main() {
             .expect("storage expected to connect and migrate"),
     );
 
+    let registry = Arc::new(InMemoryCommandRegistry::new());
+
     // Chain order = registration order: auth gates everything below it.
     let auth = Arc::new(AuthPlugin);
-    let command = Arc::new(CommandPlugin::new("!"));
+    let command = Arc::new(CommandPlugin::new(
+        Arc::clone(&registry) as Arc<dyn CommandRegistryPort>
+    ));
 
     let kernel = Arc::new(
         KernelService::builder()
@@ -64,21 +70,39 @@ async fn main() {
                 Arc::clone(&command) as Arc<dyn MiddlewarePluginPort>,
             ])
             .event_bus(InMemoryEventBus::new())
-            .chat_output_factory(Arc::clone(&chat_output_factory) as Arc<dyn ChatOutputFactoryPort>)
+            .chat_output_factory(Arc::new(SerenityChatOutputFactory::new(build_http(
+                &config.discord.token,
+                config.discord.proxy.clone(),
+                Some(app_id),
+            ))) as Arc<dyn ChatOutputFactoryPort>)
             .storage(Arc::clone(&storage) as Arc<dyn StoragePort>)
             .build(),
     );
 
     kernel.boot().expect("kernel boot failed");
 
+    // Discord specifics: publish the registry as global slash commands.
+    let registrar = DiscordCommandRegistrar::new(build_http(
+        &config.discord.token,
+        config.discord.proxy.clone(),
+        Some(app_id),
+    ));
+    registrar
+        .sync(&registry.descriptors())
+        .await
+        .expect("slash command registration expected to succeed");
+
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
 
-    let mut client = ClientBuilder::new_with_http(http, intents)
-        .event_handler(DiscordGatewayAdapter::new(Arc::clone(&kernel)))
-        .await
-        .expect("failed to create client");
+    let mut client = ClientBuilder::new_with_http(
+        build_http(&config.discord.token, config.discord.proxy, Some(app_id)),
+        intents,
+    )
+    .event_handler(DiscordGatewayAdapter::new(Arc::clone(&kernel)))
+    .await
+    .expect("failed to create client");
 
     // Ctrl-C: stop the gateway so `start` returns, then plugins stop in
     // reverse order below.
@@ -97,8 +121,11 @@ async fn main() {
     kernel.shutdown();
 }
 
-fn build_http(token: &str, proxy: Option<String>) -> Http {
+fn build_http(token: &str, proxy: Option<String>, application_id: Option<u64>) -> Http {
     let mut http_builder = HttpBuilder::new(token);
+    if let Some(application_id) = application_id {
+        http_builder = http_builder.application_id(serenity::all::ApplicationId::new(application_id));
+    }
     if let Some(proxy) = proxy {
         let proxy = reqwest::Proxy::all(proxy).expect("proxy string expected to be valid");
         let reqwest_client = reqwest::Client::builder()

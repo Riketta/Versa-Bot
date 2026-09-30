@@ -268,6 +268,7 @@ mod tests {
             channel_id: crate::kernel::models::ChannelId(2),
             user_id: crate::kernel::models::UserId(3),
             message_id: Some(crate::kernel::models::MessageId(4)),
+            reply_token: None,
         }
     }
 

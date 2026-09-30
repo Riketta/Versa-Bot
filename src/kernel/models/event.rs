@@ -22,7 +22,7 @@ impl Platform {
 /// Where an inbound event came from. Scopes event-driven outbound ports:
 /// a `ChatOutputPort` built from an origin sends to `channel_id` inside
 /// `guild_id`, so a plugin replies without a returned response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct Origin {
     pub platform: Platform,
     /// `None` for direct messages.
@@ -30,8 +30,14 @@ pub struct Origin {
     pub channel_id: ChannelId,
     /// Actor that triggered the event (message author, joined member, etc.).
     pub user_id: UserId,
-    /// Present for message lifecycle events.
+    /// Present for message lifecycle events and command invocations
+    /// (the interaction id).
     pub message_id: Option<MessageId>,
+    /// Opaque platform reply token for transactional events (e.g. a Discord
+    /// interaction token: replies must go through the interaction callback,
+    /// not a plain channel message). Set by the driving adapter; consumed by
+    /// its own response factory. The kernel treats it as opaque bytes.
+    pub reply_token: Option<String>,
 }
 
 /// Chat-agnostic inbound event taxonomy. Driving adapters normalize native
@@ -46,6 +52,10 @@ pub enum EventKind {
     MemberJoined,
     MemberLeft,
     PresenceUpdate,
+    /// A native platform command was invoked (e.g. Discord slash command).
+    /// Prefix parsing for platforms without native commands is an adapter
+    /// concern - it synthesizes this kind too, so the dispatcher is shared.
+    CommandInvoked,
 }
 
 /// Normalized per-kind event data.
@@ -54,8 +64,22 @@ pub enum EventKind {
 pub enum EventPayload {
     Message(MessagePayload),
     Member(MemberPayload),
+    /// A native platform command invocation (see [`EventKind::CommandInvoked`]).
+    Command(CommandPayload),
     /// Kinds that carry no normalized payload yet (e.g. `PresenceUpdate`).
     Empty,
+}
+
+/// A resolved native command: its registered name and string arguments.
+/// Platform value types (users, channels, roles) arrive as their IDs; typed
+/// resolution is a plugin concern via its own platform knowledge.
+#[derive(Debug, Clone)]
+pub struct CommandPayload {
+    pub name: String,
+    pub args: Vec<(String, String)>,
+    /// Opaque platform role identifiers of the invoking user (same contract
+    /// as `MessagePayload::author_roles`).
+    pub author_roles: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
