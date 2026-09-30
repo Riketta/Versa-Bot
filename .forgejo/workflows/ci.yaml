@@ -142,25 +142,28 @@ jobs:
           # Dockerfile require it.
           DOCKER_BUILDKIT: 1
         run: |
-          # OCI image paths are lowercase; the owner may not be.
-          OWNER=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          # OCI image paths are lowercase; the owner may not be. The
+          # docker:27-cli image ships BusyBox ash, not bash: no arrays, so
+          # tags live in a word-split string and build flags accumulate as
+          # positional parameters (set --).
+          OWNER=$(echo "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')
           IMAGE="$REGISTRY/$OWNER/$IMAGE_NAME"
           SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
 
-          TAGS=("$IMAGE:sha-$SHORT")
+          TAGS="sha-$SHORT"
           if [ "$FORGEJO_REF_NAME" = "main" ]; then
-            TAGS+=("$IMAGE:latest")
+            TAGS="$TAGS latest"
           fi
           case "$FORGEJO_REF_NAME" in
-            v*) TAGS+=("$IMAGE:$FORGEJO_REF_NAME") ;;
+            v*) TAGS="$TAGS $FORGEJO_REF_NAME" ;;
           esac
 
-          ARGS=()
-          for tag in "${TAGS[@]}"; do
-            ARGS+=(-t "$tag")
+          set --
+          for tag in $TAGS; do
+            set -- "$@" -t "$IMAGE:$tag"
           done
 
-          docker build "${ARGS[@]}" .
-          for tag in "${TAGS[@]}"; do
-            docker push "$tag"
+          docker build "$@" .
+          for tag in $TAGS; do
+            docker push "$IMAGE:$tag"
           done
