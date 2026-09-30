@@ -4,6 +4,7 @@
 //! adapters behind the same trait.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use super::model::GenParams;
 
@@ -45,9 +46,27 @@ pub struct CompletionRequest {
     pub params: GenParams,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionResponse {
     pub content: String,
+    /// Provider-reported token usage; `None` when the endpoint does not
+    /// provide usage stats (the field is optional in the shape).
+    pub usage: Option<TokenUsage>,
+}
+
+/// Token accounting of one completion, as reported by the endpoint. Field
+/// names mirror the wire object 1:1 (hence the shared `_tokens` postfix).
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    /// Prompt tokens served from the provider's cache, when the endpoint
+    /// reports the breakdown - the number that tells whether the
+    /// byte-stable-prefix design is actually hitting.
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]

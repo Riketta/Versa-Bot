@@ -243,7 +243,7 @@ mod tests {
             &self,
             _request: CompletionRequest,
         ) -> Result<CompletionResponse, LlmError> {
-            Ok(CompletionResponse { content: "stub reply".to_owned() })
+            Ok(CompletionResponse { content: "stub reply".to_owned(), usage: None })
         }
     }
 

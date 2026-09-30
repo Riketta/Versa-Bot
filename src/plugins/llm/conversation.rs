@@ -85,16 +85,52 @@ pub fn should_trigger(
         })
 }
 
+/// Per-turn framing cost estimate (role markers, separators) added on top
+/// of the content's estimated tokens.
+const TURN_TOKEN_OVERHEAD: u64 = 8;
+
 /// Assembles the LLM context: fixed schema - the system prompt, then the
 /// always-present summary slot (compacted context or placeholder), then the
 /// live window. User turns render via the channel template; assistant turns
 /// pass through raw (the role already says who spoke).
+///
+/// The window fills NEWEST-FIRST under two caps, whichever bites first:
+/// `history_depth` (message count) and, when the channel sets
+/// `context_budget_tokens`, the estimated token budget (per-turn cost =
+/// framing + content chars x `tokens_per_char`, calibrated from the
+/// endpoint's own usage reports). The newest turn is always included - a
+/// reply must at least see what it answers.
 pub fn assemble_context(
     config: &ChannelConfig,
     settings: &LlmSettings,
     state: &ConversationState,
     records: &[ConversationRecord],
+    tokens_per_char: f64,
 ) -> Vec<ChatMessage> {
+    let budget = config.context_budget_tokens.map(u64::from);
+    let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
+    let mut count = 0usize;
+    let mut used: u64 = 0;
+    while count < records.len() && count < depth {
+        let Some(record) = records.get(records.len() - count - 1) else {
+            break;
+        };
+        // Estimator: precision loss is fine.
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let cost =
+            TURN_TOKEN_OVERHEAD + (record.content.chars().count() as f64 * tokens_per_char) as u64;
+        if budget.is_some_and(|budget| used + cost > budget) && count > 0 {
+            break;
+        }
+        used += cost;
+        count += 1;
+    }
+    let (_, window) = records.split_at(records.len() - count);
+
     let mut messages = Vec::new();
     messages.push(ChatMessage {
         role: ChatRole::System,
@@ -111,7 +147,7 @@ pub fn assemble_context(
         },
     });
     let template = config.turn_template.as_deref().unwrap_or(DEFAULT_TURN_TEMPLATE);
-    for record in records {
+    for record in window {
         let message = match record.role {
             RecordRole::User => ChatMessage {
                 role: ChatRole::User,
@@ -274,7 +310,7 @@ mod tests {
             },
         ];
 
-        let messages = assemble_context(&config, &settings, &state, &records);
+        let messages = assemble_context(&config, &settings, &state, &records, 0.25);
 
         assert_eq!(messages.len(), 5);
         assert_eq!(
@@ -313,7 +349,7 @@ mod tests {
             cutoff_at: Some(1_717_000_000),
         };
 
-        let messages = assemble_context(&config, &settings, &state, &[]);
+        let messages = assemble_context(&config, &settings, &state, &[], 0.25);
 
         assert_eq!(messages.first().map(|m| m.content.as_str()), Some("custom prompt"));
         assert_eq!(
@@ -333,9 +369,57 @@ mod tests {
         let state = ConversationState::default();
         let records = vec![user_record(10, "alice", "hello")];
 
-        let messages = assemble_context(&config, &settings, &state, &records);
+        let messages = assemble_context(&config, &settings, &state, &records, 0.25);
 
         assert_eq!(messages.get(2).map(|m| m.content.as_str()), Some("<alice> hello"));
+    }
+
+    #[test]
+    fn token_budget_fills_newest_first() {
+        let settings = LlmSettings::default();
+        let state = ConversationState::default();
+        // Ratio 1.0 + overhead 8 -> per-turn costs: aaaa=12, bb=10, cccccc=14.
+        let records = vec![
+            user_record(1, "a1", "aaaa"),
+            user_record(2, "a2", "bb"),
+            user_record(3, "a3", "cccccc"),
+        ];
+        let config = ChannelConfig {
+            history_depth: 10,
+            context_budget_tokens: Some(24),
+            ..ChannelConfig::assigned("m".to_owned())
+        };
+
+        let messages = assemble_context(&config, &settings, &state, &records, 1.0);
+
+        // Newest-first: cccccc (14) + bb (10) fill the budget exactly; aaaa
+        // would exceed it and is dropped.
+        assert_eq!(messages.len(), 4);
+        assert!(messages.get(2).expect("turn expected").content.contains("a2: bb"));
+        assert!(messages.get(3).expect("turn expected").content.contains("a3: cccccc"));
+    }
+
+    #[test]
+    fn token_budget_never_drops_the_newest_turn() {
+        let settings = LlmSettings::default();
+        let state = ConversationState::default();
+        let records = vec![user_record(1, "a1", "a very long message indeed")];
+        let config = ChannelConfig {
+            context_budget_tokens: Some(1),
+            ..ChannelConfig::assigned("m".to_owned())
+        };
+
+        let messages = assemble_context(&config, &settings, &state, &records, 1.0);
+
+        // A reply must at least see what it answers.
+        assert_eq!(messages.len(), 3);
+        assert!(
+            messages
+                .get(2)
+                .expect("turn expected")
+                .content
+                .contains("a1: a very long message indeed")
+        );
     }
 
     #[test]

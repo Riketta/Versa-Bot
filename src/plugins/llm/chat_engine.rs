@@ -22,11 +22,11 @@ use crate::kernel::{
     spi_ports::{ChatStreamPort, GuildStorage},
 };
 
-use super::completion_port::{CompletionRequest, LlmCompletionPort};
+use super::completion_port::{CompletionRequest, LlmCompletionPort, TokenUsage};
 use super::conversation::{self, ConversationRecord, RecordRole};
 use super::model::{
-    ChannelConfig, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, channel_state_key,
-    records_namespace, unix_now,
+    ChannelConfig, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats,
+    blend_ratio, channel_state_key, channel_stats_key, records_namespace, unix_now,
 };
 use super::providers::LlmSettings;
 use super::rng::{RandomPort, RandomScope};
@@ -94,6 +94,7 @@ impl ChatEngine {
         let Some(state) = self.load_state(storage, channel_id).await else {
             return;
         };
+        let usage_stats = self.load_stats(storage, channel_id).await;
         let mut live = self.load_live_records(storage, channel_id, state.cutoff_seq).await;
 
         let reply_to = payload.reply_to.map(MessageId::get);
@@ -128,7 +129,15 @@ impl ChatEngine {
         }
 
         if conversation::should_trigger(payload.mentions_bot, reply_to, &live_records) {
-            self.answer(origin, config, &state, &live_records, services).await;
+            self.answer(
+                origin,
+                config,
+                &state,
+                &live_records,
+                usage_stats.tokens_per_char,
+                services,
+            )
+            .await;
         } else if captured
             && config.random_chance_percent > 0.0
             && self.chime_allowed(origin)
@@ -147,13 +156,22 @@ impl ChatEngine {
             // eligible: chiming in on a message the bot never tracked would
             // look like answering nothing.
             self.note_chime(origin);
-            self.answer(origin, config, &state, &live_records, services).await;
+            self.answer(
+                origin,
+                config,
+                &state,
+                &live_records,
+                usage_stats.tokens_per_char,
+                services,
+            )
+            .await;
         }
 
         // Compaction runs after the reply (the triggering turn used the
         // pre-compaction context) and after every capture, so all-messages
         // channels compact too - not just chatty ones.
-        self.maybe_compact(origin, config, &state, &live, services).await;
+        self.maybe_compact(origin, config, &state, &live, usage_stats.tokens_per_char, services)
+            .await;
     }
 
     /// Completes and delivers the answer for a triggering message. The
@@ -165,6 +183,7 @@ impl ChatEngine {
         config: &ChannelConfig,
         state: &ConversationState,
         live: &[ConversationRecord],
+        tokens_per_char: f64,
         services: &KernelServices,
     ) {
         let channel_id = origin.channel_id.get();
@@ -176,9 +195,16 @@ impl ChatEngine {
             live
         };
 
+        let messages =
+            conversation::assemble_context(config, &self.settings, state, window, tokens_per_char);
+        // The endpoint's usage report is measured against exactly this
+        // context, so the ratio calibration compares like with like.
+        #[allow(clippy::cast_precision_loss)] // estimator: precision loss is fine
+        let context_chars: u64 =
+            messages.iter().map(|message| message.content.chars().count() as u64).sum();
         let request = CompletionRequest {
             model: config.model.clone(),
-            messages: conversation::assemble_context(config, &self.settings, state, window),
+            messages,
             params: config.params.clone(),
         };
         let response = match self.completion.complete(request).await {
@@ -199,6 +225,8 @@ impl ChatEngine {
                 return;
             }
         };
+        self.record_usage(services, channel_id, response.usage, context_chars, tokens_per_char)
+            .await;
 
         let max_length = config.max_length.unwrap_or(self.settings.max_message_length);
         let chunks = conversation::split_reply(&response.content, max_length);
@@ -329,6 +357,7 @@ impl ChatEngine {
         config: &ChannelConfig,
         state: &ConversationState,
         live: &[(u64, ConversationRecord)],
+        tokens_per_char: f64,
         services: &KernelServices,
     ) {
         if !config.compaction_enabled {
@@ -364,13 +393,14 @@ impl ChatEngine {
             .or_else(|| self.settings.compaction_model.clone())
             .unwrap_or_else(|| config.model.clone());
 
+        let messages =
+            conversation::compaction_input(&prompt, state.summary.as_deref(), &chunk_records);
+        #[allow(clippy::cast_precision_loss)] // estimator: precision loss is fine
+        let context_chars: u64 =
+            messages.iter().map(|message| message.content.chars().count() as u64).sum();
         let request = CompletionRequest {
             model,
-            messages: conversation::compaction_input(
-                &prompt,
-                state.summary.as_deref(),
-                &chunk_records,
-            ),
+            messages,
             // Summarization needs no sampling tuning - provider defaults.
             params: GenParams::default(),
         };
@@ -392,6 +422,8 @@ impl ChatEngine {
                 return;
             }
         };
+        self.record_usage(services, channel_id, response.usage, context_chars, tokens_per_char)
+            .await;
 
         let new_state = ConversationState {
             summary: Some(response.content),
@@ -535,6 +567,52 @@ impl ChatEngine {
         self.chimes.lock().insert(key, Instant::now());
     }
 
+    /// Persists the last completion's token usage and blends the observed
+    /// tokens-per-character ratio into the channel's estimate. Best effort:
+    /// a failed write only degrades the next estimate back to the previous
+    /// ratio; endpoints without usage stats write nothing at all.
+    async fn record_usage(
+        &self,
+        services: &KernelServices,
+        channel_id: u64,
+        usage: Option<TokenUsage>,
+        context_chars: u64,
+        tokens_per_char: f64,
+    ) {
+        let Some(usage) = usage else {
+            return; // endpoint does not report usage: nothing to record
+        };
+        let Some(storage) = &services.guild_storage else {
+            return;
+        };
+        let stats = UsageStats {
+            last: Some(usage),
+            tokens_per_char: blend_ratio(tokens_per_char, usage.prompt_tokens, context_chars),
+        };
+        if let Err(err) = storage
+            .set(
+                NAMESPACE,
+                &channel_stats_key(channel_id),
+                serde_json::to_value(&stats).unwrap_or(serde_json::Value::Null),
+            )
+            .await
+        {
+            tracing::warn!(channel = channel_id, %err, "failed to persist token usage stats");
+        }
+    }
+
+    /// The channel's calibration state; unreadable stats fall back to the
+    /// default ratio (stats are observability, never reply-blocking).
+    async fn load_stats(&self, storage: &Arc<dyn GuildStorage>, channel_id: u64) -> UsageStats {
+        storage
+            .get(NAMESPACE, &channel_stats_key(channel_id))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_value(raw).ok())
+            .unwrap_or_default()
+    }
+
     /// Reveals `content` in place on `message`, at the configured cadence,
     /// in at most [`MAX_STREAM_EDITS`] edits - the last one carries the
     /// exact full text. Failed updates are logged and skipped: the next
@@ -568,7 +646,9 @@ mod tests {
     use crate::kernel::spi_ports::{
         ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, StoragePort,
     };
-    use crate::plugins::llm::completion_port::{ChatRole, CompletionResponse, LlmError};
+    use crate::plugins::llm::completion_port::{
+        ChatRole, CompletionResponse, LlmError, TokenUsage,
+    };
     use crate::plugins::llm::model::{CaptureMode, channel_config_key};
     use crate::plugins::llm::rng::RandRandom;
     use crate::test_support::{InMemoryStorage, RecordingChatOutput};
@@ -579,11 +659,16 @@ mod tests {
     struct FakeCompletion {
         responses: Mutex<Vec<Result<String, LlmError>>>,
         requests: Mutex<Vec<CompletionRequest>>,
+        usage: Mutex<Option<TokenUsage>>,
     }
 
     impl FakeCompletion {
         fn requests(&self) -> Vec<CompletionRequest> {
             self.requests.lock().clone()
+        }
+
+        fn set_usage(&self, usage: Option<TokenUsage>) {
+            *self.usage.lock() = usage;
         }
     }
 
@@ -594,9 +679,10 @@ mod tests {
             request: CompletionRequest,
         ) -> Result<CompletionResponse, LlmError> {
             self.requests.lock().push(request);
+            let usage = self.usage.lock().to_owned();
             self.responses.lock().pop().map_or_else(
-                || Ok(CompletionResponse { content: "canned".to_owned() }),
-                |response| response.map(|content| CompletionResponse { content }),
+                || Ok(CompletionResponse { content: "canned".to_owned(), usage }),
+                |response| response.map(|content| CompletionResponse { content, usage }),
             )
         }
     }
@@ -696,6 +782,7 @@ mod tests {
         let fake = Arc::new(FakeCompletion {
             responses: Mutex::new(responses),
             requests: Mutex::new(Vec::new()),
+            usage: Mutex::new(None),
         });
         let engine = ChatEngine::new(
             Arc::clone(&settings),
@@ -977,6 +1064,7 @@ mod tests {
         let fake = Arc::new(FakeCompletion {
             responses: Mutex::new(vec![]),
             requests: Mutex::new(Vec::new()),
+            usage: Mutex::new(None),
         });
         let engine = ChatEngine::new(
             settings,
@@ -1201,5 +1289,53 @@ mod tests {
         for update in &updates {
             assert!("answer text".starts_with(update.as_str()));
         }
+    }
+
+    #[tokio::test]
+    async fn token_usage_is_recorded_and_calibrates_the_estimate() {
+        let ctx = ctx(vec![Ok("ok".to_owned())]);
+        ctx.fake.set_usage(Some(TokenUsage {
+            prompt_tokens: 1200,
+            completion_tokens: 5,
+            total_tokens: 1205,
+            cached_tokens: None,
+        }));
+        seed_config(&ctx.storage, &assigned_config());
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .await;
+
+        let stats_raw = ctx
+            .storage
+            .guild_scoped(Platform::Discord, GuildId(1))
+            .get(NAMESPACE, &channel_stats_key(2))
+            .await
+            .expect("stats readable")
+            .expect("stats expected");
+        let stats: UsageStats =
+            serde_json::from_value(stats_raw).expect("stats expected to deserialize");
+        assert_eq!(stats.last.map(|usage| usage.prompt_tokens), Some(1200));
+        // 1200 prompt tokens over a tiny default context pins the ratio at
+        // the clamp - the estimate reacts strongly to the first observation.
+        assert!((stats.tokens_per_char - 2.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn stats_stay_absent_when_endpoint_reports_nothing() {
+        let ctx = ctx(vec![Ok("ok".to_owned())]); // no usage reported
+        seed_config(&ctx.storage, &assigned_config());
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .await;
+
+        let stats_raw = ctx
+            .storage
+            .guild_scoped(Platform::Discord, GuildId(1))
+            .get(NAMESPACE, &channel_stats_key(2))
+            .await
+            .expect("stats readable");
+        assert_eq!(stats_raw, None);
     }
 }

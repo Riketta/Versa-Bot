@@ -65,7 +65,11 @@ a slash command from any other reply path.
   edit until final), and the bot may chime in on unrelated messages with a
   configurable per-channel chance. Providers are OpenAI-compatible
   endpoints declared in `[llm]` (keys via env); the guild message content
-  the bot reads is why `MESSAGE_CONTENT` is requested.
+  the bot reads is why `MESSAGE_CONTENT` is requested. Endpoints that
+  report token usage get their stats recorded per channel - the calibrated
+  estimate can fill the context by tokens (per-channel budget, message
+  count as secondary cap), and `/llm_status` shows last-request tokens
+  including cache hits.
 - Status rotator (`status_rotator` plugin): cycles the bot's activity
   through a configured list on a configured interval - both come from the
   optional `[status]` section of the config file (presence is bot-wide,

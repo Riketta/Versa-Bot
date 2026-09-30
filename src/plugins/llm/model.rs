@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::plugins::llm::completion_port::TokenUsage;
+
 /// Guild storage namespace owned by this plugin (the plugin's slug).
 pub const NAMESPACE: &str = "llm";
 
@@ -24,6 +26,15 @@ pub fn channel_config_key(channel_id: u64) -> String {
 #[must_use]
 pub fn channel_state_key(channel_id: u64) -> String {
     format!("channel:{channel_id}:state")
+}
+
+/// Document key of a channel's completion statistics:
+/// `channel:{id}:stats` - last reported token usage + the calibration
+/// estimate derived from it. Observability only: unreadable stats never
+/// affect replies.
+#[must_use]
+pub fn channel_stats_key(channel_id: u64) -> String {
+    format!("channel:{channel_id}:stats")
 }
 
 /// Record namespace of one channel's conversation log: the plugin slug,
@@ -111,6 +122,13 @@ pub struct ChannelConfig {
     /// `{message}` are substituted. `None` = `{sender}: {message}`.
     #[serde(default)]
     pub turn_template: Option<String>,
+    /// Estimated token budget for the assembled context. When set, turns
+    /// fill newest-first by estimated tokens (calibrated from the
+    /// endpoint's own usage reports) and `history_depth` remains the
+    /// secondary cap; `None` = count-only filling. Completions always keep
+    /// room for the reply on top - this budgets the prompt side only.
+    #[serde(default)]
+    pub context_budget_tokens: Option<u32>,
 }
 
 impl ChannelConfig {
@@ -131,8 +149,46 @@ impl ChannelConfig {
             random_chance_percent: default_random_chance(),
             max_length: None,
             turn_template: None,
+            context_budget_tokens: None,
         }
     }
+}
+
+/// Per-channel completion statistics and context calibration state
+/// (`channel:{id}:stats`). Observability + estimation only: unreadable
+/// stats never affect replies, they only degrade the token estimate back
+/// to the default ratio.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UsageStats {
+    /// Token usage of the last completion, when the endpoint reports it.
+    pub last: Option<TokenUsage>,
+    /// Rolling estimate of tokens per character of assembled context,
+    /// blended from the endpoint's own usage reports (EWMA). The estimate
+    /// sizes the token-budget fill; the default is typical English prose
+    /// (~4 chars/token) and self-corrects after the first request.
+    pub tokens_per_char: f64,
+}
+
+impl Default for UsageStats {
+    fn default() -> Self {
+        Self { last: None, tokens_per_char: 0.25 }
+    }
+}
+
+/// Blends a newly observed ratio into the rolling estimate. 30% weight on
+/// the newest request keeps the estimate responsive to topic/language
+/// switches while staying stable against single outliers; clamped to
+/// ratios that can plausibly occur in chat text.
+pub(crate) fn blend_ratio(previous: f64, prompt_tokens: u64, context_chars: u64) -> f64 {
+    if context_chars == 0 {
+        return previous;
+    }
+    // Lossy on purpose: a ratio estimate tolerates precision loss by
+    // definition, and chat-sized counts are far below f64's exact range.
+    #[allow(clippy::cast_precision_loss)]
+    let observed = prompt_tokens as f64 / context_chars as f64;
+    (previous * 0.7 + observed * 0.3).clamp(0.05, 2.0)
 }
 
 fn default_true() -> bool {
@@ -186,6 +242,7 @@ mod tests {
         assert!(config.compaction_enabled);
         assert!((config.random_chance_percent - 2.0).abs() < f64::EPSILON);
         assert_eq!(config.capture_mode, CaptureMode::BotRelated);
+        assert_eq!(config.context_budget_tokens, None);
     }
 
     #[test]
@@ -219,7 +276,9 @@ mod tests {
     fn keys_scope_by_channel() {
         assert_eq!(channel_config_key(42), "channel:42");
         assert_eq!(channel_state_key(42), "channel:42:state");
+        assert_eq!(channel_stats_key(42), "channel:42:stats");
         assert_ne!(channel_config_key(42), channel_state_key(42));
+        assert_ne!(channel_state_key(42), channel_stats_key(42));
         // Record namespaces are plugin-prefixed and channel-partitioned.
         assert_eq!(records_namespace(42), "llm:c:42");
         assert_ne!(records_namespace(42), records_namespace(43));
@@ -232,5 +291,39 @@ mod tests {
                 .expect("state expected to deserialize");
         assert_eq!(state.cutoff_seq, 7);
         assert_eq!(state.cutoff_at, None);
+    }
+
+    #[test]
+    fn usage_stats_default_and_blend() {
+        let stats = UsageStats::default();
+        assert_eq!(stats.last, None);
+        assert!((stats.tokens_per_char - 0.25).abs() < f64::EPSILON);
+
+        // Blend moves 30% toward the observation, clamped to plausible chat
+        // ratios; Cyrillic-heavy channels drift up, English stays low.
+        let blended = blend_ratio(0.25, 300, 1000);
+        assert!((blended - (0.25 * 0.7 + 0.3 * 0.3)).abs() < 1e-9);
+        assert!((blend_ratio(0.25, 300, 0) - 0.25).abs() < 1e-9); // nothing observed
+        assert!((blend_ratio(0.25, 10_000, 1000) - 2.0).abs() < 1e-9); // clamped high
+        // One observation only moves the EWMA 30% - the low clamp bites when
+        // an already-low estimate observes an even lower ratio.
+        assert!((blend_ratio(0.05, 1, 1000) - 0.05).abs() < 1e-9); // clamped low
+        assert!((blend_ratio(2.0, 10, 1000) - 1.403).abs() < 1e-9); // inside: pure EWMA
+    }
+
+    #[test]
+    fn usage_stats_survive_storage_roundtrip() {
+        let stats = UsageStats {
+            last: Some(TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 10,
+                total_tokens: 110,
+                cached_tokens: Some(40),
+            }),
+            tokens_per_char: 0.31,
+        };
+        let json = serde_json::to_value(&stats).expect("stats expected to serialize");
+        let back: UsageStats = serde_json::from_value(json).expect("stats expected to deserialize");
+        assert_eq!(back, stats);
     }
 }

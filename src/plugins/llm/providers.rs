@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::completion_port::{
-    ChatMessage, CompletionRequest, CompletionResponse, LlmCompletionPort, LlmError,
+    ChatMessage, CompletionRequest, CompletionResponse, LlmCompletionPort, LlmError, TokenUsage,
 };
 use super::model::GenParams;
 
@@ -299,7 +299,8 @@ fn completion_body(
     Value::Object(body)
 }
 
-/// Extracts `choices[0].message.content` from an OpenAI-compatible response.
+/// Extracts `choices[0].message.content` plus the optional `usage` block
+/// from an OpenAI-compatible response.
 fn parse_completion_content(text: &str) -> Result<CompletionResponse, LlmError> {
     let value: Value = serde_json::from_str(text)
         .map_err(|err| LlmError::Request(format!("malformed JSON: {err}")))?;
@@ -309,12 +310,26 @@ fn parse_completion_content(text: &str) -> Result<CompletionResponse, LlmError> 
         .and_then(|choice| choice.get("message"))
         .and_then(|message| message.get("content"))
         .and_then(|content| content.as_str());
-    match content {
-        Some(content) if !content.is_empty() => {
-            Ok(CompletionResponse { content: content.to_owned() })
-        }
-        _ => Err(LlmError::EmptyResponse),
-    }
+    let Some(content) = content.filter(|content| !content.is_empty()) else {
+        return Err(LlmError::EmptyResponse);
+    };
+    Ok(CompletionResponse { content: content.to_owned(), usage: parse_usage(&value) })
+}
+
+/// `usage` is optional in the `OpenAI` shape: endpoints that do not report
+/// token stats simply get `None`. A partial `usage` block is treated as
+/// absent rather than guessed at.
+fn parse_usage(response: &Value) -> Option<TokenUsage> {
+    let usage = response.get("usage")?;
+    Some(TokenUsage {
+        prompt_tokens: usage.get("prompt_tokens").and_then(Value::as_u64)?,
+        completion_tokens: usage.get("completion_tokens").and_then(Value::as_u64)?,
+        total_tokens: usage.get("total_tokens").and_then(Value::as_u64)?,
+        cached_tokens: usage
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64),
+    })
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -409,6 +424,8 @@ mod tests {
         )
         .expect("response expected to parse");
         assert_eq!(response.content, "hello there");
+        // Endpoint without usage stats: absent, not zeroed.
+        assert_eq!(response.usage, None);
 
         // Reasoning models may answer with null content - that is no answer.
         assert!(matches!(
@@ -420,6 +437,53 @@ mod tests {
             Err(LlmError::EmptyResponse)
         ));
         assert!(matches!(parse_completion_content("not json"), Err(LlmError::Request(_))));
+    }
+
+    #[test]
+    fn usage_is_parsed_when_the_endpoint_reports_it() {
+        let response = parse_completion_content(
+            r#"{
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {
+                    "prompt_tokens": 1200,
+                    "completion_tokens": 34,
+                    "total_tokens": 1234,
+                    "prompt_tokens_details": {"cached_tokens": 800}
+                }
+            }"#,
+        )
+        .expect("response expected to parse");
+        assert_eq!(
+            response.usage,
+            Some(TokenUsage {
+                prompt_tokens: 1200,
+                completion_tokens: 34,
+                total_tokens: 1234,
+                cached_tokens: Some(800),
+            })
+        );
+
+        // No cached-token breakdown: the core fields still parse.
+        let response = parse_completion_content(
+            r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#,
+        )
+        .expect("response expected to parse");
+        assert_eq!(
+            response.usage,
+            Some(TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                total_tokens: 3,
+                cached_tokens: None,
+            })
+        );
+
+        // Partial usage blocks are treated as absent, not guessed at.
+        let response = parse_completion_content(
+            r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1}}"#,
+        )
+        .expect("response expected to parse");
+        assert_eq!(response.usage, None);
     }
 
     #[test]

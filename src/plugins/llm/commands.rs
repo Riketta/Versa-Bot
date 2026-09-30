@@ -3,18 +3,21 @@
 //! pipeline with the event itself, so channel-anchored assignment ("run me
 //! in the channel to assign") needs no platform channel types.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::kernel::{
     models::{Embed, MessageId, OutboundMessage, RequestContext},
     plugin_ports::{CommandArgs, CommandHandler},
     services::KernelServices,
+    spi_ports::GuildStorage,
 };
 
 use super::conversation::ConversationRecord;
 use super::model::{
-    CaptureMode, ChannelConfig, ConversationState, NAMESPACE, SERVICE_CHANNEL_KEY,
-    channel_config_key, channel_state_key, records_namespace, unix_now,
+    CaptureMode, ChannelConfig, ConversationState, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats,
+    channel_config_key, channel_state_key, channel_stats_key, records_namespace, unix_now,
 };
 
 /// Recognized `/llm_set` keys, in display order. Doubles as the Discord
@@ -30,6 +33,7 @@ pub(super) const SET_KEYS: &[&str] = &[
     "max_tokens",
     "reasoning_effort",
     "depth",
+    "context_budget",
     "streaming",
     "random_chance",
     "capture_mode",
@@ -96,31 +100,19 @@ fn parse_bool(value: &str) -> Option<bool> {
 /// for an unknown key or malformed value.
 fn apply_set(config: &mut ChannelConfig, key: &str, value: &str) -> Result<String, String> {
     let cleared = matches!(value, "clear" | "none" | "default");
+    if let Some(result) = apply_numeric(config, key, value, cleared) {
+        return result;
+    }
+    if let Some(result) = apply_optional_field(config, key, value, cleared) {
+        return result;
+    }
+    if let Some(result) = apply_flag(config, key, value) {
+        return result;
+    }
     match key {
         "model" if !cleared && !value.is_empty() => {
-            config.model = value.to_owned();
+            config.model = value.to_string();
             Ok(format!("`model` set to `{value}`."))
-        }
-        "temperature" | "top_p" | "top_k" | "min_p" | "frequency_penalty" | "presence_penalty" => {
-            if cleared {
-                set_float(config, key, None);
-                return Ok(format!("`{key}` cleared (provider default)."));
-            }
-            let parsed: f64 =
-                value.parse().map_err(|_| format!("`{key}` expects a number, got `{value}`."))?;
-            set_float(config, key, Some(parsed));
-            Ok(format!("`{key}` set to {parsed}."))
-        }
-        "max_tokens" => {
-            if cleared {
-                config.params.max_tokens = None;
-                return Ok(format!("`{key}` cleared (provider default)."));
-            }
-            let parsed: u32 = value
-                .parse()
-                .map_err(|_| format!("`{key}` expects a whole number, got `{value}`."))?;
-            config.params.max_tokens = Some(parsed);
-            Ok(format!("`{key}` set to {parsed}."))
         }
         "reasoning_effort" => {
             if cleared || value == "off" {
@@ -132,95 +124,177 @@ fn apply_set(config: &mut ChannelConfig, key: &str, value: &str) -> Result<Strin
                 "`reasoning_effort` set to `{value}` (sent only if the model declares reasoning support)."
             ))
         }
-        "depth" if !cleared => {
-            let parsed: u32 = value
-                .parse()
-                .map_err(|_| format!("`depth` expects a whole number, got `{value}`."))?;
-            if parsed == 0 {
-                return Err("`depth` must be at least 1.".to_owned());
-            }
-            config.history_depth = parsed;
-            Ok(format!("`depth` set to {parsed} messages."))
-        }
-        "streaming" => {
-            let parsed = parse_bool(value)
-                .ok_or_else(|| format!("`streaming` expects on/off, got `{value}`."))?;
-            config.streaming = parsed;
-            Ok(format!("`streaming` turned {}.", if parsed { "on" } else { "off" }))
-        }
-        "random_chance" => {
-            if cleared {
-                config.random_chance_percent = 0.0;
-                return Ok("`random_chance` cleared (chime-ins off).".to_owned());
-            }
-            let parsed: f64 = value.parse().map_err(|_| {
-                format!("`random_chance` expects a number (percent), got `{value}`.")
-            })?;
-            let clamped = parsed.clamp(0.0, 100.0);
-            config.random_chance_percent = clamped;
-            Ok(format!("`random_chance` set to {clamped}%."))
-        }
         "capture_mode" => {
-            let parsed: CaptureMode =
+            let mode: CaptureMode =
                 serde_json::from_value(serde_json::json!(value)).map_err(|_| {
                     format!("`capture_mode` expects bot_related or all_messages, got `{value}`.")
                 })?;
-            config.capture_mode = parsed;
+            config.capture_mode = mode;
             Ok(format!("`capture_mode` set to `{value}`."))
-        }
-        "compaction" => {
-            let parsed = parse_bool(value)
-                .ok_or_else(|| format!("`compaction` expects on/off, got `{value}`."))?;
-            config.compaction_enabled = parsed;
-            Ok(format!("`compaction` turned {}.", if parsed { "on" } else { "off" }))
-        }
-        "compaction_model" => {
-            if cleared {
-                config.compaction_model = None;
-                return Ok(format!("`{key}` cleared (plugin default applies)."));
-            }
-            config.compaction_model = Some(value.to_owned());
-            Ok(format!("`{key}` set to `{value}`."))
-        }
-        "compaction_prompt" => {
-            if cleared {
-                config.compaction_prompt = None;
-                return Ok(format!("`{key}` cleared (plugin default applies)."));
-            }
-            config.compaction_prompt = Some(value.to_owned());
-            Ok(format!("`{key}` updated."))
-        }
-        "max_length" => {
-            if cleared {
-                config.max_length = None;
-                return Ok(format!("`{key}` cleared (plugin default applies)."));
-            }
-            let parsed: usize = value
-                .parse()
-                .map_err(|_| format!("`{key}` expects a whole number, got `{value}`."))?;
-            if parsed == 0 {
-                return Err(format!("`{key}` must be at least 1."));
-            }
-            config.max_length = Some(parsed);
-            Ok(format!("`{key}` set to {parsed} characters."))
-        }
-        "turn_template" => {
-            if cleared {
-                config.turn_template = None;
-                return Ok(format!("`{key}` cleared (`{{sender}}: {{message}}` applies)."));
-            }
-            if !value.contains("{sender}") || !value.contains("{message}") {
-                return Err(format!(
-                    "`{key}` must contain `{{sender}}` and `{{message}}`, got `{value}`."
-                ));
-            }
-            config.turn_template = Some(value.to_owned());
-            Ok(format!("`{key}` set to `{value}`."))
         }
         "model" | "depth" => {
             Err(format!("`{key}` cannot be cleared - assign a value or use `/llm_unassign`."))
         }
         other => Err(format!("Unknown key `{other}`. Keys: {}.", SET_KEYS.join(", "))),
+    }
+}
+
+/// On/off settings. `None` = the key is not a flag (caller continues matching).
+fn apply_flag(
+    config: &mut ChannelConfig,
+    key: &str,
+    value: &str,
+) -> Option<Result<String, String>> {
+    let enabled = parse_bool(value)?;
+    match key {
+        "streaming" => {
+            config.streaming = enabled;
+            Some(Ok(format!("`streaming` turned {}.", if enabled { "on" } else { "off" })))
+        }
+        "compaction" => {
+            config.compaction_enabled = enabled;
+            Some(Ok(format!("`compaction` turned {}.", if enabled { "on" } else { "off" })))
+        }
+        _ => None,
+    }
+}
+
+/// Numeric settings: sampling floats, token counts, depth, budget, chance.
+/// `None` = the key is not numeric (caller continues matching).
+fn apply_numeric(
+    config: &mut ChannelConfig,
+    key: &str,
+    value: &str,
+    cleared: bool,
+) -> Option<Result<String, String>> {
+    match key {
+        "temperature" | "top_p" | "top_k" | "min_p" | "frequency_penalty" | "presence_penalty" => {
+            if cleared {
+                set_float(config, key, None);
+                return Some(Ok(format!("`{key}` cleared (provider default).")));
+            }
+            match value.parse::<f64>() {
+                Ok(parsed) => {
+                    set_float(config, key, Some(parsed));
+                    Some(Ok(format!("`{key}` set to {parsed}.")))
+                }
+                Err(_) => Some(Err(format!("`{key}` expects a number, got `{value}`."))),
+            }
+        }
+        "max_tokens" => {
+            if cleared {
+                config.params.max_tokens = None;
+                return Some(Ok(format!("`{key}` cleared (provider default).")));
+            }
+            match value.parse::<u32>() {
+                Ok(parsed) => {
+                    config.params.max_tokens = Some(parsed);
+                    Some(Ok(format!("`{key}` set to {parsed}.")))
+                }
+                Err(_) => Some(Err(format!("`{key}` expects a whole number, got `{value}`."))),
+            }
+        }
+        "depth" => {
+            if cleared {
+                return Some(Err(format!(
+                    "`{key}` cannot be cleared - assign a value or use `/llm_unassign`."
+                )));
+            }
+            match value.parse::<u32>() {
+                Ok(0) => Some(Err("`depth` must be at least 1.".to_owned())),
+                Ok(parsed) => {
+                    config.history_depth = parsed;
+                    Some(Ok(format!("`depth` set to {parsed} messages.")))
+                }
+                Err(_) => Some(Err(format!("`depth` expects a whole number, got `{value}`."))),
+            }
+        }
+        "context_budget" => {
+            if cleared {
+                config.context_budget_tokens = None;
+                return Some(Ok(format!("`{key}` cleared (count-only filling).")));
+            }
+            match value.parse::<u32>() {
+                Ok(parsed) => {
+                    config.context_budget_tokens = Some(parsed);
+                    Some(Ok(format!("`{key}` set to {parsed} tokens.")))
+                }
+                Err(_) => {
+                    Some(Err(format!("`{key}` expects a whole number of tokens, got `{value}`.")))
+                }
+            }
+        }
+        "random_chance" => {
+            if cleared {
+                config.random_chance_percent = 0.0;
+                return Some(Ok("`random_chance` cleared (chime-ins off).".to_owned()));
+            }
+            match value.parse::<f64>() {
+                Ok(parsed) => {
+                    let clamped = parsed.clamp(0.0, 100.0);
+                    config.random_chance_percent = clamped;
+                    Some(Ok(format!("`random_chance` set to {clamped}%.")))
+                }
+                Err(_) => {
+                    Some(Err(format!("`random_chance` expects a number (percent), got `{value}`.")))
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Optional text/size fields that `clear` resets to plugin defaults.
+/// `None` = the key is not one of them (caller continues matching).
+fn apply_optional_field(
+    config: &mut ChannelConfig,
+    key: &str,
+    value: &str,
+    cleared: bool,
+) -> Option<Result<String, String>> {
+    match key {
+        // Both compaction fields share the same set/clear shape.
+        "compaction_model" | "compaction_prompt" => {
+            if cleared {
+                if key == "compaction_model" {
+                    config.compaction_model = None;
+                } else {
+                    config.compaction_prompt = None;
+                }
+                return Some(Ok(format!("`{key}` cleared (plugin default applies).")));
+            }
+            if key == "compaction_model" {
+                config.compaction_model = Some(value.to_owned());
+                Some(Ok(format!("`{key}` set to `{value}`.")))
+            } else {
+                config.compaction_prompt = Some(value.to_owned());
+                Some(Ok(format!("`{key}` updated.")))
+            }
+        }
+        "max_length" => {
+            if cleared {
+                config.max_length = None;
+                return Some(Ok(format!("`{key}` cleared (plugin default applies).")));
+            }
+            match value.parse::<usize>() {
+                Ok(0) => Some(Err(format!("`{key}` must be at least 1."))),
+                Ok(characters) => {
+                    config.max_length = Some(characters);
+                    Some(Ok(format!("`{key}` set to {characters} characters.")))
+                }
+                Err(_) => Some(Err(format!("`{key}` expects a whole number, got `{value}`."))),
+            }
+        }
+        "turn_template" => Some(if cleared {
+            config.turn_template = None;
+            Ok(format!("`{key}` cleared (`{{sender}}: {{message}}` applies)."))
+        } else if !value.contains("{sender}") || !value.contains("{message}") {
+            Err(format!("`{key}` must contain `{{sender}}` and `{{message}}`, got `{value}`."))
+        } else {
+            config.turn_template = Some(value.to_owned());
+            Ok(format!("`{key}` set to `{value}`."))
+        }),
+        _ => None,
     }
 }
 
@@ -365,6 +439,57 @@ fn preview(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// The token-usage lines of `/llm_status`: the calibrated live-window
+/// estimate and the last request's reported usage. Both appear only once
+/// the endpoint has reported real usage - before that the default ratio is
+/// an uncalibrated guess and showing it would be noise.
+async fn usage_lines(
+    storage: &Arc<dyn GuildStorage>,
+    records_ns: &str,
+    state: &ConversationState,
+    live: u64,
+    usage_stats: &UsageStats,
+    config: &ChannelConfig,
+) -> UsageLines {
+    let Some(last) = usage_stats.last else {
+        return UsageLines { estimate: None, last_request: None };
+    };
+
+    let mut context_chars = 0u64;
+    let limit = u32::try_from(live).unwrap_or(u32::MAX);
+    for stored in storage.list_after(records_ns, state.cutoff_seq, limit).await.unwrap_or_default()
+    {
+        if let Ok(record) = serde_json::from_value::<ConversationRecord>(stored.payload) {
+            let counted = record.content.chars().count();
+            // estimator: precision loss is fine
+            #[allow(clippy::cast_precision_loss)]
+            let counted = counted as u64;
+            context_chars += counted;
+        }
+    }
+    // estimator: precision loss is fine
+    #[allow(clippy::cast_precision_loss)]
+    let estimated = usage_stats.tokens_per_char * context_chars as f64 + 8.0 * live as f64;
+    let estimate = Some(match config.context_budget_tokens {
+        Some(budget) => format!("Est. context: ~{estimated:.0} / {budget} tokens"),
+        None => format!("Est. context: ~{estimated:.0} tokens"),
+    });
+
+    let cached =
+        last.cached_tokens.map(|cached| format!(" (+{cached} cached)")).unwrap_or_default();
+    let last_request = Some(format!(
+        "Last request: {} prompt / {} completion / {} total tokens{cached}",
+        last.prompt_tokens, last.completion_tokens, last.total_tokens
+    ));
+    UsageLines { estimate, last_request }
+}
+
+/// The two optional `/llm_status` lines fed by calibration data.
+struct UsageLines {
+    estimate: Option<String>,
+    last_request: Option<String>,
+}
+
 /// `/llm_status`: inspect the channel's chat configuration and conversation
 /// state. Ephemeral where the platform allows (slash invocations), since the
 /// summary preview may be considered sensitive.
@@ -417,13 +542,19 @@ impl CommandHandler for StatusLlmHandler {
                 }),
             None => None,
         };
+        let usage_stats: UsageStats = storage
+            .get(NAMESPACE, &channel_stats_key(channel_id))
+            .await?
+            .and_then(|raw| serde_json::from_value(raw).ok())
+            .unwrap_or_default();
+        let usage = usage_lines(storage, &records_ns, &state, live, &usage_stats, &config).await;
 
         let summary = match &state.summary {
             Some(summary) => preview(summary, 200),
             None => "none".to_owned(),
         };
         let context_start = first_link.unwrap_or_else(|| "no messages after the cutoff".to_owned());
-        let description = format!(
+        let mut description = format!(
             "Model: `{}`
 Context: {live}/{} messages ({total} kept)
 Compaction: {}
@@ -433,6 +564,14 @@ Context start: {context_start}",
             config.history_depth,
             if config.compaction_enabled { "on" } else { "off" },
         );
+        if let Some(line) = usage.estimate {
+            description.push('\n');
+            description.push_str(&line);
+        }
+        if let Some(line) = usage.last_request {
+            description.push('\n');
+            description.push_str(&line);
+        }
 
         services
             .chat_output
