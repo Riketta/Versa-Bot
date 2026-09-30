@@ -22,9 +22,16 @@ impl InMemoryCommandRegistry {
 
 impl CommandRegistryPort for InMemoryCommandRegistry {
     fn register(&self, descriptor: CommandDescriptor, handler: Arc<dyn CommandHandler>) {
+        let name = descriptor.name.clone();
+        let new_plugin_id = descriptor.plugin_id.clone();
         let mut commands = self.commands.write();
-        if commands.insert(descriptor.name.clone(), (descriptor, handler)).is_some() {
-            tracing::debug!("command re-registered, previous handler replaced");
+        if let Some((previous, _)) = commands.insert(name.clone(), (descriptor, handler)) {
+            tracing::warn!(
+                command = %name,
+                previous_plugin = %previous.plugin_id,
+                new_plugin = %new_plugin_id,
+                "command name collision: previous handler replaced (last wins)"
+            );
         }
     }
 

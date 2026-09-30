@@ -68,13 +68,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute short SHA
+        # Explicit 8-char short, matching the Forgejo workflow's tag scheme
+        # (metadata-action's type=sha uses a different default length).
+        run: echo "SHORT_SHA=${GITHUB_SHA::8}" >> "$GITHUB_ENV"
+
       - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=sha,prefix=sha-
+            type=raw,value=sha-${{ env.SHORT_SHA }}
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=tag
 

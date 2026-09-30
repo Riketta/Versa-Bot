@@ -32,10 +32,12 @@ a slash command from any other reply path.
 - Per-guild authorization (`auth` plugin): user and role allow-lists,
   administered from Discord via `/auth` (`action:allow|deny|show` with a
   user or role; Manage Server permission, guild-only, ephemeral answers).
-  Unconfigured guilds are open by default; a malformed policy fails closed.
-  A denied slash command is answered with an ephemeral error embed, visible
-  only to the invoker, naming the rejected permission group (users / roles);
-  if the policy itself is unreadable, it gets a "policy unavailable" notice
+  Unconfigured guilds are open by default; a malformed or unreadable policy
+  fails closed. A policy with both lists empty falls back to Discord guild
+  administrators - there is always at least one admin. A denied slash
+  command is answered with an ephemeral error embed, visible only to the
+  invoker, naming the rejected permission group (users / roles); if the
+  policy itself is unreadable, it gets a "policy unavailable" notice
   instead.
 - User activity tracker (`tracker` plugin): logs member joins/leaves to the
   guild's audit channel and publishes `UserJoinedGuild` / `UserLeftGuild`
@@ -188,11 +190,11 @@ src/
 │   │   ├── plugin_ports/   # plugin contracts (PluginPort, commands, bus)
 │   │   └── services/       # KernelService (pipeline runner, lifecycle)
 │   └── models/             # event taxonomy, IDs, errors
-├── plugins/           # features: auth, command dispatcher, tracker, audit trail, status (WIP)
+├── plugins/           # features: auth, command dispatcher, tracker, audit trail, status rotator
 ├── infrastructure/    # adapters
 │   ├── inbound_adapters/   # Discord gateway + scoped output factory
-│   ├── outbound_adapters/  # storage (sqlx), Discord command registrar
-│   └── plugin_adapters/    # in-memory event bus, command registry
+│   ├── outbound_adapters/  # storage (sqlx), Discord command registrar, presence
+│   └── plugin_adapters/    # in-memory event bus, command registry, scheduler
 └── common/
 ```
 

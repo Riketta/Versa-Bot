@@ -9,6 +9,7 @@ pub use command_registry_port::{
     Permission,
 };
 pub use event_bus_port::EventBusPort;
+pub use event_bus_port::EventBusSubscription;
 pub use event_bus_port::EventHandler;
 pub use middleware_plugin_port::MiddlewarePluginPort;
 pub use middleware_plugin_port::Next;

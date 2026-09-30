@@ -7,6 +7,27 @@ pub trait EventHandler<E: Event + 'static>: Send + Sync {
     fn handle(&self, event: &E);
 }
 
+/// Cancellation handle for a bus subscription. Unsubscribed handlers stop
+/// receiving events from the bus; dropping the handle does NOT unsubscribe -
+/// call [`EventBusSubscription::unsubscribe`] explicitly (same style as
+/// `JobHandle`: cloning shares the same subscription, dropping is inert).
+#[derive(Clone)]
+pub struct EventBusSubscription {
+    cancel: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl EventBusSubscription {
+    pub(crate) fn new(cancel: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self { cancel }
+    }
+
+    /// Detaches the handler: it stops receiving events. Idempotent - a
+    /// second call is a no-op.
+    pub fn unsubscribe(&self) {
+        (self.cancel)();
+    }
+}
+
 /// Kernel-owned pub/sub bus for runtime plugin-to-plugin messaging. Plugins
 /// publish/subscribe to events they own; the kernel routes but never defines
 /// event meanings. It never carries raw inbound events - a middleware plugin
@@ -22,5 +43,8 @@ pub trait EventHandler<E: Event + 'static>: Send + Sync {
 pub trait EventBusPort: Send + Sync + 'static {
     fn publish(&self, event: Arc<dyn Event>);
 
-    fn subscribe<E: Event + 'static>(&self, handler: Arc<dyn EventHandler<E>>);
+    fn subscribe<E: Event + 'static>(
+        &self,
+        handler: Arc<dyn EventHandler<E>>,
+    ) -> EventBusSubscription;
 }

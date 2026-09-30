@@ -6,4 +6,6 @@ pub enum PluginError {
     Start(String),
     #[error("plugin stop failed: {0}")]
     Stop(String),
+    #[error("invalid kernel configuration: {0}")]
+    Invalid(String),
 }

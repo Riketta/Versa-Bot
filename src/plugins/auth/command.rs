@@ -63,8 +63,8 @@ async fn mutate_policy(
     };
 
     // Read-modify-write of the policy document. The document is never
-    // deleted: an empty policy denies everyone (fail closed), a missing
-    // one would re-open the guild.
+    // deleted: an empty policy admits only guild administrators (see the
+    // gate in `super`), a missing one would re-open the guild.
     let mut policy = match read_policy(storage).await {
         Ok(policy) => policy,
         Err(message) => return reply(services, message).await,
@@ -228,6 +228,7 @@ mod tests {
                 name: "auth".to_owned(),
                 args: Vec::new(),
                 author_roles: Vec::new(),
+                author_permissions: 0,
             }),
         }
     }

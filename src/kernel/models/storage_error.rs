@@ -4,4 +4,6 @@ pub enum StorageError {
     Database(String),
     #[error("serialization error: {0}")]
     Serialization(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 }

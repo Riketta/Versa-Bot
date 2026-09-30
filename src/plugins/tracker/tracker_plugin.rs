@@ -35,15 +35,18 @@ pub struct TrackerConfig {
 /// User activity tracker: observes member lifecycle events in the pipeline
 /// and turns each into two things:
 ///
-/// - an audit message in the guild's configured channel (best effort - a
-///   failed or unconfigured destination never blocks the pipeline), and
 /// - a plugin-owned domain event on the bus ([`UserJoinedGuild`] /
-///   [`UserLeftGuild`]), so bus-only plugins can react without joining the
-///   pipeline themselves.
+///   [`UserLeftGuild`]), published for EVERY guild member event regardless
+///   of policy-config readability, so bus-only plugins can react without
+///   joining the pipeline themselves, and
+/// - an audit message in the guild's configured channel (best effort - an
+///   unconfigured or unreadable config or a broken destination skips only
+///   the log line; it never blocks the pipeline or the publication).
 ///
 /// Passive middleware: always `Continue` - tracking observes, never gates.
 /// Policy contrasts with auth: a malformed config here fails *open* (skip
-/// the log line) because observability must not break the event flow.
+/// the audit line, keep publishing) because observability must not break
+/// the event flow.
 ///
 /// The audit channel is assigned per guild via `/assign_tracker` (run in the
 /// channel to assign) and cleared via `/unassign_tracker`; both are declared
@@ -111,14 +114,37 @@ impl<B: EventBusPort> MiddlewarePluginPort for UserActivityTrackerPlugin<B> {
         let Some(guild_id) = event.origin.guild_id else {
             return Next::Continue;
         };
+
+        // The domain fact is published for EVERY guild member event,
+        // regardless of policy-config readability: bus subscribers react to
+        // what happened, not to whether the audit log could be written.
+        let derived: Arc<dyn Event> = if joined {
+            Arc::new(UserJoinedGuild {
+                platform: event.origin.platform,
+                guild_id,
+                user_id: event.origin.user_id,
+                username: username.clone(),
+            })
+        } else {
+            Arc::new(UserLeftGuild {
+                platform: event.origin.platform,
+                guild_id,
+                user_id: event.origin.user_id,
+                username: username.clone(),
+            })
+        };
+        self.bus.publish(derived);
+
+        // The audit message is best effort and secondary: an unreadable
+        // config (storage failure, malformed document, missing or invalid
+        // channel) skips only the log line below, never the publication above.
         let Some(storage) = &services.guild_storage else {
             return Next::Continue;
         };
 
-        // Unconfigured = tracking off for this guild. A storage failure is
-        // not "unconfigured": audit loss must at least be visible in the log.
         let raw = match storage.get(NAMESPACE, CONFIG_KEY).await {
             Ok(Some(raw)) => raw,
+            // Unconfigured = audit off for this guild (the event is out already).
             Ok(None) => return Next::Continue,
             Err(err) => {
                 tracing::warn!(namespace = NAMESPACE, %err, "tracker config unreadable - audit skipped");
@@ -137,8 +163,7 @@ impl<B: EventBusPort> MiddlewarePluginPort for UserActivityTrackerPlugin<B> {
             }
         };
 
-        let display =
-            username.clone().unwrap_or_else(|| format!("user {}", event.origin.user_id.get()));
+        let display = username.unwrap_or_else(|| format!("user {}", event.origin.user_id.get()));
         let announcement = if joined {
             format!("📥 **{display}** joined the guild")
         } else {
@@ -152,25 +177,6 @@ impl<B: EventBusPort> MiddlewarePluginPort for UserActivityTrackerPlugin<B> {
         if let Err(err) = output.send(OutboundMessage::text(announcement)).await {
             tracing::warn!(%err, "failed to deliver member audit message");
         }
-
-        // The domain fact is published regardless of audit delivery above:
-        // bus subscribers react to what happened, not to whether the log wrote.
-        let derived: Arc<dyn Event> = if joined {
-            Arc::new(UserJoinedGuild {
-                platform: event.origin.platform,
-                guild_id,
-                user_id: event.origin.user_id,
-                username,
-            })
-        } else {
-            Arc::new(UserLeftGuild {
-                platform: event.origin.platform,
-                guild_id,
-                user_id: event.origin.user_id,
-                username,
-            })
-        };
-        self.bus.publish(derived);
 
         Next::Continue
     }
@@ -416,19 +422,23 @@ mod tests {
         assert!(fixture.joined.events.lock().is_empty());
     }
 
+    /// Publish-always: even an unconfigured guild gets the derived event;
+    /// only the audit message is skipped.
     #[tokio::test]
-    async fn unconfigured_guild_is_silent() {
+    async fn unconfigured_guild_publishes_without_audit() {
         let (plugin, services, fixture) = fixture(Some(Arc::new(InMemoryStorage::new())));
         let mut event = member_event(EventKind::MemberJoined, Some(1), "someone");
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
 
         assert!(fixture.sent.messages.lock().is_empty());
-        assert!(fixture.joined.events.lock().is_empty());
+        assert_eq!(fixture.joined.events.lock().len(), 1, "publish is unconditional");
     }
 
+    /// Unlike auth (fail closed), a malformed config only skips the audit
+    /// line - the domain event is still published exactly once.
     #[tokio::test]
-    async fn malformed_config_fails_open() {
+    async fn malformed_config_skips_audit_but_publishes() {
         let storage = InMemoryStorage::new();
         storage.seed(
             Platform::Discord,
@@ -440,10 +450,49 @@ mod tests {
         let (plugin, services, fixture) = fixture(Some(Arc::new(storage)));
         let mut event = member_event(EventKind::MemberJoined, Some(1), "someone");
 
-        // Unlike auth (fail closed), tracking just skips its log line.
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
         assert!(fixture.sent.messages.lock().is_empty());
-        assert!(fixture.joined.events.lock().is_empty());
+        assert_eq!(fixture.joined.events.lock().len(), 1);
+    }
+
+    /// Storage failure (unreadable config): audit is skipped, the domain
+    /// event is still published exactly once (publish-always contract).
+    #[tokio::test]
+    async fn unreadable_config_skips_audit_but_publishes() {
+        let bus = InMemoryEventBus::new();
+        let joined = Arc::new(Recorder::<UserJoinedGuild> { events: Mutex::new(Vec::new()) });
+        bus.subscribe(Arc::clone(&joined) as Arc<dyn EventHandler<UserJoinedGuild>>);
+        let sent = Arc::new(Sent::default());
+        let output = RecordingChatOutput::new();
+        let services = KernelServices {
+            chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
+            chat_output_factory: Arc::new(ChannelRecordingFactory { sent: Arc::clone(&sent) }),
+            guild_storage: Some(
+                crate::test_support::FailingStorage.guild_scoped(Platform::Discord, GuildId(1)),
+            ),
+        };
+        let plugin = UserActivityTrackerPlugin::new(bus, Arc::new(InMemoryCommandRegistry::new()));
+        let mut event = member_event(EventKind::MemberJoined, Some(1), "someone");
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+
+        assert!(sent.messages.lock().is_empty(), "audit must be skipped");
+        assert_eq!(joined.events.lock().len(), 1, "event must still be published");
+    }
+
+    /// Config present but no usable audit channel: skip the log line, keep
+    /// the publication.
+    #[tokio::test]
+    async fn missing_audit_channel_skips_audit_but_publishes() {
+        let storage = InMemoryStorage::new();
+        storage.seed(Platform::Discord, GuildId(1), NAMESPACE, CONFIG_KEY, serde_json::json!({}));
+        let (plugin, services, fixture) = fixture(Some(Arc::new(storage)));
+        let mut event = member_event(EventKind::MemberJoined, Some(1), "someone");
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+
+        assert!(fixture.sent.messages.lock().is_empty());
+        assert_eq!(fixture.joined.events.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -466,6 +515,7 @@ mod tests {
                 name: "ping".to_owned(),
                 args: Vec::new(),
                 author_roles: Vec::new(),
+                author_permissions: 0,
             }),
         };
 
@@ -562,10 +612,12 @@ mod tests {
         assert_eq!(stored, None);
         assert_eq!(fixture.output.messages().len(), 1);
 
-        // Tracking is off now: a join produces no audit message and no event.
+        // Tracking is off now: a join skips the audit message but still
+        // publishes the domain event (publish-always contract).
         let mut join = member_event(EventKind::MemberJoined, Some(1), "someone");
         let _ = plugin.pre(&mut join, &services).await;
         assert!(fixture.sent.messages.lock().is_empty());
+        assert_eq!(fixture.joined.events.lock().len(), 1);
     }
 
     #[tokio::test]

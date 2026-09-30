@@ -35,18 +35,25 @@ impl<H: RequestHandlerPort> DiscordGatewayAdapter<H> {
 #[async_trait]
 impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
     async fn message(&self, _ctx: Context, message: Message) {
-        if message.author.bot {
+        // Bots and webhooks both feed noise into the pipeline.
+        if message.author.bot || message.webhook_id.is_some() {
             return;
         }
 
-        // Best effort: role data is only present when Discord included the
-        // member in the payload. Authorization treats missing roles as "no
-        // roles", never as a hard failure.
+        // Best effort: role and permission data are only present when Discord
+        // included the member in the payload. Authorization treats missing
+        // roles as "no roles" and missing permissions as unknown (0), never
+        // as a hard failure.
         let author_roles: Vec<String> = message
             .member
             .as_ref()
             .map(|member| member.roles.iter().map(|role| role.get().to_string()).collect())
             .unwrap_or_default();
+        let author_permissions = message
+            .member
+            .as_ref()
+            .and_then(|member| member.permissions)
+            .map_or(0, |permissions| permissions.bits());
 
         let origin = Origin {
             platform: Platform::Discord,
@@ -60,6 +67,7 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
         let mut event = RequestContext::message_received(origin, message.content);
         if let EventPayload::Message(payload) = &mut event.payload {
             payload.author_roles = author_roles;
+            payload.author_permissions = author_permissions;
         }
 
         self.handler.handle(event).await;
@@ -73,13 +81,16 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
         // Interaction responses owe Discord an answer within ~3 seconds.
         // Acknowledge deferred right here, at ingestion, so plugins can take
         // as long as they need; their replies go out as followups bound to
-        // the interaction token. Type 5 = DeferredChannelMessageWithSource.
+        // the interaction token. Type 5 = DeferredChannelMessageWithSource;
+        // flags 64 (EPHEMERAL) shows the "thinking" indicator to the invoker
+        // only, so denied or failed commands no longer flash publicly. Later
+        // followups control their own visibility - public replies still work.
         if let Err(err) = ctx
             .http
             .create_interaction_response(
                 command.id,
                 &command.token,
-                &serde_json::json!({ "type": 5 }),
+                &serde_json::json!({ "type": 5, "flags": 64 }),
                 Vec::new(),
             )
             .await
@@ -93,6 +104,13 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
             .as_ref()
             .map(|member| member.roles.iter().map(|role| role.get().to_string()).collect())
             .unwrap_or_default();
+
+        // Same best-effort contract as the message path above.
+        let author_permissions = command
+            .member
+            .as_ref()
+            .and_then(|member| member.permissions)
+            .map_or(0, |permissions| permissions.bits());
 
         let origin = Origin {
             platform: Platform::Discord,
@@ -110,6 +128,7 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
                 name: command.data.name.clone(),
                 args: flatten_options(&command.data.options),
                 author_roles,
+                author_permissions,
             }),
         };
 
@@ -235,16 +254,28 @@ impl ChatOutputFactoryPort for SerenityChatOutputFactory {
             });
         }
 
+        // Member lifecycle origins carry no channel (`ChannelId(0)`); a
+        // Discord call for channel 0 is a guaranteed 404, so fail fast.
+        if origin.channel_id.get() == 0 {
+            return Arc::new(UndeliverableChatOutput);
+        }
+
         Arc::new(SerenityChatOutput {
             http: Arc::clone(&self.http),
             channel_id: SerenityChannelId::new(origin.channel_id.get()),
         })
     }
 
+    /// Configured-channel logging. Enforcement is degenerate-case-only (the
+    /// origin must be guild-bound and the channel non-zero): verifying that
+    /// a channel id actually belongs to the origin guild requires the
+    /// gateway cache and is deferred.
     fn channel_output(&self, origin: &Origin, channel_id: ChannelId) -> Arc<dyn ChatOutputPort> {
         // Configured-channel logging is never an interaction reply, so a
         // reply token on the origin is deliberately ignored here.
-        let _ = origin;
+        if origin.guild_id.is_none() || channel_id.get() == 0 {
+            return Arc::new(UndeliverableChatOutput);
+        }
         Arc::new(SerenityChatOutput {
             http: Arc::clone(&self.http),
             channel_id: SerenityChannelId::new(channel_id.get()),
@@ -280,6 +311,20 @@ impl ChatOutputPort for SerenityChatOutput {
             .await
             .map_err(|err| OutboundError::Send(err.to_string()))?;
         Ok(())
+    }
+}
+
+/// Terminal output for origins with no deliverable Discord destination
+/// (channel-less member lifecycle events, configured channels outside any
+/// guild): every send logs a warning and reports failure instead of
+/// building a Discord call that is guaranteed to 404.
+struct UndeliverableChatOutput;
+
+#[async_trait]
+impl ChatOutputPort for UndeliverableChatOutput {
+    async fn send(&self, _message: OutboundMessage) -> Result<(), OutboundError> {
+        tracing::warn!("dropping outbound message: origin has no deliverable Discord channel");
+        Err(OutboundError::Send("no deliverable Discord channel for this origin".to_owned()))
     }
 }
 

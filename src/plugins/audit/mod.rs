@@ -7,9 +7,11 @@
 
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use crate::kernel::{
     models::{GuildId, Platform, PluginError, UserId},
-    plugin_ports::{EventBusPort, EventHandler, PluginPort},
+    plugin_ports::{EventBusPort, EventBusSubscription, EventHandler, PluginPort},
 };
 use crate::plugins::tracker::{UserJoinedGuild, UserLeftGuild};
 
@@ -20,12 +22,15 @@ use crate::plugins::tracker::{UserJoinedGuild, UserLeftGuild};
 /// this plugin observes the domain facts themselves.
 pub struct AuditLogPlugin<B: EventBusPort> {
     bus: B,
+    /// Live bus subscriptions; non-empty means `init` already ran. The
+    /// kernel stops a plugin exactly once, but re-init stays harmless.
+    subscriptions: Mutex<Vec<EventBusSubscription>>,
 }
 
 impl<B: EventBusPort> AuditLogPlugin<B> {
     #[must_use]
     pub fn new(bus: B) -> Self {
-        Self { bus }
+        Self { bus, subscriptions: Mutex::new(Vec::new()) }
     }
 }
 
@@ -35,10 +40,29 @@ impl<B: EventBusPort> PluginPort for AuditLogPlugin<B> {
     }
 
     fn init(&self) -> Result<(), PluginError> {
+        let mut subscriptions = self.subscriptions.lock();
         // Subscription is the plugin's setup: no events flow before the
-        // kernel boots, so init-time subscription cannot miss any.
-        self.bus.subscribe(Arc::new(MembershipAudit) as Arc<dyn EventHandler<UserJoinedGuild>>);
-        self.bus.subscribe(Arc::new(MembershipAudit) as Arc<dyn EventHandler<UserLeftGuild>>);
+        // kernel boots, so init-time subscription cannot miss any. A repeated
+        // init must not re-subscribe - that would duplicate the handling.
+        if subscriptions.is_empty() {
+            subscriptions.push(
+                self.bus
+                    .subscribe(Arc::new(MembershipAudit) as Arc<dyn EventHandler<UserJoinedGuild>>),
+            );
+            subscriptions.push(
+                self.bus
+                    .subscribe(Arc::new(MembershipAudit) as Arc<dyn EventHandler<UserLeftGuild>>),
+            );
+        }
+        Ok(())
+    }
+
+    fn stop(&self) -> Result<(), PluginError> {
+        let mut subscriptions = self.subscriptions.lock();
+        for subscription in subscriptions.iter() {
+            subscription.unsubscribe();
+        }
+        subscriptions.clear();
         Ok(())
     }
 }
@@ -181,13 +205,58 @@ mod tests {
         assert!(log.contains("username=\"unknown\""), "log: {log}");
     }
 
-    /// A repeated init is harmless (duplicate subscription, no panic).
+    /// Captures formatted log lines produced while `f` runs.
+    fn captured<F: FnOnce()>(f: F) -> String {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber =
+            tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();
+
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(capture.0.lock().clone()).expect("log expected to be utf8")
+    }
+
+    /// A repeated init must not re-subscribe: after two `init()` calls, one
+    /// published event produces exactly ONE audit handling.
     #[test]
-    fn double_init_is_harmless() {
+    fn double_init_does_not_duplicate_handling() {
         let bus = InMemoryEventBus::new();
-        let plugin = AuditLogPlugin::new(bus);
+        let plugin = AuditLogPlugin::new(bus.clone());
 
         plugin.init().expect("first init expected to succeed");
         plugin.init().expect("second init expected to succeed");
+
+        let log = captured(|| bus.publish(Arc::new(joined_event())));
+        assert_eq!(
+            log.matches("user joined the guild").count(),
+            1,
+            "double init must not duplicate the handling; log: {log}"
+        );
+    }
+
+    /// `stop()` unsubscribes everything `init()` subscribed; a later init
+    /// subscribes again - the plugin is reusable across kernel restarts.
+    #[test]
+    fn stop_unsubscribes_and_reinit_resubscribes() {
+        let bus = InMemoryEventBus::new();
+        let plugin = AuditLogPlugin::new(bus.clone());
+
+        plugin.init().expect("init expected to succeed");
+        plugin.stop().expect("stop expected to succeed");
+
+        let log = captured(|| bus.publish(Arc::new(joined_event())));
+        assert_eq!(
+            log.matches("user joined the guild").count(),
+            0,
+            "a stopped plugin must not handle events; log: {log}"
+        );
+
+        plugin.init().expect("re-init expected to succeed");
+        let log = captured(|| bus.publish(Arc::new(joined_event())));
+        assert_eq!(
+            log.matches("user joined the guild").count(),
+            1,
+            "a re-initialized plugin must handle events again; log: {log}"
+        );
     }
 }

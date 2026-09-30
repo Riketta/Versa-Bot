@@ -165,10 +165,13 @@ async fn main() -> ExitCode {
 
     let start_result = client.start().await;
     kernel.shutdown();
+    gateway_exit_code(start_result)
+}
 
-    // Non-zero exit on gateway failure so orchestrator restart policies
-    // (Docker restart=on-failure, systemd Restart=on-failure) see the crash;
-    // the clean Ctrl-C path exits 0.
+/// Maps the gateway outcome onto the process exit code: non-zero on gateway
+/// failure so orchestrator restart policies (Docker restart=on-failure,
+/// systemd Restart=on-failure) see the crash; the clean Ctrl-C path exits 0.
+fn gateway_exit_code(start_result: serenity::Result<()>) -> ExitCode {
     match start_result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

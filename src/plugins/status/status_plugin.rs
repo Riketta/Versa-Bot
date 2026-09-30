@@ -35,8 +35,9 @@ impl StatusSettings {
 /// when the list is empty and re-applies on configuration changes
 /// ([`Self::update`]): identical settings are a no-op, an empty list stops
 /// the rotation, otherwise the job is rescheduled with the new interval and
-/// list. The job runs on the kernel scheduler (first run immediate); `stop`
-/// cancels it.
+/// list. `start` schedules only when no job is active yet, so an `update`
+/// landing between construction and start cannot double-schedule. The job
+/// runs on the kernel scheduler (first run immediate); `stop` cancels it.
 pub struct StatusRotatorPlugin {
     scheduler: Arc<dyn SchedulerPort>,
     presence: Arc<dyn PresencePort>,
@@ -99,8 +100,12 @@ impl PluginPort for StatusRotatorPlugin {
     }
 
     fn start(&self) -> Result<(), PluginError> {
-        let settings = self.settings.lock().clone();
-        self.schedule_rotation(settings);
+        // An `update` landing between construction and start has already
+        // scheduled the rotation - starting must not schedule a second job.
+        if self.job.lock().is_none() {
+            let settings = self.settings.lock().clone();
+            self.schedule_rotation(settings);
+        }
         Ok(())
     }
 
@@ -360,5 +365,22 @@ mod tests {
 
         plugin.update(settings(30, &["a"]));
         assert_eq!(scheduler.scheduled().len(), scheduled_after_disable + 1);
+    }
+
+    /// A config change landing between construction and `start` has already
+    /// scheduled the rotation - starting must not schedule a second job.
+    #[tokio::test]
+    async fn update_before_start_does_not_double_schedule() {
+        let scheduler = FakeScheduler::new();
+        let presence = FakePresence::new();
+        let plugin = plugin(&scheduler, &presence, vec![]);
+
+        plugin.update(settings(45, &["x"]));
+        plugin.start().expect("start expected to succeed");
+
+        assert_eq!(
+            scheduler.scheduled(),
+            vec![("status_rotator".to_owned(), Duration::from_secs(45))]
+        );
     }
 }

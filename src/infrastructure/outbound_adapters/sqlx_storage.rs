@@ -9,7 +9,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
 use crate::kernel::{
     models::{GuildId, Platform, StorageError},
-    spi_ports::{GuildStorage, StoragePort},
+    spi_ports::{GUILD_SETTINGS, GuildStorage, StoragePort},
 };
 
 /// Connection to one of the supported engines. Kept as an explicit enum
@@ -120,6 +120,19 @@ impl GuildStorage for ScopedGuildStorage {
     }
 
     async fn set(&self, namespace: &str, key: &str, value: Value) -> Result<(), StorageError> {
+        // The `guild` namespace is reserved for guild settings (kernel
+        // policy, adapter-enforced): plugins must not be able to corrupt
+        // them, so writes from any scoped handle are rejected. Reads stay
+        // permitted.
+        if namespace == GUILD_SETTINGS {
+            tracing::error!(
+                namespace = GUILD_SETTINGS,
+                key,
+                "rejected write to the reserved guild namespace"
+            );
+            return Err(StorageError::Forbidden("the 'guild' namespace is reserved".to_owned()));
+        }
+
         let json = serde_json::to_string(&value)
             .map_err(|err| StorageError::Serialization(err.to_string()))?;
 
@@ -160,6 +173,15 @@ impl GuildStorage for ScopedGuildStorage {
     }
 
     async fn delete(&self, namespace: &str, key: &str) -> Result<(), StorageError> {
+        if namespace == GUILD_SETTINGS {
+            tracing::error!(
+                namespace = GUILD_SETTINGS,
+                key,
+                "rejected delete in the reserved guild namespace"
+            );
+            return Err(StorageError::Forbidden("the 'guild' namespace is reserved".to_owned()));
+        }
+
         match &*self.db {
             Db::Sqlite(pool) => sqlx::query(
                 "DELETE FROM guild_documents \
@@ -257,6 +279,17 @@ mod tests {
             first.get("command", "prefix").await.unwrap(),
             Some(Value::String("!".to_owned()))
         );
+    }
+
+    #[tokio::test]
+    async fn reserved_guild_namespace_rejects_writes() {
+        let storage = sqlite_storage().await;
+        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+
+        let set = guild.set(GUILD_SETTINGS, "language", Value::String("en".to_owned())).await;
+        assert!(matches!(set, Err(StorageError::Forbidden(_))));
+        let delete = guild.delete(GUILD_SETTINGS, "language").await;
+        assert!(matches!(delete, Err(StorageError::Forbidden(_))));
     }
 
     #[tokio::test]

@@ -61,21 +61,29 @@ impl<E: EventBusPort> KernelService<E> {
     /// starts. A plugin registered in both `plugins` and `middleware` (the
     /// same `Arc`, dual registration) is initialized/started once.
     ///
+    /// Boot validates registration first (see [`Self::validated_plugins`]).
+    /// If a `start` fails, the already-started plugins are stopped in reverse
+    /// order before the error propagates; an `init`-phase failure needs no
+    /// rollback - nothing has started yet.
+    ///
     /// # Errors
-    /// Propagates the first plugin `init`/`start` failure; remaining plugins
-    /// are neither initialized nor started.
+    /// Propagates the first plugin `init`/`start` failure, or
+    /// `PluginError::Invalid` on registration conflicts.
     pub fn boot(&self) -> Result<(), PluginError> {
-        let mut seen = HashSet::new();
-        for plugin in &self.plugins {
-            if seen.insert(plugin.name()) {
-                plugin.init()?;
-            }
+        let plugins = self.validated_plugins()?;
+
+        for plugin in &plugins {
+            plugin.init()?;
         }
 
-        let mut seen = HashSet::new();
-        for plugin in &self.plugins {
-            if seen.insert(plugin.name()) {
-                plugin.start()?;
+        let mut started: Vec<Arc<dyn PluginPort>> = Vec::new();
+        for plugin in &plugins {
+            match plugin.start() {
+                Ok(()) => started.push(Arc::clone(plugin)),
+                Err(err) => {
+                    Self::rollback_started(&started);
+                    return Err(err);
+                }
             }
         }
 
@@ -83,17 +91,72 @@ impl<E: EventBusPort> KernelService<E> {
         Ok(())
     }
 
+    /// Registration validation, shared by `boot`: every middleware step must
+    /// be a registered plugin, and a name listed twice in `plugins` must be
+    /// the same instance (a harmless duplicate registration) - a name
+    /// collision across distinct instances is an `Invalid` configuration.
+    /// Returns the plugins to boot in registration order, duplicates skipped.
+    fn validated_plugins(&self) -> Result<Vec<Arc<dyn PluginPort>>, PluginError> {
+        for step in &self.middleware {
+            if !self.plugins.iter().any(|plugin| plugin.name() == step.name()) {
+                return Err(PluginError::Invalid(format!(
+                    "middleware plugin `{}` is not registered as a plugin",
+                    step.name()
+                )));
+            }
+        }
+
+        let mut unique: Vec<Arc<dyn PluginPort>> = Vec::new();
+        for plugin in &self.plugins {
+            if let Some(registered) = unique.iter().find(|p| p.name() == plugin.name()) {
+                if !Self::same_instance(registered, plugin) {
+                    return Err(PluginError::Invalid(format!(
+                        "plugin name `{}` is claimed by two distinct plugin instances",
+                        plugin.name()
+                    )));
+                }
+                continue;
+            }
+            unique.push(Arc::clone(plugin));
+        }
+        Ok(unique)
+    }
+
+    /// Instance identity via the fat-pointer data address of the `Arc`.
+    fn same_instance(a: &Arc<dyn PluginPort>, b: &Arc<dyn PluginPort>) -> bool {
+        std::ptr::eq(Arc::as_ptr(a).cast::<()>(), Arc::as_ptr(b).cast::<()>())
+    }
+
+    /// Boot rollback: stops already-started plugins in reverse order. Stop
+    /// failures are logged and skipped - a broken `stop` must not strand the
+    /// other plugins' cleanup nor mask the original boot error.
+    fn rollback_started(started: &[Arc<dyn PluginPort>]) {
+        for plugin in started.iter().rev() {
+            if let Err(err) = plugin.stop() {
+                tracing::error!(
+                    plugin = plugin.name(),
+                    %err,
+                    "plugin stop failed during boot rollback"
+                );
+            }
+        }
+    }
+
     /// Ordered stop of all plugins, reverse registration order. Idempotent:
     /// an explicit `shutdown()` followed by `Drop` stops every plugin exactly
     /// once, so `PluginPort::stop` implementations are never double-invoked
-    /// by the kernel.
+    /// by the kernel. A name listed twice (the same instance, dual
+    /// registration) is stopped once.
     pub fn shutdown(&self) {
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
         }
+        let mut seen = HashSet::new();
         for plugin in self.plugins.iter().rev() {
-            if let Err(err) = plugin.stop() {
-                tracing::error!(plugin = plugin.name(), %err, "plugin stop failed");
+            if seen.insert(plugin.name()) {
+                if let Err(err) = plugin.stop() {
+                    tracing::error!(plugin = plugin.name(), %err, "plugin stop failed");
+                }
             }
         }
     }
@@ -212,6 +275,7 @@ mod tests {
     use super::*;
     use crate::kernel::models::OutboundMessage;
     use crate::kernel::models::{EventKind, Platform};
+    use crate::kernel::plugin_ports::EventBusSubscription;
     use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
     use parking_lot::Mutex;
     use serde_json::json;
@@ -319,6 +383,28 @@ mod tests {
         }
     }
 
+    /// Plugin whose `start` fails - the fixture for the boot rollback tests.
+    /// Records `stop` calls the same way `RecorderPlugin` does.
+    struct FailingStartPlugin {
+        name: &'static str,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PluginPort for FailingStartPlugin {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn start(&self) -> Result<(), PluginError> {
+            Err(PluginError::Start(format!("start failed: {}", self.name)))
+        }
+
+        fn stop(&self) -> Result<(), PluginError> {
+            self.log.lock().push(format!("stop:{}", self.name));
+            Ok(())
+        }
+    }
+
     struct TestEventBus;
 
     impl EventBusPort for TestEventBus {
@@ -327,7 +413,8 @@ mod tests {
         fn subscribe<E: crate::kernel::models::Event + 'static>(
             &self,
             _handler: Arc<dyn crate::kernel::plugin_ports::EventHandler<E>>,
-        ) {
+        ) -> EventBusSubscription {
+            EventBusSubscription::new(Arc::new(|| {}))
         }
     }
 
@@ -405,6 +492,89 @@ mod tests {
             started.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "dual-registered plugin must start exactly once"
+        );
+    }
+
+    /// Registration validation: a middleware step that is not registered as
+    /// a plugin is an invalid kernel configuration - boot must refuse it.
+    #[tokio::test]
+    async fn middleware_only_plugin_fails_boot() {
+        let (kernel, _output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![],
+            vec![Arc::new(SilentPlugin) as Arc<dyn MiddlewarePluginPort>],
+        );
+
+        let err = kernel.boot().expect_err("middleware-only registration must fail boot");
+        assert!(matches!(err, PluginError::Invalid(_)), "unexpected error: {err:?}");
+    }
+
+    /// Registration validation: two DISTINCT instances claiming the same name
+    /// are an invalid configuration (a twice-registered SAME instance is the
+    /// harmless dual registration, see the test above).
+    #[tokio::test]
+    async fn duplicate_name_fails_boot() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let first = Arc::new(RecorderPlugin {
+            name: "duplicate",
+            log: Arc::clone(&log),
+            panic_in_pre: false,
+            panic_in_post: false,
+        });
+        let second = Arc::new(RecorderPlugin {
+            name: "duplicate",
+            log: Arc::clone(&log),
+            panic_in_pre: false,
+            panic_in_post: false,
+        });
+
+        let (kernel, _output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![
+                Arc::clone(&first) as Arc<dyn PluginPort>,
+                Arc::clone(&second) as Arc<dyn PluginPort>,
+            ],
+            vec![],
+        );
+
+        let err = kernel.boot().expect_err("distinct instances with one name must fail boot");
+        assert!(matches!(err, PluginError::Invalid(_)), "unexpected error: {err:?}");
+
+        let entries = log.lock().clone();
+        assert!(entries.is_empty(), "validation must run no lifecycle hooks: {entries:?}");
+    }
+
+    /// Boot rollback: a `start` failure stops the already-started plugins in
+    /// reverse order before the error propagates - the failed plugin itself
+    /// is never stopped (it never started).
+    #[tokio::test]
+    async fn boot_failure_rolls_back_started_plugins() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let healthy = Arc::new(RecorderPlugin {
+            name: "healthy",
+            log: Arc::clone(&log),
+            panic_in_pre: false,
+            panic_in_post: false,
+        });
+        let failing = Arc::new(FailingStartPlugin { name: "failing", log: Arc::clone(&log) });
+
+        let (kernel, _output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![
+                Arc::clone(&healthy) as Arc<dyn PluginPort>,
+                Arc::clone(&failing) as Arc<dyn PluginPort>,
+            ],
+            vec![],
+        );
+
+        let err = kernel.boot().expect_err("boot must propagate the start failure");
+        assert!(matches!(err, PluginError::Start(_)), "unexpected error: {err:?}");
+
+        let entries = log.lock().clone();
+        assert_eq!(
+            entries,
+            vec!["stop:healthy".to_owned()],
+            "the started plugin must be rolled back, the failed one must not be stopped"
         );
     }
 

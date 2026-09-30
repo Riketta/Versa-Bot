@@ -39,5 +39,10 @@ impl JobHandle {
 pub trait SchedulerPort: Send + Sync + 'static {
     /// Schedules `job` under `name` (used for log attribution). Cancel via
     /// the returned handle - plugins do so in `stop()`.
+    ///
+    /// # Precondition
+    /// `interval` must be non-zero - a zero period cannot drive a periodic
+    /// ticker. Implementations enforce this: a zero interval yields an
+    /// already-cancelled (dead) handle and the job never runs.
     fn schedule(&self, name: &str, interval: Duration, job: Arc<dyn Job>) -> JobHandle;
 }

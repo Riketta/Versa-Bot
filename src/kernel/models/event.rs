@@ -85,6 +85,9 @@ pub struct CommandPayload {
     /// Opaque platform role identifiers of the invoking user (same contract
     /// as `MessagePayload::author_roles`).
     pub author_roles: Vec<String>,
+    /// Platform permission bits of the author (`0` = unknown); opaque
+    /// pass-through data the auth plugin interprets.
+    pub author_permissions: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +97,9 @@ pub struct MessagePayload {
     /// adapters when the platform provides them (empty otherwise). Lets
     /// guild plugins do role checks without platform-specific types.
     pub author_roles: Vec<String>,
+    /// Platform permission bits of the author (`0` = unknown); opaque
+    /// pass-through data the auth plugin interprets.
+    pub author_permissions: u64,
 }
 
 #[derive(Debug, Clone)]

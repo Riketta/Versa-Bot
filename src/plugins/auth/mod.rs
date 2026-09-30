@@ -18,8 +18,13 @@ pub use command::AuthCommandHandler;
 
 /// Guild storage namespace owned by this plugin (the plugin's slug).
 pub(crate) const NAMESPACE: &str = "auth";
-/// Guild storage key holding the serialized [`AuthConfig`].
+/// Per-guild storage key holding the serialized [`AuthConfig`].
 pub(crate) const CONFIG_KEY: &str = "config";
+
+/// Discord's `ADMINISTRATOR` permission bit. The taxonomy carries author
+/// permissions as opaque platform data; this bit value is Discord's, passed
+/// through by the driving adapter, and nothing interprets the other bits.
+const GUILD_ADMINISTRATOR_BIT: u64 = 0x8;
 
 /// Per-guild authorization policy, stored as a JSON document in the
 /// plugin's guild storage namespace. The `/auth` management command (same
@@ -43,6 +48,9 @@ pub struct AuthConfig {
 ///   roles (provided by the driving adapter, best effort) appears in
 ///   `allowed_roles`. Otherwise the event is stopped; commands additionally
 ///   get an ephemeral denial answer (see `answer_denial`).
+/// - A policy that exists but lists nobody falls back to Discord guild
+///   administrators (master-admin fallback): an empty policy must not lock
+///   out the admins who would reconfigure it (see `is_allowed`).
 /// - An unconfigured guild is open by default (bootstrap: otherwise auth
 ///   would deny the very commands that configure it).
 /// - A malformed config document fails closed - corruption never widens
@@ -160,8 +168,25 @@ impl MiddlewarePluginPort for AuthPlugin {
 }
 
 impl AuthPlugin {
+    /// Access rule: listed by user or role; a policy that exists but lists
+    /// nobody additionally admits Discord guild administrators - the empty
+    /// policy must not lock the admins who would reconfigure it out.
     fn is_allowed(&self, config: &AuthConfig, event: &RequestContext) -> bool {
-        self.user_listed(config, event) || self.role_listed(config, event)
+        if self.user_listed(config, event) || self.role_listed(config, event) {
+            return true;
+        }
+        config.allowed_users.is_empty()
+            && config.allowed_roles.is_empty()
+            && Self::author_is_guild_admin(event)
+    }
+
+    fn author_is_guild_admin(event: &RequestContext) -> bool {
+        let author_permissions = match &event.payload {
+            EventPayload::Message(message) => message.author_permissions,
+            EventPayload::Command(command) => command.author_permissions,
+            _ => return false,
+        };
+        (author_permissions & GUILD_ADMINISTRATOR_BIT) != 0
     }
 
     /// Delivers a denial to transactional events only (slash commands owe
@@ -222,9 +247,10 @@ impl AuthPlugin {
             );
         }
         if reasons.is_empty() {
-            // A policy with empty groups denies everyone.
+            // Empty policy: non-admins were just denied; say who is still
+            // allowed.
             reasons.push(
-                "The access policy currently allows no one - ask a guild admin to configure it."
+                "While the access policy is empty, only Discord guild administrators are allowed."
                     .to_owned(),
             );
         }
@@ -283,6 +309,7 @@ mod tests {
                 name: "ping".to_owned(),
                 args: Vec::new(),
                 author_roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+                author_permissions: 0,
             }),
         }
     }
@@ -294,8 +321,19 @@ mod tests {
             payload: EventPayload::Message(MessagePayload {
                 content: "!ping".to_owned(),
                 author_roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+                author_permissions: 0,
             }),
         }
+    }
+
+    /// Command event carrying explicit platform permission bits (opaque
+    /// pass-through data; `0x8` marks a Discord guild administrator).
+    fn command_event_with_permissions(user_id: u64, author_permissions: u64) -> RequestContext {
+        let mut event = command_event(user_id, &[]);
+        if let EventPayload::Command(payload) = &mut event.payload {
+            payload.author_permissions = author_permissions;
+        }
+        event
     }
 
     fn join_event(user_id: u64) -> RequestContext {
@@ -419,18 +457,35 @@ mod tests {
         assert!(text.contains("Missing role"));
     }
 
+    /// An empty policy denies non-admins, and the denial explains the
+    /// administrator fallback.
     #[tokio::test]
-    async fn denied_command_with_empty_policy_points_at_configuration() {
+    async fn denied_command_with_empty_policy_denies_non_admin() {
         let storage = configured_storage(&[], &[]);
         let (services, output) = test_services(&storage);
         let plugin = test_plugin();
+        // author_permissions: 0 = unknown, in particular not an administrator.
         let mut event = command_event(3, &[]);
         event.origin.reply_token = Some("token".to_owned());
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
 
         let text = output.messages().into_iter().next().expect("denial expected");
-        assert!(text.contains("allows no one"));
+        assert!(text.contains("While the access policy is empty"));
+        assert!(text.contains("only Discord guild administrators are allowed"));
+    }
+
+    /// Master-admin fallback: a policy that exists but lists nobody keeps
+    /// Discord guild administrators allowed (bit 0x8, opaque pass-through).
+    #[tokio::test]
+    async fn empty_policy_allows_guild_admin() {
+        let storage = configured_storage(&[], &[]);
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin();
+        let mut event = command_event_with_permissions(3, 0x8);
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+        assert!(output.messages().is_empty());
     }
 
     #[tokio::test]

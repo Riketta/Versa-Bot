@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::kernel::{
-    models::{EventPayload, OutboundMessage, RequestContext},
+    models::{Embed, EventPayload, OutboundMessage, RequestContext},
     plugin_ports::{
         CommandArgs, CommandDescriptor, CommandHandler, CommandRegistryPort, MiddlewarePluginPort,
         Next, PluginPort,
@@ -14,7 +14,9 @@ use crate::kernel::{
 /// Command dispatcher: routes native [`EventKind::CommandInvoked`] events to
 /// handlers registered in the `CommandRegistryPort`. Meaning lives in the
 /// owning plugins; this plugin only dispatches. An unknown command yields no
-/// output - there is no "not found" default.
+/// output - there is no "not found" default. A handler failure on a
+/// transactional invocation (reply token) sends a generic ephemeral failure
+/// notice; plain events stay silent.
 pub struct CommandPlugin {
     registry: Arc<dyn CommandRegistryPort>,
 }
@@ -64,6 +66,20 @@ impl MiddlewarePluginPort for CommandPlugin {
         let args = CommandArgs(command.args.clone());
         if let Err(err) = handler.invoke(event, &args, services).await {
             tracing::error!(command = %command.name, %err, "command handler failed");
+            // Transactional invocations (slash commands) owe the platform an
+            // answer: a generic ephemeral notice keeps the interaction from
+            // hanging; details stay in the log, not in the channel. Plain
+            // events stay silent, like denied plain messages.
+            if event.origin.reply_token.is_some() {
+                let notice = OutboundMessage::embed(Embed {
+                    title: "⚠️ Command failed".to_owned(),
+                    description: "The command could not be executed. Try again later.".to_owned(),
+                })
+                .ephemeral();
+                if let Err(notice_err) = services.chat_output.send(notice).await {
+                    tracing::warn!(%notice_err, "failed to deliver command failure notice");
+                }
+            }
         }
 
         // Deliberate handling: like auth, a resolved command stops the chain.
@@ -133,6 +149,7 @@ mod tests {
                 name: name.to_owned(),
                 args: args.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
                 author_roles: Vec::new(),
+                author_permissions: 0,
             }),
         }
     }
@@ -241,5 +258,72 @@ mod tests {
             services.chat_output.send(OutboundMessage::text(text)).await?;
             Ok(())
         }
+    }
+
+    struct FailingHandler;
+
+    #[async_trait]
+    impl CommandHandler for FailingHandler {
+        async fn invoke(
+            &self,
+            _event: &RequestContext,
+            _args: &CommandArgs,
+            _services: &KernelServices,
+        ) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("boom"))
+        }
+    }
+
+    fn failing_registry() -> Arc<InMemoryCommandRegistry> {
+        let registry = InMemoryCommandRegistry::new();
+        registry.register(
+            CommandDescriptor {
+                plugin_id: "test".to_owned(),
+                name: "fail".to_owned(),
+                description: "test".to_owned(),
+                arguments: Vec::new(),
+                required_permission: None,
+                guild_only: false,
+            },
+            Arc::new(FailingHandler),
+        );
+        Arc::new(registry)
+    }
+
+    /// A handler failure on a transactional invocation answers the invoker
+    /// with exactly one generic ephemeral notice; details stay in the log.
+    #[tokio::test]
+    async fn failing_handler_answers_ephemerally_with_reply_token() {
+        let plugin = CommandPlugin::new(failing_registry());
+        let output = RecordingChatOutput::new();
+        let services = test_services(&output);
+        let mut event = command_event("fail", &[]);
+        event.origin.reply_token = Some("token".to_owned());
+
+        let next = plugin.pre(&mut event, &services).await;
+
+        assert!(matches!(next, Next::Stop));
+        let sent = output.sent();
+        assert_eq!(sent.len(), 1, "exactly one failure notice expected");
+        let notice = sent.first().expect("notice expected");
+        assert!(notice.ephemeral, "failure notice must be visible to the invoker only");
+        let text = output.messages().into_iter().next().expect("notice expected");
+        assert!(text.contains("⚠️ Command failed"));
+        assert!(text.contains("Try again later."));
+    }
+
+    /// Plain events have no transactional answer: a handler failure stays
+    /// silent (a public rejection would be a spam vector).
+    #[tokio::test]
+    async fn failing_handler_without_reply_token_stays_silent() {
+        let plugin = CommandPlugin::new(failing_registry());
+        let output = RecordingChatOutput::new();
+        let services = test_services(&output);
+        let mut event = command_event("fail", &[]);
+
+        let next = plugin.pre(&mut event, &services).await;
+
+        assert!(matches!(next, Next::Stop));
+        assert!(output.messages().is_empty());
     }
 }
