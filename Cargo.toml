@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "1.0.104"
 async-trait = "0.1.91"
 bon = "3.9.1"
-bytes = "1.12.1"
+
 config = {
   version = "0.15.25",
   default-features = false,
@@ -18,7 +18,6 @@ config = {
   ]
 }
 parking_lot = "0.12.5"
-poise = "0.6.2"
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 reqwest = { version = "0.12", features = ["socks"] }
 sentry = { version = "0.49", default-features = false, features = [
@@ -48,12 +47,6 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "signal"] }
 tokio-util = "0.7.19"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-twilight-cache-inmemory = "0.17.1"
-twilight-gateway = "0.17.1"
-twilight-http = "0.17.1"
-twilight-mention = "0.17.0"
-twilight-model = "0.17.1"
-twilight-util = "0.17.0"
 
 [lints.clippy]
 cargo = { level = "warn", priority = -1 }
