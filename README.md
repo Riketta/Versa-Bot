@@ -129,6 +129,31 @@ Environment variables override the file:
 `VERSABOT__DISCORD__TOKEN`, `VERSABOT__STORAGE__URL`,
 `VERSABOT__SENTRY__DSN`, ...
 
+## Docker
+
+CI builds the image on every push to `main` and on `v*` git tags -
+GitHub Actions pushes to GHCR (`ghcr.io/<owner>/versa-bot`) and Forgejo to
+its instance registry (`git.versalita.net/<owner>/versa-bot`). Tags per
+run: `sha-<short>` per commit, `latest` for `main`, and the matching
+tag name for every `v*` tag.
+
+The image runs as a non-root user, applies migrations on start, and reads
+configuration from `/app/versabot.toml` (optional) with `VERSABOT__*`
+environment overrides - in a container, env-only configuration is the
+usual choice:
+
+```sh
+docker run -d --name versa-bot \
+  -e VERSABOT__DISCORD__TOKEN=your-token \
+  -e VERSABOT__STORAGE__URL=sqlite:///data/versabot.db \
+  -v versa-bot-data:/data \
+  ghcr.io/owner/versa-bot:latest
+```
+
+For production, point `VERSABOT__STORAGE__URL` at PostgreSQL. To use a
+config file instead of env vars, mount it at `/app/versabot.toml:ro`.
+Set `RUST_LOG` to tune log verbosity (default `info`).
+
 ## Development
 
 - `cargo test` - unit tests cover the kernel pipeline, storage guild

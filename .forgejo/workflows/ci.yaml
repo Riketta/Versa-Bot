@@ -1,0 +1,166 @@
+# CI for versa-bot: tests, then Docker image build + push to the instance's
+# own container registry.
+#
+# Images: git.versalita.net/riketta/versa-bot
+#   - sha-<8>   always
+#   - latest    pushes to main (and manual runs on main)
+#   - v*        matching git tag pushes
+#
+# Registry push needs REGISTRY_TOKEN (repo secret): an access token with
+# package read+write scope for the account owning the image. The automatic
+# GITHUB_TOKEN cannot push to the container registry (401 on blob upload).
+#
+# One-time runner requirement (runner's config.yaml, then restart it):
+#   container:
+#     valid_volumes:
+#       - /var/run/docker.sock
+# The packaging job talks to the host Docker daemon through the socket -
+# no dind (forgejo-runner services cannot be privileged), and the BuildKit
+# cache mounts in the Dockerfile stay warm on the host between runs.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: git.versalita.net
+  # Explicit instead of derived from the repo name, so the Forgejo
+  # repository may be named anything without changing the image path.
+  IMAGE_NAME: versa-bot
+
+jobs:
+  test:
+    runs-on: docker
+    container:
+      # Pinned minor; ships git + cargo, no clippy.
+      image: rust:1.98
+    timeout-minutes: 90
+    steps:
+      - name: Fetch source (API archive - HTTP git is disabled on this instance)
+        env:
+          API_REPO: https://git.versalita.net/api/v1/repos/${{ github.repository }}
+        run: |
+          fetch() {
+            curl --fail-with-body --location --silent --show-error \
+              --header "Authorization: token $GITHUB_TOKEN" \
+              --output source.tar.gz "$API_REPO/archive/$1.tar.gz"
+          }
+          # Older archive endpoints do not resolve raw commit SHAs; the
+          # branch/tag name is the documented input.
+          if fetch "$GITHUB_SHA"; then
+            echo "fetched by SHA"
+          elif fetch "$FORGEJO_REF_NAME"; then
+            echo "fetched by ref name ($FORGEJO_REF_NAME)"
+          else
+            echo "all archive attempts failed; repo API says:"
+            curl --silent --show-error --header "Authorization: token $GITHUB_TOKEN" "$API_REPO" | head -c 1500
+            exit 1
+          fi
+          tar -xzf source.tar.gz --strip-components=1
+          rm source.tar.gz
+
+      - name: Install clippy (not preinstalled in the rust image)
+        run: rustup component add clippy
+
+      - name: Rustfmt (verify formatting)
+        run: |
+          rustup component add rustfmt
+          cargo fmt --all -- --check
+
+      - name: Clippy (deny-level lints gate)
+        run: cargo clippy --all-targets
+
+      - name: Tests
+        run: cargo test
+
+  package:
+    needs: [test]
+    runs-on: docker
+    # Main pushes and v* tag pushes only; manual runs on feature branches
+    # must not silently publish images.
+    if: forgejo.ref == 'refs/heads/main' || startsWith(forgejo.ref, 'refs/tags/v')
+    container:
+      image: docker:27-cli
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    timeout-minutes: 60
+    steps:
+      - name: Install curl
+        run: apk add --no-cache curl
+
+      - name: Fetch source (API archive - HTTP git is disabled on this instance)
+        env:
+          API_REPO: https://git.versalita.net/api/v1/repos/${{ github.repository }}
+        run: |
+          fetch() {
+            curl --fail-with-body --location --silent --show-error \
+              --header "Authorization: token $GITHUB_TOKEN" \
+              --output source.tar.gz "$API_REPO/archive/$1.tar.gz"
+          }
+          if fetch "$GITHUB_SHA"; then
+            echo "fetched by SHA"
+          elif fetch "$FORGEJO_REF_NAME"; then
+            echo "fetched by ref name ($FORGEJO_REF_NAME)"
+          else
+            echo "all archive attempts failed; repo API says:"
+            curl --silent --show-error --header "Authorization: token $GITHUB_TOKEN" "$API_REPO" | head -c 1500
+            exit 1
+          fi
+          tar -xzf source.tar.gz --strip-components=1
+          rm source.tar.gz
+
+      - name: Log into the instance registry
+        env:
+          # The automatic GITHUB_TOKEN can authenticate but not push: Forgejo
+          # issues it without package write scope, so the blob upload POST
+          # returns 401. REGISTRY_TOKEN is an access token with package
+          # read+write scope, stored as a repository secret.
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$REGISTRY_TOKEN" ]; then
+            echo "REGISTRY_TOKEN is empty: create an access token with package read+write scope (Settings > Applications > Access tokens), then add it as the repository secret REGISTRY_TOKEN (Settings > Actions > Secrets)." >&2
+            exit 1
+          fi
+          # A Forgejo access token is 40 hex chars; anything longer almost
+          # always means a trailing newline got captured with the secret.
+          case "$REGISTRY_TOKEN" in
+            *[[:space:]]*)
+              echo "REGISTRY_TOKEN contains whitespace (length ${#REGISTRY_TOKEN}); recreate the secret with only the token value." >&2
+              exit 1
+              ;;
+          esac
+          echo "logging in as ${{ forgejo.actor }} with a ${#REGISTRY_TOKEN}-char token (expect 40)"
+          printf '%s' "$REGISTRY_TOKEN" | docker login "$REGISTRY" --username "${{ forgejo.actor }}" --password-stdin
+
+      - name: Build and push
+        env:
+          # Use the daemon's embedded BuildKit: cache mounts in the
+          # Dockerfile require it.
+          DOCKER_BUILDKIT: 1
+        run: |
+          # OCI image paths are lowercase; the owner may not be.
+          OWNER=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE="$REGISTRY/$OWNER/$IMAGE_NAME"
+          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
+
+          TAGS=("$IMAGE:sha-$SHORT")
+          if [ "$FORGEJO_REF_NAME" = "main" ]; then
+            TAGS+=("$IMAGE:latest")
+          fi
+          case "$FORGEJO_REF_NAME" in
+            v*) TAGS+=("$IMAGE:$FORGEJO_REF_NAME") ;;
+          esac
+
+          ARGS=()
+          for tag in "${TAGS[@]}"; do
+            ARGS+=(-t "$tag")
+          done
+
+          docker build "${ARGS[@]}" .
+          for tag in "${TAGS[@]}"; do
+            docker push "$tag"
+          done

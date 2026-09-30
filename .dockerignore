@@ -1,0 +1,16 @@
+# The real config carries the Discord token - never bake it into an image.
+versabot.toml
+versabot.db*
+.env*
+
+target/
+.git/
+.zed/
+
+# CI and docs are not needed in the build context.
+.github/
+.forgejo/
+Dockerfile
+.dockerignore
+README.md
+AGENTS.md
