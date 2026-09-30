@@ -1,8 +1,12 @@
+# Checked-in configuration template. Copy it to `versabot.toml`
+# (gitignored) and fill in the real values.
+
 debug = true
 
 [discord]
 token = "YOUR_TOKEN"
-# proxy = ""
+# SOCKS/HTTP proxy for the Discord API, if your network needs one.
+# proxy = "socks5://127.0.0.1:1080"
 
 [storage]
 # SQLite for development; PostgreSQL in production, e.g.

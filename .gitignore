@@ -1,4 +1,5 @@
 /target
+versabot.toml
 
 .env*
 !.env.example

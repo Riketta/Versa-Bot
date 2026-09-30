@@ -41,7 +41,13 @@ a slash command from any other reply path.
 
 Prerequisites: Rust 1.88+ (edition 2024).
 
-1. Create `VersaBot.toml` in the project root:
+1. Copy the checked-in example and fill in your Discord token:
+
+   ```sh
+   cp versabot.example.toml versabot.toml
+   ```
+
+   The real `versabot.toml` is gitignored and looks like this:
 
    ```toml
    debug = true

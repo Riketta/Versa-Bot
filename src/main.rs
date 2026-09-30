@@ -21,7 +21,7 @@ use versa_bot::plugins::command::CommandPlugin;
 #[tokio::main]
 async fn main() {
     let config = Config::builder()
-        .add_source(File::with_name("VersaBot").required(false))
+        .add_source(File::with_name("versabot").required(false))
         .add_source(Environment::with_prefix("VERSABOT").separator("__"))
         .build()
         .expect("config expected to exist")
