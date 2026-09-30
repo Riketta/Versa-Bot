@@ -27,6 +27,10 @@ Initially it will be used with Discord, but later it should be possible to use f
 
 **Platform strategy (calibrated):** universal feature parity across chats is explicitly NOT a goal. The kernel and the taxonomy are platform-blind; core plugins work off the taxonomy and degrade gracefully where a platform lacks a concept (e.g. no roles -> user allow-lists only). Platform-specific features live in adapters or clearly scoped platform plugins without pretending to be universal. Platform types never enter the kernel or core plugins - because of economics, not purity: platform branching inside every plugin scales with (plugins x platforms), while new-adapter integration scales with 1.
 
+## README maintenance
+
+`README.md` is user-facing documentation and must stay in sync with reality. When a change adds or alters features, configuration, commands, project layout, or setup steps, update the README in the same change. The README describes what the bot does today; the Roadmap section is the only forward-looking part.
+
 ## Hexagonal Micro-Kernel Architecture
 
 TODO: add `MiddlewarePipelineRunner` trait to kernel (not port!).
