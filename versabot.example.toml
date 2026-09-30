@@ -27,3 +27,34 @@ url = "sqlite://versabot.db"
 # [status]
 # interval_seconds = 300
 # statuses = ["with the API", "versa-bot", "over the guild"]
+
+# Optional: LLM chat runtime. This section is the bot operator's domain -
+# guild admins only pick among the declared models via /llm_assign and
+# /llm_set, never configure endpoints. Startup-only: changes require a
+# restart. Without the section the chat engine has no providers.
+# [llm]
+# default_system_prompt = "You are a helpful chat assistant."
+# default_compaction_prompt = "Summarize the conversation above, preserving facts, decisions, names and open questions. Be concise."
+# compaction_keep_tail = 10
+# max_message_length = 2000
+# stream_interval_ms = 2000
+
+# Providers are OpenAI-compatible endpoints. `api_key_env` names the
+# environment variable holding the key (local endpoints may omit it);
+# optional per-provider `proxy` and `timeout_secs`.
+# [llm.providers.zai]
+# api_url = "https://api.z.ai/api/coding/paas/v4"
+# api_key_env = "VERSABOT_LLM_ZAI_KEY"
+# reasoning_style = "openai_effort"   # or "glm_thinking"
+#
+# [llm.providers.local]
+# api_url = "http://192.168.1.35:8001/v1"
+# timeout_secs = 180
+
+# Model capability declarations. Undeclared models are usable but get
+# default capabilities (no reasoning parameter is ever sent for them).
+# [llm.models."zai/glm-5.3-flash"]
+# reasoning = true
+#
+# [llm.models."local/unsloth/gemma-4-26B-A4B-it-qat-GGUF"]
+# reasoning = false

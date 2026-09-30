@@ -17,7 +17,7 @@ use crate::kernel::{
 use super::chat_engine::ChatEngine;
 use super::commands::{
     AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler, CutoffLlmHandler,
-    StatusLlmHandler, UnassignLlmHandler,
+    PromptLlmHandler, SET_KEYS, SetLlmHandler, StatusLlmHandler, UnassignLlmHandler,
 };
 use super::model::{ChannelConfig, NAMESPACE, channel_config_key};
 
@@ -123,6 +123,43 @@ impl PluginPort for LlmPlugin {
                 Vec::new(),
             ),
             Arc::new(StatusLlmHandler),
+        );
+        self.registry.register(
+            self.descriptor(
+                "llm_set",
+                "Tune this channel's chat bot",
+                vec![
+                    ArgDescriptor {
+                        name: "key".to_owned(),
+                        description: "Setting to change".to_owned(),
+                        required: true,
+                        kind: ArgKind::String,
+                        choices: Some(SET_KEYS.iter().map(|key| (*key).to_owned()).collect()),
+                    },
+                    ArgDescriptor {
+                        name: "value".to_owned(),
+                        description: "New value (`clear` resets)".to_owned(),
+                        required: true,
+                        kind: ArgKind::String,
+                        choices: None,
+                    },
+                ],
+            ),
+            Arc::new(SetLlmHandler),
+        );
+        self.registry.register(
+            self.descriptor(
+                "llm_prompt",
+                "Set this channel's system prompt",
+                vec![ArgDescriptor {
+                    name: "prompt".to_owned(),
+                    description: "Prompt text, or `clear`".to_owned(),
+                    required: true,
+                    kind: ArgKind::String,
+                    choices: None,
+                }],
+            ),
+            Arc::new(PromptLlmHandler),
         );
         Ok(())
     }
@@ -300,6 +337,8 @@ mod tests {
                 "llm_admin_clear",
                 "llm_assign",
                 "llm_cutoff",
+                "llm_prompt",
+                "llm_set",
                 "llm_status",
                 "llm_unassign"
             ]
@@ -637,5 +676,141 @@ mod tests {
             .expect("status expected to succeed");
 
         assert!(fixture.output.messages().iter().any(|m| m.contains("not assigned")));
+    }
+
+    #[tokio::test]
+    async fn set_updates_stored_channel_config() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&fixture.storage);
+
+        SetLlmHandler
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![
+                    ("key".to_owned(), "temperature".to_owned()),
+                    ("value".to_owned(), "0.7".to_owned()),
+                ]),
+                &fixture.services,
+            )
+            .await
+            .expect("set expected to succeed");
+
+        let raw = fixture
+            .services
+            .guild_storage
+            .as_ref()
+            .expect("guild storage expected")
+            .get(NAMESPACE, &channel_config_key(2))
+            .await
+            .expect("config readable")
+            .expect("config expected");
+        let config: ChannelConfig =
+            serde_json::from_value(raw).expect("config expected to deserialize");
+        assert_eq!(config.params.temperature, Some(0.7));
+        assert!(fixture.output.messages().iter().any(|m| m.contains("`temperature` set")));
+    }
+
+    #[tokio::test]
+    async fn set_with_malformed_value_replies_usage_and_saves_nothing() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&fixture.storage);
+
+        SetLlmHandler
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![
+                    ("key".to_owned(), "depth".to_owned()),
+                    ("value".to_owned(), "abc".to_owned()),
+                ]),
+                &fixture.services,
+            )
+            .await
+            .expect("set expected to be handled");
+
+        assert!(fixture.output.messages().iter().any(|m| m.contains("expects a whole number")));
+        let raw = fixture
+            .services
+            .guild_storage
+            .as_ref()
+            .expect("guild storage expected")
+            .get(NAMESPACE, &channel_config_key(2))
+            .await
+            .expect("config readable")
+            .expect("config expected");
+        // The malformed set must not have touched the stored depth.
+        let config: ChannelConfig =
+            serde_json::from_value(raw).expect("config expected to deserialize");
+        assert_eq!(config.history_depth, 100);
+    }
+
+    #[tokio::test]
+    async fn set_on_unassigned_channel_replies_so() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+
+        SetLlmHandler
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![
+                    ("key".to_owned(), "depth".to_owned()),
+                    ("value".to_owned(), "10".to_owned()),
+                ]),
+                &fixture.services,
+            )
+            .await
+            .expect("set expected to be handled");
+
+        assert!(fixture.output.messages().iter().any(|m| m.contains("not assigned")));
+    }
+
+    #[tokio::test]
+    async fn prompt_sets_and_clears_system_prompt() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&fixture.storage);
+
+        PromptLlmHandler
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("prompt".to_owned(), "You are a pirate.".to_owned())]),
+                &fixture.services,
+            )
+            .await
+            .expect("prompt expected to succeed");
+        let raw = fixture
+            .services
+            .guild_storage
+            .as_ref()
+            .expect("guild storage expected")
+            .get(NAMESPACE, &channel_config_key(2))
+            .await
+            .expect("config readable")
+            .expect("config expected");
+        let config: ChannelConfig =
+            serde_json::from_value(raw).expect("config expected to deserialize");
+        assert_eq!(config.system_prompt.as_deref(), Some("You are a pirate."));
+
+        PromptLlmHandler
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("prompt".to_owned(), "clear".to_owned())]),
+                &fixture.services,
+            )
+            .await
+            .expect("clear expected to succeed");
+        let raw = fixture
+            .services
+            .guild_storage
+            .as_ref()
+            .expect("guild storage expected")
+            .get(NAMESPACE, &channel_config_key(2))
+            .await
+            .expect("config readable")
+            .expect("config expected");
+        let config: ChannelConfig =
+            serde_json::from_value(raw).expect("config expected to deserialize");
+        assert_eq!(config.system_prompt, None);
     }
 }

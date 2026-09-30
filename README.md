@@ -49,16 +49,23 @@ a slash command from any other reply path.
   membership changes published on the bus as structured `audit` tracing
   events (stdout + Sentry/GlitchTip), with origin fields, no per-guild
   configuration needed.
-- LLM chat plugin (`llm` plugin, management commands live): guild admins can
-  already wire channels up - `/llm_assign model` assigns the chat bot to the
-  channel it is run in, `/llm_unassign` removes it, `/llm_admin` and
-  `/llm_admin_clear` manage the guild's service channel for LLM errors and
-  notices, `/llm_cutoff` resets the channel's conversation context (history
-  is kept) and `/llm_status` shows the channel's configuration and context
-  state (all Manage Server, guild-only). Per-channel configuration -
-  model, sampling parameters, system prompt, compaction, streaming - is
-  stored guild-partitioned and takes effect as the conversation engine
-  lands (see Roadmap).
+- LLM chat bot (`llm` plugin): per-channel chat with conversation history.
+  Guild admins assign it with `/llm_assign model`, tune it with `/llm_set`
+  (model, sampling parameters, reasoning effort, history depth, capture
+  mode, compaction, streaming, random-reply chance, reply length, turn
+  template) and `/llm_prompt` (system prompt); `/llm_cutoff` resets the
+  context (history is kept) and `/llm_status` shows model, window and
+  summary state with a link to where the context starts; `/llm_admin` and
+  `/llm_admin_clear` manage the guild's service channel for error notices
+  (all Manage Server, guild-only). History tracks bot-related messages only
+  (mentions and reply chains) by default, with an optional whole-channel
+  mode; the window is chunk-compacted after replies (summary + cutoff -
+  never a sliding window, so provider prompt caches stay warm). Long
+  answers split on line boundaries, can stream in place (create once,
+  edit until final), and the bot may chime in on unrelated messages with a
+  configurable per-channel chance. Providers are OpenAI-compatible
+  endpoints declared in `[llm]` (keys via env); the guild message content
+  the bot reads is why `MESSAGE_CONTENT` is requested.
 - Status rotator (`status_rotator` plugin): cycles the bot's activity
   through a configured list on a configured interval - both come from the
   optional `[status]` section of the config file (presence is bot-wide,
@@ -77,7 +84,7 @@ a slash command from any other reply path.
   re-read every few seconds; changes to hot-reloadable sections apply
   without a restart - e.g. editing `[status]` re-applies the rotation live
   (identical settings are ignored, removing the section stops it). Startup
-  -only settings (token, storage, Sentry) are not affected.
+  -only settings (token, storage, Sentry, LLM providers) are not affected.
 - Graceful shutdown on Ctrl-C (plugins stop in reverse order).
 
 ## Getting started
@@ -113,6 +120,14 @@ Prerequisites: Rust 1.88+ (edition 2024).
    # [status]
    # interval_seconds = 300
    # statuses = ["with the API", "versa-bot"]
+
+   # Optional: LLM chat runtime (providers, model capabilities, defaults -
+   # see versabot.example.toml for the full reference).
+   # [llm]
+   # [llm.providers.local]
+   # api_url = "http://127.0.0.1:8001/v1"
+   # [llm.models."local/gemma"]
+   # reasoning = false
    ```
 
 2. `cargo run` from the project root (migrations load from `./migrations`).
@@ -212,9 +227,4 @@ src/
 
 ## Roadmap
 
-- LLM chat plugin runtime wiring: the `[llm]` config section (providers,
-  models, compaction defaults) and the `/llm_set`, `/llm_prompt` commands
-  (the conversation engine - capture/trigger, context assembly, compaction,
-  streaming, random replies, and the OpenAI-compatible provider layer - is
-  implemented)
 - Further platform adapters (Telegram, Matrix, ...)

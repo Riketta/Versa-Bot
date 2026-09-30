@@ -7,7 +7,7 @@ use config::{Config, Environment, File};
 use serenity::all::{ClientBuilder, GatewayIntents, Http, HttpBuilder};
 
 use versa_bot::infrastructure::{
-    Configuration, PollingConfigWatcher,
+    Configuration, LlmConfig, LlmReasoningStyle, PollingConfigWatcher,
     inbound_adapters::{DiscordGatewayAdapter, SerenityChatOutputFactory},
     observability,
     outbound_adapters::{DiscordCommandRegistrar, SerenityPresence, SqlxStorage},
@@ -24,8 +24,8 @@ use versa_bot::plugins::audit::AuditLogPlugin;
 use versa_bot::plugins::auth::AuthPlugin;
 use versa_bot::plugins::command::CommandPlugin;
 use versa_bot::plugins::llm::{
-    ChatEngine, LlmCompletionPort, LlmPlugin, LlmSettings, OpenAiCompatibleAdapter, RandRandom,
-    RandomPort,
+    ChatEngine, LlmCompletionPort, LlmPlugin, LlmSettings, ModelSettings, OpenAiCompatibleAdapter,
+    ProviderSettings, RandRandom, RandomPort, ReasoningStyle,
 };
 use versa_bot::plugins::status::{StatusRotatorPlugin, StatusSettings};
 use versa_bot::plugins::tracker::UserActivityTrackerPlugin;
@@ -72,14 +72,14 @@ async fn main() -> ExitCode {
         event_bus.clone(),
         Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
     ));
-    // LLM chat plugin: the conversation engine is live. The provider layer
-    // starts empty until the [llm] config section is wired here - channels
-    // can already be assigned; completions fail with a clear error until
-    // providers are declared. Random replies use the plain RNG adapter;
-    // swapping in the deck-style generator is a one-argument change.
-    let llm_settings = Arc::new(LlmSettings::default());
+    // LLM chat plugin: the conversation engine is live. `[llm]` is
+    // startup-only - provider clients and API keys are built once here, so
+    // changes require a restart (same class as token/storage). Random
+    // replies use the plain RNG adapter; swapping in the deck-style
+    // generator is a one-argument change.
+    let llm_settings = Arc::new(config.llm.as_ref().map(llm_settings_from).unwrap_or_default());
     let llm_adapter = OpenAiCompatibleAdapter::from_settings(Arc::clone(&llm_settings))
-        .expect("llm provider settings expected to configure cleanly");
+        .expect("config [llm] section expected to be valid (api_key_env set, proxies parseable)");
     let llm_engine = Arc::new(ChatEngine::new(
         llm_settings,
         Arc::new(llm_adapter) as Arc<dyn LlmCompletionPort>,
@@ -189,6 +189,44 @@ async fn main() -> ExitCode {
     let start_result = client.start().await;
     kernel.shutdown();
     gateway_exit_code(start_result)
+}
+
+/// Maps the infra `[llm]` config onto the plugin-facing settings. Field-by-
+/// field on purpose: the composition root is the only place allowed to know
+/// both sides.
+fn llm_settings_from(config: &LlmConfig) -> LlmSettings {
+    LlmSettings {
+        default_system_prompt: config.default_system_prompt.clone(),
+        default_compaction_prompt: config.default_compaction_prompt.clone(),
+        compaction_model: config.compaction_model.clone(),
+        compaction_keep_tail: config.compaction_keep_tail,
+        max_message_length: config.max_message_length,
+        stream_interval_ms: config.stream_interval_ms,
+        providers: config
+            .providers
+            .iter()
+            .map(|(name, provider)| {
+                (
+                    name.clone(),
+                    ProviderSettings {
+                        api_url: provider.api_url.clone(),
+                        api_key_env: provider.api_key_env.clone(),
+                        proxy: provider.proxy.clone(),
+                        timeout_secs: provider.timeout_secs,
+                        reasoning_style: match provider.reasoning_style {
+                            LlmReasoningStyle::OpenaiEffort => ReasoningStyle::OpenaiEffort,
+                            LlmReasoningStyle::GlmThinking => ReasoningStyle::GlmThinking,
+                        },
+                    },
+                )
+            })
+            .collect(),
+        models: config
+            .models
+            .iter()
+            .map(|(name, model)| (name.clone(), ModelSettings { reasoning: model.reasoning }))
+            .collect(),
+    }
 }
 
 /// Maps the gateway outcome onto the process exit code: non-zero on gateway
