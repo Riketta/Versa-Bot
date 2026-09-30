@@ -102,12 +102,14 @@ async fn main() {
         .await
         .expect("slash command registration expected to succeed");
 
-    // GUILD_MEMBERS is a privileged intent: enable it for the bot in the
-    // Discord Developer Portal, or the gateway will disconnect on start.
+    // Minimal intent set, one per justified feature (see README "Gateway
+    // intents"). GUILD_MEMBERS is privileged: enable "Server Members Intent"
+    // in the Developer Portal, or the gateway disconnects on start.
+    // MESSAGE_CONTENT is deliberately not requested - no current feature
+    // reads guild message content; the LLM chat plugin will.
     let intents = GatewayIntents::GUILD_MESSAGES
-        | GatewayIntents::GUILD_MEMBERS
         | GatewayIntents::DIRECT_MESSAGES
-        | GatewayIntents::MESSAGE_CONTENT;
+        | GatewayIntents::GUILD_MEMBERS;
 
     let mut client = ClientBuilder::new_with_http(
         build_http(&config.discord.token, config.discord.proxy, Some(app_id)),

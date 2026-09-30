@@ -81,9 +81,22 @@ Prerequisites: Rust 1.88+ (edition 2024).
    commands appear. Global commands can take up to an hour to propagate on
    first registration.
 
-   The bot also uses the **Server Members** privileged intent (member
-   join/leave tracking) - enable "Server Members Intent" for the bot in the
-   Discord Developer Portal, otherwise the gateway will disconnect on start.
+### Gateway intents
+
+The bot requests a minimal gateway intent set - every intent is justified
+by a concrete plugin or core feature:
+
+| Intent | Kind | Requested for |
+|---|---|---|
+| `GUILD_MESSAGES` | regular | Core message intake: guild messages flow through the pipeline (the auth gate) |
+| `DIRECT_MESSAGES` | regular | Core DM intake: DM events flow with no guild scope |
+| `GUILD_MEMBERS` | **privileged** | `tracker` plugin: member join/leave events (`/assign_tracker` audit) |
+| `MESSAGE_CONTENT` | privileged | **not requested** - no current feature reads guild message content; the planned LLM chat plugin will add it back |
+
+So exactly one portal toggle is needed today: enable **Server Members
+Intent** (Discord Developer Portal → Bot), otherwise the gateway
+disconnects on start. When the LLM chat plugin lands, also enable **Message
+Content Intent**.
 
 Environment variables override the file:
 `VERSABOT__DISCORD__TOKEN`, `VERSABOT__STORAGE__URL`,
