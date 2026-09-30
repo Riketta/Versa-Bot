@@ -50,7 +50,8 @@ a slash command from any other reply path.
   events (stdout + Sentry/GlitchTip), with origin fields, no per-guild
   configuration needed.
 - LLM chat bot (`llm` plugin): per-channel chat with conversation history.
-  Guild admins assign it with `/llm_assign model`, tune it with `/llm_set`
+  Guild admins assign it with `/llm_assign model`, remove it with
+  `/llm_unassign`, tune it with `/llm_set`
   (model, sampling parameters, reasoning effort, history depth, capture
   mode, compaction, streaming, random-reply chance, reply length, turn
   template) and `/llm_prompt` (system prompt); `/llm_cutoff` resets the
@@ -155,10 +156,9 @@ by a concrete plugin or core feature:
 | `GUILD_MEMBERS` | **privileged** | `tracker` plugin: member join/leave events (`/assign_tracker` audit) |
 | `MESSAGE_CONTENT` | **privileged** | the LLM chat plugin reads guild message content for conversation history - enable "Message Content Intent" in the Developer Portal |
 
-So exactly one portal toggle is needed today: enable **Server Members
-Intent** (Discord Developer Portal → Bot), otherwise the gateway
-disconnects on start. When the LLM chat plugin lands, also enable **Message
-Content Intent**.
+So exactly two portal toggles are needed today (Developer Portal → Bot),
+otherwise the gateway disconnects on start: enable **Server Members Intent**
+and **Message Content Intent**.
 
 Environment variables override the file:
 `VERSABOT__DISCORD__TOKEN`, `VERSABOT__STORAGE__URL`,
@@ -192,8 +192,10 @@ Set `RUST_LOG` to tune log verbosity (default `info`).
 ## Development
 
 - `cargo test` - unit tests cover the kernel pipeline, storage guild
-  isolation, the command registry/dispatcher, the auth policy, and the
-  activity tracker.
+  isolation (documents + record log), the command registry/dispatcher, the
+  auth policy, the activity tracker, and the LLM chat plugin (context
+  assembly, token budgets, compaction, splitting, provider request
+  building, RNG adapters).
 - `cargo clippy --all-targets` - the deny-level lints must stay clean.
 
 ### CI
