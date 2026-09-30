@@ -263,7 +263,9 @@ mod tests {
             Platform, UserId,
         },
         plugin_ports::EventHandler,
-        spi_ports::{ChatOutputFactoryPort, ChatOutputPort, GUILD_SETTINGS, StoragePort},
+        spi_ports::{
+            ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, GUILD_SETTINGS, StoragePort,
+        },
     };
     use crate::test_support::{InMemoryStorage, RecordingChatOutput};
     use crate::{
@@ -308,6 +310,23 @@ mod tests {
             channel_id: ChannelIdModel,
         ) -> Arc<dyn ChatOutputPort> {
             Arc::new(ChannelRecorder { sent: Arc::clone(&self.sent), channel: channel_id.get() })
+        }
+
+        fn stream_output(&self, _origin: &Origin) -> Arc<dyn ChatStreamPort> {
+            Arc::new(NoStream) as Arc<dyn ChatStreamPort>
+        }
+    }
+
+    struct NoStream;
+
+    #[async_trait]
+    impl ChatStreamPort for NoStream {
+        async fn begin(&self, _message: OutboundMessage) -> Result<MessageId, OutboundError> {
+            Err(OutboundError::Send("streaming not supported in this test".to_owned()))
+        }
+
+        async fn update(&self, _message: MessageId, _content: String) -> Result<(), OutboundError> {
+            Err(OutboundError::Send("streaming not supported in this test".to_owned()))
         }
     }
 

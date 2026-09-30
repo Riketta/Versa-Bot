@@ -55,7 +55,9 @@ a slash command from any other reply path.
   not per-guild); omitted or empty means the rotation is off.
 - Guild-partitioned document storage: plugins persist JSON documents scoped
   to `(platform, guild)` - reading another guild's data is impossible by
-  construction. SQLite (default) and PostgreSQL.
+  construction. An append-only record log (`append`/`list_after`/`count_after`)
+  sits alongside the documents for high-volume ordered data such as
+  conversation history. SQLite (default) and PostgreSQL.
 - Observability: `tracing` logging to stdout plus optional Sentry/GlitchTip
   reporting (DSN-driven); every event is traced with its origin.
 - Fault isolation: a panicking plugin cannot crash the bot - pipeline hooks
@@ -121,7 +123,7 @@ by a concrete plugin or core feature:
 | `GUILD_MESSAGES` | regular | Core message intake: guild messages flow through the pipeline (the auth gate) |
 | `DIRECT_MESSAGES` | regular | Core DM intake: DM events flow with no guild scope |
 | `GUILD_MEMBERS` | **privileged** | `tracker` plugin: member join/leave events (`/assign_tracker` audit) |
-| `MESSAGE_CONTENT` | privileged | **not requested** - no current feature reads guild message content; the planned LLM chat plugin will add it back |
+| `MESSAGE_CONTENT` | **privileged** | the LLM chat plugin reads guild message content for conversation history - enable "Message Content Intent" in the Developer Portal |
 
 So exactly one portal toggle is needed today: enable **Server Members
 Intent** (Discord Developer Portal → Bot), otherwise the gateway

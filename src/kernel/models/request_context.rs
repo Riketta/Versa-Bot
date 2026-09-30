@@ -20,10 +20,13 @@ impl RequestContext {
             origin,
             payload: EventPayload::Message(MessagePayload {
                 content: content.into(),
+                author_name: None,
                 author_roles: Vec::new(),
                 // 0 = unknown; the driving adapter overwrites this with the
                 // platform's permission bits when it has them.
                 author_permissions: 0,
+                reply_to: None,
+                mentions_bot: false,
             }),
         }
     }

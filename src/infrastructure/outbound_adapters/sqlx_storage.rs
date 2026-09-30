@@ -9,7 +9,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
 use crate::kernel::{
     models::{GuildId, Platform, StorageError},
-    spi_ports::{GUILD_SETTINGS, GuildStorage, StoragePort},
+    spi_ports::{GUILD_SETTINGS, GuildStorage, StoragePort, StoredRecord},
 };
 
 /// Connection to one of the supported engines. Kept as an explicit enum
@@ -239,6 +239,151 @@ impl GuildStorage for ScopedGuildStorage {
 
         Ok(keys)
     }
+
+    async fn append(&self, namespace: &str, payload: Value) -> Result<u64, StorageError> {
+        // Same reserved-namespace policy as document writes: plugins record
+        // into their own namespaces, never into guild settings.
+        if namespace == GUILD_SETTINGS {
+            tracing::error!(
+                namespace = GUILD_SETTINGS,
+                "rejected append to the reserved guild namespace"
+            );
+            return Err(StorageError::Forbidden("the 'guild' namespace is reserved".to_owned()));
+        }
+
+        let json = serde_json::to_string(&payload)
+            .map_err(|err| StorageError::Serialization(err.to_string()))?;
+
+        // One statement assigns the next guild-scoped sequence (MAX+1 over
+        // the scope's rows) and returns it - no read-write race window.
+        let seq: i64 = match &*self.db {
+            Db::Sqlite(pool) => {
+                sqlx::query_scalar(
+                    "INSERT INTO guild_records (platform, guild_id, namespace, seq, value) \
+                     SELECT ?, ?, ?, COALESCE(MAX(seq), 0) + 1, ? \
+                     FROM guild_records \
+                     WHERE platform = ? AND guild_id = ? AND namespace = ? \
+                     RETURNING seq",
+                )
+                .bind(&self.platform)
+                .bind(self.guild_id)
+                .bind(namespace)
+                .bind(&json)
+                .bind(&self.platform)
+                .bind(self.guild_id)
+                .bind(namespace)
+                .fetch_one(pool)
+                .await
+            }
+            Db::Postgres(pool) => {
+                sqlx::query_scalar(
+                    "INSERT INTO guild_records (platform, guild_id, namespace, seq, value) \
+                     SELECT $1, $2, $3, COALESCE(MAX(seq), 0) + 1, $4 \
+                     FROM guild_records \
+                     WHERE platform = $5 AND guild_id = $6 AND namespace = $7 \
+                     RETURNING seq",
+                )
+                .bind(&self.platform)
+                .bind(self.guild_id)
+                .bind(namespace)
+                .bind(&json)
+                .bind(&self.platform)
+                .bind(self.guild_id)
+                .bind(namespace)
+                .fetch_one(pool)
+                .await
+            }
+        }
+        .map_err(|err| StorageError::Database(err.to_string()))?;
+
+        Ok(u64::try_from(seq).map_err(|err| StorageError::Database(err.to_string()))?)
+    }
+
+    async fn list_after(
+        &self,
+        namespace: &str,
+        after_seq: u64,
+        limit: u32,
+    ) -> Result<Vec<StoredRecord>, StorageError> {
+        let after =
+            i64::try_from(after_seq).map_err(|err| StorageError::Database(err.to_string()))?;
+        let rows: Vec<(i64, String)> = match &*self.db {
+            Db::Sqlite(pool) => {
+                sqlx::query_as(
+                    "SELECT seq, value FROM guild_records \
+                     WHERE platform = ? AND guild_id = ? AND namespace = ? AND seq > ? \
+                     ORDER BY seq LIMIT ?",
+                )
+                .bind(&self.platform)
+                .bind(self.guild_id)
+                .bind(namespace)
+                .bind(after)
+                .bind(i64::from(limit))
+                .fetch_all(pool)
+                .await
+            }
+            Db::Postgres(pool) => {
+                sqlx::query_as(
+                    "SELECT seq, value FROM guild_records \
+                     WHERE platform = $1 AND guild_id = $2 AND namespace = $3 AND seq > $4 \
+                     ORDER BY seq LIMIT $5",
+                )
+                .bind(&self.platform)
+                .bind(self.guild_id)
+                .bind(namespace)
+                .bind(after)
+                .bind(i64::from(limit))
+                .fetch_all(pool)
+                .await
+            }
+        }
+        .map_err(|err| StorageError::Database(err.to_string()))?;
+
+        rows.into_iter()
+            .map(|(seq, json)| {
+                Ok(StoredRecord {
+                    seq: u64::try_from(seq)
+                        .map_err(|err| StorageError::Database(err.to_string()))?,
+                    payload: serde_json::from_str(&json)
+                        .map_err(|err| StorageError::Serialization(err.to_string()))?,
+                })
+            })
+            .collect()
+    }
+
+    async fn count_after(&self, namespace: &str, after_seq: u64) -> Result<u64, StorageError> {
+        let after =
+            i64::try_from(after_seq).map_err(|err| StorageError::Database(err.to_string()))?;
+        let count: i64 = match &*self.db {
+            Db::Sqlite(pool) => {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM guild_records \
+                     WHERE platform = ? AND guild_id = ? AND namespace = ? AND seq > ?",
+                )
+                .bind(&self.platform)
+                .bind(self.guild_id)
+                .bind(namespace)
+                .bind(after)
+                .fetch_one(pool)
+                .await
+            }
+            Db::Postgres(pool) => {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM guild_records \
+                     WHERE platform = $1 AND guild_id = $2 AND namespace = $3 AND seq > $4",
+                )
+                .bind(&self.platform)
+                .bind(self.guild_id)
+                .bind(namespace)
+                .bind(after)
+                .fetch_one(pool)
+                .await
+            }
+        }
+        .map_err(|err| StorageError::Database(err.to_string()))?;
+
+        Ok(u64::try_from(count).map_err(|err| StorageError::Database(err.to_string()))?)
+    }
 }
 
 #[cfg(test)]
@@ -304,5 +449,73 @@ mod tests {
         assert_eq!(guild.get("command", "prefix").await.unwrap(), None);
         assert_eq!(guild.list_keys("command").await.unwrap(), Vec::<String>::new());
         assert_eq!(guild.list_keys("greeter").await.unwrap(), ["greeting"]);
+    }
+
+    #[tokio::test]
+    async fn records_append_in_order_with_increasing_seq() {
+        let storage = sqlite_storage().await;
+        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+
+        let first = guild.append("llm", Value::String("a".to_owned())).await.unwrap();
+        let second = guild.append("llm", Value::String("b".to_owned())).await.unwrap();
+        let third = guild.append("llm", Value::String("c".to_owned())).await.unwrap();
+        assert!(first < second && second < third);
+
+        let records = guild.list_after("llm", 0, 100).await.unwrap();
+        assert_eq!(records.len(), 3);
+        let head = records.first().expect("three records expected");
+        assert_eq!(head.seq, first);
+        assert_eq!(head.payload, Value::String("a".to_owned()));
+        let tail = records.get(2).expect("three records expected");
+        assert_eq!(tail.seq, third);
+        assert_eq!(tail.payload, Value::String("c".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn list_after_and_count_after_window_records() {
+        let storage = sqlite_storage().await;
+        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+
+        let first = guild.append("llm", Value::from(1)).await.unwrap();
+        guild.append("llm", Value::from(2)).await.unwrap();
+        guild.append("llm", Value::from(3)).await.unwrap();
+
+        let window = guild.list_after("llm", first, 100).await.unwrap();
+        assert_eq!(window.len(), 2);
+        assert_eq!(window.first().map(|record| record.payload.clone()), Some(Value::from(2)));
+        assert_eq!(guild.count_after("llm", first).await.unwrap(), 2);
+        assert_eq!(guild.count_after("llm", 0).await.unwrap(), 3);
+
+        // Ascending order + LIMIT keeps the earliest records after the
+        // cursor - consumers page forward by cursor (e.g. compaction walks
+        // the oldest chunk first).
+        let limited = guild.list_after("llm", 0, 2).await.unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited.first().map(|record| record.payload.clone()), Some(Value::from(1)));
+    }
+
+    #[tokio::test]
+    async fn records_do_not_mix_across_namespaces_and_guilds() {
+        let storage = sqlite_storage().await;
+        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        let other_guild = storage.guild_scoped(Platform::Discord, GuildId(2));
+
+        guild.append("llm", Value::String("one".to_owned())).await.unwrap();
+        guild.append("tracker", Value::String("two".to_owned())).await.unwrap();
+        other_guild.append("llm", Value::String("three".to_owned())).await.unwrap();
+
+        assert_eq!(guild.list_after("llm", 0, 100).await.unwrap().len(), 1);
+        assert_eq!(guild.list_after("tracker", 0, 100).await.unwrap().len(), 1);
+        assert_eq!(other_guild.list_after("llm", 0, 100).await.unwrap().len(), 1);
+        assert_eq!(other_guild.count_after("tracker", 0).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn reserved_guild_namespace_rejects_appends() {
+        let storage = sqlite_storage().await;
+        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+
+        let append = guild.append(GUILD_SETTINGS, Value::String("x".to_owned())).await;
+        assert!(matches!(append, Err(StorageError::Forbidden(_))));
     }
 }

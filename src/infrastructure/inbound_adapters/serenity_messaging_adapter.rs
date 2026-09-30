@@ -2,8 +2,8 @@ use std::sync::{Arc, OnceLock};
 
 use serenity::all::{
     ChannelId as SerenityChannelId, CommandDataOption, CommandDataOptionValue, Context,
-    CreateMessage, EventHandler, GuildId as SerenityGuildId, Http, Interaction, Member, Message,
-    Ready, User,
+    CreateMessage, EditMessage, EventHandler, GuildId as SerenityGuildId, Http, Interaction,
+    Member, Message, Ready, User,
 };
 use serenity::async_trait;
 
@@ -13,7 +13,7 @@ use crate::kernel::{
         ChannelId, CommandPayload, Embed, EventKind, EventPayload, GuildId, MemberPayload,
         MessageId, Origin, OutboundError, OutboundMessage, Platform, RequestContext, UserId,
     },
-    spi_ports::{ChatOutputFactoryPort, ChatOutputPort},
+    spi_ports::{ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort},
 };
 
 /// Kernel driving adapter: normalizes Discord gateway events onto the
@@ -34,8 +34,10 @@ impl<H: RequestHandlerPort> DiscordGatewayAdapter<H> {
 
 #[async_trait]
 impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
-    async fn message(&self, _ctx: Context, message: Message) {
-        // Bots and webhooks both feed noise into the pipeline.
+    async fn message(&self, ctx: Context, message: Message) {
+        // Bots and webhooks both feed noise into the pipeline. The bot's own
+        // replies never re-enter through the gateway either: plugins that
+        // need their own turns in a conversation record them at send time.
         if message.author.bot || message.webhook_id.is_some() {
             return;
         }
@@ -54,6 +56,23 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
             .as_ref()
             .and_then(|member| member.permissions)
             .map_or(0, |permissions| permissions.bits());
+        // Same best-effort display naming: channel nick when present, else
+        // the platform username, frozen at capture time for history renders.
+        let author_name = message
+            .member
+            .as_ref()
+            .and_then(|member| member.nick.clone())
+            .unwrap_or_else(|| message.author.name.clone());
+        // The reply reference survives even when the referenced message is
+        // not cached (or was deleted) - unlike `referenced_message`.
+        let reply_to = message
+            .message_reference
+            .and_then(|reference| reference.message_id)
+            .map(|message_id| MessageId(message_id.get()));
+        // Mention matching needs the bot identity, which lives in the
+        // gateway cache and is guaranteed present once messages flow.
+        let current_user_id = ctx.cache.current_user().id;
+        let mentions_bot = message.mentions.iter().any(|user| user.id == current_user_id);
 
         let origin = Origin {
             platform: Platform::Discord,
@@ -66,8 +85,11 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
 
         let mut event = RequestContext::message_received(origin, message.content);
         if let EventPayload::Message(payload) = &mut event.payload {
+            payload.author_name = Some(author_name);
             payload.author_roles = author_roles;
             payload.author_permissions = author_permissions;
+            payload.reply_to = reply_to;
+            payload.mentions_bot = mentions_bot;
         }
 
         self.handler.handle(event).await;
@@ -281,6 +303,20 @@ impl ChatOutputFactoryPort for SerenityChatOutputFactory {
             channel_id: SerenityChannelId::new(channel_id.get()),
         })
     }
+
+    /// Streaming is plain-channel progressive rendering: never an interaction
+    /// reply (followup edits are a different endpoint and no plugin needs
+    /// them yet) and never a channel-less origin.
+    fn stream_output(&self, origin: &Origin) -> Arc<dyn ChatStreamPort> {
+        if origin.reply_token.is_some() || origin.guild_id.is_none() || origin.channel_id.get() == 0
+        {
+            return Arc::new(UndeliverableChatStream);
+        }
+        Arc::new(SerenityChatStream {
+            http: Arc::clone(&self.http),
+            channel_id: SerenityChannelId::new(origin.channel_id.get()),
+        })
+    }
 }
 
 struct SerenityChatOutput {
@@ -325,6 +361,64 @@ impl ChatOutputPort for UndeliverableChatOutput {
     async fn send(&self, _message: OutboundMessage) -> Result<(), OutboundError> {
         tracing::warn!("dropping outbound message: origin has no deliverable Discord channel");
         Err(OutboundError::Send("no deliverable Discord channel for this origin".to_owned()))
+    }
+}
+
+/// Progressive-rendering output: creates the message on `begin`, then edits
+/// it in place as content arrives. Content-only - embeds are ignored in a
+/// message that exists to be overwritten.
+struct SerenityChatStream {
+    http: Arc<Http>,
+    channel_id: SerenityChannelId,
+}
+
+#[async_trait]
+impl ChatStreamPort for SerenityChatStream {
+    async fn begin(&self, message: OutboundMessage) -> Result<MessageId, OutboundError> {
+        if message.content.is_empty() {
+            tracing::warn!(channel = %self.channel_id, "dropping empty streaming placeholder");
+            return Err(OutboundError::Send("empty streaming placeholder".to_owned()));
+        }
+        let created = self
+            .http
+            .send_message(
+                self.channel_id,
+                Vec::new(),
+                &CreateMessage::new().content(message.content),
+            )
+            .await
+            .map_err(|err| OutboundError::Send(err.to_string()))?;
+        Ok(MessageId(created.id.get()))
+    }
+
+    async fn update(&self, message: MessageId, content: String) -> Result<(), OutboundError> {
+        self.http
+            .edit_message(
+                self.channel_id,
+                serenity::all::MessageId::new(message.get()),
+                &EditMessage::new().content(content),
+                Vec::new(),
+            )
+            .await
+            .map_err(|err| OutboundError::Send(err.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Terminal streaming output for origins with no streamable Discord channel
+/// (transactional reply tokens, channel-less events, direct messages).
+struct UndeliverableChatStream;
+
+#[async_trait]
+impl ChatStreamPort for UndeliverableChatStream {
+    async fn begin(&self, _message: OutboundMessage) -> Result<MessageId, OutboundError> {
+        tracing::warn!("dropping streaming begin: origin has no streamable Discord channel");
+        Err(OutboundError::Send("no streamable Discord channel for this origin".to_owned()))
+    }
+
+    async fn update(&self, _message: MessageId, _content: String) -> Result<(), OutboundError> {
+        tracing::warn!("dropping streaming update: origin has no streamable Discord channel");
+        Err(OutboundError::Send("no streamable Discord channel for this origin".to_owned()))
     }
 }
 

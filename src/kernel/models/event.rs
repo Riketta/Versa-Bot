@@ -93,6 +93,10 @@ pub struct CommandPayload {
 #[derive(Debug, Clone)]
 pub struct MessagePayload {
     pub content: String,
+    /// Author display name at capture time (channel nick, else platform
+    /// username; best effort). Lets history consumers render `{sender}:
+    /// {message}` context lines without a gateway cache.
+    pub author_name: Option<String>,
     /// Opaque platform role identifiers of the author, filled by driving
     /// adapters when the platform provides them (empty otherwise). Lets
     /// guild plugins do role checks without platform-specific types.
@@ -100,6 +104,13 @@ pub struct MessagePayload {
     /// Platform permission bits of the author (`0` = unknown); opaque
     /// pass-through data the auth plugin interprets.
     pub author_permissions: u64,
+    /// Message this one replies to, when the platform provides the
+    /// reference. Lets conversation-history consumers follow reply chains.
+    pub reply_to: Option<MessageId>,
+    /// True when the message mentions this bot - resolved by the driving
+    /// adapter, which owns the bot identity. Core plugins stay blind to
+    /// platform mention syntax.
+    pub mentions_bot: bool,
 }
 
 #[derive(Debug, Clone)]

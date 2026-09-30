@@ -137,13 +137,15 @@ async fn main() -> ExitCode {
         .expect("slash command registration expected to succeed");
 
     // Minimal intent set, one per justified feature (see README "Gateway
-    // intents"). GUILD_MEMBERS is privileged: enable "Server Members Intent"
-    // in the Developer Portal, or the gateway disconnects on start.
-    // MESSAGE_CONTENT is deliberately not requested - no current feature
-    // reads guild message content; the LLM chat plugin will.
+    // intents"). GUILD_MEMBERS and MESSAGE_CONTENT are privileged: enable
+    // "Server Members Intent" and "Message Content Intent" in the Developer
+    // Portal, or the gateway disconnects on start. MESSAGE_CONTENT is
+    // consumed by the LLM plugin, which reads guild message content for
+    // conversation history.
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
-        | GatewayIntents::GUILD_MEMBERS;
+        | GatewayIntents::GUILD_MEMBERS
+        | GatewayIntents::MESSAGE_CONTENT;
 
     let mut client = ClientBuilder::new_with_http(
         build_http(&config.discord.token, config.discord.proxy, Some(app_id)),

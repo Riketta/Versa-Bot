@@ -320,8 +320,11 @@ mod tests {
             origin: origin(user_id),
             payload: EventPayload::Message(MessagePayload {
                 content: "!ping".to_owned(),
+                author_name: None,
                 author_roles: roles.iter().map(|role| (*role).to_owned()).collect(),
                 author_permissions: 0,
+                reply_to: None,
+                mentions_bot: false,
             }),
         }
     }

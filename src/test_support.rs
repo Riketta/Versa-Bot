@@ -10,16 +10,23 @@ use serde_json::Value;
 
 use crate::kernel::{
     models::{GuildId, OutboundError, OutboundMessage, Platform, StorageError},
-    spi_ports::{ChatOutputFactoryPort, ChatOutputPort, GuildStorage, StoragePort},
+    spi_ports::{
+        ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, GuildStorage, StoragePort,
+        StoredRecord,
+    },
 };
 
 type Row = (String, i64, String, String);
 
+/// Scope of one append-only record log: `(platform, guild_id, namespace)`.
+type RecordScope = (String, i64, String);
+
 /// In-memory [`StoragePort`]: guild-partitioned, mirroring the real
-/// adapter's isolation shape.
+/// adapter's isolation shape for documents and records alike.
 #[derive(Default)]
 pub struct InMemoryStorage {
     documents: Arc<Mutex<HashMap<Row, Value>>>,
+    records: Arc<Mutex<HashMap<RecordScope, Vec<(u64, Value)>>>>,
 }
 
 impl InMemoryStorage {
@@ -54,6 +61,7 @@ impl StoragePort for InMemoryStorage {
     fn guild_scoped(&self, platform: Platform, guild_id: GuildId) -> Arc<dyn GuildStorage> {
         Arc::new(ScopedView {
             documents: Arc::clone(&self.documents),
+            records: Arc::clone(&self.records),
             key_prefix: (platform.as_str().to_owned(), guild_id.get() as i64),
         })
     }
@@ -61,6 +69,7 @@ impl StoragePort for InMemoryStorage {
 
 struct ScopedView {
     documents: Arc<Mutex<HashMap<Row, Value>>>,
+    records: Arc<Mutex<HashMap<RecordScope, Vec<(u64, Value)>>>>,
     key_prefix: (String, i64),
 }
 
@@ -98,6 +107,44 @@ impl GuildStorage for ScopedView {
             .filter(|(p, g, ns, _)| p == &platform && g == &guild_id && ns == namespace)
             .map(|(_, _, _, key)| key.clone())
             .collect())
+    }
+
+    async fn append(&self, namespace: &str, payload: Value) -> Result<u64, StorageError> {
+        let (platform, guild_id) = self.key_prefix.clone();
+        let mut records = self.records.lock();
+        let scope = records.entry((platform, guild_id, namespace.to_owned())).or_default();
+        // Appends are ordered, so the last entry carries the highest seq.
+        let seq = scope.last().map_or(1, |(last_seq, _)| last_seq + 1);
+        scope.push((seq, payload));
+        Ok(seq)
+    }
+
+    async fn list_after(
+        &self,
+        namespace: &str,
+        after_seq: u64,
+        limit: u32,
+    ) -> Result<Vec<StoredRecord>, StorageError> {
+        let (platform, guild_id) = self.key_prefix.clone();
+        let records = self.records.lock();
+        Ok(records
+            .get(&(platform, guild_id, namespace.to_owned()))
+            .map(|rows| {
+                rows.iter()
+                    .filter(|(seq, _)| *seq > after_seq)
+                    .take(limit as usize)
+                    .map(|(seq, payload)| StoredRecord { seq: *seq, payload: payload.clone() })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn count_after(&self, namespace: &str, after_seq: u64) -> Result<u64, StorageError> {
+        let (platform, guild_id) = self.key_prefix.clone();
+        let records = self.records.lock();
+        Ok(records
+            .get(&(platform, guild_id, namespace.to_owned()))
+            .map_or(0, |rows| rows.iter().filter(|(seq, _)| *seq > after_seq).count() as u64))
     }
 }
 
@@ -172,6 +219,23 @@ impl GuildStorage for FailingView {
     async fn list_keys(&self, _namespace: &str) -> Result<Vec<String>, StorageError> {
         Err(StorageError::Database("simulated storage failure".to_owned()))
     }
+
+    async fn append(&self, _namespace: &str, _payload: Value) -> Result<u64, StorageError> {
+        Err(StorageError::Database("simulated storage failure".to_owned()))
+    }
+
+    async fn list_after(
+        &self,
+        _namespace: &str,
+        _after_seq: u64,
+        _limit: u32,
+    ) -> Result<Vec<StoredRecord>, StorageError> {
+        Err(StorageError::Database("simulated storage failure".to_owned()))
+    }
+
+    async fn count_after(&self, _namespace: &str, _after_seq: u64) -> Result<u64, StorageError> {
+        Err(StorageError::Database("simulated storage failure".to_owned()))
+    }
 }
 
 impl StoragePort for FailingStorage {
@@ -209,5 +273,40 @@ impl ChatOutputFactoryPort for RecordingChatOutputFactory {
         _channel_id: crate::kernel::models::ChannelId,
     ) -> Arc<dyn ChatOutputPort> {
         Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
+    }
+
+    fn stream_output(
+        &self,
+        _origin: &crate::kernel::models::Origin,
+    ) -> Arc<dyn crate::kernel::spi_ports::ChatStreamPort> {
+        // No streaming assertions exist yet; plugins under test get a port
+        // that reports failure loudly instead of silently pretending success.
+        Arc::new(NoopChatStream) as Arc<dyn crate::kernel::spi_ports::ChatStreamPort>
+    }
+}
+
+/// [`ChatStreamPort`] test double: refuses to stream, so a plugin that
+/// unexpectedly reaches for streaming fails its test instead of no-oping.
+struct NoopChatStream;
+
+#[async_trait::async_trait]
+impl crate::kernel::spi_ports::ChatStreamPort for NoopChatStream {
+    async fn begin(
+        &self,
+        _message: crate::kernel::models::OutboundMessage,
+    ) -> Result<crate::kernel::models::MessageId, crate::kernel::models::OutboundError> {
+        Err(crate::kernel::models::OutboundError::Send(
+            "streaming not supported by the test factory".to_owned(),
+        ))
+    }
+
+    async fn update(
+        &self,
+        _message: crate::kernel::models::MessageId,
+        _content: String,
+    ) -> Result<(), crate::kernel::models::OutboundError> {
+        Err(crate::kernel::models::OutboundError::Send(
+            "streaming not supported by the test factory".to_owned(),
+        ))
     }
 }
