@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::kernel::{
-    models::{EventKind, EventPayload, OutboundMessage, RequestContext},
+    models::{EventPayload, OutboundMessage, RequestContext},
     plugin_ports::{
         CommandArgs, CommandDescriptor, CommandHandler, CommandRegistryPort, MiddlewarePluginPort,
         Next, PluginPort,
@@ -76,10 +76,7 @@ struct PingHandler;
 #[async_trait]
 impl CommandHandler for PingHandler {
     async fn invoke(&self, _args: &CommandArgs, services: &KernelServices) -> anyhow::Result<()> {
-        services
-            .chat_output
-            .send(OutboundMessage::text("Pong!"))
-            .await?;
+        services.chat_output.send(OutboundMessage::text("Pong!")).await?;
         Ok(())
     }
 }
@@ -89,10 +86,10 @@ mod tests {
     use super::*;
     use crate::infrastructure::plugin_adapters::InMemoryCommandRegistry;
     use crate::kernel::{
-        models::{ChannelId, GuildId, MessageId, Origin, Platform, UserId},
-        spi_ports::{ChatOutputPort, StoragePort},
+        models::{ChannelId, EventKind, GuildId, MessageId, Origin, Platform, UserId},
+        spi_ports::StoragePort,
     };
-    use crate::test_support::{InMemoryStorage, RecordingChatOutput};
+    use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
     use std::sync::Arc;
 
     struct StaticHandler {
@@ -101,11 +98,12 @@ mod tests {
 
     #[async_trait]
     impl CommandHandler for StaticHandler {
-        async fn invoke(&self, _args: &CommandArgs, services: &KernelServices) -> anyhow::Result<()> {
-            services
-                .chat_output
-                .send(OutboundMessage::text(self.reply))
-                .await?;
+        async fn invoke(
+            &self,
+            _args: &CommandArgs,
+            services: &KernelServices,
+        ) -> anyhow::Result<()> {
+            services.chat_output.send(OutboundMessage::text(self.reply)).await?;
             Ok(())
         }
     }
@@ -127,10 +125,7 @@ mod tests {
             origin: origin(),
             payload: EventPayload::Command(crate::kernel::models::CommandPayload {
                 name: name.to_owned(),
-                args: args
-                    .iter()
-                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-                    .collect(),
+                args: args.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
                 author_roles: Vec::new(),
             }),
         }
@@ -155,8 +150,8 @@ mod tests {
     fn test_services(output: &Arc<RecordingChatOutput>) -> KernelServices {
         let storage = InMemoryStorage::new();
         KernelServices {
-            chat_output: Arc::clone(output)
-                as Arc<dyn crate::kernel::spi_ports::ChatOutputPort>,
+            chat_output: Arc::clone(output) as Arc<dyn crate::kernel::spi_ports::ChatOutputPort>,
+            chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(output)).boxed(),
             guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
         }
     }
@@ -230,12 +225,13 @@ mod tests {
 
     #[async_trait]
     impl CommandHandler for EchoTextHandler {
-        async fn invoke(&self, args: &CommandArgs, services: &KernelServices) -> anyhow::Result<()> {
+        async fn invoke(
+            &self,
+            args: &CommandArgs,
+            services: &KernelServices,
+        ) -> anyhow::Result<()> {
             let text = args.get("text").unwrap_or("nothing");
-            services
-                .chat_output
-                .send(OutboundMessage::text(text))
-                .await?;
+            services.chat_output.send(OutboundMessage::text(text)).await?;
             Ok(())
         }
     }

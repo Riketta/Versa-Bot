@@ -4,11 +4,11 @@ use config::{Config, Environment, File};
 use serenity::all::{ClientBuilder, GatewayIntents, Http, HttpBuilder};
 
 use versa_bot::infrastructure::{
+    Configuration,
     inbound_adapters::{DiscordGatewayAdapter, SerenityChatOutputFactory},
     observability,
     outbound_adapters::{DiscordCommandRegistrar, SqlxStorage},
     plugin_adapters::{InMemoryCommandRegistry, InMemoryEventBus},
-    Configuration,
 };
 use versa_bot::kernel::{
     plugin_ports::{CommandRegistryPort, MiddlewarePluginPort, PluginPort},
@@ -17,6 +17,7 @@ use versa_bot::kernel::{
 };
 use versa_bot::plugins::auth::AuthPlugin;
 use versa_bot::plugins::command::CommandPlugin;
+use versa_bot::plugins::tracker::UserActivityTrackerPlugin;
 
 #[tokio::main]
 async fn main() {
@@ -52,24 +53,29 @@ async fn main() {
     );
 
     let registry = Arc::new(InMemoryCommandRegistry::new());
+    let event_bus = InMemoryEventBus::new();
 
     // Chain order = registration order: auth gates everything below it.
     let auth = Arc::new(AuthPlugin);
-    let command = Arc::new(CommandPlugin::new(
-        Arc::clone(&registry) as Arc<dyn CommandRegistryPort>
-    ));
+    let command =
+        Arc::new(CommandPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>));
+    // The bus is kernel-owned; each plugin receives its own clone at
+    // construction (same instance, per the cardinality rule).
+    let tracker = Arc::new(UserActivityTrackerPlugin::new(event_bus.clone()));
 
     let kernel = Arc::new(
         KernelService::builder()
             .plugins(vec![
                 Arc::clone(&auth) as Arc<dyn PluginPort>,
                 Arc::clone(&command) as Arc<dyn PluginPort>,
+                Arc::clone(&tracker) as Arc<dyn PluginPort>,
             ])
             .middleware(vec![
                 Arc::clone(&auth) as Arc<dyn MiddlewarePluginPort>,
                 Arc::clone(&command) as Arc<dyn MiddlewarePluginPort>,
+                Arc::clone(&tracker) as Arc<dyn MiddlewarePluginPort>,
             ])
-            .event_bus(InMemoryEventBus::new())
+            .event_bus(event_bus)
             .chat_output_factory(Arc::new(SerenityChatOutputFactory::new(build_http(
                 &config.discord.token,
                 config.discord.proxy.clone(),
@@ -92,7 +98,10 @@ async fn main() {
         .await
         .expect("slash command registration expected to succeed");
 
+    // GUILD_MEMBERS is a privileged intent: enable it for the bot in the
+    // Discord Developer Portal, or the gateway will disconnect on start.
     let intents = GatewayIntents::GUILD_MESSAGES
+        | GatewayIntents::GUILD_MEMBERS
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
 
@@ -124,7 +133,8 @@ async fn main() {
 fn build_http(token: &str, proxy: Option<String>, application_id: Option<u64>) -> Http {
     let mut http_builder = HttpBuilder::new(token);
     if let Some(application_id) = application_id {
-        http_builder = http_builder.application_id(serenity::all::ApplicationId::new(application_id));
+        http_builder =
+            http_builder.application_id(serenity::all::ApplicationId::new(application_id));
     }
     if let Some(proxy) = proxy {
         let proxy = reqwest::Proxy::all(proxy).expect("proxy string expected to be valid");

@@ -3,9 +3,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::kernel::plugin_ports::{
-    CommandDescriptor, CommandHandler, CommandRegistryPort,
-};
+use crate::kernel::plugin_ports::{CommandDescriptor, CommandHandler, CommandRegistryPort};
 
 /// The single active `CommandRegistryPort` adapter: name-keyed, last
 /// registration wins (logged). Anything the platform sync or the dispatcher
@@ -25,19 +23,13 @@ impl InMemoryCommandRegistry {
 impl CommandRegistryPort for InMemoryCommandRegistry {
     fn register(&self, descriptor: CommandDescriptor, handler: Arc<dyn CommandHandler>) {
         let mut commands = self.commands.write();
-        if commands
-            .insert(descriptor.name.clone(), (descriptor, handler))
-            .is_some()
-        {
+        if commands.insert(descriptor.name.clone(), (descriptor, handler)).is_some() {
             tracing::debug!("command re-registered, previous handler replaced");
         }
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn CommandHandler>> {
-        self.commands
-            .read()
-            .get(name)
-            .map(|(_, handler)| Arc::clone(handler))
+        self.commands.read().get(name).map(|(_, handler)| Arc::clone(handler))
     }
 
     fn descriptors(&self) -> Vec<CommandDescriptor> {
@@ -55,7 +47,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CommandHandler for NoopHandler {
-        async fn invoke(&self, _args: &CommandArgs, _services: &KernelServices) -> anyhow::Result<()> {
+        async fn invoke(
+            &self,
+            _args: &CommandArgs,
+            _services: &KernelServices,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -81,10 +77,7 @@ mod tests {
         assert!(registry.lookup("unknown").is_none());
         let descriptors = registry.descriptors();
         assert_eq!(descriptors.len(), 1);
-        assert_eq!(
-            descriptors.first().expect("command expected registered").name,
-            "ping"
-        );
+        assert_eq!(descriptors.first().expect("command expected registered").name, "ping");
     }
 
     #[test]

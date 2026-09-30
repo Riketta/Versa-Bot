@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::kernel::{
     models::{GuildId, OutboundError, OutboundMessage, Platform, StorageError},
-    spi_ports::{ChatOutputPort, GuildStorage, StoragePort},
+    spi_ports::{ChatOutputFactoryPort, ChatOutputPort, GuildStorage, StoragePort},
 };
 
 type Row = (String, i64, String, String);
@@ -77,18 +77,15 @@ impl GuildStorage for ScopedView {
 
     async fn set(&self, namespace: &str, key: &str, value: Value) -> Result<(), StorageError> {
         let (platform, guild_id) = self.key_prefix.clone();
-        self.documents.lock().insert(
-            (platform, guild_id, namespace.to_owned(), key.to_owned()),
-            value,
-        );
+        self.documents
+            .lock()
+            .insert((platform, guild_id, namespace.to_owned(), key.to_owned()), value);
         Ok(())
     }
 
     async fn delete(&self, namespace: &str, key: &str) -> Result<(), StorageError> {
         let (platform, guild_id) = self.key_prefix.clone();
-        self.documents
-            .lock()
-            .remove(&(platform, guild_id, namespace.to_owned(), key.to_owned()));
+        self.documents.lock().remove(&(platform, guild_id, namespace.to_owned(), key.to_owned()));
         Ok(())
     }
 
@@ -127,5 +124,37 @@ impl ChatOutputPort for RecordingChatOutput {
     async fn send(&self, message: OutboundMessage) -> Result<(), OutboundError> {
         self.messages.lock().push(message.content);
         Ok(())
+    }
+}
+
+/// [`ChatOutputFactoryPort`] handing out the same [`RecordingChatOutput`] for
+/// every origin and channel - channel-agnostic, so assertions can stay flat.
+pub struct RecordingChatOutputFactory {
+    output: Arc<RecordingChatOutput>,
+}
+
+impl RecordingChatOutputFactory {
+    #[must_use]
+    pub fn new(output: Arc<RecordingChatOutput>) -> Self {
+        Self { output }
+    }
+
+    #[must_use]
+    pub fn boxed(self) -> Arc<dyn ChatOutputFactoryPort> {
+        Arc::new(self)
+    }
+}
+
+impl ChatOutputFactoryPort for RecordingChatOutputFactory {
+    fn chat_output(&self, _origin: &crate::kernel::models::Origin) -> Arc<dyn ChatOutputPort> {
+        Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
+    }
+
+    fn channel_output(
+        &self,
+        _origin: &crate::kernel::models::Origin,
+        _channel_id: crate::kernel::models::ChannelId,
+    ) -> Arc<dyn ChatOutputPort> {
+        Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
     }
 }

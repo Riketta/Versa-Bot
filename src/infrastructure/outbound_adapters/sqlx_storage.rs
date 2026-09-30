@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::PgPool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
 use crate::kernel::{
     models::{GuildId, Platform, StorageError},
@@ -36,11 +36,8 @@ impl SqlxStorage {
             let options = SqliteConnectOptions::from_str(url)
                 .map_err(|err| StorageError::Database(err.to_string()))?
                 .create_if_missing(true);
-            let options = if in_memory {
-                options
-            } else {
-                options.journal_mode(SqliteJournalMode::Wal)
-            };
+            let options =
+                if in_memory { options } else { options.journal_mode(SqliteJournalMode::Wal) };
             // An in-memory database lives per connection - keep a single one.
             let pool = SqlitePoolOptions::new()
                 .max_connections(if in_memory { 1 } else { 5 })
@@ -53,13 +50,8 @@ impl SqlxStorage {
             let migrator = sqlx::migrate::Migrator::new(Path::new("./migrations"))
                 .await
                 .map_err(|err| StorageError::Database(err.to_string()))?;
-            migrator
-                .run(&pool)
-                .await
-                .map_err(|err| StorageError::Database(err.to_string()))?;
-            Ok(Self {
-                db: Arc::new(Db::Sqlite(pool)),
-            })
+            migrator.run(&pool).await.map_err(|err| StorageError::Database(err.to_string()))?;
+            Ok(Self { db: Arc::new(Db::Sqlite(pool)) })
         } else {
             let pool = PgPool::connect(url)
                 .await
@@ -67,13 +59,8 @@ impl SqlxStorage {
             let migrator = sqlx::migrate::Migrator::new(Path::new("./migrations"))
                 .await
                 .map_err(|err| StorageError::Database(err.to_string()))?;
-            migrator
-                .run(&pool)
-                .await
-                .map_err(|err| StorageError::Database(err.to_string()))?;
-            Ok(Self {
-                db: Arc::new(Db::Postgres(pool)),
-            })
+            migrator.run(&pool).await.map_err(|err| StorageError::Database(err.to_string()))?;
+            Ok(Self { db: Arc::new(Db::Postgres(pool)) })
         }
     }
 }
@@ -174,32 +161,28 @@ impl GuildStorage for ScopedGuildStorage {
 
     async fn delete(&self, namespace: &str, key: &str) -> Result<(), StorageError> {
         match &*self.db {
-            Db::Sqlite(pool) => {
-                sqlx::query(
-                    "DELETE FROM guild_documents \
+            Db::Sqlite(pool) => sqlx::query(
+                "DELETE FROM guild_documents \
                      WHERE platform = ? AND guild_id = ? AND namespace = ? AND key = ?",
-                )
-                .bind(&self.platform)
-                .bind(self.guild_id)
-                .bind(namespace)
-                .bind(key)
-                .execute(pool)
-                .await
-                .map(|_| ())
-            }
-            Db::Postgres(pool) => {
-                sqlx::query(
-                    "DELETE FROM guild_documents \
+            )
+            .bind(&self.platform)
+            .bind(self.guild_id)
+            .bind(namespace)
+            .bind(key)
+            .execute(pool)
+            .await
+            .map(|_| ()),
+            Db::Postgres(pool) => sqlx::query(
+                "DELETE FROM guild_documents \
                      WHERE platform = $1 AND guild_id = $2 AND namespace = $3 AND key = $4",
-                )
-                .bind(&self.platform)
-                .bind(self.guild_id)
-                .bind(namespace)
-                .bind(key)
-                .execute(pool)
-                .await
-                .map(|_| ())
-            }
+            )
+            .bind(&self.platform)
+            .bind(self.guild_id)
+            .bind(namespace)
+            .bind(key)
+            .execute(pool)
+            .await
+            .map(|_| ()),
         }
         .map_err(|err| StorageError::Database(err.to_string()))?;
         Ok(())
@@ -252,10 +235,7 @@ mod tests {
         let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
 
         assert_eq!(guild.get("command", "prefix").await.unwrap(), None);
-        guild
-            .set("command", "prefix", Value::String("!".to_owned()))
-            .await
-            .unwrap();
+        guild.set("command", "prefix", Value::String("!".to_owned())).await.unwrap();
         assert_eq!(
             guild.get("command", "prefix").await.unwrap(),
             Some(Value::String("!".to_owned()))
@@ -269,16 +249,10 @@ mod tests {
         let first = storage.guild_scoped(Platform::Discord, GuildId(1));
         let second = storage.guild_scoped(Platform::Discord, GuildId(2));
 
-        first
-            .set("command", "prefix", Value::String("!".to_owned()))
-            .await
-            .unwrap();
+        first.set("command", "prefix", Value::String("!".to_owned())).await.unwrap();
 
         assert_eq!(second.get("command", "prefix").await.unwrap(), None);
-        second
-            .set("command", "prefix", Value::String("?".to_owned()))
-            .await
-            .unwrap();
+        second.set("command", "prefix", Value::String("?".to_owned())).await.unwrap();
         assert_eq!(
             first.get("command", "prefix").await.unwrap(),
             Some(Value::String("!".to_owned()))
@@ -290,14 +264,8 @@ mod tests {
         let storage = sqlite_storage().await;
         let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
 
-        guild
-            .set("command", "prefix", Value::String("!".to_owned()))
-            .await
-            .unwrap();
-        guild
-            .set("greeter", "greeting", Value::String("hi".to_owned()))
-            .await
-            .unwrap();
+        guild.set("command", "prefix", Value::String("!".to_owned())).await.unwrap();
+        guild.set("greeter", "greeting", Value::String("hi".to_owned())).await.unwrap();
         guild.delete("command", "prefix").await.unwrap();
 
         assert_eq!(guild.get("command", "prefix").await.unwrap(), None);

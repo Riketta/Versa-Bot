@@ -27,6 +27,11 @@ pub struct Origin {
     pub platform: Platform,
     /// `None` for direct messages.
     pub guild_id: Option<GuildId>,
+    /// Channel the event belongs to and where an origin-bound reply lands.
+    /// `ChannelId(0)` marks channel-less events (member join/leave, presence):
+    /// they carry no channel, and replying to them is meaningless - plugins
+    /// that need a real channel pick a configured one via
+    /// `ChatOutputFactoryPort::channel_output`.
     pub channel_id: ChannelId,
     /// Actor that triggered the event (message author, joined member, etc.).
     pub user_id: UserId,

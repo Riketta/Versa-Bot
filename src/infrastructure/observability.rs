@@ -13,23 +13,19 @@ pub fn init(
     sentry_environment: Option<&str>,
 ) -> Option<sentry::ClientInitGuard> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let registry = tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer());
+    let registry =
+        tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer());
 
-    let guard = sentry_dsn
-        .map(str::trim)
-        .filter(|dsn| !dsn.is_empty())
-        .map(|dsn| {
-            // `ClientOptions` is `#[non_exhaustive]` - construct via defaults
-            // and field assignment, not a struct literal.
-            let mut options = sentry::ClientOptions::default();
-            options.dsn = Some(dsn.parse().expect("sentry dsn must be a valid DSN"));
-            // Cow<'static, str> - the borrowed &str outlives nothing here,
-            // so take ownership first.
-            options.environment = sentry_environment.map(String::from).map(Into::into);
-            sentry::init(options)
-        });
+    let guard = sentry_dsn.map(str::trim).filter(|dsn| !dsn.is_empty()).map(|dsn| {
+        // `ClientOptions` is `#[non_exhaustive]` - construct via defaults
+        // and field assignment, not a struct literal.
+        let mut options = sentry::ClientOptions::default();
+        options.dsn = Some(dsn.parse().expect("sentry dsn must be a valid DSN"));
+        // Cow<'static, str> - the borrowed &str outlives nothing here,
+        // so take ownership first.
+        options.environment = sentry_environment.map(String::from).map(Into::into);
+        sentry::init(options)
+    });
 
     match &guard {
         Some(_) => registry.with(sentry_tracing::layer()).init(),

@@ -94,6 +94,8 @@ E.g. `UserActivityTrackerPlugin` receives `MemberJoined` via the pipeline, logs 
 
 Outbound ports injected into the pipeline are bound to the current event's origin - a plugin's `ChatOutputPort::send` lands in the source channel/guild. The driving adapter (or kernel) constructs these scoped ports per event. This is how a plugin knows where to reply without a returned response.
 
+Plugins that log to a *configured* channel instead of replying (activity tracker, audit log) obtain a channel-scoped port via `ChatOutputFactoryPort::channel_output(origin, channel_id)` - same platform+guild scope as the event, arbitrary channel inside it. The factory rides in `KernelServices`, so scope never escapes the event's own guild; there is no way to send across guilds. Member lifecycle events (join/leave) have no channel at all - `Origin::channel_id` is `0` for them and replying is meaningless; only configured-channel sends make sense.
+
 **Development Sequence:**
 
 Prepare the directory structure. The kernel splits its ports by direction: `api_ports` (driving ports the kernel implements - e.g. `RequestHandlerPort`, the inbound entry point driving adapters call), `spi_ports` (driven ports the kernel consumes - e.g. `StoragePort`, `ConfigPort`), and `plugin_ports` (the plugin-facing contracts - `PluginPort`, `MiddlewarePluginPort`, `EventBusPort`). So plugin-specific ports live at `src/kernel/app/plugin_ports/`, separate from the driven ports at `src/kernel/app/spi_ports/`. Services live at `src/kernel/app/services/` (`KernelService`, `KernelServices`). Plugins live at `src/plugins/<name>/`, and their concrete adapters at `src/infrastructure/{inbound_adapters,outbound_adapters,plugin_adapters}/`.

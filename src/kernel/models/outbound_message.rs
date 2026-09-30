@@ -7,8 +7,6 @@ pub struct OutboundMessage {
 impl OutboundMessage {
     #[must_use]
     pub fn text(content: impl Into<String>) -> Self {
-        Self {
-            content: content.into(),
-        }
+        Self { content: content.into() }
     }
 }

@@ -2,15 +2,16 @@ use std::sync::Arc;
 
 use serenity::all::{
     ChannelId as SerenityChannelId, CommandDataOption, CommandDataOptionValue, Context,
-    CreateMessage, EventHandler, Http, Interaction, Message, Ready,
+    CreateMessage, EventHandler, GuildId as SerenityGuildId, Http, Interaction, Member, Message,
+    Ready, User,
 };
 use serenity::async_trait;
 
 use crate::kernel::{
     api_ports::RequestHandlerPort,
     models::{
-        ChannelId, CommandPayload, EventKind, EventPayload, GuildId, MessageId, Origin,
-        OutboundError, OutboundMessage, Platform, RequestContext, UserId,
+        ChannelId, CommandPayload, EventKind, EventPayload, GuildId, MemberPayload, MessageId,
+        Origin, OutboundError, OutboundMessage, Platform, RequestContext, UserId,
     },
     spi_ports::{ChatOutputFactoryPort, ChatOutputPort},
 };
@@ -41,13 +42,7 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
         let author_roles: Vec<String> = message
             .member
             .as_ref()
-            .map(|member| {
-                member
-                    .roles
-                    .iter()
-                    .map(|role| role.get().to_string())
-                    .collect()
-            })
+            .map(|member| member.roles.iter().map(|role| role.get().to_string()).collect())
             .unwrap_or_default();
 
         let origin = Origin {
@@ -76,12 +71,16 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
         // Acknowledge deferred right here, at ingestion, so plugins can take
         // as long as they need; their replies go out as followups bound to
         // the interaction token. Type 5 = DeferredChannelMessageWithSource.
-        if let Err(err) = ctx.http.create_interaction_response(
-            command.id,
-            &command.token,
-            &serde_json::json!({ "type": 5 }),
-            Vec::new(),
-        ).await {
+        if let Err(err) = ctx
+            .http
+            .create_interaction_response(
+                command.id,
+                &command.token,
+                &serde_json::json!({ "type": 5 }),
+                Vec::new(),
+            )
+            .await
+        {
             tracing::error!(%err, "failed to defer interaction");
             return;
         }
@@ -89,13 +88,7 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
         let author_roles: Vec<String> = command
             .member
             .as_ref()
-            .map(|member| {
-                member
-                    .roles
-                    .iter()
-                    .map(|role| role.get().to_string())
-                    .collect()
-            })
+            .map(|member| member.roles.iter().map(|role| role.get().to_string()).collect())
             .unwrap_or_default();
 
         let origin = Origin {
@@ -120,8 +113,48 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
         self.handler.handle(event).await;
     }
 
+    /// Member lifecycle events carry no channel; the audit destination is a
+    /// per-guild plugin decision, not an event property.
+    async fn guild_member_addition(&self, _ctx: Context, new_member: Member) {
+        let event = RequestContext {
+            kind: EventKind::MemberJoined,
+            origin: member_origin(new_member.guild_id, &new_member.user),
+            payload: EventPayload::Member(MemberPayload {
+                username: Some(new_member.user.name.clone()),
+            }),
+        };
+        self.handler.handle(event).await;
+    }
+
+    async fn guild_member_removal(
+        &self,
+        _ctx: Context,
+        guild_id: SerenityGuildId,
+        user: User,
+        _member_data_if_available: Option<Member>,
+    ) {
+        let event = RequestContext {
+            kind: EventKind::MemberLeft,
+            origin: member_origin(guild_id, &user),
+            payload: EventPayload::Member(MemberPayload { username: Some(user.name.clone()) }),
+        };
+        self.handler.handle(event).await;
+    }
+
     async fn ready(&self, _ctx: Context, ready: Ready) {
         tracing::info!("connected as {}", ready.user.name);
+    }
+}
+
+/// Origin for channel-less member lifecycle events (`ChannelId(0)` sentinel).
+fn member_origin(guild_id: SerenityGuildId, user: &User) -> Origin {
+    Origin {
+        platform: Platform::Discord,
+        guild_id: Some(GuildId(guild_id.get())),
+        channel_id: ChannelId(0),
+        user_id: UserId(user.id.get()),
+        message_id: None,
+        reply_token: None,
     }
 }
 
@@ -185,9 +218,7 @@ pub struct SerenityChatOutputFactory {
 
 impl SerenityChatOutputFactory {
     pub fn new(http: Http) -> Self {
-        Self {
-            http: Arc::new(http),
-        }
+        Self { http: Arc::new(http) }
     }
 }
 
@@ -203,6 +234,16 @@ impl ChatOutputFactoryPort for SerenityChatOutputFactory {
         Arc::new(SerenityChatOutput {
             http: Arc::clone(&self.http),
             channel_id: SerenityChannelId::new(origin.channel_id.get()),
+        })
+    }
+
+    fn channel_output(&self, origin: &Origin, channel_id: ChannelId) -> Arc<dyn ChatOutputPort> {
+        // Configured-channel logging is never an interaction reply, so a
+        // reply token on the origin is deliberately ignored here.
+        let _ = origin;
+        Arc::new(SerenityChatOutput {
+            http: Arc::clone(&self.http),
+            channel_id: SerenityChannelId::new(channel_id.get()),
         })
     }
 }
@@ -250,11 +291,6 @@ impl ChatOutputPort for InteractionFollowupOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn option(name: &str, value: serde_json::Value) -> CommandDataOption {
-        serde_json::from_value(serde_json::json!({ "name": name, "value": value }))
-            .expect("test option expected to deserialize")
-    }
 
     #[test]
     fn flattens_subcommands_and_resolved_entities() {

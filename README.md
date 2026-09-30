@@ -18,7 +18,8 @@ kernel and core plugins never learn platform specifics.
   capabilities (slash-command registration, interaction replies) live here.
 
 Inbound events (`MessageReceived`, `CommandInvoked`, `MemberJoined`, ...)
-flow through the middleware chain (auth gates, command dispatcher, ...).
+flow through the middleware chain (auth gates, command dispatcher, activity
+tracker, ...).
 There is no request/response: plugins produce output through event-scoped
 ports - replies land in the event's channel/guild automatically, and slash
 replies go through the interaction followup endpoint. Plugins cannot tell
@@ -30,6 +31,12 @@ a slash command from any other reply path.
   declarations (`/ping` ships as the demo command).
 - Per-guild authorization (`auth` plugin): user and role allow-lists;
   unconfigured guilds are open by default; a malformed policy fails closed.
+- User activity tracker (`tracker` plugin): logs member joins/leaves to the
+  guild's configured audit channel and publishes `UserJoinedGuild` /
+  `UserLeftGuild` domain events on the plugin bus for other plugins to
+  react to. Per-guild settings live in plugin storage (namespace `tracker`,
+  key `config`: `{ "audit_channel_id": "<channel id>" }`); absent config
+  means tracking is off for that guild.
 - Guild-partitioned document storage: plugins persist JSON documents scoped
   to `(platform, guild)` - reading another guild's data is impossible by
   construction. SQLite (default) and PostgreSQL.
@@ -74,6 +81,10 @@ Prerequisites: Rust 1.88+ (edition 2024).
    commands appear. Global commands can take up to an hour to propagate on
    first registration.
 
+   The bot also uses the **Server Members** privileged intent (member
+   join/leave tracking) - enable "Server Members Intent" for the bot in the
+   Discord Developer Portal, otherwise the gateway will disconnect on start.
+
 Environment variables override the file:
 `VERSABOT__DISCORD__TOKEN`, `VERSABOT__STORAGE__URL`,
 `VERSABOT__SENTRY__DSN`, ...
@@ -81,7 +92,8 @@ Environment variables override the file:
 ## Development
 
 - `cargo test` - unit tests cover the kernel pipeline, storage guild
-  isolation, the command registry/dispatcher, and the auth policy.
+  isolation, the command registry/dispatcher, the auth policy, and the
+  activity tracker.
 - `cargo clippy --all-targets` - the deny-level lints must stay clean.
 
 ### Project layout
@@ -95,7 +107,7 @@ src/
 │   │   ├── plugin_ports/   # plugin contracts (PluginPort, commands, bus)
 │   │   └── services/       # KernelService (pipeline runner, lifecycle)
 │   └── models/             # event taxonomy, IDs, errors
-├── plugins/           # features: auth, command dispatcher, status (WIP)
+├── plugins/           # features: auth, command dispatcher, tracker, status (WIP)
 ├── infrastructure/    # adapters
 │   ├── inbound_adapters/   # Discord gateway + scoped output factory
 │   ├── outbound_adapters/  # storage (sqlx), Discord command registrar
@@ -106,7 +118,6 @@ src/
 ## Roadmap
 
 - `/auth` management commands (allow users/roles per guild)
-- Activity tracker plugin (join/leave audit via the event bus)
 - Configuration hot-reload; scheduler (status rotation)
 - LLM chat plugin; message history
 - Further platform adapters (Telegram, Matrix, ...)

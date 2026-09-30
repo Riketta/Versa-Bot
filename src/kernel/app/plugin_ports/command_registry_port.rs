@@ -23,10 +23,7 @@ pub struct CommandArgs(pub Vec<(String, String)>);
 impl CommandArgs {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.0
-            .iter()
-            .find(|(arg_name, _)| arg_name == name)
-            .map(|(_, value)| value.as_str())
+        self.0.iter().find(|(arg_name, _)| arg_name == name).map(|(_, value)| value.as_str())
     }
 }
 

@@ -54,10 +54,7 @@ impl PluginPort for AuthPlugin {
 #[async_trait]
 impl MiddlewarePluginPort for AuthPlugin {
     async fn pre(&self, event: &mut RequestContext, services: &KernelServices) -> Next {
-        if !matches!(
-            event.kind,
-            EventKind::MessageReceived | EventKind::CommandInvoked
-        ) {
+        if !matches!(event.kind, EventKind::MessageReceived | EventKind::CommandInvoked) {
             return Next::Continue;
         }
 
@@ -71,10 +68,7 @@ impl MiddlewarePluginPort for AuthPlugin {
         };
 
         let Ok(config) = serde_json::from_value::<AuthConfig>(raw) else {
-            tracing::warn!(
-                namespace = NAMESPACE,
-                "auth config is malformed - failing closed"
-            );
+            tracing::warn!(namespace = NAMESPACE, "auth config is malformed - failing closed");
             return Next::Stop;
         };
 
@@ -95,11 +89,7 @@ impl MiddlewarePluginPort for AuthPlugin {
 
 impl AuthPlugin {
     fn is_allowed(&self, config: &AuthConfig, event: &RequestContext) -> bool {
-        if config
-            .allowed_users
-            .iter()
-            .any(|id| *id == event.origin.user_id.get().to_string())
-        {
+        if config.allowed_users.iter().any(|id| *id == event.origin.user_id.get().to_string()) {
             return true;
         }
 
@@ -108,9 +98,7 @@ impl AuthPlugin {
             EventPayload::Command(command) => &command.author_roles,
             _ => return false,
         };
-        author_roles
-            .iter()
-            .any(|role| config.allowed_roles.contains(role))
+        author_roles.iter().any(|role| config.allowed_roles.contains(role))
     }
 }
 
@@ -124,7 +112,7 @@ mod tests {
         },
         spi_ports::{GUILD_SETTINGS, StoragePort},
     };
-    use crate::test_support::{InMemoryStorage, RecordingChatOutput};
+    use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -166,9 +154,7 @@ mod tests {
         RequestContext {
             kind: EventKind::MemberJoined,
             origin: origin(user_id),
-            payload: EventPayload::Member(MemberPayload {
-                username: Some("someone".to_owned()),
-            }),
+            payload: EventPayload::Member(MemberPayload { username: Some("someone".to_owned()) }),
         }
     }
 
@@ -176,6 +162,7 @@ mod tests {
         let output = RecordingChatOutput::new();
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn crate::kernel::spi_ports::ChatOutputPort>,
+            chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
         };
         (services, output)
@@ -203,10 +190,7 @@ mod tests {
         let plugin = AuthPlugin;
         let mut event = message_event(3, &[]);
 
-        assert!(matches!(
-            plugin.pre(&mut event, &services).await,
-            Next::Continue
-        ));
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
         assert!(output.messages().is_empty());
     }
 
@@ -217,10 +201,7 @@ mod tests {
         let plugin = AuthPlugin;
         let mut event = message_event(3, &[]);
 
-        assert!(matches!(
-            plugin.pre(&mut event, &services).await,
-            Next::Continue
-        ));
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
         assert!(output.messages().is_empty());
     }
 
@@ -242,10 +223,7 @@ mod tests {
         let plugin = AuthPlugin;
         let mut event = message_event(3, &["42"]);
 
-        assert!(matches!(
-            plugin.pre(&mut event, &services).await,
-            Next::Continue
-        ));
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
         assert!(output.messages().is_empty());
     }
 
@@ -263,13 +241,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_config_fails_closed() {
         let storage = InMemoryStorage::new();
-        storage.seed(
-            Platform::Discord,
-            GuildId(1),
-            NAMESPACE,
-            CONFIG_KEY,
-            json!("not an object"),
-        );
+        storage.seed(Platform::Discord, GuildId(1), NAMESPACE, CONFIG_KEY, json!("not an object"));
         let (services, output) = test_services(&storage);
         let plugin = AuthPlugin;
         let mut event = message_event(3, &[]);
@@ -285,10 +257,7 @@ mod tests {
         let plugin = AuthPlugin;
         let mut event = join_event(3);
 
-        assert!(matches!(
-            plugin.pre(&mut event, &services).await,
-            Next::Continue
-        ));
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
         assert!(output.messages().is_empty());
     }
 
@@ -310,10 +279,7 @@ mod tests {
         let plugin = AuthPlugin;
         let mut event = command_event(3, &["42"]);
 
-        assert!(matches!(
-            plugin.pre(&mut event, &services).await,
-            Next::Continue
-        ));
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
         assert!(output.messages().is_empty());
     }
 
@@ -325,15 +291,13 @@ mod tests {
             Arc::clone(&output) as Arc<dyn crate::kernel::spi_ports::ChatOutputPort>;
         let services = KernelServices {
             chat_output,
+            chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: None,
         };
         let plugin = AuthPlugin;
         let mut event = message_event(3, &[]);
 
-        assert!(matches!(
-            plugin.pre(&mut event, &services).await,
-            Next::Continue
-        ));
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
         assert!(output.messages().is_empty());
     }
 

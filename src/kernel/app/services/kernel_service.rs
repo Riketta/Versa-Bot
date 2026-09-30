@@ -37,13 +37,7 @@ impl<E: EventBusPort> KernelService<E> {
         chat_output_factory: Arc<dyn ChatOutputFactoryPort>,
         storage: Arc<dyn StoragePort>,
     ) -> Self {
-        Self {
-            plugins,
-            middleware,
-            event_bus,
-            chat_output_factory,
-            storage,
-        }
+        Self { plugins, middleware, event_bus, chat_output_factory, storage }
     }
 
     /// Kernel entrypoint: two-phase plugin lifecycle - `init` on all plugins
@@ -87,6 +81,7 @@ impl<E: EventBusPort> KernelService<E> {
     fn scoped_services(&self, origin: &Origin) -> KernelServices {
         KernelServices {
             chat_output: self.chat_output_factory.chat_output(origin),
+            chat_output_factory: Arc::clone(&self.chat_output_factory),
             guild_storage: origin
                 .guild_id
                 .map(|guild_id| self.storage.guild_scoped(origin.platform, guild_id)),
@@ -159,23 +154,10 @@ impl<E: EventBusPort> KernelService<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::{
-        models::{EventKind, Platform},
-        spi_ports::ChatOutputPort,
-    };
     use crate::kernel::models::OutboundMessage;
-    use crate::test_support::{InMemoryStorage, RecordingChatOutput};
+    use crate::kernel::models::{EventKind, Platform};
+    use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
     use serde_json::json;
-
-    struct RecordingChatOutputFactory {
-        output: Arc<RecordingChatOutput>,
-    }
-
-    impl ChatOutputFactoryPort for RecordingChatOutputFactory {
-        fn chat_output(&self, _origin: &Origin) -> Arc<dyn ChatOutputPort> {
-            Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
-        }
-    }
 
     struct PongPlugin {
         started: Arc<std::sync::atomic::AtomicUsize>,
@@ -187,8 +169,7 @@ mod tests {
         }
 
         fn start(&self) -> Result<(), PluginError> {
-            self.started
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
@@ -199,10 +180,7 @@ mod tests {
             if event.kind != EventKind::MessageReceived {
                 return Next::Continue;
             }
-            let _ = services
-                .chat_output
-                .send(OutboundMessage::text("pong"))
-                .await;
+            let _ = services.chat_output.send(OutboundMessage::text("pong")).await;
             Next::Stop
         }
     }
@@ -230,10 +208,7 @@ mod tests {
                 .flatten()
                 .and_then(|value| value.as_str().map(ToOwned::to_owned))
                 .unwrap_or_else(|| "hello".to_owned());
-            let _ = services
-                .chat_output
-                .send(OutboundMessage::text(greeting))
-                .await;
+            let _ = services.chat_output.send(OutboundMessage::text(greeting)).await;
             Next::Stop
         }
     }
@@ -282,9 +257,7 @@ mod tests {
             .plugins(plugins)
             .middleware(middleware)
             .event_bus(TestEventBus)
-            .chat_output_factory(Arc::new(RecordingChatOutputFactory {
-                output: Arc::clone(&output),
-            }))
+            .chat_output_factory(RecordingChatOutputFactory::new(Arc::clone(&output)).boxed())
             .storage(storage)
             .build();
         (kernel, output)
@@ -294,18 +267,15 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_produces_output_and_short_circuits() {
-        let pong = Arc::new(PongPlugin {
-            started: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        });
+        let pong =
+            Arc::new(PongPlugin { started: Arc::new(std::sync::atomic::AtomicUsize::new(0)) });
         let (kernel, output) = test_kernel(
             Arc::new(InMemoryStorage::new()),
             vec![Arc::clone(&pong) as Arc<dyn PluginPort>],
             vec![Arc::clone(&pong) as Arc<dyn MiddlewarePluginPort>],
         );
 
-        kernel
-            .handle(RequestContext::message_received(test_origin(), "ping"))
-            .await;
+        kernel.handle(RequestContext::message_received(test_origin(), "ping")).await;
 
         assert_eq!(output.messages(), ["pong"]);
     }
@@ -318,9 +288,7 @@ mod tests {
             vec![Arc::new(SilentPlugin) as Arc<dyn MiddlewarePluginPort>],
         );
 
-        kernel
-            .handle(RequestContext::message_received(test_origin(), "ping"))
-            .await;
+        kernel.handle(RequestContext::message_received(test_origin(), "ping")).await;
 
         assert!(output.messages().is_empty());
     }
@@ -328,9 +296,7 @@ mod tests {
     #[tokio::test]
     async fn boot_starts_each_dual_registered_plugin_once() {
         let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let pong = Arc::new(PongPlugin {
-            started: Arc::clone(&started),
-        });
+        let pong = Arc::new(PongPlugin { started: Arc::clone(&started) });
 
         let (kernel, _output) = test_kernel(
             Arc::new(InMemoryStorage::new()),
@@ -351,13 +317,7 @@ mod tests {
     async fn pipeline_hands_plugin_guild_scoped_storage() {
         let storage = Arc::new(InMemoryStorage::new());
         // Guild 1 is greeted by config; guild 2 has none and gets the default.
-        storage.seed(
-            Platform::Discord,
-            GuildId(1),
-            "greeter",
-            "greeting",
-            json!("privit"),
-        );
+        storage.seed(Platform::Discord, GuildId(1), "greeter", "greeting", json!("privit"));
 
         let (kernel, output) = test_kernel(
             storage,
@@ -365,17 +325,10 @@ mod tests {
             vec![Arc::new(GreeterPlugin) as Arc<dyn MiddlewarePluginPort>],
         );
 
-        kernel
-            .handle(RequestContext::message_received(test_origin(), "hi"))
-            .await;
+        kernel.handle(RequestContext::message_received(test_origin(), "hi")).await;
 
-        let other_guild = Origin {
-            guild_id: Some(GuildId(2)),
-            ..test_origin()
-        };
-        kernel
-            .handle(RequestContext::message_received(other_guild, "hi"))
-            .await;
+        let other_guild = Origin { guild_id: Some(GuildId(2)), ..test_origin() };
+        kernel.handle(RequestContext::message_received(other_guild, "hi")).await;
 
         assert_eq!(output.messages(), ["privit", "hello"]);
     }

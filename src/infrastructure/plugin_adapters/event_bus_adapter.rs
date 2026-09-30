@@ -29,10 +29,7 @@ impl EventBusPort for InMemoryEventBus {
     fn publish(&self, event: Arc<dyn Event>) {
         let handlers = {
             let subscribers = self.subscribers.read();
-            subscribers
-                .get(&event.as_any().type_id())
-                .cloned()
-                .unwrap_or_default()
+            subscribers.get(&event.as_any().type_id()).cloned().unwrap_or_default()
         };
 
         for handler in handlers {
@@ -47,11 +44,7 @@ impl EventBusPort for InMemoryEventBus {
             }
         });
 
-        self.subscribers
-            .write()
-            .entry(TypeId::of::<E>())
-            .or_default()
-            .push(erased);
+        self.subscribers.write().entry(TypeId::of::<E>()).or_default().push(erased);
     }
 }
 
