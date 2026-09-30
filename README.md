@@ -30,15 +30,9 @@ a slash command from any other reply path.
 - Native Discord slash commands, auto-registered at startup from plugin
   declarations (`/ping` ships as the demo command).
 - Per-guild authorization (`auth` plugin): user and role allow-lists,
-  administered from Discord via `/auth` (`action:allow|deny|show` with a
-  user or role; Manage Server permission, guild-only, ephemeral answers).
-  Unconfigured guilds are open by default; a malformed or unreadable policy
-  fails closed. A policy with both lists empty falls back to Discord guild
-  administrators - there is always at least one admin. A denied slash
-  command is answered with an ephemeral error embed, visible only to the
-  invoker, naming the rejected permission group (users / roles); if the
-  policy itself is unreadable, it gets a "policy unavailable" notice
-  instead.
+  administered from Discord via `/auth` - unconfigured guilds are open,
+  an empty policy means guild-administrators-only, corruption fails
+  closed. Details in [Plugins](#plugins).
 - User activity tracker (`tracker` plugin): logs member joins/leaves to the
   guild's audit channel and publishes `UserJoinedGuild` / `UserLeftGuild`
   domain events on the plugin bus for other plugins to react to. Channel
@@ -163,6 +157,62 @@ and **Message Content Intent**.
 Environment variables override the file:
 `VERSABOT__DISCORD__TOKEN`, `VERSABOT__STORAGE__URL`,
 `VERSABOT__SENTRY__DSN`, ...
+
+## Plugins
+
+### Authorization: who can use the bot (`auth` plugin)
+
+The auth plugin is the bot's per-guild access gate. It runs first in the
+middleware pipeline on every guild message and slash command; whatever it
+rejects never reaches the other plugins.
+
+**Policy model.** Per guild, two allow-lists: allowed **users** and
+allowed **roles**. A member passes when they are listed by user or hold
+any listed role. There are no deny-lists - `deny` removes an entry from
+the allow-lists. The policy is stored in the guild's own storage
+namespace, so guilds never see each other's configuration.
+
+Three policy states with deliberately different defaults:
+
+| State | Who can use the bot |
+|---|---|
+| No policy (fresh guild) | everyone - open by default, otherwise the gate would deny the very commands that configure it |
+| Policy exists, both lists empty | only Discord guild administrators - there is always at least one admin |
+| Policy has at least one entry | exactly the listed users and holders of listed roles - guild administrators are not special |
+
+The third row is the one to remember: **adding the first entry switches
+the guild to list-only mode.** Make sure the first `allow` includes
+yourself (or a role you hold), or you lock yourself out until someone
+still allowed re-adds you.
+
+Robustness rules:
+
+- A malformed or unreadable policy **fails closed**: the request is
+  denied with a "policy is unreadable" notice - corruption never widens
+  access.
+- Denied slash commands get an ephemeral embed, visible to the invoker
+  only, naming the group that rejected them (`users` group / `roles`
+  group / "only guild administrators while the policy is empty"). Denied
+  plain messages are rejected silently - a public "no" would be a spam
+  vector, and ephemeral replies are impossible there.
+- Passive events (member joins/leaves, presence) and DMs are not gated:
+  auth decides who may *command* the bot, not what happens in the guild.
+
+**Usage.** `/auth` is guild-only and requires the **Manage Server**
+permission (Discord hides it from members without it); every answer is
+ephemeral, so policy data stays between the bot and the admin.
+
+| Command | Effect |
+|---|---|
+| `/auth action:show` | show the current policy as mention lists |
+| `/auth action:allow user:@member` | allow a user |
+| `/auth action:allow role:@role` | allow everyone holding the role |
+| `/auth action:deny user:@member` | remove a user; warns when this empties the policy |
+| `/auth action:deny role:@role` | remove a role |
+
+Specify either `user` or `role`, never both. Managing the policy is
+itself gated by the policy: whoever runs `/auth` must already be allowed
+to use the bot - do not deny yourself out.
 
 ## Docker
 
