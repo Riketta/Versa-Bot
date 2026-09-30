@@ -1,20 +1,29 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::kernel::{
-    models::{Embed, EventKind, EventPayload, OutboundMessage, RequestContext},
-    plugin_ports::{MiddlewarePluginPort, Next, PluginPort},
+    models::{Embed, EventKind, EventPayload, OutboundMessage, PluginError, RequestContext},
+    plugin_ports::{
+        ArgDescriptor, ArgKind, CommandDescriptor, CommandRegistryPort, MiddlewarePluginPort, Next,
+        Permission, PluginPort,
+    },
     services::KernelServices,
 };
 
+mod command;
+
+pub use command::AuthCommandHandler;
+
 /// Guild storage namespace owned by this plugin (the plugin's slug).
-const NAMESPACE: &str = "auth";
+pub(crate) const NAMESPACE: &str = "auth";
 /// Guild storage key holding the serialized [`AuthConfig`].
-const CONFIG_KEY: &str = "config";
+pub(crate) const CONFIG_KEY: &str = "config";
 
 /// Per-guild authorization policy, stored as a JSON document in the
-/// plugin's guild storage namespace. The `!auth` management commands
-/// (CommandRegistry step) write this document.
+/// plugin's guild storage namespace. The `/auth` management command (same
+/// plugin, interactive half) writes this document.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthConfig {
     #[serde(default)]
@@ -32,22 +41,74 @@ pub struct AuthConfig {
 ///   happens in the guild.
 /// - A user passes when listed in `allowed_users`, or when any of their
 ///   roles (provided by the driving adapter, best effort) appears in
-///   `allowed_roles`. Otherwise the event is stopped silently.
+///   `allowed_roles`. Otherwise the event is stopped; commands additionally
+///   get an ephemeral denial answer (see `answer_denial`).
 /// - An unconfigured guild is open by default (bootstrap: otherwise auth
 ///   would deny the very commands that configure it).
 /// - A malformed config document fails closed - corruption never widens
 ///   access.
-pub struct AuthPlugin;
+///
+/// The allow-list also gates `/auth` itself: whoever manages the policy
+/// must stay listed (or hold an allowed role).
+pub struct AuthPlugin {
+    registry: Arc<dyn CommandRegistryPort>,
+}
 
-impl Default for AuthPlugin {
-    fn default() -> Self {
-        Self
+impl AuthPlugin {
+    #[must_use]
+    pub fn new(registry: Arc<dyn CommandRegistryPort>) -> Self {
+        Self { registry }
     }
 }
 
 impl PluginPort for AuthPlugin {
     fn name(&self) -> &'static str {
         "auth"
+    }
+
+    fn init(&self) -> Result<(), PluginError> {
+        // The interactive half of this plugin. Discord additionally hides
+        // the command behind Manage Server (`default_member_permissions`);
+        // the policy gate below remains the kernel-side check.
+        self.registry.register(
+            CommandDescriptor {
+                plugin_id: self.name().to_owned(),
+                name: "auth".to_owned(),
+                aliases: None,
+                description: "Manage who can use the bot in this guild".to_owned(),
+                arguments: vec![
+                    ArgDescriptor {
+                        name: "action".to_owned(),
+                        description: "What to do".to_owned(),
+                        required: true,
+                        kind: ArgKind::String,
+                        choices: Some(vec![
+                            "allow".to_owned(),
+                            "deny".to_owned(),
+                            "show".to_owned(),
+                        ]),
+                    },
+                    ArgDescriptor {
+                        name: "user".to_owned(),
+                        description: "User to allow or deny".to_owned(),
+                        required: false,
+                        kind: ArgKind::User,
+                        choices: None,
+                    },
+                    ArgDescriptor {
+                        name: "role".to_owned(),
+                        description: "Role to allow or deny".to_owned(),
+                        required: false,
+                        kind: ArgKind::Role,
+                        choices: None,
+                    },
+                ],
+                required_permission: Some(Permission { name: "manage_guild".to_owned() }),
+                guild_only: true,
+            },
+            Arc::new(AuthCommandHandler),
+        );
+        Ok(())
     }
 }
 
@@ -177,6 +238,7 @@ impl AuthPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infrastructure::plugin_adapters::InMemoryCommandRegistry;
     use crate::kernel::{
         models::{
             ChannelId, CommandPayload, GuildId, MemberPayload, MessageId, MessagePayload, Origin,
@@ -187,6 +249,12 @@ mod tests {
     use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
     use serde_json::json;
     use std::sync::Arc;
+
+    /// The gate under test; init/command tests live in `command.rs` with
+    /// their own registry, so a fresh empty registry is enough here.
+    fn test_plugin() -> AuthPlugin {
+        AuthPlugin::new(Arc::new(InMemoryCommandRegistry::new()))
+    }
 
     fn origin(user_id: u64) -> Origin {
         Origin {
@@ -259,7 +327,7 @@ mod tests {
     async fn unconfigured_guild_is_open() {
         let storage = InMemoryStorage::new();
         let (services, output) = test_services(&storage);
-        let plugin = AuthPlugin;
+        let plugin = test_plugin();
         let mut event = message_event(3, &[]);
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
@@ -270,7 +338,7 @@ mod tests {
     async fn allowed_user_passes() {
         let storage = configured_storage(&["3"], &[]);
         let (services, output) = test_services(&storage);
-        let plugin = AuthPlugin;
+        let plugin = test_plugin();
         let mut event = message_event(3, &[]);
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
@@ -281,7 +349,7 @@ mod tests {
     async fn unlisted_user_is_stopped_without_output() {
         let storage = configured_storage(&["999"], &[]);
         let (services, output) = test_services(&storage);
-        let plugin = AuthPlugin;
+        let plugin = test_plugin();
         let mut event = message_event(3, &[]);
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
@@ -294,7 +362,7 @@ mod tests {
     async fn denied_command_answers_ephemerally_with_user_group_reason() {
         let storage = configured_storage(&["999"], &[]);
         let (services, output) = test_services(&storage);
-        let plugin = AuthPlugin;
+        let plugin = test_plugin();
         let mut event = command_event(3, &[]);
         event.origin.reply_token = Some("token".to_owned());
 
@@ -315,7 +383,7 @@ mod tests {
     async fn denied_command_with_roles_config_reports_missing_role() {
         let storage = configured_storage(&[], &["42"]);
         let (services, output) = test_services(&storage);
-        let plugin = AuthPlugin;
+        let plugin = test_plugin();
         let mut event = command_event(3, &["7"]);
         event.origin.reply_token = Some("token".to_owned());
 
@@ -332,7 +400,7 @@ mod tests {
     async fn denied_command_lists_every_rejected_group() {
         let storage = configured_storage(&["999"], &["42"]);
         let (services, output) = test_services(&storage);
-        let plugin = AuthPlugin;
+        let plugin = test_plugin();
         let mut event = command_event(3, &["7"]);
         event.origin.reply_token = Some("token".to_owned());
 
@@ -347,7 +415,7 @@ mod tests {
     async fn denied_command_with_empty_policy_points_at_configuration() {
         let storage = configured_storage(&[], &[]);
         let (services, output) = test_services(&storage);
-        let plugin = AuthPlugin;
+        let plugin = test_plugin();
         let mut event = command_event(3, &[]);
         event.origin.reply_token = Some("token".to_owned());
 
@@ -361,7 +429,7 @@ mod tests {
     async fn allowed_role_passes_for_unlisted_user() {
         let storage = configured_storage(&[], &["42"]);
         let (services, output) = test_services(&storage);
-        let plugin = AuthPlugin;
+        let plugin = test_plugin();
         let mut event = message_event(3, &["42"]);
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
@@ -372,7 +440,7 @@ mod tests {
     async fn role_mismatch_denies() {
         let storage = configured_storage(&[], &["42"]);
         let (services, output) = test_services(&storage);
-        let plugin = AuthPlugin;
+        let plugin = test_plugin();
         let mut event = message_event(3, &["7"]);
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
@@ -384,7 +452,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         storage.seed(Platform::Discord, GuildId(1), NAMESPACE, CONFIG_KEY, json!("not an object"));
         let (services, output) = test_services(&storage);
-        let plugin = AuthPlugin;
+        let plugin = test_plugin();
         let mut event = message_event(3, &[]);
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
@@ -398,7 +466,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         storage.seed(Platform::Discord, GuildId(1), NAMESPACE, CONFIG_KEY, json!("not an object"));
         let (services, output) = test_services(&storage);
-        let plugin = AuthPlugin;
+        let plugin = test_plugin();
         let mut event = command_event(3, &[]);
         event.origin.reply_token = Some("token".to_owned());
 
@@ -419,7 +487,7 @@ mod tests {
     async fn non_message_events_pass_through() {
         let storage = configured_storage(&["999"], &[]);
         let (services, output) = test_services(&storage);
-        let plugin = AuthPlugin;
+        let plugin = test_plugin();
         let mut event = join_event(3);
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
@@ -430,7 +498,7 @@ mod tests {
     async fn commands_are_gated_like_messages() {
         let storage = configured_storage(&["999"], &[]);
         let (services, output) = test_services(&storage);
-        let plugin = AuthPlugin;
+        let plugin = test_plugin();
         let mut event = command_event(3, &[]);
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
@@ -441,7 +509,7 @@ mod tests {
     async fn command_with_allowed_role_passes() {
         let storage = configured_storage(&[], &["42"]);
         let (services, output) = test_services(&storage);
-        let plugin = AuthPlugin;
+        let plugin = test_plugin();
         let mut event = command_event(3, &["42"]);
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
@@ -459,7 +527,7 @@ mod tests {
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: None,
         };
-        let plugin = AuthPlugin;
+        let plugin = test_plugin();
         let mut event = message_event(3, &[]);
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));

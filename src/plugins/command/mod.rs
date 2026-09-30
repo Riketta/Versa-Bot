@@ -43,6 +43,7 @@ impl PluginPort for CommandPlugin {
                 description: "Replies with Pong!".to_owned(),
                 arguments: Vec::new(),
                 required_permission: None,
+                guild_only: false,
             },
             Arc::new(PingHandler),
         );
@@ -147,6 +148,7 @@ mod tests {
                 description: "test".to_owned(),
                 arguments: Vec::new(),
                 required_permission: None,
+                guild_only: false,
             },
             Arc::new(StaticHandler { reply }),
         );
@@ -187,6 +189,7 @@ mod tests {
                 description: "test".to_owned(),
                 arguments: Vec::new(),
                 required_permission: None,
+                guild_only: false,
             },
             Arc::new(EchoTextHandler),
         );

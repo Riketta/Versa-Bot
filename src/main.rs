@@ -56,7 +56,7 @@ async fn main() {
     let event_bus = InMemoryEventBus::new();
 
     // Chain order = registration order: auth gates everything below it.
-    let auth = Arc::new(AuthPlugin);
+    let auth = Arc::new(AuthPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>));
     let command =
         Arc::new(CommandPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>));
     // The bus is kernel-owned; each plugin receives its own clone at

@@ -53,6 +53,9 @@ pub struct CommandDescriptor {
     pub description: String,
     pub arguments: Vec<ArgDescriptor>,
     pub required_permission: Option<Permission>,
+    /// Command is guild-scoped: adapters hide it from direct messages
+    /// (Discord: `dm_permission: false`).
+    pub guild_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +63,23 @@ pub struct ArgDescriptor {
     pub name: String,
     pub description: String,
     pub required: bool,
+    /// What kind of value the argument takes. Adapters map it onto native
+    /// option types (Discord: user/role pickers); the resolved entity arrives
+    /// in `args` as its ID string.
+    pub kind: ArgKind,
+    /// Fixed value set for a string argument; adapters render it as a native
+    /// dropdown (Discord: option `choices`).
+    pub choices: Option<Vec<String>>,
+}
+
+/// Platform-blind argument typing, mapped by adapters onto native option
+/// types. Grows on demand (integer, channel, ...).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgKind {
+    String,
+    User,
+    Role,
 }
 
 /// Placeholder until `AuthPlugin` grows per-command permission checks.

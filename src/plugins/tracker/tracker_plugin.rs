@@ -76,6 +76,7 @@ impl<B: EventBusPort> PluginPort for UserActivityTrackerPlugin<B> {
                 // Platform-interpreted: the Discord adapter publishes this as
                 // `default_member_permissions` (Manage Server).
                 required_permission: Some(Permission { name: "manage_guild".to_owned() }),
+                guild_only: true,
             },
             Arc::new(AssignTrackerHandler),
         );
@@ -87,6 +88,7 @@ impl<B: EventBusPort> PluginPort for UserActivityTrackerPlugin<B> {
                 description: "Stop logging member joins/leaves in this guild".to_owned(),
                 arguments: Vec::new(),
                 required_permission: Some(Permission { name: "manage_guild".to_owned() }),
+                guild_only: true,
             },
             Arc::new(UnassignTrackerHandler),
         );

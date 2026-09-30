@@ -66,6 +66,7 @@ mod tests {
             description: "test command".to_owned(),
             arguments: Vec::new(),
             required_permission: None,
+            guild_only: false,
         }
     }
 

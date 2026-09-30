@@ -29,8 +29,10 @@ a slash command from any other reply path.
 
 - Native Discord slash commands, auto-registered at startup from plugin
   declarations (`/ping` ships as the demo command).
-- Per-guild authorization (`auth` plugin): user and role allow-lists;
-  unconfigured guilds are open by default; a malformed policy fails closed.
+- Per-guild authorization (`auth` plugin): user and role allow-lists,
+  administered from Discord via `/auth` (`action:allow|deny|show` with a
+  user or role; Manage Server permission, guild-only, ephemeral answers).
+  Unconfigured guilds are open by default; a malformed policy fails closed.
   A denied slash command is answered with an ephemeral error embed, visible
   only to the invoker, naming the rejected permission group (users / roles);
   if the policy itself is unreadable, it gets a "policy unavailable" notice
@@ -134,7 +136,6 @@ src/
 
 ## Roadmap
 
-- `/auth` management commands (allow users/roles per guild)
 - Configuration hot-reload; scheduler (status rotation)
 - LLM chat plugin; message history
 - Further platform adapters (Telegram, Matrix, ...)
