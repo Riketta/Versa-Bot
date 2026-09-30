@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use config::{Config, Environment, File};
 use serenity::all::{ClientBuilder, GatewayIntents, Http, HttpBuilder};
@@ -7,17 +8,18 @@ use versa_bot::infrastructure::{
     Configuration,
     inbound_adapters::{DiscordGatewayAdapter, SerenityChatOutputFactory},
     observability,
-    outbound_adapters::{DiscordCommandRegistrar, SqlxStorage},
-    plugin_adapters::{InMemoryCommandRegistry, InMemoryEventBus},
+    outbound_adapters::{DiscordCommandRegistrar, SerenityPresence, SqlxStorage},
+    plugin_adapters::{InMemoryCommandRegistry, InMemoryEventBus, TokioScheduler},
 };
 use versa_bot::kernel::{
-    plugin_ports::{CommandRegistryPort, MiddlewarePluginPort, PluginPort},
+    plugin_ports::{CommandRegistryPort, MiddlewarePluginPort, PluginPort, SchedulerPort},
     services::KernelService,
-    spi_ports::{ChatOutputFactoryPort, StoragePort},
+    spi_ports::{ChatOutputFactoryPort, PresencePort, StoragePort},
 };
 use versa_bot::plugins::audit::AuditLogPlugin;
 use versa_bot::plugins::auth::AuthPlugin;
 use versa_bot::plugins::command::CommandPlugin;
+use versa_bot::plugins::status::StatusRotatorPlugin;
 use versa_bot::plugins::tracker::UserActivityTrackerPlugin;
 
 #[tokio::main]
@@ -71,14 +73,38 @@ async fn main() {
     // chain - it reacts to derived events, not to raw inbound ones.
     let audit = Arc::new(AuditLogPlugin::new(event_bus.clone()));
 
+    // Kernel scheduling service + presence: the status rotator's drives.
+    let scheduler = Arc::new(TokioScheduler::new());
+    let (presence, gateway_context) = SerenityPresence::new();
+    let presence = Arc::new(presence);
+
+    let mut plugins: Vec<Arc<dyn PluginPort>> = vec![
+        Arc::clone(&auth) as Arc<dyn PluginPort>,
+        Arc::clone(&command) as Arc<dyn PluginPort>,
+        Arc::clone(&tracker) as Arc<dyn PluginPort>,
+        Arc::clone(&audit) as Arc<dyn PluginPort>,
+    ];
+
+    // Optional [status] section: global presence rotation. Invalid values
+    // (zero interval, empty list) disable it with a warning.
+    match &config.status {
+        Some(status) if status.interval_seconds > 0 && !status.statuses.is_empty() => {
+            plugins.push(Arc::new(StatusRotatorPlugin::new(
+                Arc::clone(&scheduler) as Arc<dyn SchedulerPort>,
+                Arc::clone(&presence) as Arc<dyn PresencePort>,
+                Duration::from_secs(status.interval_seconds),
+                status.statuses.clone(),
+            )) as Arc<dyn PluginPort>);
+        }
+        Some(_) => tracing::warn!(
+            "config section [status] ignored: interval_seconds must be > 0 and statuses must not be empty"
+        ),
+        None => {}
+    }
+
     let kernel = Arc::new(
         KernelService::builder()
-            .plugins(vec![
-                Arc::clone(&auth) as Arc<dyn PluginPort>,
-                Arc::clone(&command) as Arc<dyn PluginPort>,
-                Arc::clone(&tracker) as Arc<dyn PluginPort>,
-                Arc::clone(&audit) as Arc<dyn PluginPort>,
-            ])
+            .plugins(plugins)
             .middleware(vec![
                 Arc::clone(&auth) as Arc<dyn MiddlewarePluginPort>,
                 Arc::clone(&command) as Arc<dyn MiddlewarePluginPort>,
@@ -120,7 +146,7 @@ async fn main() {
         build_http(&config.discord.token, config.discord.proxy, Some(app_id)),
         intents,
     )
-    .event_handler(DiscordGatewayAdapter::new(Arc::clone(&kernel)))
+    .event_handler(DiscordGatewayAdapter::new(Arc::clone(&kernel), gateway_context))
     .await
     .expect("failed to create client");
 

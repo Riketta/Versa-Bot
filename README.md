@@ -47,6 +47,10 @@ a slash command from any other reply path.
   membership changes published on the bus as structured `audit` tracing
   events (stdout + Sentry/GlitchTip), with origin fields, no per-guild
   configuration needed.
+- Status rotator (`status_rotator` plugin): cycles the bot's activity
+  through a configured list on a configured interval - both come from the
+  optional `[status]` section of the config file (presence is bot-wide,
+  not per-guild); omitted or empty means the rotation is off.
 - Guild-partitioned document storage: plugins persist JSON documents scoped
   to `(platform, guild)` - reading another guild's data is impossible by
   construction. SQLite (default) and PostgreSQL.
@@ -84,6 +88,11 @@ Prerequisites: Rust 1.88+ (edition 2024).
    # [sentry]
    # dsn = "http://your-key@localhost:9000/1"
    # environment = "development"
+
+   # Optional: status rotator - cycles the bot's activity.
+   # [status]
+   # interval_seconds = 300
+   # statuses = ["with the API", "versa-bot"]
    ```
 
 2. `cargo run` from the project root (migrations load from `./migrations`).
@@ -143,6 +152,6 @@ src/
 
 ## Roadmap
 
-- Configuration hot-reload; scheduler (status rotation)
+- Configuration hot-reload
 - LLM chat plugin; message history
 - Further platform adapters (Telegram, Matrix, ...)

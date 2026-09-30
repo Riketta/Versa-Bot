@@ -1,9 +1,13 @@
 use async_trait::async_trait;
 
+use crate::kernel::models::{OutboundError, Presence};
+
+/// Driven port for updating the bot's own presence (status/activity).
+/// Presence is a global concern - it is never guild-scoped.
 #[async_trait]
 pub trait PresencePort: Send + Sync {
-    // async fn set_status(&self, status: crate::kernel::models::OutboundMessage) ->
-    //     Result<(), crate::kernel::models::OutboundError>;
-    // async fn set_activity(&self, activity: Option<crate::kernel::models::OutboundMessage>) ->
-    //     Result<(), crate::kernel::models::OutboundError>;
+    /// Replaces the current presence. Fails when the platform connection
+    /// cannot accept the update yet (e.g. gateway not ready); callers treat
+    /// that as best effort.
+    async fn set(&self, presence: Presence) -> Result<(), OutboundError>;
 }

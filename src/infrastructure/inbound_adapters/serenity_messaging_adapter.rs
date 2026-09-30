@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serenity::all::{
     ChannelId as SerenityChannelId, CommandDataOption, CommandDataOptionValue, Context,
@@ -21,11 +21,14 @@ use crate::kernel::{
 /// pipeline. Platform specifics (serenity types) never cross this boundary.
 pub struct DiscordGatewayAdapter<H: RequestHandlerPort> {
     handler: H,
+    /// Filled on `ready` so outbound adapters (presence) can drive the
+    /// gateway; this adapter is the only writer.
+    context: Arc<OnceLock<Context>>,
 }
 
 impl<H: RequestHandlerPort> DiscordGatewayAdapter<H> {
-    pub fn new(handler: H) -> Self {
-        Self { handler }
+    pub fn new(handler: H, context: Arc<OnceLock<Context>>) -> Self {
+        Self { handler, context }
     }
 }
 
@@ -141,7 +144,8 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
         self.handler.handle(event).await;
     }
 
-    async fn ready(&self, _ctx: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
+        let _ = self.context.set(ctx);
         tracing::info!("connected as {}", ready.user.name);
     }
 }

@@ -19,3 +19,10 @@ url = "sqlite://versabot.db"
 # [sentry]
 # dsn = "http://your-key@localhost:9000/1"
 # environment = "development"
+
+# Optional: status rotator - cycles the bot's activity through the list.
+# Presence is bot-wide (not per-guild). Remove the section, empty the list,
+# or set interval_seconds to 0 to disable the rotation.
+# [status]
+# interval_seconds = 300
+# statuses = ["with the API", "versa-bot", "over the guild"]
