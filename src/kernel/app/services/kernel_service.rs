@@ -126,7 +126,9 @@ impl<E: EventBusPort> KernelService<E> {
         // A duplicated middleware entry (the same instance listed twice)
         // would silently run every event through it twice - refuse it.
         for (index, step) in self.middleware.iter().enumerate() {
-            if self.middleware[..index].iter().any(|earlier| Self::same_instance(earlier, step)) {
+            if self.middleware.get(..index).is_some_and(|earlier| {
+                earlier.iter().any(|previous| Self::same_instance(previous, step))
+            }) {
                 return Err(PluginError::Invalid(format!(
                     "middleware plugin `{}` is listed twice",
                     step.name()
