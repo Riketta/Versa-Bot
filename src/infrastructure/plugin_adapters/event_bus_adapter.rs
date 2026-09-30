@@ -2,6 +2,7 @@ use std::{any::TypeId, collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
 
+use crate::common::panic_message;
 use crate::kernel::{
     models::Event,
     plugin_ports::{EventBusPort, EventHandler},
@@ -60,17 +61,6 @@ impl EventBusPort for InMemoryEventBus {
         });
 
         self.subscribers.write().entry(TypeId::of::<E>()).or_default().push(erased);
-    }
-}
-
-/// Best-effort panic payload extraction (payloads are opaque `Any`).
-fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = panic.downcast_ref::<&'static str>() {
-        (*message).to_owned()
-    } else if let Some(message) = panic.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic payload".to_owned()
     }
 }
 

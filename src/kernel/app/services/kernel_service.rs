@@ -2,8 +2,10 @@ use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 use bon::bon;
+use futures_util::FutureExt;
 use tracing::Instrument;
 
+use crate::common::panic_message;
 use crate::kernel::{
     api_ports::RequestHandlerPort,
     models::{GuildId, Origin, PluginError, RequestContext},
@@ -117,6 +119,18 @@ impl<E: EventBusPort> RequestHandlerPort for KernelService<E> {
 }
 
 impl<E: EventBusPort> KernelService<E> {
+    /// Fire-and-forget middleware traversal with panic isolation. Hooks are
+    /// fire-and-forget (they return `Next`, never `Result`) - plugins log
+    /// their own recoverable failures; panics are the kernel's concern:
+    ///
+    /// - a `pre` that panics is logged (plugin + event) and treated as
+    ///   `Stop`: the event does not flow to remaining plugins (fail closed)
+    ///   and `post` still runs for the plugins that ran (the panicking one
+    ///   included - only its call frame unwound, its state is intact);
+    /// - a `post` that panics is logged and remaining posts still run -
+    ///   one broken observer must not skip the others' cleanup.
+    ///
+    /// No plugin panic may reach the driving adapter's task.
     async fn process(&self, mut event: RequestContext) {
         let services = self.scoped_services(&event.origin);
 
@@ -124,14 +138,27 @@ impl<E: EventBusPort> KernelService<E> {
         let mut aborted = false;
 
         for step in &self.middleware {
-            match step.pre(&mut event, &services).await {
-                Next::Continue => ran += 1,
-                Next::Stop => {
+            let outcome =
+                std::panic::AssertUnwindSafe(step.pre(&mut event, &services)).catch_unwind().await;
+
+            match outcome {
+                Ok(Next::Continue) => ran += 1,
+                Ok(Next::Stop) => {
                     ran += 1;
                     break;
                 }
-                Next::Abort => {
+                Ok(Next::Abort) => {
                     aborted = true;
+                    break;
+                }
+                Err(panic) => {
+                    tracing::error!(
+                        plugin = step.name(),
+                        kind = ?event.kind,
+                        panic = panic_message(&panic),
+                        "middleware `pre` panicked - event dropped"
+                    );
+                    ran += 1;
                     break;
                 }
             }
@@ -146,7 +173,16 @@ impl<E: EventBusPort> KernelService<E> {
         };
 
         for step in ran_steps.iter().rev() {
-            step.post(&event, &services).await;
+            let outcome =
+                std::panic::AssertUnwindSafe(step.post(&event, &services)).catch_unwind().await;
+            if let Err(panic) = outcome {
+                tracing::error!(
+                    plugin = step.name(),
+                    kind = ?event.kind,
+                    panic = panic_message(&panic),
+                    "middleware `post` panicked"
+                );
+            }
         }
     }
 }
@@ -157,6 +193,7 @@ mod tests {
     use crate::kernel::models::OutboundMessage;
     use crate::kernel::models::{EventKind, Platform};
     use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
+    use parking_lot::Mutex;
     use serde_json::json;
 
     struct PongPlugin {
@@ -223,6 +260,39 @@ mod tests {
 
     #[async_trait]
     impl MiddlewarePluginPort for SilentPlugin {}
+
+    /// Records its hook invocations; can be told to panic in either hook -
+    /// the fixture for the pipeline failure policy tests.
+    struct RecorderPlugin {
+        name: &'static str,
+        log: Arc<Mutex<Vec<String>>>,
+        panic_in_pre: bool,
+        panic_in_post: bool,
+    }
+
+    impl PluginPort for RecorderPlugin {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+    }
+
+    #[async_trait]
+    impl MiddlewarePluginPort for RecorderPlugin {
+        async fn pre(&self, _event: &mut RequestContext, _services: &KernelServices) -> Next {
+            self.log.lock().push(format!("pre:{}", self.name));
+            if self.panic_in_pre {
+                panic!("pre boom");
+            }
+            Next::Continue
+        }
+
+        async fn post(&self, _event: &RequestContext, _services: &KernelServices) {
+            self.log.lock().push(format!("post:{}", self.name));
+            if self.panic_in_post {
+                panic!("post boom");
+            }
+        }
+    }
 
     struct TestEventBus;
 
@@ -331,5 +401,85 @@ mod tests {
         kernel.handle(RequestContext::message_received(other_guild, "hi")).await;
 
         assert_eq!(output.messages(), ["privit", "hello"]);
+    }
+
+    /// Failure policy: a panicking `pre` drops the event (fail closed - the
+    /// healthy plugin never sees it) while the broken plugin's own `post`
+    /// still runs (only its call frame unwound, its state is intact).
+    #[tokio::test]
+    async fn panicking_pre_stops_chain_but_runs_post_of_ran_plugins() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let broken = Arc::new(RecorderPlugin {
+            name: "broken",
+            log: Arc::clone(&log),
+            panic_in_pre: true,
+            panic_in_post: false,
+        });
+        let healthy = Arc::new(RecorderPlugin {
+            name: "healthy",
+            log: Arc::clone(&log),
+            panic_in_pre: false,
+            panic_in_post: false,
+        });
+
+        let (kernel, _output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![],
+            vec![
+                Arc::clone(&broken) as Arc<dyn MiddlewarePluginPort>,
+                Arc::clone(&healthy) as Arc<dyn MiddlewarePluginPort>,
+            ],
+        );
+
+        kernel.handle(RequestContext::message_received(test_origin(), "hi")).await;
+
+        let entries = log.lock().clone();
+        assert_eq!(
+            entries,
+            vec!["pre:broken".to_owned(), "post:broken".to_owned()],
+            "event must not flow past the panicking plugin, but its post must run"
+        );
+    }
+
+    /// Failure policy: a panicking `post` must not skip the remaining posts
+    /// (posts run in reverse order, so the broken one is last in the chain).
+    #[tokio::test]
+    async fn panicking_post_does_not_block_other_posts() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let healthy = Arc::new(RecorderPlugin {
+            name: "healthy",
+            log: Arc::clone(&log),
+            panic_in_pre: false,
+            panic_in_post: false,
+        });
+        let broken = Arc::new(RecorderPlugin {
+            name: "broken",
+            log: Arc::clone(&log),
+            panic_in_pre: false,
+            panic_in_post: true,
+        });
+
+        let (kernel, _output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![],
+            vec![
+                Arc::clone(&healthy) as Arc<dyn MiddlewarePluginPort>,
+                Arc::clone(&broken) as Arc<dyn MiddlewarePluginPort>,
+            ],
+        );
+
+        kernel.handle(RequestContext::message_received(test_origin(), "hi")).await;
+
+        let entries = log.lock().clone();
+        assert_eq!(
+            entries,
+            vec![
+                "pre:healthy".to_owned(),
+                "pre:broken".to_owned(),
+                "post:broken".to_owned(),
+                "post:healthy".to_owned(),
+            ],
+            "healthy plugin's post must run despite the broken one panicking first"
+        );
     }
 }

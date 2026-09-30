@@ -3861,6 +3861,7 @@ dependencies = [
  "bon",
  "bytes",
  "config",
+ "futures-util",
  "parking_lot",
  "poise",
  "reqwest 0.12.28",

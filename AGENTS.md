@@ -96,6 +96,8 @@ E.g. `UserActivityTrackerPlugin` receives `MemberJoined` via the pipeline, logs 
 
 **Bus runtime contract:** `EventBusPort` handlers run inline on the publishing task, in subscription order - keep them fast and non-blocking. A panicking handler is caught, logged, and skipped: a broken subscriber cannot crash the publisher, the pipeline, or other subscribers. Delivery isolation, cross-task ordering, and backpressure (e.g. an external broker) are deferred until a real consumer needs them.
 
+**Pipeline failure policy:** hooks are fire-and-forget (they return `Next`, never `Result`); plugins log their own recoverable failures internally. Panics are the kernel's concern: a `pre` that panics is logged (plugin + event) and treated as `Stop` - the event does not flow to remaining plugins (fail closed), while `post` still runs for the plugins that ran, the panicking one included (only its call frame unwound, its state is intact); a `post` that panics is logged and remaining posts still run - one broken observer must not skip the others' cleanup. No plugin panic may reach the driving adapter's task - plugins must not be able to crash the bot.
+
 **Event-scoped outbound ports:**
 
 Outbound ports injected into the pipeline are bound to the current event's origin - a plugin's `ChatOutputPort::send` lands in the source channel/guild. The driving adapter (or kernel) constructs these scoped ports per event. This is how a plugin knows where to reply without a returned response.
