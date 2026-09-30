@@ -72,10 +72,10 @@ jobs:
           cargo fmt --all -- --check
 
       - name: Clippy (deny-level lints gate)
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets --locked
 
       - name: Tests
-        run: cargo test
+        run: cargo test --locked
 
   package:
     needs: [test]
