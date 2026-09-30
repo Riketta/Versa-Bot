@@ -15,9 +15,11 @@ use parking_lot::Mutex;
 use rand::Rng;
 use rand::seq::SliceRandom;
 
-/// Identifies one random sequence - one per channel.
+/// Identifies one random sequence - one per channel. The platform joins
+/// the key so id spaces of different platforms can never collide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RandomScope {
+    pub platform: &'static str,
     pub guild_id: u64,
     pub channel_id: u64,
 }
@@ -106,34 +108,34 @@ impl RandomPort for DeckRandom {
 mod tests {
     use super::*;
 
-    fn scope(channel_id: u64) -> RandomScope {
-        RandomScope { guild_id: 1, channel_id }
+    fn scope(platform: &'static str, channel_id: u64) -> RandomScope {
+        RandomScope { platform, guild_id: 1, channel_id }
     }
 
     #[test]
     fn zero_and_negative_chance_never_fires() {
         let rng = RandRandom;
-        assert!(!rng.chance_percent(scope(1), 0.0));
-        assert!(!rng.chance_percent(scope(1), -0.5));
+        assert!(!rng.chance_percent(scope("discord", 1), 0.0));
+        assert!(!rng.chance_percent(scope("discord", 1), -0.5));
         let deck = DeckRandom::new();
-        assert!(!deck.chance_percent(scope(1), 0.0));
-        assert!(!deck.chance_percent(scope(1), -0.5));
+        assert!(!deck.chance_percent(scope("discord", 1), 0.0));
+        assert!(!deck.chance_percent(scope("discord", 1), -0.5));
     }
 
     #[test]
     fn full_chance_always_fires() {
         let rng = RandRandom;
-        assert!(rng.chance_percent(scope(1), 100.0));
-        assert!(rng.chance_percent(scope(1), 500.0));
+        assert!(rng.chance_percent(scope("discord", 1), 100.0));
+        assert!(rng.chance_percent(scope("discord", 1), 500.0));
         let deck = DeckRandom::new();
-        assert!(deck.chance_percent(scope(1), 100.0));
-        assert!(deck.chance_percent(scope(1), 500.0));
+        assert!(deck.chance_percent(scope("discord", 1), 100.0));
+        assert!(deck.chance_percent(scope("discord", 1), 500.0));
     }
 
     #[test]
     fn deck_yields_exactly_the_promised_hits_per_cycle() {
         let deck = DeckRandom::new();
-        let scope = scope(1);
+        let scope = scope("discord", 1);
 
         let mut hits = 0;
         for _ in 0..100 {
@@ -154,7 +156,7 @@ mod tests {
         // untouched by A's draws.
         let mut a_hits = 0;
         for _ in 0..100 {
-            if deck.chance_percent(scope(1), 5.0) {
+            if deck.chance_percent(scope("discord", 1), 5.0) {
                 a_hits += 1;
             }
         }
@@ -162,7 +164,7 @@ mod tests {
 
         let mut b_hits = 0;
         for _ in 0..100 {
-            if deck.chance_percent(scope(2), 5.0) {
+            if deck.chance_percent(scope("discord", 2), 5.0) {
                 b_hits += 1;
             }
         }
@@ -170,9 +172,31 @@ mod tests {
     }
 
     #[test]
+    fn deck_state_is_per_platform() {
+        // Same raw channel id, different platform: independent sequences.
+        let deck = DeckRandom::new();
+
+        let mut discord_hits = 0;
+        for _ in 0..100 {
+            if deck.chance_percent(scope("discord", 7), 5.0) {
+                discord_hits += 1;
+            }
+        }
+        assert_eq!(discord_hits, 5);
+
+        let mut telegram_hits = 0;
+        for _ in 0..100 {
+            if deck.chance_percent(scope("telegram", 7), 5.0) {
+                telegram_hits += 1;
+            }
+        }
+        assert_eq!(telegram_hits, 5);
+    }
+
+    #[test]
     fn deck_rebuilds_when_percent_changes() {
         let deck = DeckRandom::new();
-        let scope = scope(1);
+        let scope = scope("discord", 1);
 
         // 2% deck holds 2 hits; switch to 50% mid-cycle: the bag is rebuilt
         // for the new percent, so the next 100 draws hold exactly 50 hits.
