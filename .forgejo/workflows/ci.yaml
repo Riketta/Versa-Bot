@@ -36,8 +36,8 @@ jobs:
   test:
     runs-on: docker
     container:
-      # Pinned minor; ships git + cargo, no clippy.
-      image: rust:1.98
+      # Same pinned image as the Dockerfile build stage (suite + compiler).
+      image: rust:1.98-bookworm
     timeout-minutes: 90
     steps:
       - name: Fetch source (API archive - HTTP git is disabled on this instance)

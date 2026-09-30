@@ -2,7 +2,11 @@
 
 # ---- build stage ----
 # Same image as the CI test jobs (see .forgejo/workflows/ci.yaml).
-FROM rust:1.98 AS build
+# The -bookworm suffix pins the Debian suite, not just the compiler: the
+# binary links against this base's glibc, and the runtime stage below is
+# bookworm-slim. A moving default base would break the image at startup
+# ("GLIBC_x.y not found"), not at build time.
+FROM rust:1.98-bookworm AS build
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
