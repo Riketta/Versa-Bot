@@ -32,7 +32,9 @@ a slash command from any other reply path.
 - Per-guild authorization (`auth` plugin): user and role allow-lists;
   unconfigured guilds are open by default; a malformed policy fails closed.
   A denied slash command is answered with an ephemeral error embed, visible
-  only to the invoker, naming the rejected permission group (users / roles).
+  only to the invoker, naming the rejected permission group (users / roles);
+  if the policy itself is unreadable, it gets a "policy unavailable" notice
+  instead.
 - User activity tracker (`tracker` plugin): logs member joins/leaves to the
   guild's audit channel and publishes `UserJoinedGuild` / `UserLeftGuild`
   domain events on the plugin bus for other plugins to react to. Channel

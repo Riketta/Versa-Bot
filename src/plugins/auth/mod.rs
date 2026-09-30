@@ -69,6 +69,7 @@ impl MiddlewarePluginPort for AuthPlugin {
 
         let Ok(config) = serde_json::from_value::<AuthConfig>(raw) else {
             tracing::warn!(namespace = NAMESPACE, "auth config is malformed - failing closed");
+            self.answer_denial(services, event, self.policy_unavailable_embed(event)).await;
             return Next::Stop;
         };
 
@@ -81,18 +82,7 @@ impl MiddlewarePluginPort for AuthPlugin {
             guild_id = ?event.origin.guild_id,
             "event denied by auth"
         );
-
-        // Transactional events (slash commands) owe the invoker a visible
-        // answer; make it ephemeral so a denial never exposes the policy or
-        // spams the channel. Plain messages are not interactions - ephemeral
-        // is impossible there and a public reply would be a spam vector -
-        // so they stay silent.
-        if event.origin.reply_token.is_some() {
-            let denial = OutboundMessage::embed(self.denial_embed(&config, event)).ephemeral();
-            if let Err(err) = services.chat_output.send(denial).await {
-                tracing::warn!(%err, "failed to deliver auth denial");
-            }
-        }
+        self.answer_denial(services, event, self.denial_embed(&config, event)).await;
 
         // Deliberate rejection: `Stop`, so this plugin's `post` still runs
         // (audit hook) while downstream plugins never see the event.
@@ -103,6 +93,38 @@ impl MiddlewarePluginPort for AuthPlugin {
 impl AuthPlugin {
     fn is_allowed(&self, config: &AuthConfig, event: &RequestContext) -> bool {
         self.user_listed(config, event) || self.role_listed(config, event)
+    }
+
+    /// Delivers a denial to transactional events only (slash commands owe
+    /// the invoker an answer; make it ephemeral so it never spams the
+    /// channel or exposes the policy). Plain messages are not interactions -
+    /// ephemeral is impossible there and a public reply would be a spam
+    /// vector - so they stay silent.
+    async fn answer_denial(&self, services: &KernelServices, event: &RequestContext, embed: Embed) {
+        if event.origin.reply_token.is_none() {
+            return;
+        }
+        let denial = OutboundMessage::embed(embed).ephemeral();
+        if let Err(err) = services.chat_output.send(denial).await {
+            tracing::warn!(%err, "failed to deliver auth denial");
+        }
+    }
+
+    /// Denial when the policy itself is unreadable: no reasons to quote,
+    /// point at the broken configuration instead.
+    fn policy_unavailable_embed(&self, event: &RequestContext) -> Embed {
+        let what = match &event.payload {
+            EventPayload::Command(command) => {
+                format!("Command `/{}` could not be authorized.", command.name)
+            }
+            _ => "The action could not be authorized.".to_owned(),
+        };
+        Embed {
+            title: "⛔ Not authorized".to_owned(),
+            description: format!(
+                "{what}\nThis guild's access policy is unreadable (malformed), so the request was denied.\nAsk a guild admin to fix the bot configuration."
+            ),
+        }
     }
 
     fn user_listed(&self, config: &AuthConfig, event: &RequestContext) -> bool {
@@ -367,6 +389,30 @@ mod tests {
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
         assert!(output.messages().is_empty());
+    }
+
+    /// A broken policy cannot quote reasons, but a slash command still owes
+    /// the invoker an ephemeral answer pointing at the configuration.
+    #[tokio::test]
+    async fn malformed_config_denies_commands_with_policy_unavailable_embed() {
+        let storage = InMemoryStorage::new();
+        storage.seed(Platform::Discord, GuildId(1), NAMESPACE, CONFIG_KEY, json!("not an object"));
+        let (services, output) = test_services(&storage);
+        let plugin = AuthPlugin;
+        let mut event = command_event(3, &[]);
+        event.origin.reply_token = Some("token".to_owned());
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
+
+        let sent = output.sent();
+        assert_eq!(sent.len(), 1);
+        let denial = sent.first().expect("denial expected");
+        assert!(denial.ephemeral, "denial must be visible to the invoker only");
+        let text = output.messages().into_iter().next().expect("denial expected");
+        assert!(text.contains("⛔ Not authorized"));
+        assert!(text.contains("Command `/ping` could not be authorized."));
+        assert!(text.contains("unreadable (malformed)"));
+        assert!(!text.contains("permissions group"), "no policy, no reasons");
     }
 
     #[tokio::test]
