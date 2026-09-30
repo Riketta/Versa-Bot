@@ -24,6 +24,32 @@ use super::model::{ChannelConfig, NAMESPACE, channel_config_key};
 /// Identifies one channel's processing lock: platform, guild, channel.
 type ChannelKey = (String, u64, u64);
 
+/// Per-channel processing locks, shared by the engine intake and the
+/// state-mutating admin commands: everything that reads or writes one
+/// channel's records, state, or config serializes on the same key - an
+/// in-flight engine run can no longer undo a `/llm_cutoff` commit or race
+/// a `/llm_set` read-modify-write.
+#[derive(Default)]
+pub(super) struct ChannelLocks {
+    locks: Mutex<HashMap<ChannelKey, Arc<AsyncMutex<()>>>>,
+}
+
+impl ChannelLocks {
+    #[must_use]
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub(super) fn lock_for(&self, origin: &Origin) -> Arc<AsyncMutex<()>> {
+        let key: ChannelKey = (
+            origin.platform.as_str().to_owned(),
+            origin.guild_id.map_or(0, GuildId::get),
+            origin.channel_id.get(),
+        );
+        Arc::clone(self.locks.lock().entry(key).or_default())
+    }
+}
+
 /// LLM chat plugin: lifecycle + admin commands (`PluginPort`) and the
 /// conversation intake (`MiddlewarePluginPort`).
 ///
@@ -35,22 +61,17 @@ type ChannelKey = (String, u64, u64);
 pub struct LlmPlugin {
     registry: Arc<dyn CommandRegistryPort>,
     engine: Arc<ChatEngine>,
-    channel_locks: Arc<Mutex<HashMap<ChannelKey, Arc<AsyncMutex<()>>>>>,
+    channel_locks: Arc<ChannelLocks>,
 }
 
 impl LlmPlugin {
     #[must_use]
     pub fn new(registry: Arc<dyn CommandRegistryPort>, engine: Arc<ChatEngine>) -> Self {
-        Self { registry, engine, channel_locks: Arc::new(Mutex::new(HashMap::new())) }
+        Self { registry, engine, channel_locks: ChannelLocks::new() }
     }
 
     fn channel_lock(&self, origin: &Origin) -> Arc<AsyncMutex<()>> {
-        let key: ChannelKey = (
-            origin.platform.as_str().to_owned(),
-            origin.guild_id.map_or(0, GuildId::get),
-            origin.channel_id.get(),
-        );
-        Arc::clone(self.channel_locks.lock().entry(key).or_default())
+        self.channel_locks.lock_for(origin)
     }
 
     fn descriptor(
@@ -114,7 +135,7 @@ impl PluginPort for LlmPlugin {
                 "Reset this channel's conversation context (history is kept)",
                 Vec::new(),
             ),
-            Arc::new(CutoffLlmHandler),
+            Arc::new(CutoffLlmHandler::new(Arc::clone(&self.channel_locks))),
         );
         self.registry.register(
             self.descriptor(
@@ -145,7 +166,7 @@ impl PluginPort for LlmPlugin {
                     },
                 ],
             ),
-            Arc::new(SetLlmHandler),
+            Arc::new(SetLlmHandler::new(Arc::clone(&self.channel_locks))),
         );
         self.registry.register(
             self.descriptor(
@@ -159,7 +180,7 @@ impl PluginPort for LlmPlugin {
                     choices: None,
                 }],
             ),
-            Arc::new(PromptLlmHandler),
+            Arc::new(PromptLlmHandler::new(Arc::clone(&self.channel_locks))),
         );
         Ok(())
     }
@@ -664,7 +685,7 @@ mod tests {
             serde_json::json!({"summary": "old gist", "cutoff_seq": 0}),
         );
 
-        CutoffLlmHandler
+        CutoffLlmHandler::new(ChannelLocks::new())
             .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
             .await
             .expect("cutoff expected to succeed");
@@ -684,6 +705,87 @@ mod tests {
         assert_eq!(state.cutoff_seq, 1);
         assert!(state.cutoff_at.is_some());
         assert!(fixture.output.messages().iter().any(|m| m.contains("Context cleared")));
+    }
+
+    /// `/llm_cutoff` serializes against the engine's per-channel lock: while
+    /// an engine run holds the lock, the cutoff waits instead of committing a
+    /// state an in-flight compaction could later overwrite.
+    #[tokio::test]
+    async fn cutoff_waits_for_the_channel_lock() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&fixture.storage);
+        fixture.storage.seed(
+            Platform::Discord,
+            GuildId(1),
+            NAMESPACE,
+            &channel_state_key(2),
+            serde_json::json!({"summary": "old gist", "cutoff_seq": 0}),
+        );
+        let record = serde_json::to_value(ConversationRecord {
+            message_id: Some(1),
+            role: RecordRole::User,
+            author: Some("alice".to_owned()),
+            content: "old".to_owned(),
+            reply_to: None,
+            captured_at: 0,
+        })
+        .expect("record expected to serialize");
+        fixture
+            .storage
+            .guild_scoped(Platform::Discord, GuildId(1))
+            .append(&records_namespace(2), record)
+            .await
+            .expect("append expected to succeed");
+
+        // Hold the engine-side lock for the channel.
+        let lock = plugin.channel_lock(&command_event(Some(1)).origin);
+        let guard = lock.lock().await;
+
+        let services = fixture.services.clone();
+        let handler = CutoffLlmHandler::new(Arc::clone(&plugin.channel_locks));
+        let task = tokio::spawn(async move {
+            handler
+                .invoke(&command_event(Some(1)), &CommandArgs::default(), &services)
+                .await
+                .expect("cutoff expected to succeed");
+        });
+
+        // The cutoff must still be waiting: the old state is untouched.
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        let state_raw = fixture
+            .services
+            .guild_storage
+            .as_ref()
+            .expect("guild storage expected")
+            .get(NAMESPACE, &channel_state_key(2))
+            .await
+            .expect("state readable")
+            .expect("state expected");
+        assert_eq!(
+            state_raw,
+            serde_json::json!({"summary": "old gist", "cutoff_seq": 0}),
+            "the cutoff must wait for the channel lock, not race the engine"
+        );
+
+        drop(guard);
+        task.await.expect("cutoff task expected to finish");
+
+        let state_raw = fixture
+            .services
+            .guild_storage
+            .as_ref()
+            .expect("guild storage expected")
+            .get(NAMESPACE, &channel_state_key(2))
+            .await
+            .expect("state readable")
+            .expect("state expected");
+        let state: ConversationState =
+            serde_json::from_value(state_raw).expect("state expected to deserialize");
+        assert_eq!(state.summary, None);
+        assert_eq!(state.cutoff_seq, 1);
     }
 
     #[tokio::test]
@@ -731,7 +833,7 @@ mod tests {
         plugin.init().expect("init expected to succeed");
         seed_config_in(&fixture.storage);
 
-        SetLlmHandler
+        SetLlmHandler::new(ChannelLocks::new())
             .invoke(
                 &command_event(Some(1)),
                 &CommandArgs(vec![
@@ -764,7 +866,7 @@ mod tests {
         plugin.init().expect("init expected to succeed");
         seed_config_in(&fixture.storage);
 
-        SetLlmHandler
+        SetLlmHandler::new(ChannelLocks::new())
             .invoke(
                 &command_event(Some(1)),
                 &CommandArgs(vec![
@@ -797,7 +899,7 @@ mod tests {
         let (plugin, fixture) = fixture();
         plugin.init().expect("init expected to succeed");
 
-        SetLlmHandler
+        SetLlmHandler::new(ChannelLocks::new())
             .invoke(
                 &command_event(Some(1)),
                 &CommandArgs(vec![
@@ -818,7 +920,7 @@ mod tests {
         plugin.init().expect("init expected to succeed");
         seed_config_in(&fixture.storage);
 
-        PromptLlmHandler
+        PromptLlmHandler::new(ChannelLocks::new())
             .invoke(
                 &command_event(Some(1)),
                 &CommandArgs(vec![("prompt".to_owned(), "You are a pirate.".to_owned())]),
@@ -839,7 +941,7 @@ mod tests {
             serde_json::from_value(raw).expect("config expected to deserialize");
         assert_eq!(config.system_prompt.as_deref(), Some("You are a pirate."));
 
-        PromptLlmHandler
+        PromptLlmHandler::new(ChannelLocks::new())
             .invoke(
                 &command_event(Some(1)),
                 &CommandArgs(vec![("prompt".to_owned(), "clear".to_owned())]),

@@ -15,6 +15,7 @@ use crate::kernel::{
 };
 
 use super::conversation::ConversationRecord;
+use super::llm_plugin::ChannelLocks;
 use super::model::{
     CaptureMode, ChannelConfig, ConversationState, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats,
     channel_config_key, channel_state_key, channel_stats_key, records_namespace, unix_now,
@@ -174,11 +175,14 @@ fn apply_numeric(
                 return Some(Ok(format!("`{key}` cleared (provider default).")));
             }
             match value.parse::<f64>() {
-                Ok(parsed) => {
+                // NaN/infinity would serialize as JSON null (breaking the
+                // provider request and silently vanishing on reload) -
+                // reject instead of storing a silently broken value.
+                Ok(parsed) if parsed.is_finite() => {
                     set_float(config, key, Some(parsed));
                     Some(Ok(format!("`{key}` set to {parsed}.")))
                 }
-                Err(_) => Some(Err(format!("`{key}` expects a number, got `{value}`."))),
+                _ => Some(Err(format!("`{key}` expects a finite number, got `{value}`."))),
             }
         }
         "max_tokens" => {
@@ -230,14 +234,15 @@ fn apply_numeric(
                 return Some(Ok("`random_chance` cleared (chime-ins off).".to_owned()));
             }
             match value.parse::<f64>() {
-                Ok(parsed) => {
+                // Non-finite clamps to NaN, not to the range bounds.
+                Ok(parsed) if parsed.is_finite() => {
                     let clamped = parsed.clamp(0.0, 100.0);
                     config.random_chance_percent = clamped;
                     Some(Ok(format!("`random_chance` set to {clamped}%.")))
                 }
-                Err(_) => {
-                    Some(Err(format!("`random_chance` expects a number (percent), got `{value}`.")))
-                }
+                _ => Some(Err(format!(
+                    "`random_chance` expects a finite number (percent), got `{value}`."
+                ))),
             }
         }
         _ => None,
@@ -390,8 +395,19 @@ impl CommandHandler for UnassignLlmHandler {
 /// `/llm_cutoff`: resets the channel's conversation context - the cutoff
 /// moves past every existing record and the summary clears, so the next
 /// answer starts fresh. Stored history is kept (records are never deleted);
-/// this is a context reset, not a history wipe.
-pub(super) struct CutoffLlmHandler;
+/// this is a context reset, not a history wipe. The mutation runs under the
+/// channel's processing lock: an in-flight engine run must not commit an
+/// older state (compaction) over the fresh cutoff, and the record count is
+/// only a stable "newest sequence" while no appends interleave.
+pub(super) struct CutoffLlmHandler {
+    locks: Arc<ChannelLocks>,
+}
+
+impl CutoffLlmHandler {
+    pub(super) fn new(locks: Arc<ChannelLocks>) -> Self {
+        Self { locks }
+    }
+}
 
 #[async_trait]
 impl CommandHandler for CutoffLlmHandler {
@@ -408,11 +424,14 @@ impl CommandHandler for CutoffLlmHandler {
                 .await?;
             return Ok(());
         };
+        let channel = self.locks.lock_for(&event.origin);
+        let _channel = channel.lock().await;
 
         let channel_id = event.origin.channel_id.get();
         let records_ns = records_namespace(channel_id);
         // Per-scope sequence numbers are 1..=count, so the record count IS
-        // the newest sequence - the cutoff moves past everything.
+        // the newest sequence - the cutoff moves past everything. Safe only
+        // under the channel lock (no concurrent appends).
         let total = storage.count_after(&records_ns, 0).await?;
         let state =
             ConversationState { summary: None, cutoff_seq: total, cutoff_at: Some(unix_now()) };
@@ -653,7 +672,19 @@ impl CommandHandler for ClearServiceChannelHandler {
 /// `/llm_set`: tunes one setting of the channel's chat configuration by
 /// `key`/`value`. Values of `clear`/`none`/`default` reset the setting to
 /// its default; malformed values are answered with usage and never saved.
-pub(super) struct SetLlmHandler;
+/// `/llm_set`: tunes one channel setting; `value: clear` restores the
+/// setting's default; malformed values are answered with usage and never
+/// saved. The read-modify-write runs under the channel's processing lock so
+/// concurrent admin commands cannot lose an update.
+pub(super) struct SetLlmHandler {
+    locks: Arc<ChannelLocks>,
+}
+
+impl SetLlmHandler {
+    pub(super) fn new(locks: Arc<ChannelLocks>) -> Self {
+        Self { locks }
+    }
+}
 
 #[async_trait]
 impl CommandHandler for SetLlmHandler {
@@ -663,6 +694,10 @@ impl CommandHandler for SetLlmHandler {
         args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
+        // The lock spans load-apply-save: two admins setting values on the
+        // same channel must not lose one update.
+        let channel = self.locks.lock_for(&event.origin);
+        let _channel = channel.lock().await;
         let Some(mut config) = load_assigned_config(event, services).await? else {
             return Ok(());
         };
@@ -691,8 +726,17 @@ impl CommandHandler for SetLlmHandler {
 }
 
 /// `/llm_prompt`: sets the channel's system prompt (long free text); the
-/// value `clear` falls back to the plugin-wide default.
-pub(super) struct PromptLlmHandler;
+/// value `clear` falls back to the plugin-wide default. Like `/llm_set`, the
+/// read-modify-write runs under the channel's processing lock.
+pub(super) struct PromptLlmHandler {
+    locks: Arc<ChannelLocks>,
+}
+
+impl PromptLlmHandler {
+    pub(super) fn new(locks: Arc<ChannelLocks>) -> Self {
+        Self { locks }
+    }
+}
 
 #[async_trait]
 impl CommandHandler for PromptLlmHandler {
@@ -702,6 +746,8 @@ impl CommandHandler for PromptLlmHandler {
         args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
+        let channel = self.locks.lock_for(&event.origin);
+        let _channel = channel.lock().await;
         let Some(mut config) = load_assigned_config(event, services).await? else {
             return Ok(());
         };
@@ -808,6 +854,21 @@ mod tests {
         assert!(apply_set(&mut config, "depth", "clear").is_err());
         apply_set(&mut config, "model", "zai/glm-5.3-flash").expect("model expected");
         assert_eq!(config.model, "zai/glm-5.3-flash");
+    }
+
+    #[test]
+    fn float_keys_reject_non_finite_values() {
+        let mut config = ChannelConfig::assigned("m".to_owned());
+
+        assert!(apply_set(&mut config, "temperature", "NaN").is_err());
+        assert!(apply_set(&mut config, "top_p", "inf").is_err());
+        assert!(apply_set(&mut config, "min_p", "-inf").is_err());
+        assert_eq!(config.params.temperature, None, "nothing may be stored");
+
+        // NaN would clamp to NaN, not to the range bounds; the default stays.
+        let before = config.random_chance_percent;
+        assert!(apply_set(&mut config, "random_chance", "NaN").is_err());
+        assert!((config.random_chance_percent - before).abs() < f64::EPSILON);
     }
 
     fn user_record(content: &str) -> serde_json::Value {

@@ -96,7 +96,15 @@ impl ChatEngine {
         };
         let usage_stats = self.load_stats(storage, channel_id).await;
         let calibrated = usage_stats.last.is_some();
-        let mut live = self.load_live_records(storage, channel_id, state.cutoff_seq).await;
+        let mut live = match self.load_live_records(storage, channel_id, state.cutoff_seq).await {
+            Ok(live) => live,
+            Err(err) => {
+                // Same policy as the unreadable state doc above: history
+                // integrity unknown - never answer from a degraded context.
+                tracing::warn!(channel = channel_id, %err, "llm record log unreadable - skipping message");
+                return;
+            }
+        };
 
         let reply_to = payload.reply_to.map(MessageId::get);
         let mut live_records: Vec<ConversationRecord> =
@@ -124,7 +132,15 @@ impl ChatEngine {
                     captured = true;
                 }
                 Err(err) => {
-                    tracing::warn!(channel = channel_id, %err, "failed to capture message into history");
+                    // History integrity unknown: the message the user
+                    // expects the bot to have seen never entered the log.
+                    // Answering anyway would fabricate context - skip.
+                    tracing::warn!(
+                        channel = channel_id,
+                        %err,
+                        "failed to capture message into history - skipping"
+                    );
+                    return;
                 }
             }
         }
@@ -227,7 +243,11 @@ impl ChatEngine {
                         origin,
                         storage,
                         "LLM completion failed",
-                        format!("Model `{}`: {err}\nNo reply was sent.", config.model),
+                        format!(
+                            "Model `{}`: {}.\nNo reply was sent.",
+                            config.model,
+                            err.classify()
+                        ),
                         true,
                     )
                     .await;
@@ -325,21 +345,22 @@ impl ChatEngine {
 
     /// The channel's live window: `(seq, record)` pairs after the cutoff,
     /// ascending. Malformed records are skipped (with a warning) instead of
-    /// failing the whole window.
+    /// failing the whole window; an unreadable log is an error - the caller
+    /// must skip the message rather than answer from a degraded context.
     async fn load_live_records(
         &self,
         storage: &Arc<dyn GuildStorage>,
         channel_id: u64,
         after_seq: u64,
-    ) -> Vec<(u64, ConversationRecord)> {
+    ) -> Result<Vec<(u64, ConversationRecord)>, crate::kernel::models::StorageError> {
         let records_ns = records_namespace(channel_id);
-        let total = storage.count_after(&records_ns, after_seq).await.unwrap_or(0);
+        let total = storage.count_after(&records_ns, after_seq).await?;
         if total == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let limit = u32::try_from(total).unwrap_or(u32::MAX);
-        let stored = storage.list_after(&records_ns, after_seq, limit).await.unwrap_or_default();
-        stored
+        let stored = storage.list_after(&records_ns, after_seq, limit).await?;
+        Ok(stored
             .into_iter()
             .filter_map(|record| {
                 serde_json::from_value::<ConversationRecord>(record.payload)
@@ -347,7 +368,7 @@ impl ChatEngine {
                     .ok()
                     .map(|parsed| (record.seq, parsed))
             })
-            .collect()
+            .collect())
     }
 
     async fn append_record(
@@ -430,7 +451,10 @@ impl ChatEngine {
                         origin,
                         storage,
                         "LLM compaction failed",
-                        format!("{err}\nThe context window keeps growing until this succeeds."),
+                        format!(
+                            "{}.\nThe context window keeps growing until this succeeds.",
+                            err.classify()
+                        ),
                         true,
                     )
                     .await;
@@ -658,9 +682,12 @@ impl ChatEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::models::{ChannelId, GuildId, MessageId, OutboundError, Platform, UserId};
+    use crate::kernel::models::{
+        ChannelId, GuildId, MessageId, OutboundError, Platform, StorageError, UserId,
+    };
     use crate::kernel::spi_ports::{
-        ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, StoragePort,
+        ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, GuildStorage, StoragePort,
+        StoredRecord,
     };
     use crate::plugins::llm::completion_port::{
         ChatRole, CompletionResponse, LlmError, TokenUsage,
@@ -670,6 +697,7 @@ mod tests {
     use crate::test_support::{InMemoryStorage, RecordingChatOutput};
     use async_trait::async_trait;
     use parking_lot::Mutex;
+    use serde_json::Value;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -778,6 +806,63 @@ mod tests {
     impl RandomPort for FixedRandom {
         fn chance_percent(&self, _scope: RandomScope, _percent: f64) -> bool {
             self.0
+        }
+    }
+
+    /// Storage whose document half delegates to an in-memory storage but
+    /// whose record log always fails - the fixture for the degraded-history
+    /// policy tests (unreadable log, failed capture append).
+    struct RecordsFailStorage {
+        documents: Arc<InMemoryStorage>,
+    }
+
+    struct RecordsFailView {
+        guild: Arc<dyn GuildStorage>,
+    }
+
+    #[async_trait]
+    impl GuildStorage for RecordsFailView {
+        async fn get(&self, namespace: &str, key: &str) -> Result<Option<Value>, StorageError> {
+            self.guild.get(namespace, key).await
+        }
+
+        async fn set(&self, namespace: &str, key: &str, value: Value) -> Result<(), StorageError> {
+            self.guild.set(namespace, key, value).await
+        }
+
+        async fn delete(&self, namespace: &str, key: &str) -> Result<(), StorageError> {
+            self.guild.delete(namespace, key).await
+        }
+
+        async fn list_keys(&self, namespace: &str) -> Result<Vec<String>, StorageError> {
+            self.guild.list_keys(namespace).await
+        }
+
+        async fn append(&self, _namespace: &str, _payload: Value) -> Result<u64, StorageError> {
+            Err(StorageError::Database("records unavailable".to_owned()))
+        }
+
+        async fn list_after(
+            &self,
+            _namespace: &str,
+            _after_seq: u64,
+            _limit: u32,
+        ) -> Result<Vec<StoredRecord>, StorageError> {
+            Err(StorageError::Database("records unavailable".to_owned()))
+        }
+
+        async fn count_after(
+            &self,
+            _namespace: &str,
+            _after_seq: u64,
+        ) -> Result<u64, StorageError> {
+            Err(StorageError::Database("records unavailable".to_owned()))
+        }
+    }
+
+    impl StoragePort for RecordsFailStorage {
+        fn guild_scoped(&self, platform: Platform, guild_id: GuildId) -> Arc<dyn GuildStorage> {
+            Arc::new(RecordsFailView { guild: self.documents.guild_scoped(platform, guild_id) })
         }
     }
 
@@ -1264,6 +1349,67 @@ mod tests {
             .expect("state readable");
         assert_eq!(state_raw, None);
         assert!(ctx.output.messages().iter().any(|message| message.contains("compaction failed")));
+    }
+
+    /// An unreadable record log degrades to skipping the message - the same
+    /// policy as an unreadable state doc. The bot must not answer from a
+    /// context that may be silently empty.
+    #[tokio::test]
+    async fn unreadable_record_log_skips_the_message() {
+        let mut ctx = ctx(vec![Ok("should not answer".to_owned())]);
+        ctx.services.guild_storage = Some(
+            RecordsFailStorage { documents: Arc::clone(&ctx.storage) }
+                .guild_scoped(Platform::Discord, GuildId(1)),
+        );
+        seed_config(&ctx.storage, &assigned_config());
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .await;
+
+        assert!(ctx.fake.requests().is_empty());
+        assert!(ctx.output.messages().is_empty());
+    }
+
+    /// A failed capture append skips the reply: the message never entered
+    /// the log, so answering would fabricate a context that never saw it.
+    #[tokio::test]
+    async fn failed_capture_skips_the_reply() {
+        let mut ctx = ctx(vec![Ok("fabricated answer".to_owned())]);
+        ctx.services.guild_storage = Some(
+            RecordsFailStorage { documents: Arc::clone(&ctx.storage) }
+                .guild_scoped(Platform::Discord, GuildId(1)),
+        );
+        seed_config(&ctx.storage, &assigned_config());
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .await;
+
+        assert!(ctx.fake.requests().is_empty());
+        assert!(ctx.output.messages().is_empty());
+    }
+
+    /// Service-channel embeds carry the error classification only: the
+    /// endpoint's response body (operator-domain detail) stays in logs.
+    #[tokio::test]
+    async fn failure_embed_reports_no_endpoint_body() {
+        let ctx = ctx(vec![Err(LlmError::Request(
+            "HTTP 401: account=secret-org project=hidden".to_owned(),
+        ))]);
+        seed_config(&ctx.storage, &assigned_config());
+        seed_service_channel(&ctx);
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .await;
+
+        let text = ctx.output.messages().into_iter().next().expect("service notice expected");
+        assert!(text.contains("could not be reached"));
+        assert!(
+            !text.contains("secret-org"),
+            "the endpoint body must not reach guild-visible embeds"
+        );
     }
 
     #[tokio::test]

@@ -81,6 +81,23 @@ pub enum LlmError {
     EmptyResponse,
 }
 
+impl LlmError {
+    /// Guild-presentable classification for service-channel embeds: names
+    /// what happened without quoting the endpoint's response body, which can
+    /// carry operator-domain detail (account/project identifiers). The full
+    /// error text stays in tracing.
+    #[must_use]
+    pub fn classify(&self) -> &'static str {
+        match self {
+            Self::InvalidModelRef(_) | Self::UnknownProvider(_) => {
+                "the model is not available (check the bot configuration)"
+            }
+            Self::Request(_) => "the endpoint could not be reached or rejected the request",
+            Self::EmptyResponse => "the endpoint returned no content",
+        }
+    }
+}
+
 /// Driven port: single-shot completion. Streaming renderers ride the chat
 /// output ports, not this trait - the answer arrives as one string and is
 /// delivered (and split) by the engine.

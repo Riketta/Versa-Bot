@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -7,6 +6,7 @@ use std::{
 use async_trait::async_trait;
 use bon::bon;
 use futures_util::FutureExt;
+use parking_lot::Mutex;
 use tracing::Instrument;
 
 use crate::common::panic_message;
@@ -34,6 +34,11 @@ pub struct KernelService<E: EventBusPort> {
     /// One-shot guard: the explicit `shutdown()` and the `Drop` fallback
     /// together must stop plugins exactly once.
     shutdown_started: AtomicBool,
+    /// Plugins that reached a successful `start()` under a successful boot -
+    /// the only ones `shutdown` may ever stop. Drained by `shutdown`; a
+    /// failed boot leaves it empty (rolled-back plugins were already stopped
+    /// and a plugin that never started owes no stop).
+    started: Mutex<Vec<Arc<dyn PluginPort>>>,
 }
 
 #[bon]
@@ -53,6 +58,7 @@ impl<E: EventBusPort> KernelService<E> {
             chat_output_factory,
             storage,
             shutdown_started: AtomicBool::new(false),
+            started: Mutex::new(Vec::new()),
         }
     }
 
@@ -87,6 +93,7 @@ impl<E: EventBusPort> KernelService<E> {
             }
         }
 
+        *self.started.lock() = started;
         tracing::info!("kernel booted");
         Ok(())
     }
@@ -150,21 +157,20 @@ impl<E: EventBusPort> KernelService<E> {
         }
     }
 
-    /// Ordered stop of all plugins, reverse registration order. Idempotent:
-    /// an explicit `shutdown()` followed by `Drop` stops every plugin exactly
-    /// once, so `PluginPort::stop` implementations are never double-invoked
-    /// by the kernel. A name listed twice (the same instance, dual
-    /// registration) is stopped once.
+    /// Ordered stop of the plugins that reached a successful `start()` under
+    /// a successful boot, in reverse start order - exactly once each.
+    /// Idempotent: an explicit `shutdown()` followed by the `Drop` fallback
+    /// stops every started plugin exactly once, so `PluginPort::stop`
+    /// implementations are never double-invoked by the kernel. A failed boot
+    /// leaves nothing to stop: rolled-back plugins were stopped by the
+    /// rollback, and a plugin that never started owes no stop.
     pub fn shutdown(&self) {
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
         }
-        let mut seen = HashSet::new();
-        for plugin in self.plugins.iter().rev() {
-            if seen.insert(plugin.name()) {
-                if let Err(err) = plugin.stop() {
-                    tracing::error!(plugin = plugin.name(), %err, "plugin stop failed");
-                }
+        for plugin in self.started.lock().drain(..).rev() {
+            if let Err(err) = plugin.stop() {
+                tracing::error!(plugin = plugin.name(), %err, "plugin stop failed");
             }
         }
     }
@@ -755,12 +761,43 @@ mod tests {
             vec![Arc::clone(&plugin) as Arc<dyn PluginPort>],
             vec![],
         );
+        kernel.boot().expect("boot expected to succeed");
 
         kernel.shutdown();
         drop(kernel); // Drop runs shutdown again - a no-op by the guard.
 
         let entries = log.lock().clone();
         assert_eq!(entries, vec!["stop:p".to_owned()], "plugins must be stopped exactly once");
+    }
+
+    /// After a rolled-back boot (a later plugin's `start` failed), neither
+    /// the explicit shutdown nor `Drop` may stop the already-rolled-back
+    /// plugins a second time - and never-stated ones are not stopped at all.
+    #[test]
+    fn rollback_then_drop_never_double_stops() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let fine =
+            Arc::new(LifecyclePlugin { name: "fine", log: Arc::clone(&log), fail_init: false });
+        let broken = Arc::new(FailingStartPlugin { name: "broken", log: Arc::clone(&log) });
+
+        let (kernel, _output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![
+                Arc::clone(&fine) as Arc<dyn PluginPort>,
+                Arc::clone(&broken) as Arc<dyn PluginPort>,
+            ],
+            vec![],
+        );
+
+        assert!(kernel.boot().is_err());
+        drop(kernel);
+
+        assert_eq!(
+            log.lock().clone(),
+            vec!["init:fine".to_owned(), "start:fine".to_owned(), "stop:fine".to_owned(),],
+            "the rolled-back plugin is stopped exactly once by the rollback; 
+             the never-started one is never stopped"
+        );
     }
 
     /// `Abort` is the hard stop: remaining `pre` hooks are skipped AND no
@@ -860,6 +897,14 @@ mod tests {
             log.lock().clone(),
             vec!["init:healthy".to_owned(), "init:broken".to_owned()],
             "no start and no stop may run after an init failure"
+        );
+        // Dropping the failed kernel must not stop plugins that never
+        // started: a plugin owes a stop only after its own start.
+        drop(kernel);
+        assert_eq!(
+            log.lock().clone(),
+            vec!["init:healthy".to_owned(), "init:broken".to_owned()],
+            "Drop after a failed boot must stop nothing"
         );
     }
 

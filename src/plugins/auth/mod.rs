@@ -113,7 +113,7 @@ impl PluginPort for AuthPlugin {
                 required_permission: Some(Permission { name: "manage_guild".to_owned() }),
                 guild_only: true,
             },
-            Arc::new(AuthCommandHandler),
+            Arc::new(AuthCommandHandler::default()),
         );
         Ok(())
     }

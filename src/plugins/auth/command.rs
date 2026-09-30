@@ -2,7 +2,10 @@
 //! document the middleware gate reads; meaning (who may use the bot) lives
 //! in this plugin, not in the dispatcher.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::kernel::{
     models::{Embed, OutboundMessage, RequestContext},
@@ -18,7 +21,24 @@ use super::{AuthConfig, CONFIG_KEY, NAMESPACE};
 /// gate has already vetted the invoker; Discord additionally hides the
 /// command behind Manage Server (`default_member_permissions`). Every
 /// answer is ephemeral: policy data stays between the bot and the admin.
-pub struct AuthCommandHandler;
+/// Policy writes serialize on one plugin-wide lock: the read-modify-write of
+/// the policy document must not lose one of two concurrent admin updates.
+pub struct AuthCommandHandler {
+    policy_writes: Arc<AsyncMutex<()>>,
+}
+
+impl AuthCommandHandler {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { policy_writes: Arc::new(AsyncMutex::new(())) }
+    }
+}
+
+impl Default for AuthCommandHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait]
 impl CommandHandler for AuthCommandHandler {
@@ -35,7 +55,7 @@ impl CommandHandler for AuthCommandHandler {
         match args.get("action") {
             Some("show") => show_policy(&**storage, services).await,
             Some(action @ ("allow" | "deny")) => {
-                mutate_policy(&**storage, services, args, action).await
+                mutate_policy(&**storage, &self.policy_writes, services, args, action).await
             }
             _ => reply(services, usage()).await,
         }
@@ -49,10 +69,14 @@ enum Target {
 
 async fn mutate_policy(
     storage: &dyn GuildStorage,
+    policy_writes: &AsyncMutex<()>,
     services: &KernelServices,
     args: &CommandArgs,
     action: &str,
 ) -> anyhow::Result<()> {
+    // One write at a time: allow/deny is a document read-modify-write, and
+    // two concurrent invocations must not lose one update.
+    let _write = policy_writes.lock().await;
     let target = match (args.get("user"), args.get("role")) {
         (Some(user), None) => Target::User(user.to_owned()),
         (None, Some(role)) => Target::Role(role.to_owned()),
@@ -255,7 +279,7 @@ mod tests {
     async fn allow_user_adds_to_policy() {
         let (storage, services, output) = fixture();
 
-        AuthCommandHandler
+        AuthCommandHandler::default()
             .invoke(&command_event(), &auth_args("allow", Some("42"), None), &services)
             .await
             .expect("allow expected to succeed");
@@ -273,7 +297,7 @@ mod tests {
     async fn allow_role_adds_to_policy() {
         let (storage, services, output) = fixture();
 
-        AuthCommandHandler
+        AuthCommandHandler::default()
             .invoke(&command_event(), &auth_args("allow", None, Some("7")), &services)
             .await
             .expect("allow expected to succeed");
@@ -298,7 +322,7 @@ mod tests {
             serde_json::json!({ "allowed_users": ["42"], "allowed_roles": [] }),
         );
 
-        AuthCommandHandler
+        AuthCommandHandler::default()
             .invoke(&command_event(), &auth_args("allow", Some("42"), None), &services)
             .await
             .expect("allow expected to succeed");
@@ -323,7 +347,7 @@ mod tests {
             serde_json::json!({ "allowed_users": ["42", "43"], "allowed_roles": [] }),
         );
 
-        AuthCommandHandler
+        AuthCommandHandler::default()
             .invoke(&command_event(), &auth_args("deny", Some("42"), None), &services)
             .await
             .expect("deny expected to succeed");
@@ -345,7 +369,7 @@ mod tests {
     async fn deny_missing_reports_without_saving() {
         let (storage, services, output) = fixture();
 
-        AuthCommandHandler
+        AuthCommandHandler::default()
             .invoke(&command_event(), &auth_args("deny", Some("42"), None), &services)
             .await
             .expect("deny expected to succeed");
@@ -375,7 +399,7 @@ mod tests {
             serde_json::json!({ "allowed_users": ["42"], "allowed_roles": [] }),
         );
 
-        AuthCommandHandler
+        AuthCommandHandler::default()
             .invoke(&command_event(), &auth_args("deny", Some("42"), None), &services)
             .await
             .expect("deny expected to succeed");
@@ -401,7 +425,7 @@ mod tests {
             serde_json::json!({ "allowed_users": ["42"], "allowed_roles": ["7"] }),
         );
 
-        AuthCommandHandler
+        AuthCommandHandler::default()
             .invoke(&command_event(), &auth_args("show", None, None), &services)
             .await
             .expect("show expected to succeed");
@@ -416,7 +440,7 @@ mod tests {
     async fn show_empty_policy_reports_none() {
         let (_storage, services, output) = fixture();
 
-        AuthCommandHandler
+        AuthCommandHandler::default()
             .invoke(&command_event(), &auth_args("show", None, None), &services)
             .await
             .expect("show expected to succeed");
@@ -438,7 +462,7 @@ mod tests {
             serde_json::json!("not an object"),
         );
 
-        AuthCommandHandler
+        AuthCommandHandler::default()
             .invoke(&command_event(), &auth_args("allow", Some("42"), None), &services)
             .await
             .expect("allow expected to succeed");
@@ -457,7 +481,7 @@ mod tests {
     async fn missing_target_shows_usage() {
         let (_storage, services, output) = fixture();
 
-        AuthCommandHandler
+        AuthCommandHandler::default()
             .invoke(&command_event(), &auth_args("allow", None, None), &services)
             .await
             .expect("invoke expected to succeed");
@@ -471,7 +495,7 @@ mod tests {
     async fn both_targets_shows_usage() {
         let (_storage, services, output) = fixture();
 
-        AuthCommandHandler
+        AuthCommandHandler::default()
             .invoke(&command_event(), &auth_args("allow", Some("42"), Some("7")), &services)
             .await
             .expect("invoke expected to succeed");
@@ -489,7 +513,7 @@ mod tests {
     async fn unknown_action_shows_usage() {
         let (_storage, services, output) = fixture();
 
-        AuthCommandHandler
+        AuthCommandHandler::default()
             .invoke(&command_event(), &auth_args("teleport", Some("42"), None), &services)
             .await
             .expect("invoke expected to succeed");
@@ -504,7 +528,7 @@ mod tests {
         let output = RecordingChatOutput::new();
         let services = dm_services(&output);
 
-        AuthCommandHandler
+        AuthCommandHandler::default()
             .invoke(&command_event(), &auth_args("allow", Some("42"), None), &services)
             .await
             .expect("invoke expected to succeed");
