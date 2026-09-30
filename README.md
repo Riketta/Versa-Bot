@@ -189,6 +189,11 @@ For production, point `VERSABOT__STORAGE__URL` at PostgreSQL. To use a
 config file instead of env vars, mount it at `/app/versabot.toml:ro`.
 Set `RUST_LOG` to tune log verbosity (default `info`).
 
+A ready-made Compose deployment ships as `docker-compose.yaml`: it passes
+`.env` (copy `.env.example`) into the container, keeps the SQLite file in
+the `versa-bot-data` volume, and carries a commented PostgreSQL stack -
+`cp .env.example .env`, fill in the token, then `docker compose up -d`.
+
 ## Development
 
 - `cargo test` - unit tests cover the kernel pipeline, storage guild

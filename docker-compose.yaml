@@ -1,0 +1,56 @@
+# VersaBot Compose deployment. This file contains no secrets: they live in
+# `.env` next to it (gitignored) - copy `.env.example` and fill it in:
+#
+#   cp .env.example .env   # then edit
+#   docker compose up -d
+#
+# SQLite state lives in the `versa-bot-data` volume; the commented `db`
+# service below switches storage to PostgreSQL.
+
+services:
+  versa-bot:
+    # Built by CI on every push to main and v* tags (see README "Docker").
+    image: ghcr.io/owner/versa-bot:latest
+    # Forgejo instance registry alternative:
+    # image: git.versalita.net/owner/versa-bot:latest
+    container_name: versa-bot
+    restart: unless-stopped
+    # Injected into the container and available for ${...} substitution.
+    # Compose fails fast when the file is missing - create it first.
+    env_file: .env
+    environment:
+      # SQLite inside the volume; comment out when switching to PostgreSQL.
+      # `environment` wins over values coming from .env.
+      VERSABOT__STORAGE__URL: sqlite:///data/versabot.db
+      # PostgreSQL, together with the db service below; password from .env:
+      # VERSABOT__STORAGE__URL: postgres://versa_bot:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/versa_bot
+      # Debug logging for troubleshooting; default is info.
+      # RUST_LOG: debug
+    volumes:
+      - versa-bot-data:/data
+      # Config-file style instead of env vars: the bot reads ./versabot.toml
+      # from its working directory.
+      # - ./versabot.toml:/app/versabot.toml:ro
+    # Only needed together with PostgreSQL:
+    # depends_on:
+    #   db:
+    #     condition: service_healthy
+
+  # db:
+  #   image: postgres:18-alpine
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER: versa_bot
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+  #     POSTGRES_DB: versa_bot
+  #   volumes:
+  #     - versa-bot-pgdata:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U versa_bot -d versa_bot"]
+  #     interval: 5s
+  #     timeout: 5s
+  #     retries: 10
+
+volumes:
+  versa-bot-data:
+  # versa-bot-pgdata:
