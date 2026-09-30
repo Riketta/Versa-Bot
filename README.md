@@ -49,6 +49,14 @@ a slash command from any other reply path.
   membership changes published on the bus as structured `audit` tracing
   events (stdout + Sentry/GlitchTip), with origin fields, no per-guild
   configuration needed.
+- LLM chat plugin (`llm` plugin, management commands live): guild admins can
+  already wire channels up - `/llm_assign model` assigns the chat bot to the
+  channel it is run in, `/llm_unassign` removes it, `/llm_admin` and
+  `/llm_admin_clear` manage the guild's service channel for LLM errors and
+  notices (all Manage Server, guild-only). Per-channel configuration -
+  model, sampling parameters, system prompt, compaction, streaming - is
+  stored guild-partitioned and takes effect as the conversation engine
+  lands (see Roadmap).
 - Status rotator (`status_rotator` plugin): cycles the bot's activity
   through a configured list on a configured interval - both come from the
   optional `[status]` section of the config file (presence is bot-wide,
@@ -192,7 +200,7 @@ src/
 │   │   ├── plugin_ports/   # plugin contracts (PluginPort, commands, bus)
 │   │   └── services/       # KernelService (pipeline runner, lifecycle)
 │   └── models/             # event taxonomy, IDs, errors
-├── plugins/           # features: auth, command dispatcher, tracker, audit trail, status rotator
+├── plugins/           # features: auth, command dispatcher, tracker, audit trail, status rotator, llm chat
 ├── infrastructure/    # adapters
 │   ├── inbound_adapters/   # Discord gateway + scoped output factory
 │   ├── outbound_adapters/  # storage (sqlx), Discord command registrar, presence
@@ -202,5 +210,7 @@ src/
 
 ## Roadmap
 
-- LLM chat plugin; message history
+- LLM chat plugin conversation engine: capture/trigger rules, provider
+  adapters (OpenAI-compatible first), compaction, streaming, random replies;
+  `/llm_set`, `/llm_prompt`, `/llm_cutoff`, `/llm_status` commands
 - Further platform adapters (Telegram, Matrix, ...)

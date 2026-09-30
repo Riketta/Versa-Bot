@@ -23,6 +23,7 @@ use versa_bot::kernel::{
 use versa_bot::plugins::audit::AuditLogPlugin;
 use versa_bot::plugins::auth::AuthPlugin;
 use versa_bot::plugins::command::CommandPlugin;
+use versa_bot::plugins::llm::LlmPlugin;
 use versa_bot::plugins::status::{StatusRotatorPlugin, StatusSettings};
 use versa_bot::plugins::tracker::UserActivityTrackerPlugin;
 
@@ -68,6 +69,9 @@ async fn main() -> ExitCode {
         event_bus.clone(),
         Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
     ));
+    // LLM chat plugin: lifecycle + admin commands live now; its conversation
+    // engine joins the middleware chain as those steps land.
+    let llm = Arc::new(LlmPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>));
     // Bus-only plugin: in `plugins` for lifecycle, never in the middleware
     // chain - it reacts to derived events, not to raw inbound ones.
     let audit = Arc::new(AuditLogPlugin::new(event_bus.clone()));
@@ -101,6 +105,7 @@ async fn main() -> ExitCode {
         Arc::clone(&auth) as Arc<dyn PluginPort>,
         Arc::clone(&command) as Arc<dyn PluginPort>,
         Arc::clone(&tracker) as Arc<dyn PluginPort>,
+        Arc::clone(&llm) as Arc<dyn PluginPort>,
         Arc::clone(&audit) as Arc<dyn PluginPort>,
         Arc::clone(&status_plugin) as Arc<dyn PluginPort>,
     ];

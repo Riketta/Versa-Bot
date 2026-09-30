@@ -17,6 +17,7 @@ config = {
   ]
 }
 parking_lot = "0.12.5"
+rand = "0.9"
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 reqwest = { version = "0.12", features = ["socks"] }
 sentry = { version = "0.49", default-features = false, features = [
