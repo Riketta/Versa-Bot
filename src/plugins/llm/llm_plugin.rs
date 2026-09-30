@@ -194,7 +194,7 @@ mod tests {
     };
     use crate::plugins::llm::{
         ChatEngine, CompletionRequest, CompletionResponse, ConversationRecord, LlmCompletionPort,
-        LlmError, LlmSettings, RecordRole,
+        LlmError, LlmSettings, RandRandom, RandomPort, RecordRole,
     };
     use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
 
@@ -271,6 +271,7 @@ mod tests {
         let engine = Arc::new(ChatEngine::new(
             Arc::new(LlmSettings::default()),
             Arc::new(StubCompletion) as Arc<dyn LlmCompletionPort>,
+            Arc::new(RandRandom) as Arc<dyn RandomPort>,
         ));
         let plugin = LlmPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>, engine);
         (plugin, Fixture { registry, storage, services, output })

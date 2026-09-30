@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use crate::kernel::{
     models::{ChannelId, Embed, GuildId, MessageId, MessagePayload, Origin, OutboundMessage},
     services::KernelServices,
-    spi_ports::GuildStorage,
+    spi_ports::{ChatStreamPort, GuildStorage},
 };
 
 use super::completion_port::{CompletionRequest, LlmCompletionPort};
@@ -29,6 +29,7 @@ use super::model::{
     records_namespace, unix_now,
 };
 use super::providers::LlmSettings;
+use super::rng::{RandomPort, RandomScope};
 
 /// Identifies one channel for service-notice cooldowns: platform, guild,
 /// channel.
@@ -38,17 +39,40 @@ type ChannelKey = (String, u64, u64);
 /// provider must not turn every triggering message into an admin ping.
 const NOTICE_COOLDOWN: Duration = Duration::from_secs(300);
 
+/// Minimum interval between random chime-ins for the same channel: the deck
+/// already prevents statistical clumping, this prevents two chime-ins on
+/// consecutive messages.
+const CHIME_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// Upper bound of in-place edits while progressively revealing an answer;
+/// the reveal step derives from the content length, so this bounds the whole
+/// reveal regardless of `max_length`.
+const MAX_STREAM_EDITS: usize = 10;
+
 pub struct ChatEngine {
     settings: Arc<LlmSettings>,
     completion: Arc<dyn LlmCompletionPort>,
+    rng: Arc<dyn RandomPort>,
     /// Last error-notice time per channel (see [`NOTICE_COOLDOWN`]).
     notices: Mutex<HashMap<ChannelKey, Instant>>,
+    /// Last random chime-in time per channel (see [`CHIME_COOLDOWN`]).
+    chimes: Mutex<HashMap<ChannelKey, Instant>>,
 }
 
 impl ChatEngine {
     #[must_use]
-    pub fn new(settings: Arc<LlmSettings>, completion: Arc<dyn LlmCompletionPort>) -> Self {
-        Self { settings, completion, notices: Mutex::new(HashMap::new()) }
+    pub fn new(
+        settings: Arc<LlmSettings>,
+        completion: Arc<dyn LlmCompletionPort>,
+        rng: Arc<dyn RandomPort>,
+    ) -> Self {
+        Self {
+            settings,
+            completion,
+            rng,
+            notices: Mutex::new(HashMap::new()),
+            chimes: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Processes one inbound message of an assigned channel. Always
@@ -75,6 +99,7 @@ impl ChatEngine {
         let reply_to = payload.reply_to.map(MessageId::get);
         let mut live_records: Vec<ConversationRecord> =
             live.iter().map(|(_, record)| record.clone()).collect();
+        let mut captured = false;
         if conversation::should_capture(
             config.capture_mode,
             payload.mentions_bot,
@@ -94,6 +119,7 @@ impl ChatEngine {
                     live.push((seq, record.clone()));
                     // The triggering message must be part of the context.
                     live_records.push(record);
+                    captured = true;
                 }
                 Err(err) => {
                     tracing::warn!(channel = channel_id, %err, "failed to capture message into history");
@@ -102,6 +128,25 @@ impl ChatEngine {
         }
 
         if conversation::should_trigger(payload.mentions_bot, reply_to, &live_records) {
+            self.answer(origin, config, &state, &live_records, services).await;
+        } else if captured
+            && config.random_chance_percent > 0.0
+            && self.chime_allowed(origin)
+            && self.rng.chance_percent(
+                RandomScope {
+                    platform: origin.platform.as_str(),
+                    guild_id: origin.guild_id.map_or(0, GuildId::get),
+                    channel_id: origin.channel_id.get(),
+                },
+                config.random_chance_percent,
+            )
+        {
+            // Random chime-in: same delivery path as a mention reply - the
+            // answer is assembled from the context the message just joined
+            // and recorded as an assistant turn. Only CAPTURED messages are
+            // eligible: chiming in on a message the bot never tracked would
+            // look like answering nothing.
+            self.note_chime(origin);
             self.answer(origin, config, &state, &live_records, services).await;
         }
 
@@ -164,16 +209,22 @@ impl ChatEngine {
 
         // The streaming port doubles as the plain reply path: `begin`
         // delivers the first chunk and yields the platform message id the
-        // assistant record needs for reply-chain detection.
+        // assistant record needs for reply-chain detection. Streaming mode
+        // starts from a placeholder and reveals the first chunk in place;
+        // plain mode delivers the full first chunk immediately.
         let stream = services.chat_output_factory.stream_output(origin);
+        let first_chunk = chunks.first().expect("non-empty chunks checked").clone();
+        let placeholder = if config.streaming { "…" } else { first_chunk.as_str() };
         let mut first_message_id: Option<u64> = None;
-        if let Some(first) = chunks.first() {
-            match stream.begin(OutboundMessage::text(first.clone())).await {
-                Ok(id) => first_message_id = Some(id.get()),
-                Err(err) => {
-                    tracing::warn!(channel = channel_id, %err, "stream begin failed - falling back to plain sends");
-                }
+        match stream.begin(OutboundMessage::text(placeholder.to_owned())).await {
+            Ok(id) => first_message_id = Some(id.get()),
+            Err(err) => {
+                tracing::warn!(channel = channel_id, %err, "stream begin failed - falling back to plain sends");
             }
+        }
+
+        if let (true, Some(id)) = (config.streaming, first_message_id) {
+            self.reveal_progressively(&stream, MessageId(id), &first_chunk).await;
         }
 
         let delivered_first = usize::from(first_message_id.is_some());
@@ -465,6 +516,49 @@ impl ChatEngine {
             }
         }
     }
+
+    fn chime_allowed(&self, origin: &Origin) -> bool {
+        let key: ChannelKey = (
+            origin.platform.as_str().to_owned(),
+            origin.guild_id.map_or(0, GuildId::get),
+            origin.channel_id.get(),
+        );
+        !matches!(self.chimes.lock().get(&key), Some(last) if last.elapsed() < CHIME_COOLDOWN)
+    }
+
+    fn note_chime(&self, origin: &Origin) {
+        let key: ChannelKey = (
+            origin.platform.as_str().to_owned(),
+            origin.guild_id.map_or(0, GuildId::get),
+            origin.channel_id.get(),
+        );
+        self.chimes.lock().insert(key, Instant::now());
+    }
+
+    /// Reveals `content` in place on `message`, at the configured cadence,
+    /// in at most [`MAX_STREAM_EDITS`] edits - the last one carries the
+    /// exact full text. Failed updates are logged and skipped: the next
+    /// tick re-sends a longer prefix, so a transient edit failure heals
+    /// itself; the message is only ever behind, never wrong.
+    async fn reveal_progressively(
+        &self,
+        stream: &Arc<dyn ChatStreamPort>,
+        message: MessageId,
+        content: &str,
+    ) {
+        let interval = Duration::from_millis(self.settings.stream_interval_ms.max(1));
+        let total = content.chars().count();
+        let step = total.div_ceil(MAX_STREAM_EDITS).max(1);
+        let mut revealed = 0;
+        while revealed < total {
+            tokio::time::sleep(interval).await;
+            revealed = (revealed + step).min(total);
+            let text: String = content.chars().take(revealed).collect();
+            if let Err(err) = stream.update(message, text).await {
+                tracing::warn!(%err, "streaming update failed - continuing");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -476,6 +570,7 @@ mod tests {
     };
     use crate::plugins::llm::completion_port::{ChatRole, CompletionResponse, LlmError};
     use crate::plugins::llm::model::{CaptureMode, channel_config_key};
+    use crate::plugins::llm::rng::RandRandom;
     use crate::test_support::{InMemoryStorage, RecordingChatOutput};
     use async_trait::async_trait;
     use parking_lot::Mutex;
@@ -510,6 +605,7 @@ mod tests {
     /// `begin`-returns-a-handle behavior the engine relies on.
     struct StreamRecordingFactory {
         begins: Arc<Mutex<Vec<String>>>,
+        updates: Arc<Mutex<Vec<String>>>,
         output: Arc<RecordingChatOutput>,
     }
 
@@ -529,6 +625,7 @@ mod tests {
         fn stream_output(&self, _origin: &Origin) -> Arc<dyn ChatStreamPort> {
             Arc::new(RecordingStream {
                 begins: Arc::clone(&self.begins),
+                updates: Arc::clone(&self.updates),
                 counter: AtomicU64::new(100),
             })
         }
@@ -545,6 +642,7 @@ mod tests {
 
     struct RecordingStream {
         begins: Arc<Mutex<Vec<String>>>,
+        updates: Arc<Mutex<Vec<String>>>,
         counter: AtomicU64,
     }
 
@@ -555,8 +653,19 @@ mod tests {
             Ok(MessageId(self.counter.fetch_add(1, Ordering::Relaxed)))
         }
 
-        async fn update(&self, _message: MessageId, _content: String) -> Result<(), OutboundError> {
+        async fn update(&self, _message: MessageId, content: String) -> Result<(), OutboundError> {
+            self.updates.lock().push(content);
             Ok(())
+        }
+    }
+
+    /// Deterministic RNG for chime-in tests.
+    struct FixedRandom(bool);
+
+    #[async_trait]
+    impl RandomPort for FixedRandom {
+        fn chance_percent(&self, _scope: RandomScope, _percent: f64) -> bool {
+            self.0
         }
     }
 
@@ -566,33 +675,47 @@ mod tests {
         storage: Arc<InMemoryStorage>,
         output: Arc<RecordingChatOutput>,
         begins: Arc<Mutex<Vec<String>>>,
+        updates: Arc<Mutex<Vec<String>>>,
         services: KernelServices,
     }
 
     fn ctx(responses: Vec<Result<String, LlmError>>) -> TestCtx {
-        ctx_with(LlmSettings::default(), responses)
+        ctx_random(LlmSettings::default(), Arc::new(RandRandom), responses)
     }
 
     fn ctx_with(settings: LlmSettings, responses: Vec<Result<String, LlmError>>) -> TestCtx {
+        ctx_random(settings, Arc::new(RandRandom), responses)
+    }
+
+    fn ctx_random(
+        settings: LlmSettings,
+        rng: Arc<dyn RandomPort>,
+        responses: Vec<Result<String, LlmError>>,
+    ) -> TestCtx {
         let settings = Arc::new(settings);
         let fake = Arc::new(FakeCompletion {
             responses: Mutex::new(responses),
             requests: Mutex::new(Vec::new()),
         });
-        let engine =
-            ChatEngine::new(Arc::clone(&settings), Arc::clone(&fake) as Arc<dyn LlmCompletionPort>);
+        let engine = ChatEngine::new(
+            Arc::clone(&settings),
+            Arc::clone(&fake) as Arc<dyn LlmCompletionPort>,
+            rng,
+        );
         let storage = Arc::new(InMemoryStorage::new());
         let output = RecordingChatOutput::new();
         let begins = Arc::new(Mutex::new(Vec::new()));
+        let updates = Arc::new(Mutex::new(Vec::new()));
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::new(StreamRecordingFactory {
                 begins: Arc::clone(&begins),
+                updates: Arc::clone(&updates),
                 output: Arc::clone(&output),
             }),
             guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
         };
-        TestCtx { engine, fake, storage, output, begins, services }
+        TestCtx { engine, fake, storage, output, begins, updates, services }
     }
 
     fn assigned_config() -> ChannelConfig {
@@ -855,7 +978,11 @@ mod tests {
             responses: Mutex::new(vec![]),
             requests: Mutex::new(Vec::new()),
         });
-        let engine = ChatEngine::new(settings, Arc::clone(&fake) as Arc<dyn LlmCompletionPort>);
+        let engine = ChatEngine::new(
+            settings,
+            Arc::clone(&fake) as Arc<dyn LlmCompletionPort>,
+            Arc::new(RandRandom) as Arc<dyn RandomPort>,
+        );
         let output = RecordingChatOutput::new();
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
@@ -984,5 +1111,95 @@ mod tests {
         assert_eq!(state_raw, None);
         // Seeded record + capture + the assistant turn.
         assert_eq!(stored_records(&ctx).await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn random_reply_fires_on_captured_non_trigger_message() {
+        let ctx = ctx_random(
+            LlmSettings::default(),
+            Arc::new(FixedRandom(true)),
+            vec![Ok("random thought".to_owned())],
+        );
+        let config = ChannelConfig { capture_mode: CaptureMode::AllMessages, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
+
+        assert_eq!(ctx.fake.requests().len(), 1);
+        assert_eq!(ctx.begins.lock().clone(), vec!["random thought".to_owned()]);
+        let records = stored_records(&ctx).await;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records.get(1).map(|record| record.role), Some(RecordRole::Assistant));
+    }
+
+    #[tokio::test]
+    async fn random_reply_miss_leaves_only_the_capture() {
+        let ctx = ctx_random(LlmSettings::default(), Arc::new(FixedRandom(false)), vec![]);
+        let config = ChannelConfig { capture_mode: CaptureMode::AllMessages, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
+
+        assert!(ctx.fake.requests().is_empty());
+        assert_eq!(stored_records(&ctx).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn random_reply_never_fires_for_uncaptured_messages() {
+        // bot_related mode, no mention, no reply link: the message is not
+        // even in the context - chiming in would look like answering nothing.
+        let ctx = ctx_random(LlmSettings::default(), Arc::new(FixedRandom(true)), vec![]);
+        seed_config(&ctx.storage, &assigned_config());
+
+        ctx.engine
+            .handle_message(&origin(), &payload(false, None), &assigned_config(), &ctx.services)
+            .await;
+
+        assert!(ctx.fake.requests().is_empty());
+        assert!(stored_records(&ctx).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn random_chime_ins_are_cooldown_gated() {
+        let ctx = ctx_random(
+            LlmSettings::default(),
+            Arc::new(FixedRandom(true)),
+            vec![Ok("chime".to_owned())],
+        );
+        let config = ChannelConfig { capture_mode: CaptureMode::AllMessages, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+
+        for _ in 0..2 {
+            ctx.engine
+                .handle_message(&origin(), &payload(false, None), &config, &ctx.services)
+                .await;
+        }
+
+        // First message chimes; the second lands inside the cooldown window.
+        assert_eq!(ctx.fake.requests().len(), 1);
+        // Two captures + one assistant turn.
+        assert_eq!(stored_records(&ctx).await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn streaming_reveals_progressively_then_finalizes() {
+        let settings = LlmSettings { stream_interval_ms: 1, ..LlmSettings::default() };
+        let ctx = ctx_with(settings, vec![Ok("answer text".to_owned())]);
+        let config = ChannelConfig { streaming: true, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+
+        // Placeholder begin, then prefix reveals ending on the exact chunk.
+        assert_eq!(ctx.begins.lock().clone(), vec!["…".to_owned()]);
+        let updates = ctx.updates.lock().clone();
+        assert_eq!(updates.last().map(String::as_str), Some("answer text"));
+        assert!(updates.len() <= MAX_STREAM_EDITS);
+        let first = updates.first().expect("at least one update expected");
+        assert!(first.chars().count() < "answer text".chars().count());
+        // Reveals are prefixes of the final text - never wrong, only behind.
+        for update in &updates {
+            assert!("answer text".starts_with(update.as_str()));
+        }
     }
 }

@@ -212,8 +212,9 @@ src/
 
 ## Roadmap
 
-- LLM chat plugin engine runtime wiring: the `[llm]` config section
-  (providers, models, compaction defaults), streaming loop, random replies;
-  `/llm_set`, `/llm_prompt` commands (capture/trigger, context assembly,
-  compaction and the OpenAI-compatible provider layer are implemented)
+- LLM chat plugin runtime wiring: the `[llm]` config section (providers,
+  models, compaction defaults) and the `/llm_set`, `/llm_prompt` commands
+  (the conversation engine - capture/trigger, context assembly, compaction,
+  streaming, random replies, and the OpenAI-compatible provider layer - is
+  implemented)
 - Further platform adapters (Telegram, Matrix, ...)
