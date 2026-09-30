@@ -427,6 +427,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_overwrites_the_previous_value() {
+        // The upsert path is what the LLM plugin's one-atomic-write state
+        // commit rides: the same key must replace, not duplicate.
+        let storage = sqlite_storage().await;
+        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+
+        guild.set("llm", "state", Value::String("first".to_owned())).await.unwrap();
+        guild.set("llm", "state", Value::String("second".to_owned())).await.unwrap();
+
+        assert_eq!(
+            guild.get("llm", "state").await.unwrap(),
+            Some(Value::String("second".to_owned()))
+        );
+        assert_eq!(guild.list_keys("llm").await.unwrap(), ["state"]);
+    }
+
+    /// The reserved namespace is write-only guarded: kernel-side reads of
+    /// guild settings must stay permitted (the config manager depends on it).
+    #[tokio::test]
+    async fn reserved_guild_namespace_permits_reads() {
+        let storage = sqlite_storage().await;
+        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+
+        let seeded = guild.get(GUILD_SETTINGS, "language").await.unwrap();
+        assert_eq!(seeded, None);
+        assert!(guild.list_keys(GUILD_SETTINGS).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn reserved_guild_namespace_rejects_writes() {
         let storage = sqlite_storage().await;
         let guild = storage.guild_scoped(Platform::Discord, GuildId(1));

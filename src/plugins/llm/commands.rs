@@ -731,6 +731,11 @@ impl CommandHandler for PromptLlmHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::models::{GuildId, Platform};
+    use crate::kernel::spi_ports::StoragePort;
+    use crate::plugins::llm::RecordRole;
+    use crate::plugins::llm::completion_port::TokenUsage;
+    use crate::test_support::InMemoryStorage;
 
     #[test]
     fn float_params_set_and_clear() {
@@ -803,5 +808,87 @@ mod tests {
         assert!(apply_set(&mut config, "depth", "clear").is_err());
         apply_set(&mut config, "model", "zai/glm-5.3-flash").expect("model expected");
         assert_eq!(config.model, "zai/glm-5.3-flash");
+    }
+
+    fn user_record(content: &str) -> serde_json::Value {
+        serde_json::to_value(ConversationRecord {
+            message_id: Some(1),
+            role: RecordRole::User,
+            author: Some("alice".to_owned()),
+            content: content.to_owned(),
+            reply_to: None,
+            captured_at: 0,
+        })
+        .expect("record expected to serialize")
+    }
+
+    /// Uncalibrated channels (no endpoint usage ever reported) show no
+    /// estimate lines - the default ratio would be noise, not data.
+    #[tokio::test]
+    async fn usage_lines_stay_hidden_without_calibration() {
+        let storage = InMemoryStorage::new();
+        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+
+        let lines = usage_lines(
+            &guild,
+            &records_namespace(2),
+            &ConversationState::default(),
+            0,
+            &UsageStats::default(),
+        )
+        .await;
+
+        assert!(lines.estimate.is_none());
+        assert!(lines.last_request.is_none());
+    }
+
+    /// Calibrated: the estimate line carries the enforced budget, the last
+    /// request line the usage block incl. cached tokens. Without a budget or
+    /// cached tokens the variants degrade cleanly.
+    #[tokio::test]
+    async fn usage_lines_render_estimate_and_last_request() {
+        let storage = InMemoryStorage::new();
+        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        // Two live turns of 10 chars each after the cutoff.
+        for content in ["aaaaaaaaaa", "bbbbbbbbbb"] {
+            guild
+                .append(&records_namespace(2), user_record(content))
+                .await
+                .expect("append expected to succeed");
+        }
+        let stats = UsageStats {
+            last: Some(TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 10,
+                total_tokens: 110,
+                cached_tokens: Some(40),
+            }),
+            tokens_per_char: 1.0,
+            last_budget: Some(500),
+        };
+
+        let lines =
+            usage_lines(&guild, &records_namespace(2), &ConversationState::default(), 2, &stats)
+                .await;
+
+        // est = 1.0 tokens/char * 20 chars + 8 per-turn overhead * 2 turns.
+        assert_eq!(lines.estimate.as_deref(), Some("Est. context: ~36 / 500 tokens"));
+        assert_eq!(
+            lines.last_request.as_deref(),
+            Some("Last request: 100 prompt / 10 completion / 110 total tokens (+40 cached)")
+        );
+
+        let plain = UsageStats { last_budget: None, ..stats };
+        let mut bare = stats.last.expect("usage expected");
+        bare.cached_tokens = None;
+        let plain = UsageStats { last: Some(bare), ..plain };
+        let lines =
+            usage_lines(&guild, &records_namespace(2), &ConversationState::default(), 2, &plain)
+                .await;
+        assert_eq!(lines.estimate.as_deref(), Some("Est. context: ~36 tokens"));
+        assert_eq!(
+            lines.last_request.as_deref(),
+            Some("Last request: 100 prompt / 10 completion / 110 total tokens")
+        );
     }
 }

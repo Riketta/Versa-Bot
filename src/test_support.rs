@@ -10,7 +10,10 @@ use serde_json::Value;
 
 use crate::kernel::{
     models::{GuildId, OutboundError, OutboundMessage, Platform, StorageError},
-    spi_ports::{ChatOutputFactoryPort, ChatOutputPort, GuildStorage, StoragePort, StoredRecord},
+    spi_ports::{
+        ChatOutputFactoryPort, ChatOutputPort, GUILD_SETTINGS, GuildStorage, StoragePort,
+        StoredRecord,
+    },
 };
 
 type Row = (String, i64, String, String);
@@ -82,6 +85,12 @@ impl GuildStorage for ScopedView {
     }
 
     async fn set(&self, namespace: &str, key: &str, value: Value) -> Result<(), StorageError> {
+        // Same reserved-namespace policy as the real sqlx adapter, so plugin
+        // tests fail on a guild-settings write instead of passing against
+        // the fake and breaking only against a real database.
+        if namespace == GUILD_SETTINGS {
+            return Err(StorageError::Forbidden("the 'guild' namespace is reserved".to_owned()));
+        }
         let (platform, guild_id) = self.key_prefix.clone();
         self.documents
             .lock()
@@ -90,6 +99,9 @@ impl GuildStorage for ScopedView {
     }
 
     async fn delete(&self, namespace: &str, key: &str) -> Result<(), StorageError> {
+        if namespace == GUILD_SETTINGS {
+            return Err(StorageError::Forbidden("the 'guild' namespace is reserved".to_owned()));
+        }
         let (platform, guild_id) = self.key_prefix.clone();
         self.documents.lock().remove(&(platform, guild_id, namespace.to_owned(), key.to_owned()));
         Ok(())
@@ -107,6 +119,9 @@ impl GuildStorage for ScopedView {
     }
 
     async fn append(&self, namespace: &str, payload: Value) -> Result<u64, StorageError> {
+        if namespace == GUILD_SETTINGS {
+            return Err(StorageError::Forbidden("the 'guild' namespace is reserved".to_owned()));
+        }
         let (platform, guild_id) = self.key_prefix.clone();
         let mut records = self.records.lock();
         let scope = records.entry((platform, guild_id, namespace.to_owned())).or_default();
@@ -142,6 +157,38 @@ impl GuildStorage for ScopedView {
         Ok(records
             .get(&(platform, guild_id, namespace.to_owned()))
             .map_or(0, |rows| rows.iter().filter(|(seq, _)| *seq > after_seq).count() as u64))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fake mirrors the real adapter's reserved-namespace guard: plugin
+    /// writes to `guild` are rejected, reads stay permitted.
+    #[tokio::test]
+    async fn reserved_guild_namespace_rejects_plugin_writes() {
+        let storage = InMemoryStorage::new();
+        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+
+        let set = guild.set(GUILD_SETTINGS, "language", Value::String("en".to_owned())).await;
+        assert!(matches!(set, Err(StorageError::Forbidden(_))));
+        let delete = guild.delete(GUILD_SETTINGS, "language").await;
+        assert!(matches!(delete, Err(StorageError::Forbidden(_))));
+        let append = guild.append(GUILD_SETTINGS, Value::String("x".to_owned())).await;
+        assert!(matches!(append, Err(StorageError::Forbidden(_))));
+
+        // Arrangement seeding is direct (not via the port); reads stay
+        // permitted for every caller.
+        storage.seed(
+            Platform::Discord,
+            GuildId(1),
+            GUILD_SETTINGS,
+            "language",
+            Value::String("en".to_owned()),
+        );
+        let read = guild.get(GUILD_SETTINGS, "language").await.expect("read permitted");
+        assert_eq!(read, Some(Value::String("en".to_owned())));
     }
 }
 

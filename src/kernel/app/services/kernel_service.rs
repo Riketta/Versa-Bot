@@ -92,15 +92,21 @@ impl<E: EventBusPort> KernelService<E> {
     }
 
     /// Registration validation, shared by `boot`: every middleware step must
-    /// be a registered plugin, and a name listed twice in `plugins` must be
-    /// the same instance (a harmless duplicate registration) - a name
-    /// collision across distinct instances is an `Invalid` configuration.
-    /// Returns the plugins to boot in registration order, duplicates skipped.
+    /// be the registered plugin's own instance (the same allocation - a
+    /// distinct object sharing the name would intercept events with no
+    /// lifecycle), and a name listed twice in `plugins` must be the same
+    /// instance (a harmless duplicate registration) - a name collision across
+    /// distinct instances is an `Invalid` configuration. Returns the plugins
+    /// to boot in registration order, duplicates skipped.
     fn validated_plugins(&self) -> Result<Vec<Arc<dyn PluginPort>>, PluginError> {
         for step in &self.middleware {
-            if !self.plugins.iter().any(|plugin| plugin.name() == step.name()) {
+            if !self
+                .plugins
+                .iter()
+                .any(|plugin| plugin.name() == step.name() && Self::same_instance(plugin, step))
+            {
                 return Err(PluginError::Invalid(format!(
-                    "middleware plugin `{}` is not registered as a plugin",
+                    "middleware plugin `{}` is not dual-registered as the same plugin instance",
                     step.name()
                 )));
             }
@@ -122,8 +128,10 @@ impl<E: EventBusPort> KernelService<E> {
         Ok(unique)
     }
 
-    /// Instance identity via the fat-pointer data address of the `Arc`.
-    fn same_instance(a: &Arc<dyn PluginPort>, b: &Arc<dyn PluginPort>) -> bool {
+    /// Instance identity via the fat-pointer data address of the `Arc`:
+    /// dual registration must hand the kernel the same allocation (an `Arc`
+    /// clone), not two objects that merely share a name.
+    fn same_instance<T: ?Sized, U: ?Sized>(a: &Arc<T>, b: &Arc<U>) -> bool {
         std::ptr::eq(Arc::as_ptr(a).cast::<()>(), Arc::as_ptr(b).cast::<()>())
     }
 
@@ -397,6 +405,58 @@ mod tests {
 
         fn start(&self) -> Result<(), PluginError> {
             Err(PluginError::Start(format!("start failed: {}", self.name)))
+        }
+
+        fn stop(&self) -> Result<(), PluginError> {
+            self.log.lock().push(format!("stop:{}", self.name));
+            Ok(())
+        }
+    }
+
+    /// Plugin whose `pre` hard-stops the chain with `Abort` - the fixture
+    /// for the hard-stop policy test.
+    struct AbortingPlugin {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PluginPort for AbortingPlugin {
+        fn name(&self) -> &'static str {
+            "aborter"
+        }
+    }
+
+    #[async_trait]
+    impl MiddlewarePluginPort for AbortingPlugin {
+        async fn pre(&self, _event: &mut RequestContext, _services: &KernelServices) -> Next {
+            self.log.lock().push("pre:aborter".to_owned());
+            Next::Abort
+        }
+    }
+
+    /// Logs every lifecycle call in order - the fixture for the two-phase
+    /// boot contract tests.
+    struct LifecyclePlugin {
+        name: &'static str,
+        log: Arc<Mutex<Vec<String>>>,
+        fail_init: bool,
+    }
+
+    impl PluginPort for LifecyclePlugin {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn init(&self) -> Result<(), PluginError> {
+            self.log.lock().push(format!("init:{}", self.name));
+            if self.fail_init {
+                return Err(PluginError::Init(format!("init failed: {}", self.name)));
+            }
+            Ok(())
+        }
+
+        fn start(&self) -> Result<(), PluginError> {
+            self.log.lock().push(format!("start:{}", self.name));
+            Ok(())
         }
 
         fn stop(&self) -> Result<(), PluginError> {
@@ -701,5 +761,166 @@ mod tests {
 
         let entries = log.lock().clone();
         assert_eq!(entries, vec!["stop:p".to_owned()], "plugins must be stopped exactly once");
+    }
+
+    /// `Abort` is the hard stop: remaining `pre` hooks are skipped AND no
+    /// `post` runs at all - unlike `Stop`, which still runs the posts of the
+    /// plugins that ran.
+    #[tokio::test]
+    async fn abort_skips_remaining_pre_and_all_post() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let first = Arc::new(RecorderPlugin {
+            name: "first",
+            log: Arc::clone(&log),
+            panic_in_pre: false,
+            panic_in_post: false,
+        });
+        let aborter = Arc::new(AbortingPlugin { log: Arc::clone(&log) });
+        let last = Arc::new(RecorderPlugin {
+            name: "last",
+            log: Arc::clone(&log),
+            panic_in_pre: false,
+            panic_in_post: false,
+        });
+
+        let (kernel, output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![
+                Arc::clone(&first) as Arc<dyn PluginPort>,
+                Arc::clone(&aborter) as Arc<dyn PluginPort>,
+                Arc::clone(&last) as Arc<dyn PluginPort>,
+            ],
+            vec![
+                Arc::clone(&first) as Arc<dyn MiddlewarePluginPort>,
+                Arc::clone(&aborter) as Arc<dyn MiddlewarePluginPort>,
+                Arc::clone(&last) as Arc<dyn MiddlewarePluginPort>,
+            ],
+        );
+
+        kernel.handle(RequestContext::message_received(test_origin(), "hi")).await;
+
+        assert_eq!(
+            log.lock().clone(),
+            vec!["pre:first".to_owned(), "pre:aborter".to_owned()],
+            "pre after the Abort and every post must be skipped"
+        );
+        assert!(output.messages().is_empty());
+    }
+
+    /// Two-phase lifecycle: every plugin initializes before any starts.
+    #[test]
+    fn init_runs_for_all_plugins_before_any_start() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let a = Arc::new(LifecyclePlugin { name: "a", log: Arc::clone(&log), fail_init: false });
+        let b = Arc::new(LifecyclePlugin { name: "b", log: Arc::clone(&log), fail_init: false });
+
+        let (kernel, _output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![Arc::clone(&a) as Arc<dyn PluginPort>, Arc::clone(&b) as Arc<dyn PluginPort>],
+            vec![],
+        );
+
+        kernel.boot().expect("boot expected to succeed");
+
+        assert_eq!(
+            log.lock().clone(),
+            vec![
+                "init:a".to_owned(),
+                "init:b".to_owned(),
+                "start:a".to_owned(),
+                "start:b".to_owned(),
+            ],
+            "every init must precede any start"
+        );
+    }
+
+    /// An `init` failure fails boot with nothing started: no `start` ran, so
+    /// no rollback (stop) is owed either.
+    #[test]
+    fn init_failure_fails_boot_without_starting_anything() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let healthy =
+            Arc::new(LifecyclePlugin { name: "healthy", log: Arc::clone(&log), fail_init: false });
+        let broken =
+            Arc::new(LifecyclePlugin { name: "broken", log: Arc::clone(&log), fail_init: true });
+
+        let (kernel, _output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![
+                Arc::clone(&healthy) as Arc<dyn PluginPort>,
+                Arc::clone(&broken) as Arc<dyn PluginPort>,
+            ],
+            vec![],
+        );
+
+        let result = kernel.boot();
+
+        assert!(matches!(result, Err(PluginError::Init(_))));
+        assert_eq!(
+            log.lock().clone(),
+            vec!["init:healthy".to_owned(), "init:broken".to_owned()],
+            "no start and no stop may run after an init failure"
+        );
+    }
+
+    /// DM events carry no guild storage handle: a plugin reading its config
+    /// via the scoped handle must degrade (Continue), not answer from any
+    /// guild's data - there is none.
+    #[tokio::test]
+    async fn dm_origin_gets_no_guild_storage() {
+        let greeter = Arc::new(GreeterPlugin);
+        let pong =
+            Arc::new(PongPlugin { started: Arc::new(std::sync::atomic::AtomicUsize::new(0)) });
+        let (kernel, output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![
+                Arc::clone(&greeter) as Arc<dyn PluginPort>,
+                Arc::clone(&pong) as Arc<dyn PluginPort>,
+            ],
+            vec![
+                Arc::clone(&greeter) as Arc<dyn MiddlewarePluginPort>,
+                Arc::clone(&pong) as Arc<dyn MiddlewarePluginPort>,
+            ],
+        );
+        let dm_origin = Origin { guild_id: None, ..test_origin() };
+
+        kernel.handle(RequestContext::message_received(dm_origin, "ping")).await;
+
+        // The greeter had no storage handle to read a greeting from and
+        // continued; only the pong plugin answered. With a guild origin the
+        // greeter would have replied "hello" and stopped the chain.
+        assert_eq!(output.messages(), ["pong"]);
+    }
+
+    /// A middleware step that merely shares a registered plugin's name but
+    /// is a distinct instance is rejected: it would intercept events with no
+    /// lifecycle behind it - the exact shape boot exists to prevent.
+    #[test]
+    fn middleware_masquerading_under_registered_name_fails_boot() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let registered = Arc::new(RecorderPlugin {
+            name: "x",
+            log: Arc::clone(&log),
+            panic_in_pre: false,
+            panic_in_post: false,
+        });
+        let impostor = Arc::new(RecorderPlugin {
+            name: "x",
+            log: Arc::clone(&log),
+            panic_in_pre: false,
+            panic_in_post: false,
+        });
+
+        let (kernel, _output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![Arc::clone(&registered) as Arc<dyn PluginPort>],
+            vec![Arc::clone(&impostor) as Arc<dyn MiddlewarePluginPort>],
+        );
+
+        let result = kernel.boot();
+        assert!(
+            matches!(result, Err(PluginError::Invalid(_))),
+            "a name-shared impostor instance must fail boot validation"
+        );
     }
 }

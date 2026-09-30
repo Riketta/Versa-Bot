@@ -82,6 +82,18 @@ mod tests {
         }
     }
 
+    /// Job that counts itself and then panics - the fixture for the failure
+    /// policy: a broken job keeps being scheduled.
+    struct PanickingJob(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl Job for PanickingJob {
+        async fn run(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("job boom");
+        }
+    }
+
     /// A zero interval cannot drive a ticker (`tokio::time::interval` would
     /// panic inside the spawned task): the adapter must return a dead handle
     /// without spawning - the job never runs, cancelling stays a no-op.
@@ -100,5 +112,79 @@ mod tests {
 
         assert_eq!(counter.load(Ordering::SeqCst), 0, "a dead job must never run");
         handle.cancel(); // cancelling a dead handle must not panic
+    }
+
+    /// The live happy path: a nonzero-interval job ticks (first run is
+    /// immediate) and keeps ticking - the heartbeat behind config hot
+    /// reload and status rotation.
+    #[tokio::test]
+    async fn live_job_ticks_repeatedly() {
+        let scheduler = TokioScheduler::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let _handle = scheduler.schedule(
+            "ticker",
+            Duration::from_millis(10),
+            Arc::new(CountingJob(Arc::clone(&counter))),
+        );
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert!(
+            counter.load(Ordering::SeqCst) >= 2,
+            "a live job must tick repeatedly, got {}",
+            counter.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Cancelling stops future runs; a run already in flight completes.
+    #[tokio::test]
+    async fn cancel_stops_future_runs() {
+        let scheduler = TokioScheduler::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let handle = scheduler.schedule(
+            "cancellable",
+            Duration::from_millis(10),
+            Arc::new(CountingJob(Arc::clone(&counter))),
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(counter.load(Ordering::SeqCst) >= 1, "job must run before cancel");
+
+        handle.cancel();
+        // Let any in-flight run land before taking the baseline.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let stopped_at = counter.load(Ordering::SeqCst);
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            stopped_at,
+            "a cancelled job must never run again"
+        );
+    }
+
+    /// Same failure policy as the pipeline and the bus: a panicking job is
+    /// logged and keeps being scheduled - one broken job must not silently
+    /// kill the scheduler loop for itself or others.
+    #[tokio::test]
+    async fn panicking_job_keeps_being_scheduled() {
+        let scheduler = TokioScheduler::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let _handle = scheduler.schedule(
+            "panicker",
+            Duration::from_millis(10),
+            Arc::new(PanickingJob(Arc::clone(&counter))),
+        );
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert!(
+            counter.load(Ordering::SeqCst) >= 2,
+            "a panicking job must keep being scheduled, got {}",
+            counter.load(Ordering::SeqCst)
+        );
     }
 }

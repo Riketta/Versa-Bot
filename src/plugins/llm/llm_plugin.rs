@@ -233,7 +233,9 @@ mod tests {
         ChatEngine, CompletionRequest, CompletionResponse, ConversationRecord, LlmCompletionPort,
         LlmError, LlmSettings, RandRandom, RandomPort, RecordRole,
     };
-    use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
+    use crate::test_support::{
+        FailingStorage, InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory,
+    };
 
     struct StubCompletion;
 
@@ -563,6 +565,51 @@ mod tests {
         let mut event = message_event(3, true); // no config doc for channel 3
         let next = plugin.pre(&mut event, &fixture.services).await;
         assert!(matches!(next, Next::Continue));
+
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert!(fixture.output.messages().is_empty());
+    }
+
+    /// An unreadable config document is a degraded guild, not a crashed one:
+    /// the hook continues (no engine run) instead of failing the pipeline.
+    #[tokio::test]
+    async fn pre_continues_when_config_storage_fails() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        let output = Arc::clone(&fixture.output);
+        let services = KernelServices {
+            chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
+            chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
+            guild_storage: Some(FailingStorage.guild_scoped(Platform::Discord, GuildId(1))),
+        };
+
+        let mut event = message_event(2, true);
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert!(fixture.output.messages().is_empty());
+    }
+
+    /// A malformed config document skips the channel (warn + Continue):
+    /// answering from defaults would fabricate a conversation.
+    #[tokio::test]
+    async fn pre_skips_channel_with_malformed_config() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        fixture.storage.seed(
+            Platform::Discord,
+            GuildId(1),
+            NAMESPACE,
+            &channel_config_key(2),
+            serde_json::json!("not a config"),
+        );
+
+        let mut event = message_event(2, true);
+        assert!(matches!(plugin.pre(&mut event, &fixture.services).await, Next::Continue));
 
         for _ in 0..200 {
             tokio::task::yield_now().await;

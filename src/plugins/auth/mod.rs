@@ -491,6 +491,43 @@ mod tests {
         assert!(output.messages().is_empty());
     }
 
+    /// The inverse master-admin boundary: an administrator is NOT a master
+    /// admin of a configured (non-empty) policy that does not list them.
+    /// Only an EMPTY policy admits admins - never a filled one.
+    #[tokio::test]
+    async fn guild_admin_is_denied_by_a_non_empty_policy_that_omits_them() {
+        let storage = configured_storage(&["1"], &[]);
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin();
+        let mut event = command_event_with_permissions(3, 0x8);
+        event.origin.reply_token = Some("token".to_owned());
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
+
+        let text = output.messages().into_iter().next().expect("denial expected");
+        assert!(text.contains("Not authorized for the `users` permissions group."));
+        assert!(
+            !text.contains("While the access policy is empty"),
+            "the policy is not empty - the admin fallback must not apply"
+        );
+    }
+
+    /// The admin fallback reads the administrator bit off BOTH payload kinds:
+    /// a plain message from a guild admin passes an empty policy too.
+    #[tokio::test]
+    async fn empty_policy_admin_fallback_applies_to_plain_messages() {
+        let storage = configured_storage(&[], &[]);
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin();
+        let mut event = message_event(3, &[]);
+        if let EventPayload::Message(payload) = &mut event.payload {
+            payload.author_permissions = 0x8;
+        }
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+        assert!(output.messages().is_empty());
+    }
+
     #[tokio::test]
     async fn allowed_role_passes_for_unlisted_user() {
         let storage = configured_storage(&[], &["42"]);

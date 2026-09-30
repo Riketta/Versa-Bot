@@ -89,8 +89,18 @@ async fn mutate_policy(
         }
     } else if listed {
         list.retain(|candidate| candidate != &id);
+        // An emptied policy silently widens access: the gate's empty-policy
+        // fallback admits every Discord guild administrator. Say so.
+        let emptied = policy.allowed_users.is_empty() && policy.allowed_roles.is_empty();
         storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
-        format!("🚫 {noun} {mention} is no longer allowed.")
+        if emptied {
+            format!(
+                "🚫 {noun} {mention} is no longer allowed.\n⚠️ The policy is now empty: only \
+                 Discord guild administrators can use the bot."
+            )
+        } else {
+            format!("🚫 {noun} {mention} is no longer allowed.")
+        }
     } else {
         format!("{noun} {mention} was not in the policy.")
     };
@@ -348,6 +358,36 @@ mod tests {
                 .next()
                 .is_some_and(|message| message.contains("was not in the policy"))
         );
+    }
+
+    /// Denying the final listed entry empties the policy - which silently
+    /// FLIPS the gate's semantics: every Discord guild administrator becomes
+    /// allowed (empty-policy fallback). The reply must warn about exactly
+    /// that widening.
+    #[tokio::test]
+    async fn denying_the_last_entry_warns_about_the_admin_fallback() {
+        let (storage, services, output) = fixture();
+        storage.seed(
+            Platform::Discord,
+            GuildId(1),
+            NAMESPACE,
+            CONFIG_KEY,
+            serde_json::json!({ "allowed_users": ["42"], "allowed_roles": [] }),
+        );
+
+        AuthCommandHandler
+            .invoke(&command_event(), &auth_args("deny", Some("42"), None), &services)
+            .await
+            .expect("deny expected to succeed");
+
+        assert_eq!(
+            stored_policy(&storage).await,
+            Some(serde_json::json!({ "allowed_users": [], "allowed_roles": [] }))
+        );
+        let message = output.messages().into_iter().next().expect("reply expected");
+        assert!(message.contains("no longer allowed"));
+        assert!(message.contains("The policy is now empty"));
+        assert!(message.contains("only Discord guild administrators"));
     }
 
     #[tokio::test]

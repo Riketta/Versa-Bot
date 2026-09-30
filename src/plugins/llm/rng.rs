@@ -92,7 +92,11 @@ impl RandomPort for DeckRandom {
         let deck =
             decks.entry(scope).or_insert(Deck { built_for: u32::MAX, remaining: Vec::new() });
         if deck.built_for != rounded || deck.remaining.is_empty() {
-            let hits = usize::from(u16::try_from(rounded).unwrap_or(u16::MAX).min(100));
+            // Sub-0.5% chances round to zero hits: without the floor the bag
+            // would hold only misses, never empty, and never rebuild - the
+            // channel would stay silent forever. Any nonzero chance fires at
+            // least once per cycle (a 0.4% setting behaves as ~1%).
+            let hits = usize::from(u16::try_from(rounded).unwrap_or(u16::MAX).min(100)).max(1);
             let mut bag: Vec<bool> = std::iter::repeat_n(true, hits)
                 .chain(std::iter::repeat_n(false, 100 - hits))
                 .collect();
@@ -208,5 +212,37 @@ mod tests {
             }
         }
         assert_eq!(hits, 50);
+    }
+
+    /// Sub-0.5% chances round to zero hits: without a floor the bag would
+    /// hold only misses, never empty, and never rebuild - the channel would
+    /// stay silent forever. Any nonzero chance fires at least once per cycle.
+    #[test]
+    fn sub_half_percent_chance_still_fires_once_per_cycle() {
+        let deck = DeckRandom::new();
+        let scope = scope("discord", 1);
+
+        let mut hits = 0;
+        for _ in 0..100 {
+            if deck.chance_percent(scope, 0.4) {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 1);
+    }
+
+    /// Non-integer percents round half away from zero: 2.5% decks as 3 hits.
+    #[test]
+    fn non_integer_percent_rounds_to_nearest_whole_hits() {
+        let deck = DeckRandom::new();
+        let scope = scope("discord", 1);
+
+        let mut hits = 0;
+        for _ in 0..100 {
+            if deck.chance_percent(scope, 2.5) {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 3);
     }
 }

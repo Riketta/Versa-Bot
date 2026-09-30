@@ -173,16 +173,7 @@ impl ChatEngine {
         // Compaction runs after the reply (the triggering turn used the
         // pre-compaction context) and after every capture, so all-messages
         // channels compact too - not just chatty ones.
-        self.maybe_compact(
-            origin,
-            config,
-            &state,
-            &live,
-            usage_stats.tokens_per_char,
-            calibrated,
-            services,
-        )
-        .await;
+        self.maybe_compact(origin, config, &state, &live, services).await;
     }
 
     /// Completes and delivers the answer for a triggering message. The
@@ -383,8 +374,6 @@ impl ChatEngine {
         config: &ChannelConfig,
         state: &ConversationState,
         live: &[(u64, ConversationRecord)],
-        tokens_per_char: f64,
-        calibrated: bool,
         services: &KernelServices,
     ) {
         if !config.compaction_enabled {
@@ -422,9 +411,9 @@ impl ChatEngine {
 
         let messages =
             conversation::compaction_input(&prompt, state.summary.as_deref(), &chunk_records);
-        #[allow(clippy::cast_precision_loss)] // estimator: precision loss is fine
-        let context_chars: u64 =
-            messages.iter().map(|message| message.content.chars().count() as u64).sum();
+        // The summarizer call is deliberately NOT recorded into the channel's
+        // chat stats: the EWMA ratio and the "last request" report must
+        // reflect chat completions only, not compaction traffic.
         let request = CompletionRequest {
             model,
             messages,
@@ -449,16 +438,6 @@ impl ChatEngine {
                 return;
             }
         };
-        self.record_usage(
-            services,
-            channel_id,
-            response.usage,
-            context_chars,
-            tokens_per_char,
-            conversation::resolve_budget(config, &self.settings, calibrated),
-        )
-        .await;
-
         let new_state = ConversationState {
             summary: Some(response.content),
             cutoff_seq: chunk_end_seq,
@@ -601,10 +580,11 @@ impl ChatEngine {
         self.chimes.lock().insert(key, Instant::now());
     }
 
-    /// Persists the last completion's token usage and blends the observed
-    /// tokens-per-character ratio into the channel's estimate. Best effort:
-    /// a failed write only degrades the next estimate back to the previous
-    /// ratio; endpoints without usage stats write nothing at all.
+    /// Persists the last chat completion's token usage and blends the
+    /// observed tokens-per-character ratio into the channel's estimate.
+    /// Compaction never records (its transcript is not chat traffic).
+    /// Best effort: a failed write only degrades the next estimate back to
+    /// the previous ratio; endpoints without usage stats write nothing.
     async fn record_usage(
         &self,
         services: &KernelServices,
@@ -690,12 +670,15 @@ mod tests {
     use crate::test_support::{InMemoryStorage, RecordingChatOutput};
     use async_trait::async_trait;
     use parking_lot::Mutex;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct FakeCompletion {
         responses: Mutex<Vec<Result<String, LlmError>>>,
         requests: Mutex<Vec<CompletionRequest>>,
         usage: Mutex<Option<TokenUsage>>,
+        /// Per-call usage overrides (call order); falls back to `usage`.
+        usage_queue: Mutex<VecDeque<Option<TokenUsage>>>,
     }
 
     impl FakeCompletion {
@@ -706,6 +689,12 @@ mod tests {
         fn set_usage(&self, usage: Option<TokenUsage>) {
             *self.usage.lock() = usage;
         }
+
+        /// Usage for the first N completion calls, in call order (chat,
+        /// compaction, ...). Calls beyond the queue fall back to `usage`.
+        fn set_usage_per_call(&self, usages: Vec<Option<TokenUsage>>) {
+            self.usage_queue.lock().extend(usages);
+        }
     }
 
     #[async_trait]
@@ -715,7 +704,8 @@ mod tests {
             request: CompletionRequest,
         ) -> Result<CompletionResponse, LlmError> {
             self.requests.lock().push(request);
-            let usage = self.usage.lock().to_owned();
+            let queued = self.usage_queue.lock().pop_front();
+            let usage = queued.unwrap_or_else(|| self.usage.lock().to_owned());
             self.responses.lock().pop().map_or_else(
                 || Ok(CompletionResponse { content: "canned".to_owned(), usage }),
                 |response| response.map(|content| CompletionResponse { content, usage }),
@@ -819,6 +809,7 @@ mod tests {
             responses: Mutex::new(responses),
             requests: Mutex::new(Vec::new()),
             usage: Mutex::new(None),
+            usage_queue: Mutex::new(VecDeque::new()),
         });
         let engine = ChatEngine::new(
             Arc::clone(&settings),
@@ -1076,6 +1067,39 @@ mod tests {
         );
     }
 
+    /// The cutoff is a context boundary, not a deletion: records before
+    /// `cutoff_seq` never re-enter the context but stay stored.
+    #[tokio::test]
+    async fn cutoff_keeps_old_records_out_of_the_context() {
+        let ctx = ctx(vec![Ok("fresh answer".to_owned())]);
+        seed_config(&ctx.storage, &assigned_config());
+        ctx.storage.seed(
+            Platform::Discord,
+            GuildId(1),
+            NAMESPACE,
+            &channel_state_key(2),
+            serde_json::json!({"cutoff_seq": 2}),
+        );
+        append_record(&ctx.storage, &user_record(1, "old1", "m1")).await;
+        append_record(&ctx.storage, &user_record(2, "old2", "m2")).await;
+        append_record(&ctx.storage, &user_record(3, "new1", "m3")).await;
+        append_record(&ctx.storage, &user_record(4, "new2", "m4")).await;
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .await;
+
+        // The context holds only post-cutoff turns plus the triggering one.
+        let request = ctx.fake.requests().first().expect("request expected").clone();
+        let turns: Vec<&str> =
+            request.messages.iter().map(|message| message.content.as_str()).collect();
+        assert!(turns.iter().any(|turn| turn.contains("new1: m3")));
+        assert!(!turns.iter().any(|turn| turn.contains("m1") || turn.contains("m2")));
+        // The cutoff moved nothing: all records are still stored
+        // (4 seeded + the captured trigger + the assistant turn).
+        assert_eq!(stored_records(&ctx).await.len(), 6);
+    }
+
     #[tokio::test]
     async fn history_depth_clamps_the_window() {
         let ctx = ctx(vec![Ok("ok".to_owned())]);
@@ -1101,6 +1125,7 @@ mod tests {
             responses: Mutex::new(vec![]),
             requests: Mutex::new(Vec::new()),
             usage: Mutex::new(None),
+            usage_queue: Mutex::new(VecDeque::new()),
         });
         let engine = ChatEngine::new(
             settings,
@@ -1167,6 +1192,50 @@ mod tests {
         // are kept.
         assert_eq!(ctx.begins.lock().clone(), vec!["the answer".to_owned()]);
         assert_eq!(stored_records(&ctx).await.len(), 5);
+    }
+
+    /// The summarizer call is invisible to chat stats: the EWMA ratio and
+    /// the "last request" report reflect chat completions only.
+    #[tokio::test]
+    async fn compaction_does_not_pollute_chat_stats() {
+        let settings = LlmSettings { compaction_keep_tail: 2, ..LlmSettings::default() };
+        let ctx =
+            ctx_with(settings, vec![Ok("summary text".to_owned()), Ok("the answer".to_owned())]);
+        ctx.fake.set_usage_per_call(vec![
+            Some(TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 10,
+                total_tokens: 110,
+                cached_tokens: None,
+            }),
+            Some(TokenUsage {
+                prompt_tokens: 50_000,
+                completion_tokens: 20,
+                total_tokens: 50_020,
+                cached_tokens: None,
+            }),
+        ]);
+        let config = ChannelConfig { history_depth: 3, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+        append_record(&ctx.storage, &user_record(1, "a1", "m1")).await;
+        append_record(&ctx.storage, &user_record(2, "a2", "m2")).await;
+        append_record(&ctx.storage, &user_record(3, "a3", "m3")).await;
+
+        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+
+        // Both completions ran (chat + compaction), but the stored "last
+        // request" stays the CHAT call's usage - the summarizer never writes.
+        assert_eq!(ctx.fake.requests().len(), 2);
+        let stats_raw = ctx
+            .storage
+            .guild_scoped(Platform::Discord, GuildId(1))
+            .get(NAMESPACE, &channel_stats_key(2))
+            .await
+            .expect("stats readable")
+            .expect("stats expected");
+        let stats: UsageStats =
+            serde_json::from_value(stats_raw).expect("stats expected to deserialize");
+        assert_eq!(stats.last.map(|usage| usage.prompt_tokens), Some(100));
     }
 
     #[tokio::test]
