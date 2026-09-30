@@ -43,29 +43,13 @@ a slash command from any other reply path.
   membership changes published on the bus as structured `audit` tracing
   events (stdout + Sentry/GlitchTip), with origin fields, no per-guild
   configuration needed.
-- LLM chat bot (`llm` plugin): per-channel chat with conversation history.
-  Guild admins assign it with `/llm_assign model`, remove it with
-  `/llm_unassign`, tune it with `/llm_set`
-  (model, sampling parameters, reasoning effort, history depth, capture
-  mode, compaction, streaming, random-reply chance, reply length, turn
-  template) and `/llm_prompt` (system prompt); `/llm_cutoff` resets the
-  context (history is kept) and `/llm_status` shows model, window and
-  summary state with a link to where the context starts; `/llm_admin` and
-  `/llm_admin_clear` manage the guild's service channel for error notices
-  (all Manage Server, guild-only). History tracks bot-related messages only
-  (mentions and reply chains) by default, with an optional whole-channel
-  mode; the window is chunk-compacted after replies (summary + cutoff -
-  never a sliding window, so provider prompt caches stay warm). Long
-  answers split on line boundaries, can stream in place (create once,
-  edit until final), and the bot may chime in on unrelated messages with a
-  configurable per-channel chance. Providers are OpenAI-compatible
-  endpoints declared in `[llm]` (keys via env); the guild message content
-  the bot reads is why `MESSAGE_CONTENT` is requested. Endpoints that
-  report token usage get their stats recorded per channel - the calibrated
-  estimate fills the context newest-first up to the model's declared
-  context window (or a per-channel budget) with the message limit as the
-  secondary cap, and `/llm_status` shows last-request tokens including
-  cache hits plus the calibrated context estimate.
+- LLM chat bot (`llm` plugin): per-channel chat with conversation history,
+  compaction, streaming, token-budget context filling and random
+  chime-ins. Operators declare OpenAI-compatible providers in `[llm]`
+  (keys via env); guild admins assign and tune each channel via `/llm_*`
+  commands. The guild message content the bot reads is why
+  `MESSAGE_CONTENT` is requested. Full manual in
+  [Plugins](#llm-chat-bot-llm-plugin).
 - Status rotator (`status_rotator` plugin): cycles the bot's activity
   through a configured list on a configured interval - both come from the
   optional `[status]` section of the config file (presence is bot-wide,
@@ -213,6 +197,132 @@ ephemeral, so policy data stays between the bot and the admin.
 Specify either `user` or `role`, never both. Managing the policy is
 itself gated by the policy: whoever runs `/auth` must already be allowed
 to use the bot - do not deny yourself out.
+
+### LLM chat bot (`llm` plugin)
+
+A per-channel chat assistant driven by OpenAI-compatible endpoints. The
+split of responsibilities is deliberate:
+
+- The **bot operator** declares providers (endpoints + keys) and model
+  capabilities once in the `[llm]` config section. Startup-only:
+  changes require a restart.
+- **Guild admins** assign the bot to channels and tune each channel via
+  slash commands - picking among the declared models, never configuring
+  endpoints. Keys never appear in config files or guild storage; they
+  are resolved from environment variables at boot.
+
+Every channel's conversation lives in its own storage namespace inside
+the guild's partition - channels and guilds cannot read each other's
+history.
+
+**Operator setup.** Minimal example (full reference in
+`versabot.example.toml`):
+
+```toml
+[llm]
+# Optional defaults: default_system_prompt, default_compaction_prompt,
+# compaction_model, compaction_keep_tail, max_message_length,
+# stream_interval_ms.
+
+[llm.providers.zai]
+api_url = "https://api.z.ai/api/coding/paas/v4"
+api_key_env = "VERSABOT_LLM_ZAI_KEY"
+# How the reasoning parameter is rendered: "openai_effort" sends
+# reasoning_effort: "<value>"; "glm_thinking" sends the boolean
+# thinking: {"type": "enabled"} switch.
+reasoning_style = "openai_effort"
+
+[llm.models."zai/glm-5.3-flash"]
+reasoning = true          # per-channel reasoning_effort is sent only for these
+context_window = 131072   # enables token-budget context filling
+```
+
+Undeclared models remain usable but get default capabilities: no
+reasoning parameter is ever sent for them, and context filling stays
+message-count based.
+
+**How conversations work.**
+
+- **Capture** decides what enters the channel's history. `bot_related`
+  (default) tracks only bot-related messages: mentions and replies into
+  the captured conversation. `all_messages` tracks everything. The
+  bot's own answers are recorded at send time.
+- **Trigger** decides when the bot answers: an explicit mention or a
+  direct reply to one of the bot's own messages. Replies between users
+  are captured but do not trigger (`random_chance` below is the
+  exception).
+- **Context** is assembled as: system prompt -> compaction summary (or a
+  stable placeholder if none) -> live window, oldest first. User turns
+  render through the channel's turn template (`{sender}: {message}` by
+  default); bot turns are plain assistant messages. The window is
+  selected newest-first under the token budget and `depth`, whichever
+  bites first - the newest turn is always included.
+- **Compaction** runs after a reply once the live window outgrows
+  `depth` (100 messages by default): everything except the newest
+  `compaction_keep_tail` (10) records folds into a rolling summary via
+  the compaction model. The window is never slid between compactions,
+  so the prompt prefix stays byte-stable and provider prompt caches
+  stay warm. Records are never deleted - compaction only moves the
+  cutoff forward.
+
+**Context sizing.** The window fills newest-first up to `depth`
+messages. Once the endpoint has reported real token usage (recorded
+per channel), filling becomes token-budget based: the channel's
+`context_budget` if set, otherwise the model's declared
+`context_window` minus the completion reserve and a 10% estimator
+margin - with `depth` remaining the secondary cap. Until then (or
+without a declared window) only the message limit applies.
+`/llm_status` shows which mechanism is active.
+
+**Commands.** All are guild-only and require the **Manage Server**
+permission (Discord hides them from members without it):
+
+| Command | Effect |
+|---|---|
+| `/llm_assign model:<provider/model>` | assign the bot to this channel; re-assigning retunes in place |
+| `/llm_unassign` | remove the bot from this channel (history is kept) |
+| `/llm_prompt prompt:<text>` | set the channel system prompt; `clear` falls back to the plugin default |
+| `/llm_set key:<key> value:<value>` | tune one channel setting (table below); value `clear`/`none`/`default` resets it |
+| `/llm_cutoff` | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
+| `/llm_status` | ephemeral report: model, window usage, summary preview, link to the context start, last-request token stats |
+| `/llm_admin` | make this channel the guild's service channel for error notices (one per guild, last write wins) |
+| `/llm_admin_clear` | stop service notices |
+
+**`/llm_set` keys** (invalid values are answered with usage and never
+saved):
+
+| Key | Meaning | Default |
+|---|---|---|
+| `model` | provider/model reference | set by `/llm_assign` |
+| `temperature` `top_p` `top_k` `min_p` `frequency_penalty` `presence_penalty` | sampling parameters; cleared = not sent | provider defaults |
+| `max_tokens` | completion size cap | provider default |
+| `reasoning_effort` | reasoning hint sent only when the model declares `reasoning = true`; `off` sends nothing | none |
+| `depth` | live-window size in messages; reaching it triggers compaction | 100 |
+| `context_budget` | prompt-side token budget; cleared = auto (model window) once calibrated | auto |
+| `capture_mode` | `bot_related` or `all_messages` | `bot_related` |
+| `compaction` | summarize-and-cutoff on/off | on |
+| `compaction_model` | model used for summaries | the channel's chat model |
+| `compaction_prompt` | summarization instruction | plugin default |
+| `streaming` | edit the answer in place while it renders | off |
+| `random_chance` | percent chance to chime in on a captured non-trigger message | 2 |
+| `max_length` | per-channel reply-splitting limit | 2000 (`max_message_length`) |
+| `turn_template` | user-turn rendering; must contain `{sender}` and `{message}` | `{sender}: {message}` |
+
+**Delivery.** Long answers split on line boundaries - a line that does
+not fit moves whole to the next message. With `streaming` on, the
+answer is created once and edited in place (throttled by
+`stream_interval_ms`, bounded number of edits) until the final full
+text. Chime-ins are cooldown-guarded (5 minutes per channel) and only
+fire on messages the bot actually captured.
+
+**Failures.** Users see silence, never error spam: when the provider
+is unreachable or rejects a request, the triggering channel gets no
+answer, and a rate-limited embed (at most one per 5 minutes per
+service channel) carries the error classification only - endpoint
+response bodies can name operator accounts or projects, so they stay
+in the logs. History integrity is never guessed around: an unreadable
+state or record log skips the message entirely rather than answering
+from a degraded context.
 
 ## Docker
 
