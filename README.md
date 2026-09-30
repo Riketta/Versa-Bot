@@ -67,9 +67,10 @@ a slash command from any other reply path.
   endpoints declared in `[llm]` (keys via env); the guild message content
   the bot reads is why `MESSAGE_CONTENT` is requested. Endpoints that
   report token usage get their stats recorded per channel - the calibrated
-  estimate can fill the context by tokens (per-channel budget, message
-  count as secondary cap), and `/llm_status` shows last-request tokens
-  including cache hits.
+  estimate fills the context newest-first up to the model's declared
+  context window (or a per-channel budget) with the message limit as the
+  secondary cap, and `/llm_status` shows last-request tokens including
+  cache hits plus the calibrated context estimate.
 - Status rotator (`status_rotator` plugin): cycles the bot's activity
   through a configured list on a configured interval - both come from the
   optional `[status]` section of the config file (presence is bot-wide,

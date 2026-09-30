@@ -53,8 +53,15 @@ url = "sqlite://versabot.db"
 
 # Model capability declarations. Undeclared models are usable but get
 # default capabilities (no reasoning parameter is ever sent for them).
+# `context_window` (total tokens) enables token-budget context filling for
+# channels without an explicit budget: the prompt is filled newest-first up
+# to the window minus the completion reserve and a safety margin, once the
+# endpoint has reported its first usage (before that, the per-channel
+# message limit fills the context).
 # [llm.models."zai/glm-5.3-flash"]
 # reasoning = true
+# context_window = 131072
 #
 # [llm.models."local/unsloth/gemma-4-26B-A4B-it-qat-GGUF"]
 # reasoning = false
+# context_window = 32768

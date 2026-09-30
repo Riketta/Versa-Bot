@@ -448,10 +448,9 @@ async fn usage_lines(
     records_ns: &str,
     state: &ConversationState,
     live: u64,
-    usage_stats: &UsageStats,
-    config: &ChannelConfig,
+    stats: &UsageStats,
 ) -> UsageLines {
-    let Some(last) = usage_stats.last else {
+    let Some(last) = stats.last else {
         return UsageLines { estimate: None, last_request: None };
     };
 
@@ -469,8 +468,10 @@ async fn usage_lines(
     }
     // estimator: precision loss is fine
     #[allow(clippy::cast_precision_loss)]
-    let estimated = usage_stats.tokens_per_char * context_chars as f64 + 8.0 * live as f64;
-    let estimate = Some(match config.context_budget_tokens {
+    let estimated = stats.tokens_per_char * context_chars as f64 + 8.0 * live as f64;
+    // The budget the engine actually enforced last time (channel override
+    // or model-window derived); absent while filling is count-only.
+    let estimate = Some(match stats.last_budget {
         Some(budget) => format!("Est. context: ~{estimated:.0} / {budget} tokens"),
         None => format!("Est. context: ~{estimated:.0} tokens"),
     });
@@ -547,7 +548,7 @@ impl CommandHandler for StatusLlmHandler {
             .await?
             .and_then(|raw| serde_json::from_value(raw).ok())
             .unwrap_or_default();
-        let usage = usage_lines(storage, &records_ns, &state, live, &usage_stats, &config).await;
+        let usage = usage_lines(storage, &records_ns, &state, live, &usage_stats).await;
 
         let summary = match &state.summary {
             Some(summary) => preview(summary, 200),

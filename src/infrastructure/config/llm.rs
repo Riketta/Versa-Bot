@@ -97,6 +97,9 @@ pub struct LlmModelConfig {
     /// The model accepts a reasoning/thinking parameter. Per-channel
     /// `reasoning_effort` is ignored for models without this.
     pub reasoning: bool,
+    /// Total context window in tokens; enables token-budget context filling
+    /// for channels that do not set their own budget.
+    pub context_window: Option<u64>,
 }
 
 #[cfg(test)]

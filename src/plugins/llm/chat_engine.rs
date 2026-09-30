@@ -95,6 +95,7 @@ impl ChatEngine {
             return;
         };
         let usage_stats = self.load_stats(storage, channel_id).await;
+        let calibrated = usage_stats.last.is_some();
         let mut live = self.load_live_records(storage, channel_id, state.cutoff_seq).await;
 
         let reply_to = payload.reply_to.map(MessageId::get);
@@ -135,6 +136,7 @@ impl ChatEngine {
                 &state,
                 &live_records,
                 usage_stats.tokens_per_char,
+                calibrated,
                 services,
             )
             .await;
@@ -162,6 +164,7 @@ impl ChatEngine {
                 &state,
                 &live_records,
                 usage_stats.tokens_per_char,
+                calibrated,
                 services,
             )
             .await;
@@ -170,8 +173,16 @@ impl ChatEngine {
         // Compaction runs after the reply (the triggering turn used the
         // pre-compaction context) and after every capture, so all-messages
         // channels compact too - not just chatty ones.
-        self.maybe_compact(origin, config, &state, &live, usage_stats.tokens_per_char, services)
-            .await;
+        self.maybe_compact(
+            origin,
+            config,
+            &state,
+            &live,
+            usage_stats.tokens_per_char,
+            calibrated,
+            services,
+        )
+        .await;
     }
 
     /// Completes and delivers the answer for a triggering message. The
@@ -184,6 +195,7 @@ impl ChatEngine {
         state: &ConversationState,
         live: &[ConversationRecord],
         tokens_per_char: f64,
+        calibrated: bool,
         services: &KernelServices,
     ) {
         let channel_id = origin.channel_id.get();
@@ -194,9 +206,16 @@ impl ChatEngine {
         } else {
             live
         };
+        let budget = conversation::resolve_budget(config, &self.settings, calibrated);
 
-        let messages =
-            conversation::assemble_context(config, &self.settings, state, window, tokens_per_char);
+        let messages = conversation::assemble_context(
+            config,
+            &self.settings,
+            state,
+            window,
+            tokens_per_char,
+            budget,
+        );
         // The endpoint's usage report is measured against exactly this
         // context, so the ratio calibration compares like with like.
         #[allow(clippy::cast_precision_loss)] // estimator: precision loss is fine
@@ -225,8 +244,15 @@ impl ChatEngine {
                 return;
             }
         };
-        self.record_usage(services, channel_id, response.usage, context_chars, tokens_per_char)
-            .await;
+        self.record_usage(
+            services,
+            channel_id,
+            response.usage,
+            context_chars,
+            tokens_per_char,
+            budget,
+        )
+        .await;
 
         let max_length = config.max_length.unwrap_or(self.settings.max_message_length);
         let chunks = conversation::split_reply(&response.content, max_length);
@@ -358,6 +384,7 @@ impl ChatEngine {
         state: &ConversationState,
         live: &[(u64, ConversationRecord)],
         tokens_per_char: f64,
+        calibrated: bool,
         services: &KernelServices,
     ) {
         if !config.compaction_enabled {
@@ -422,8 +449,15 @@ impl ChatEngine {
                 return;
             }
         };
-        self.record_usage(services, channel_id, response.usage, context_chars, tokens_per_char)
-            .await;
+        self.record_usage(
+            services,
+            channel_id,
+            response.usage,
+            context_chars,
+            tokens_per_char,
+            conversation::resolve_budget(config, &self.settings, calibrated),
+        )
+        .await;
 
         let new_state = ConversationState {
             summary: Some(response.content),
@@ -578,6 +612,7 @@ impl ChatEngine {
         usage: Option<TokenUsage>,
         context_chars: u64,
         tokens_per_char: f64,
+        budget: Option<u64>,
     ) {
         let Some(usage) = usage else {
             return; // endpoint does not report usage: nothing to record
@@ -588,6 +623,7 @@ impl ChatEngine {
         let stats = UsageStats {
             last: Some(usage),
             tokens_per_char: blend_ratio(tokens_per_char, usage.prompt_tokens, context_chars),
+            last_budget: budget,
         };
         if let Err(err) = storage
             .set(

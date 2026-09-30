@@ -89,40 +89,80 @@ pub fn should_trigger(
 /// of the content's estimated tokens.
 const TURN_TOKEN_OVERHEAD: u64 = 8;
 
+/// Completion space kept out of a model-window-derived prompt budget when
+/// the channel sets no explicit `max_tokens`.
+const DEFAULT_COMPLETION_RESERVE: u64 = 1024;
+
+/// Resolves the effective prompt-side token budget:
+///
+/// 1. the channel's explicit `context_budget_tokens` override;
+/// 2. the model's declared `context_window` minus the completion reserve
+///    (channel `max_tokens` or a default - the answer needs room) and a 10%
+///    margin for estimator error;
+/// 3. `None` - message-count filling only. This is also forced while the
+///    channel is uncalibrated (no reported usage yet): token filling on a
+///    guessed ratio could silently truncate the context.
+pub(crate) fn resolve_budget(
+    config: &ChannelConfig,
+    settings: &LlmSettings,
+    calibrated: bool,
+) -> Option<u64> {
+    if let Some(explicit) = config.context_budget_tokens {
+        return Some(u64::from(explicit));
+    }
+    if !calibrated {
+        return None;
+    }
+    let window = settings.models.get(&config.model)?.context_window?;
+    let reserve = u64::from(config.params.max_tokens.unwrap_or(DEFAULT_COMPLETION_RESERVE as u32));
+    Some(window.saturating_sub(reserve).saturating_sub(window / 10))
+}
+
+/// Estimated token cost of one piece of prompt text (framing + content).
+fn estimated_tokens(text: &str, tokens_per_char: f64) -> u64 {
+    // estimator: precision loss is fine.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let cost = TURN_TOKEN_OVERHEAD + (text.chars().count() as f64 * tokens_per_char) as u64;
+    cost
+}
+
 /// Assembles the LLM context: fixed schema - the system prompt, then the
 /// always-present summary slot (compacted context or placeholder), then the
 /// live window. User turns render via the channel template; assistant turns
 /// pass through raw (the role already says who spoke).
 ///
-/// The window fills NEWEST-FIRST under two caps, whichever bites first:
-/// `history_depth` (message count) and, when the channel sets
-/// `context_budget_tokens`, the estimated token budget (per-turn cost =
-/// framing + content chars x `tokens_per_char`, calibrated from the
-/// endpoint's own usage reports). The newest turn is always included - a
-/// reply must at least see what it answers.
+/// The whole prompt side (system + summary + turns) counts against the
+/// resolved budget, and turns fill NEWEST-FIRST under that budget and
+/// `history_depth`, whichever bites first. The newest turn is always
+/// included - a reply must at least see what it answers. Without a budget
+/// (uncalibrated, no model window, no channel override) only `history_depth`
+/// applies.
 pub fn assemble_context(
     config: &ChannelConfig,
     settings: &LlmSettings,
     state: &ConversationState,
     records: &[ConversationRecord],
     tokens_per_char: f64,
+    budget: Option<u64>,
 ) -> Vec<ChatMessage> {
-    let budget = config.context_budget_tokens.map(u64::from);
     let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
+    let system =
+        config.system_prompt.clone().unwrap_or_else(|| settings.default_system_prompt.clone());
+    let summary_slot = match &state.summary {
+        Some(summary) => format!("Earlier conversation summary:\n{summary}"),
+        None => NO_EARLIER_CONTEXT.to_owned(),
+    };
+
+    // The fixed slots are part of the budget: the endpoint bills them as
+    // prompt tokens just like the turns.
+    let mut used = estimated_tokens(&system, tokens_per_char)
+        + estimated_tokens(&summary_slot, tokens_per_char);
     let mut count = 0usize;
-    let mut used: u64 = 0;
     while count < records.len() && count < depth {
         let Some(record) = records.get(records.len() - count - 1) else {
             break;
         };
-        // Estimator: precision loss is fine.
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
-        let cost =
-            TURN_TOKEN_OVERHEAD + (record.content.chars().count() as f64 * tokens_per_char) as u64;
+        let cost = estimated_tokens(&record.content, tokens_per_char);
         if budget.is_some_and(|budget| used + cost > budget) && count > 0 {
             break;
         }
@@ -132,20 +172,8 @@ pub fn assemble_context(
     let (_, window) = records.split_at(records.len() - count);
 
     let mut messages = Vec::new();
-    messages.push(ChatMessage {
-        role: ChatRole::System,
-        content: config
-            .system_prompt
-            .clone()
-            .unwrap_or_else(|| settings.default_system_prompt.clone()),
-    });
-    messages.push(ChatMessage {
-        role: ChatRole::System,
-        content: match &state.summary {
-            Some(summary) => format!("Earlier conversation summary:\n{summary}"),
-            None => NO_EARLIER_CONTEXT.to_owned(),
-        },
-    });
+    messages.push(ChatMessage { role: ChatRole::System, content: system });
+    messages.push(ChatMessage { role: ChatRole::System, content: summary_slot });
     let template = config.turn_template.as_deref().unwrap_or(DEFAULT_TURN_TEMPLATE);
     for record in window {
         let message = match record.role {
@@ -242,6 +270,7 @@ pub fn split_reply(content: &str, max_length: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::llm::providers::ModelSettings;
 
     fn user_record(message_id: u64, author: &str, content: &str) -> ConversationRecord {
         ConversationRecord {
@@ -310,7 +339,7 @@ mod tests {
             },
         ];
 
-        let messages = assemble_context(&config, &settings, &state, &records, 0.25);
+        let messages = assemble_context(&config, &settings, &state, &records, 0.25, None);
 
         assert_eq!(messages.len(), 5);
         assert_eq!(
@@ -349,7 +378,7 @@ mod tests {
             cutoff_at: Some(1_717_000_000),
         };
 
-        let messages = assemble_context(&config, &settings, &state, &[], 0.25);
+        let messages = assemble_context(&config, &settings, &state, &[], 0.25, None);
 
         assert_eq!(messages.first().map(|m| m.content.as_str()), Some("custom prompt"));
         assert_eq!(
@@ -369,7 +398,7 @@ mod tests {
         let state = ConversationState::default();
         let records = vec![user_record(10, "alice", "hello")];
 
-        let messages = assemble_context(&config, &settings, &state, &records, 0.25);
+        let messages = assemble_context(&config, &settings, &state, &records, 0.25, None);
 
         assert_eq!(messages.get(2).map(|m| m.content.as_str()), Some("<alice> hello"));
     }
@@ -378,7 +407,9 @@ mod tests {
     fn token_budget_fills_newest_first() {
         let settings = LlmSettings::default();
         let state = ConversationState::default();
-        // Ratio 1.0 + overhead 8 -> per-turn costs: aaaa=12, bb=10, cccccc=14.
+        // Ratio 1.0 -> per-turn costs: aaaa=12, bb=10, cccccc=14. The fixed
+        // slots (system 33 chars + placeholder 20 chars, +8 overhead each)
+        // consume 69 of the budget before any turn.
         let records = vec![
             user_record(1, "a1", "aaaa"),
             user_record(2, "a2", "bb"),
@@ -386,14 +417,14 @@ mod tests {
         ];
         let config = ChannelConfig {
             history_depth: 10,
-            context_budget_tokens: Some(24),
+            context_budget_tokens: Some(93),
             ..ChannelConfig::assigned("m".to_owned())
         };
 
-        let messages = assemble_context(&config, &settings, &state, &records, 1.0);
+        let budget = resolve_budget(&config, &settings, true);
+        let messages = assemble_context(&config, &settings, &state, &records, 1.0, budget);
 
-        // Newest-first: cccccc (14) + bb (10) fill the budget exactly; aaaa
-        // would exceed it and is dropped.
+        // 69 fixed + 14 (cccccc) + 10 (bb) = 93 exactly; aaaa would exceed.
         assert_eq!(messages.len(), 4);
         assert!(messages.get(2).expect("turn expected").content.contains("a2: bb"));
         assert!(messages.get(3).expect("turn expected").content.contains("a3: cccccc"));
@@ -409,7 +440,8 @@ mod tests {
             ..ChannelConfig::assigned("m".to_owned())
         };
 
-        let messages = assemble_context(&config, &settings, &state, &records, 1.0);
+        let budget = resolve_budget(&config, &settings, true);
+        let messages = assemble_context(&config, &settings, &state, &records, 1.0, budget);
 
         // A reply must at least see what it answers.
         assert_eq!(messages.len(), 3);
@@ -420,6 +452,62 @@ mod tests {
                 .content
                 .contains("a1: a very long message indeed")
         );
+    }
+
+    #[test]
+    fn model_window_derives_the_budget_but_only_when_calibrated() {
+        let state = ConversationState::default();
+        let mut settings = LlmSettings::default();
+        settings.models.insert(
+            "local/gemma".to_owned(),
+            ModelSettings { reasoning: false, context_window: Some(2000) },
+        );
+        // No channel override -> budget = window 2000 - reserve 1024 - 10%
+        // margin (200) = 776. Ratio 1.0, fixed slots 68 -> 300-char turns
+        // cost 308 each: two fit (68+308+308 = 684), the third (992) exceeds.
+        let records = vec![
+            user_record(1, "a1", &"x".repeat(300)),
+            user_record(2, "a2", &"x".repeat(300)),
+            user_record(3, "a3", &"x".repeat(300)),
+            user_record(4, "a4", &"x".repeat(300)),
+        ];
+        let config = ChannelConfig {
+            history_depth: 10,
+            ..ChannelConfig::assigned("local/gemma".to_owned())
+        };
+
+        let budget = resolve_budget(&config, &settings, true);
+        let calibrated = assemble_context(&config, &settings, &state, &records, 1.0, budget);
+        assert_eq!(calibrated.len(), 4, "two fixed slots + two budgeted turns");
+
+        // Uncalibrated: no usage data, so filling falls back to the message
+        // limit - all four turns are present despite the declared window.
+        let budget = resolve_budget(&config, &settings, false);
+        let uncalibrated = assemble_context(&config, &settings, &state, &records, 1.0, budget);
+        assert_eq!(uncalibrated.len(), 6);
+    }
+
+    #[test]
+    fn resolve_budget_prefers_channel_overrides_model_and_gates_on_calibration() {
+        let mut settings = LlmSettings::default();
+        settings.models.insert(
+            "local/gemma".to_owned(),
+            ModelSettings { reasoning: false, context_window: Some(8000) },
+        );
+        let mut config = ChannelConfig::assigned("local/gemma".to_owned());
+
+        // No override, uncalibrated: message-count filling.
+        assert_eq!(resolve_budget(&config, &settings, false), None);
+        // Calibrated: window 8000 - reserve 1024 - 10% (800) = 6176.
+        assert_eq!(resolve_budget(&config, &settings, true), Some(6176));
+
+        // Explicit channel budget wins and does not need calibration.
+        config.context_budget_tokens = Some(1500);
+        assert_eq!(resolve_budget(&config, &settings, false), Some(1500));
+
+        // Undeclared model: no window, no budget.
+        let other = ChannelConfig::assigned("unknown/model".to_owned());
+        assert_eq!(resolve_budget(&other, &settings, true), None);
     }
 
     #[test]

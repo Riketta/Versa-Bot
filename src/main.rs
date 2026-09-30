@@ -224,7 +224,15 @@ fn llm_settings_from(config: &LlmConfig) -> LlmSettings {
         models: config
             .models
             .iter()
-            .map(|(name, model)| (name.clone(), ModelSettings { reasoning: model.reasoning }))
+            .map(|(name, model)| {
+                (
+                    name.clone(),
+                    ModelSettings {
+                        reasoning: model.reasoning,
+                        context_window: model.context_window,
+                    },
+                )
+            })
             .collect(),
     }
 }

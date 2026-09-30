@@ -110,6 +110,12 @@ pub struct ModelSettings {
     /// The model accepts a reasoning/thinking parameter. Per-channel
     /// `reasoning_effort` is ignored for models without this.
     pub reasoning: bool,
+    /// Total context window in tokens. When declared, channels without an
+    /// explicit `context_budget_tokens` fill their prompt up to this window
+    /// minus the completion reserve and an estimator margin (token-budget
+    /// filling needs calibrated usage data; before the first reported
+    /// request, message-count filling applies).
+    pub context_window: Option<u64>,
 }
 
 struct ProviderClient {

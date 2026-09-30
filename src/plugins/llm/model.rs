@@ -168,11 +168,16 @@ pub struct UsageStats {
     /// sizes the token-budget fill; the default is typical English prose
     /// (~4 chars/token) and self-corrects after the first request.
     pub tokens_per_char: f64,
+    /// The effective prompt budget the engine last enforced (channel
+    /// override or model-window derived); `None` while filling is
+    /// count-only. `/llm_status` shows it so admins can see which
+    /// mechanism is active.
+    pub last_budget: Option<u64>,
 }
 
 impl Default for UsageStats {
     fn default() -> Self {
-        Self { last: None, tokens_per_char: 0.25 }
+        Self { last: None, tokens_per_char: 0.25, last_budget: None }
     }
 }
 
@@ -321,9 +326,18 @@ mod tests {
                 cached_tokens: Some(40),
             }),
             tokens_per_char: 0.31,
+            last_budget: Some(6176),
         };
         let json = serde_json::to_value(&stats).expect("stats expected to serialize");
         let back: UsageStats = serde_json::from_value(json).expect("stats expected to deserialize");
         assert_eq!(back, stats);
+
+        // Old stats documents (no last_budget) load with the field cleared.
+        let legacy: UsageStats = serde_json::from_value(serde_json::json!({
+            "last": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            "tokens_per_char": 0.3
+        }))
+        .expect("legacy stats expected to deserialize");
+        assert_eq!(legacy.last_budget, None);
     }
 }
