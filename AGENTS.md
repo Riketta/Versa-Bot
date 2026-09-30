@@ -33,10 +33,13 @@ Initially it will be used with Discord, but later it should be possible to use f
 
 ## Build & CI
 
-Both forges run the same pipeline (`.github/workflows/ci.yml` -> GHCR, `.forgejo/workflows/ci.yaml` -> the instance registry) on pushes to `main` and `v*` tags: `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked`, `cargo test --locked`, then the Docker image build (`cargo build --release --locked` inside the Dockerfile), gated on the test job. The toolchain is pinned to `rust:1.98` in CI and in the Dockerfile - the same compiler everywhere.
+Both forges run the same pipeline (`.github/workflows/ci.yml` -> GHCR, `.forgejo/workflows/ci.yaml` -> the instance registry) on pushes to `main` and `v*` tags: `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked`, `cargo test --locked`, then the Docker image build (`cargo build --release --locked` inside the Dockerfile), gated on the test job. The toolchain is pinned to `rust:1.98-bookworm` in CI and in the Dockerfile - the same compiler everywhere, with the Debian suite pinned alongside it so the binary's glibc ABI matches the `debian:bookworm-slim` runtime stage.
 
 - The clippy gate is deny-level lints only, deliberately NOT `-D warnings`: the codebase carries tolerated pedantic/doc warnings. Do not switch to `-D warnings` until a zero-warning cleanup pass lands.
 - Every cargo gate runs `--locked` (tests, clippy, and the image build alike): a stale `Cargo.lock` must fail fast in the test job, not in packaging. Dependency changes ship with an updated lockfile.
+- The local gate IS the CI gate: run exactly what CI runs - same commands, same order, same flags (`cargo fmt --all -- --check`, then `cargo clippy --all-targets --locked`, then `cargo test --locked`). The deny lints are declared in the `[lints.clippy]` table in `Cargo.toml`, so cargo applies them to every local clippy run exactly as in CI, and the pinned toolchain is the same - a lint error that appears in CI is always reproducible locally with the exact CI command. If it was not caught locally, the gate was not run after the final edit.
+- Run the full trio after the LAST edit of a change, and read the clippy run's exit status and `error:` lines, not the warning count: a deny-level lint failure adds an error without changing the warning tally, so a count-based check is blind to it.
+- `cargo test` does not execute clippy lints (`[lints.clippy]` applies only under clippy-driver): green tests never imply a clean clippy gate.
 - Docker BuildKit cache mounts persist on the Forgejo host builder (docker-socket packaging job) but do not survive between GitHub hosted runners - image builds there recompile dependencies whenever source changes. Accepted for now.
 
 ## Hexagonal Micro-Kernel Architecture

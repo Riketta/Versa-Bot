@@ -246,12 +246,26 @@ the `versa-bot-data` volume, and carries a commented PostgreSQL stack -
 
 ## Development
 
+Verify changes with the same gates CI runs - same commands, same order,
+same flags:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked
+cargo test --locked
+```
+
 - `cargo test` - unit tests cover the kernel pipeline, storage guild
   isolation (documents + record log), the command registry/dispatcher, the
   auth policy, the activity tracker, and the LLM chat plugin (context
   assembly, token budgets, compaction, splitting, provider request
   building, RNG adapters).
-- `cargo clippy --all-targets` - the deny-level lints must stay clean.
+- `cargo clippy --all-targets` - the deny-level lints (`indexing_slicing`,
+  `string_slice`, declared in the `[lints.clippy]` table in `Cargo.toml`)
+  must stay clean. Clippy lints do not run under `cargo test`, so green
+  tests never imply a clean clippy gate - and a deny-level failure adds an
+  `error:` line without changing the warning count, so check the exit
+  status, not the warnings.
 
 ### CI
 
