@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
 
+use crate::common::panic_message;
 use crate::kernel::{
     models::{Embed, EventPayload, OutboundMessage, RequestContext},
     plugin_ports::{
@@ -14,9 +16,10 @@ use crate::kernel::{
 /// Command dispatcher: routes native [`EventKind::CommandInvoked`] events to
 /// handlers registered in the `CommandRegistryPort`. Meaning lives in the
 /// owning plugins; this plugin only dispatches. An unknown command yields no
-/// output - there is no "not found" default. A handler failure on a
-/// transactional invocation (reply token) sends a generic ephemeral failure
-/// notice; plain events stay silent.
+/// output - there is no "not found" default. A handler failure (an `Err` or
+/// a panic - both are caught here, the pipeline never sees either) on a
+/// transactional invocation sends a generic ephemeral failure notice; plain
+/// events stay silent.
 pub struct CommandPlugin {
     registry: Arc<dyn CommandRegistryPort>,
 }
@@ -64,8 +67,19 @@ impl MiddlewarePluginPort for CommandPlugin {
         };
 
         let args = CommandArgs(command.args.clone());
-        if let Err(err) = handler.invoke(event, &args, services).await {
-            tracing::error!(command = %command.name, %err, "command handler failed");
+        // Panic-isolated like every plugin hook: a broken handler must not
+        // unwind into the pipeline, and a deferred interaction must not hang
+        // on "thinking" because the failure never became an `Err`.
+        let failure = match std::panic::AssertUnwindSafe(handler.invoke(event, &args, services))
+            .catch_unwind()
+            .await
+        {
+            Ok(Ok(())) => None,
+            Ok(Err(err)) => Some(err.to_string()),
+            Err(panic) => Some(format!("handler panicked: {}", panic_message(&panic))),
+        };
+        if let Some(detail) = failure {
+            tracing::error!(command = %command.name, detail = %detail, "command handler failed");
             // Transactional invocations (slash commands) owe the platform an
             // answer: a generic ephemeral notice keeps the interaction from
             // hanging; details stay in the log, not in the channel. Plain
@@ -274,6 +288,39 @@ mod tests {
         }
     }
 
+    struct PanickingHandler;
+
+    #[async_trait]
+    impl CommandHandler for PanickingHandler {
+        async fn invoke(
+            &self,
+            _event: &RequestContext,
+            _args: &CommandArgs,
+            _services: &KernelServices,
+        ) -> anyhow::Result<()> {
+            panic!("handler boom");
+        }
+    }
+
+    fn registry_with_handler(
+        command: &str,
+        handler: Arc<dyn CommandHandler>,
+    ) -> Arc<InMemoryCommandRegistry> {
+        let registry = InMemoryCommandRegistry::new();
+        registry.register(
+            CommandDescriptor {
+                plugin_id: "test".to_owned(),
+                name: command.to_owned(),
+                description: "test".to_owned(),
+                arguments: Vec::new(),
+                required_permission: None,
+                guild_only: false,
+            },
+            handler,
+        );
+        Arc::new(registry)
+    }
+
     fn failing_registry() -> Arc<InMemoryCommandRegistry> {
         let registry = InMemoryCommandRegistry::new();
         registry.register(
@@ -320,6 +367,43 @@ mod tests {
         let output = RecordingChatOutput::new();
         let services = test_services(&output);
         let mut event = command_event("fail", &[]);
+
+        let next = plugin.pre(&mut event, &services).await;
+
+        assert!(matches!(next, Next::Stop));
+        assert!(output.messages().is_empty());
+    }
+
+    /// A PANICKING handler is failure like any other: the dispatcher catches
+    /// it, the transactional invocation gets the same ephemeral answer, and
+    /// no panic unwinds into the pipeline.
+    #[tokio::test]
+    async fn panicking_handler_answers_ephemerally_with_reply_token() {
+        let registry = registry_with_handler("boom", Arc::new(PanickingHandler));
+        let plugin = CommandPlugin::new(registry);
+        let output = RecordingChatOutput::new();
+        let services = test_services(&output);
+        let mut event = command_event("boom", &[]);
+        event.origin.reply_token = Some("token".to_owned());
+
+        let next = plugin.pre(&mut event, &services).await;
+
+        assert!(matches!(next, Next::Stop));
+        let sent = output.sent();
+        assert_eq!(sent.len(), 1, "exactly one failure notice expected");
+        assert!(sent.first().expect("notice expected").ephemeral);
+        assert!(
+            output.messages().into_iter().next().is_some_and(|t| t.contains("⚠️ Command failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_handler_without_reply_token_stays_silent() {
+        let registry = registry_with_handler("boom", Arc::new(PanickingHandler));
+        let plugin = CommandPlugin::new(registry);
+        let output = RecordingChatOutput::new();
+        let services = test_services(&output);
+        let mut event = command_event("boom", &[]);
 
         let next = plugin.pre(&mut event, &services).await;
 

@@ -262,8 +262,10 @@ pub struct SerenityChatOutputFactory {
 }
 
 impl SerenityChatOutputFactory {
-    pub fn new(http: Http) -> Self {
-        Self { http: Arc::new(http) }
+    /// Takes the shared REST client: serenity rate limiting is per `Http`,
+    /// so every driven Discord caller must share one instance.
+    pub fn new(http: Arc<Http>) -> Self {
+        Self { http }
     }
 }
 

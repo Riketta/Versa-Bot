@@ -537,7 +537,9 @@ impl ChatEngine {
 
     /// Best-effort report to the guild's configured service channel;
     /// without one this is tracing only. Error notices are rate-limited
-    /// per channel ([`NOTICE_COOLDOWN`]), success notices are not.
+    /// per SERVICE channel ([`NOTICE_COOLDOWN`]) - an outage across many
+    /// active channels still yields one embed per window - success notices
+    /// are not rate-limited.
     async fn notify_service(
         &self,
         services: &KernelServices,
@@ -547,9 +549,6 @@ impl ChatEngine {
         description: String,
         is_error: bool,
     ) {
-        if is_error && !self.error_notice_allowed(origin) {
-            return;
-        }
         let raw = match storage.get(NAMESPACE, SERVICE_CHANNEL_KEY).await {
             Ok(Some(raw)) => raw,
             Ok(None) => return, // no service channel: logs only
@@ -562,6 +561,11 @@ impl ChatEngine {
             tracing::warn!("service channel config is malformed");
             return;
         };
+        // The cooldown keys on the destination, so it is known only after the
+        // service-channel lookup above.
+        if is_error && !self.error_notice_allowed(origin, service_channel) {
+            return;
+        }
         let output =
             services.chat_output_factory.channel_output(origin, ChannelId(service_channel));
         let notice = OutboundMessage::embed(Embed { title: title.to_owned(), description });
@@ -570,11 +574,11 @@ impl ChatEngine {
         }
     }
 
-    fn error_notice_allowed(&self, origin: &Origin) -> bool {
+    fn error_notice_allowed(&self, origin: &Origin, service_channel: u64) -> bool {
         let key: ChannelKey = (
             origin.platform.as_str().to_owned(),
             origin.guild_id.map_or(0, GuildId::get),
-            origin.channel_id.get(),
+            service_channel,
         );
         let mut notices = self.notices.lock();
         match notices.get(&key) {
@@ -1426,6 +1430,34 @@ mod tests {
 
         // Three failed completions - one rate-limited error embed.
         assert_eq!(ctx.output.messages().len(), 1);
+    }
+
+    /// The cooldown keys on the SERVICE channel, not the origin: an outage
+    /// across two active channels still yields a single embed per window.
+    #[tokio::test]
+    async fn error_notices_are_rate_limited_across_channels() {
+        let ctx = ctx(vec![Err(LlmError::Request("down".to_owned())); 4]);
+        seed_config(&ctx.storage, &assigned_config());
+        seed_service_channel(&ctx);
+
+        for channel in [2_u64, 3] {
+            let mut channel_origin = origin();
+            channel_origin.channel_id = ChannelId(channel);
+            ctx.engine
+                .handle_message(
+                    &channel_origin,
+                    &payload(true, None),
+                    &assigned_config(),
+                    &ctx.services,
+                )
+                .await;
+        }
+
+        assert_eq!(
+            ctx.output.messages().len(),
+            1,
+            "one outage window = one embed, regardless of origin channels"
+        );
     }
 
     #[tokio::test]

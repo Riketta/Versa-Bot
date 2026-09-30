@@ -52,6 +52,14 @@ async fn main() -> ExitCode {
         .id
         .get();
 
+    // One shared REST client for every driven Discord call (factory outputs,
+    // command registration): serenity rate limiting is per `Http`, so one
+    // instance keeps them in one bucket set. The gateway client must own its
+    // own `Http` (serenity API), and the bootstrap above exists only because
+    // the application id is not known before it runs.
+    let http =
+        Arc::new(build_http(&config.discord.token, config.discord.proxy.clone(), Some(app_id)));
+
     let storage = Arc::new(
         SqlxStorage::connect(&config.storage.url)
             .await
@@ -135,11 +143,8 @@ async fn main() -> ExitCode {
                 Arc::clone(&llm) as Arc<dyn MiddlewarePluginPort>,
             ])
             .event_bus(event_bus)
-            .chat_output_factory(Arc::new(SerenityChatOutputFactory::new(build_http(
-                &config.discord.token,
-                config.discord.proxy.clone(),
-                Some(app_id),
-            ))) as Arc<dyn ChatOutputFactoryPort>)
+            .chat_output_factory(Arc::new(SerenityChatOutputFactory::new(Arc::clone(&http)))
+                as Arc<dyn ChatOutputFactoryPort>)
             .storage(Arc::clone(&storage) as Arc<dyn StoragePort>)
             .build(),
     );
@@ -147,11 +152,7 @@ async fn main() -> ExitCode {
     kernel.boot().expect("kernel boot failed");
 
     // Discord specifics: publish the registry as global slash commands.
-    let registrar = DiscordCommandRegistrar::new(build_http(
-        &config.discord.token,
-        config.discord.proxy.clone(),
-        Some(app_id),
-    ));
+    let registrar = DiscordCommandRegistrar::new(Arc::clone(&http));
     registrar
         .sync(&registry.descriptors())
         .await

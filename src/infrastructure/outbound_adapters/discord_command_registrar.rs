@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serenity::all::Http;
 
 use crate::kernel::{
@@ -10,11 +12,13 @@ use crate::kernel::{
 /// registration port exists; each platform adapter wires this itself at its
 /// composition root.
 pub struct DiscordCommandRegistrar {
-    http: Http,
+    http: Arc<Http>,
 }
 
 impl DiscordCommandRegistrar {
-    pub fn new(http: Http) -> Self {
+    /// Takes the shared REST client: serenity rate limiting is per `Http`,
+    /// so every driven Discord caller must share one instance.
+    pub fn new(http: Arc<Http>) -> Self {
         Self { http }
     }
 

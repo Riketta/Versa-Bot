@@ -72,6 +72,10 @@ impl<E: EventBusPort> KernelService<E> {
     /// order before the error propagates; an `init`-phase failure needs no
     /// rollback - nothing has started yet.
     ///
+    /// Hook ORDER is the composition root's policy: the kernel is
+    /// meaning-blind and cannot know which plugin gates which, so a gating
+    /// plugin (e.g. auth) must be registered before the plugins it gates.
+    ///
     /// # Errors
     /// Propagates the first plugin `init`/`start` failure, or
     /// `PluginError::Invalid` on registration conflicts.
@@ -114,6 +118,17 @@ impl<E: EventBusPort> KernelService<E> {
             {
                 return Err(PluginError::Invalid(format!(
                     "middleware plugin `{}` is not dual-registered as the same plugin instance",
+                    step.name()
+                )));
+            }
+        }
+
+        // A duplicated middleware entry (the same instance listed twice)
+        // would silently run every event through it twice - refuse it.
+        for (index, step) in self.middleware.iter().enumerate() {
+            if self.middleware[..index].iter().any(|earlier| Self::same_instance(earlier, step)) {
+                return Err(PluginError::Invalid(format!(
+                    "middleware plugin `{}` is listed twice",
                     step.name()
                 )));
             }
@@ -966,6 +981,34 @@ mod tests {
         assert!(
             matches!(result, Err(PluginError::Invalid(_))),
             "a name-shared impostor instance must fail boot validation"
+        );
+    }
+
+    /// The same instance listed twice in the middleware chain would run
+    /// every event through it twice - boot refuses the configuration.
+    #[test]
+    fn duplicate_middleware_entry_fails_boot() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let plugin = Arc::new(RecorderPlugin {
+            name: "x",
+            log: Arc::clone(&log),
+            panic_in_pre: false,
+            panic_in_post: false,
+        });
+
+        let (kernel, _output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![Arc::clone(&plugin) as Arc<dyn PluginPort>],
+            vec![
+                Arc::clone(&plugin) as Arc<dyn MiddlewarePluginPort>,
+                Arc::clone(&plugin) as Arc<dyn MiddlewarePluginPort>,
+            ],
+        );
+
+        let result = kernel.boot();
+        assert!(
+            matches!(result, Err(PluginError::Invalid(_))),
+            "a duplicated middleware entry must fail boot validation"
         );
     }
 }

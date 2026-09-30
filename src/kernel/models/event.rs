@@ -48,14 +48,26 @@ pub struct Origin {
 /// Chat-agnostic inbound event taxonomy. Driving adapters normalize native
 /// platform events onto these kinds; middleware plugins match on the kinds
 /// they care about and ignore the rest.
+///
+/// Currently emitted kinds: `MessageReceived`, `MemberJoined`, `MemberLeft`,
+/// `CommandInvoked`. The remaining variants are reserved for future adapters
+/// - no adapter emits them yet, so a plugin matching on them never fires
+/// (listed here so the taxonomy is not read as a false contract).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventKind {
     MessageReceived,
+    /// Reserved: no adapter emits this yet. Editing is append-hostile for
+    /// the LLM record log, so a real implementation needs a consumer-driven
+    /// policy (e.g. record rewrites vs. compensating events) first.
     MessageEdited,
+    /// Reserved: no adapter emits this yet.
     MessageDeleted,
     MemberJoined,
     MemberLeft,
+    /// Reserved: no adapter emits inbound presence updates yet - the bot
+    /// only SETS its own presence (`PresencePort`), it does not consume
+    /// anyone else's.
     PresenceUpdate,
     /// A native platform command was invoked (e.g. Discord slash command).
     /// Prefix parsing for platforms without native commands is an adapter
