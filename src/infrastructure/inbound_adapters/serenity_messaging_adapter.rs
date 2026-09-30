@@ -42,9 +42,27 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
             message_id: Some(MessageId(message.id.get())),
         };
 
-        self.handler
-            .handle(RequestContext::message_received(origin, message.content))
-            .await;
+        // Best effort: role data is only present when Discord included the
+        // member in the payload. Authorization treats missing roles as "no
+        // roles", never as a hard failure.
+        let author_roles: Vec<String> = message
+            .member
+            .as_ref()
+            .map(|member| {
+                member
+                    .roles
+                    .iter()
+                    .map(|role| role.get().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut event = RequestContext::message_received(origin, message.content);
+        if let crate::kernel::models::EventPayload::Message(payload) = &mut event.payload {
+            payload.author_roles = author_roles;
+        }
+
+        self.handler.handle(event).await;
     }
 
     async fn ready(&self, _ctx: Context, ready: Ready) {

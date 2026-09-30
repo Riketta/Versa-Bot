@@ -17,6 +17,7 @@ use versa_bot::kernel::{
     services::KernelService,
     spi_ports::{ChatOutputFactoryPort, StoragePort},
 };
+use versa_bot::plugins::auth::AuthPlugin;
 use versa_bot::plugins::command::CommandPlugin;
 
 #[tokio::main]
@@ -48,12 +49,20 @@ async fn main() {
             .expect("storage expected to connect and migrate"),
     );
 
+    // Chain order = registration order: auth gates everything below it.
+    let auth = Arc::new(AuthPlugin);
     let command = Arc::new(CommandPlugin::new("!"));
 
     let kernel = Arc::new(
         KernelService::builder()
-            .plugins(vec![Arc::clone(&command) as Arc<dyn PluginPort>])
-            .middleware(vec![Arc::clone(&command) as Arc<dyn MiddlewarePluginPort>])
+            .plugins(vec![
+                Arc::clone(&auth) as Arc<dyn PluginPort>,
+                Arc::clone(&command) as Arc<dyn PluginPort>,
+            ])
+            .middleware(vec![
+                Arc::clone(&auth) as Arc<dyn MiddlewarePluginPort>,
+                Arc::clone(&command) as Arc<dyn MiddlewarePluginPort>,
+            ])
             .event_bus(InMemoryEventBus::new())
             .chat_output_factory(Arc::clone(&chat_output_factory) as Arc<dyn ChatOutputFactoryPort>)
             .storage(Arc::clone(&storage) as Arc<dyn StoragePort>)

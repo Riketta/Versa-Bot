@@ -20,6 +20,7 @@ impl RequestContext {
             origin,
             payload: EventPayload::Message(MessagePayload {
                 content: content.into(),
+                author_roles: Vec::new(),
             }),
         }
     }

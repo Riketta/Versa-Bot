@@ -61,6 +61,10 @@ pub enum EventPayload {
 #[derive(Debug, Clone)]
 pub struct MessagePayload {
     pub content: String,
+    /// Opaque platform role identifiers of the author, filled by driving
+    /// adapters when the platform provides them (empty otherwise). Lets
+    /// guild plugins do role checks without platform-specific types.
+    pub author_roles: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
