@@ -375,7 +375,8 @@ proxied from the config:
 
 The fix is to route the whole container through the proxy at the network
 level so both paths ride it. For a SOCKS5 proxy, a tun2socks sidecar
-works (check the image README for exact env names):
+works - and the proxy's own host must be excluded from the tunnel, or
+the sidecar would loop into itself:
 
 ```yaml
 services:
@@ -388,9 +389,8 @@ services:
       - /dev/net/tun
     environment:
       TUN: tun0
-      TUN_ADDR: 198.18.0.2
-      TUN_GW: 198.18.0.1
       PROXY: socks5://192.168.1.35:8081
+      TUN_EXCLUDED_ROUTES: 192.168.1.35/32  # the proxy host, direct via eth0
 
   versa-bot:
     # ...unchanged, except the network:
