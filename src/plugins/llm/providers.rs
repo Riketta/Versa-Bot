@@ -159,8 +159,18 @@ impl OpenAiCompatibleAdapter {
             let api_key = match &provider.api_key_env {
                 Some(var) => {
                     let key = std::env::var(var).map_err(|_| {
+                        // The most common misconfiguration is the key pasted
+                        // into the field that must name the variable holding
+                        // it - such values carry characters no settable env
+                        // var name can (dots, slashes), so call it out.
+                        let hint = if var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                            ""
+                        } else {
+                            " - api_key_env must NAME the environment variable holding \
+                             the key (e.g. VERSABOT_LLM_ZAI_KEY), not contain the key itself"
+                        };
                         LlmError::Request(format!(
-                            "provider `{name}`: env var `{var}` (api_key_env) is not set"
+                            "provider `{name}`: env var `{var}` (api_key_env) is not set{hint}"
                         ))
                     })?;
                     Some(key).filter(|key| !key.is_empty())
@@ -507,6 +517,32 @@ mod tests {
         };
         let result = OpenAiCompatibleAdapter::from_settings(Arc::new(settings));
         assert!(matches!(result, Err(LlmError::Request(_))));
+    }
+
+    /// A value that cannot be an env var name (dots, slashes) is almost
+    /// always the key itself pasted into `api_key_env` - the error says so.
+    #[test]
+    fn from_settings_names_the_variable_not_the_key() {
+        let settings = LlmSettings {
+            providers: BTreeMap::from([(
+                "zai".to_owned(),
+                ProviderSettings {
+                    api_url: "https://example.invalid/v4".to_owned(),
+                    api_key_env: Some("0344272d.key.value".to_owned()),
+                    ..ProviderSettings::default()
+                },
+            )]),
+            ..LlmSettings::default()
+        };
+        let message = match OpenAiCompatibleAdapter::from_settings(Arc::new(settings)) {
+            Err(LlmError::Request(message)) => message,
+            Err(err) => panic!("expected a request error, got {err}"),
+            Ok(_) => panic!("expected an error, but the adapter built"),
+        };
+        assert!(
+            message.contains("must NAME the environment variable"),
+            "hint missing from: {message}"
+        );
     }
 
     #[test]

@@ -42,12 +42,13 @@ url = "sqlite://versabot.db"
 # max_message_length = 2000
 # stream_interval_ms = 2000
 
-# Providers are OpenAI-compatible endpoints. `api_key_env` names the
-# environment variable holding the key (local endpoints may omit it);
-# optional per-provider `proxy` and `timeout_secs`.
+# Providers are OpenAI-compatible endpoints. `api_key_env` NAMES the
+# environment variable holding the key - it must never contain the key
+# itself (keys never live in config files or guild storage); local
+# endpoints may omit it. Optional per-provider `proxy` and `timeout_secs`.
 # [llm.providers.zai]
 # api_url = "https://api.z.ai/api/coding/paas/v4"
-# api_key_env = "VERSABOT_LLM_ZAI_KEY"
+# api_key_env = "VERSABOT_LLM_ZAI_KEY"   # then: VERSABOT_LLM_ZAI_KEY=<key> in the environment
 # reasoning_style = "openai_effort"   # or "glm_thinking"
 #
 # [llm.providers.local]
