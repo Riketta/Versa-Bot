@@ -321,7 +321,7 @@ saved):
 | `model` | provider/model reference - declared models only (see `/llm_models`) | set by `/llm_assign` |
 | `temperature` `top_p` `top_k` `min_p` `frequency_penalty` `presence_penalty` | sampling parameters; cleared = not sent | provider defaults |
 | `max_tokens` | completion size cap | provider default |
-| `reasoning_effort` | reasoning hint sent only when the model declares `reasoning = true`; `off` sends nothing | none |
+| `reasoning_effort` | reasoning hint sent only when the model declares `reasoning = true`; `off`/`clear` sends no reasoning parameter at all (provider default applies) | none |
 | `depth` | live-window size in messages; reaching it triggers compaction | 100 |
 | `context_budget` | prompt-side token budget; cleared = auto (model window) once calibrated | auto |
 | `capture_mode` | `bot_related` or `all_messages` | `bot_related` |

@@ -211,18 +211,20 @@ impl PluginPort for LlmPlugin {
         self.registry.register(
             self.descriptor(
                 "llm_set",
-                "Tune this channel's chat bot",
+                "Tune this channel's chat bot (model, reasoning, sampling, depth, streaming)",
                 vec![
                     ArgDescriptor {
                         name: "key".to_owned(),
-                        description: "Setting to change".to_owned(),
+                        description: "Setting to change; reasoning_effort=off disables reasoning"
+                            .to_owned(),
                         required: true,
                         kind: ArgKind::String,
                         choices: Some(SET_KEYS.iter().map(|key| (*key).to_owned()).collect()),
                     },
                     ArgDescriptor {
                         name: "value".to_owned(),
-                        description: "New value (`clear` resets)".to_owned(),
+                        description: "New value; `clear` resets; `off` disables reasoning"
+                            .to_owned(),
                         required: true,
                         kind: ArgKind::String,
                         choices: None,
