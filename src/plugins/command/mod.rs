@@ -63,6 +63,7 @@ impl MiddlewarePluginPort for CommandPlugin {
         };
 
         let Some(handler) = self.registry.lookup(&command.name) else {
+            tracing::debug!(command = %command.name, "no handler registered - ignoring command");
             return Next::Continue;
         };
 
@@ -94,6 +95,25 @@ impl MiddlewarePluginPort for CommandPlugin {
                     tracing::warn!(%notice_err, "failed to deliver command failure notice");
                 }
             }
+        } else {
+            // Audit trail: who ran what. User/guild/channel ride in the
+            // kernel span; argument values render only while short (settings
+            // keys, ids, `clear`) - long free text (prompts) is a shape, not
+            // content, so the audit never carries message-sized payloads.
+            let summary = args
+                .0
+                .iter()
+                .map(|(name, value)| {
+                    let count = value.chars().count();
+                    if count <= 64 {
+                        format!("{name}={value:?}")
+                    } else {
+                        format!("{name}=<{count} chars>")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::info!(command = %command.name, summary = %summary, "command executed");
         }
 
         // Deliberate handling: like auth, a resolved command stops the chain.

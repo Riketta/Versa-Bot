@@ -227,6 +227,13 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
         if let Some(api_key) = &provider.api_key {
             request_builder = request_builder.bearer_auth(api_key);
         }
+        let started = std::time::Instant::now();
+        tracing::debug!(
+            provider = provider_name,
+            model = model_name,
+            messages = request.messages.len(),
+            "LLM request dispatched"
+        );
         let response =
             request_builder.send().await.map_err(|err| LlmError::Request(err.to_string()))?;
         let status = response.status();
@@ -234,7 +241,16 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
         if !status.is_success() {
             return Err(LlmError::Request(format!("HTTP {status}: {}", truncate(&text, 300))));
         }
-        parse_completion_content(&text)
+        let parsed = parse_completion_content(&text)?;
+        tracing::debug!(
+            provider = provider_name,
+            model = model_name,
+            status = %status,
+            elapsed_ms = started.elapsed().as_millis(),
+            content_chars = parsed.content.chars().count(),
+            "LLM response received"
+        );
+        Ok(parsed)
     }
 }
 

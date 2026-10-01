@@ -45,6 +45,7 @@ impl SchedulerPort for TokioScheduler {
                 if shutdown.is_cancelled() {
                     break;
                 }
+                tracing::debug!(job = %job_name, "job tick");
 
                 let run = std::panic::AssertUnwindSafe(job.run()).catch_unwind().await;
                 if let Err(panic) = run {

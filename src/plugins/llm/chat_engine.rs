@@ -44,6 +44,31 @@ const NOTICE_COOLDOWN: Duration = Duration::from_secs(300);
 /// consecutive messages.
 const CHIME_COOLDOWN: Duration = Duration::from_secs(300);
 
+/// One answer attempt's inputs, grouped so [`ChatEngine::answer`] and the
+/// chime helper keep flat signatures.
+struct AnswerRequest<'a> {
+    config: &'a ChannelConfig,
+    state: &'a ConversationState,
+    live: &'a [ConversationRecord],
+    usage_stats: &'a UsageStats,
+    /// Audit label: `"triggered"` (the user addressed the bot) or `"chime"`
+    /// (unprompted roll).
+    trigger: &'a str,
+}
+
+/// Fields of the per-completion audit record, grouped so the logging helper
+/// keeps a flat signature.
+struct AnswerAudit<'a> {
+    trigger: &'a str,
+    started: Instant,
+    model: &'a str,
+    usage: Option<TokenUsage>,
+    window: usize,
+    window_used: usize,
+    context_chars: u64,
+    calibrated: bool,
+}
+
 /// Upper bound of in-place edits while progressively revealing an answer;
 /// the reveal step derives from the content length, so this bounds the whole
 /// reveal regardless of `max_length`.
@@ -113,7 +138,6 @@ impl ChatEngine {
             return;
         };
         let usage_stats = self.load_stats(storage, channel_id).await;
-        let calibrated = usage_stats.last.is_some();
         let mut live = match self.load_live_records(storage, channel_id, state.cutoff_seq).await {
             Ok(live) => live,
             Err(err) => {
@@ -166,37 +190,22 @@ impl ChatEngine {
             None => {}
         }
 
+        let request = AnswerRequest {
+            config,
+            state: &state,
+            live: &live_records,
+            usage_stats: &usage_stats,
+            trigger: "triggered",
+        };
         if conversation::should_trigger(payload.mentions_bot, reply_to, &live_records) {
             if capture_failed {
                 self.send_fallback(origin, services).await;
-            } else if !self
-                .answer(
-                    origin,
-                    config,
-                    &state,
-                    &live_records,
-                    usage_stats.tokens_per_char,
-                    calibrated,
-                    services,
-                )
-                .await
-            {
+            } else if !self.answer(origin, request, services).await {
                 // The generated answer is impossible - the triggered message
                 // still gets a visible response.
                 self.send_fallback(origin, services).await;
             }
-        } else if captured
-            && config.random_chance_percent > 0.0
-            && self.chime_allowed(origin)
-            && self.rng.chance_percent(
-                RandomScope {
-                    platform: origin.platform.as_str(),
-                    guild_id: origin.guild_id.map_or(0, GuildId::get),
-                    channel_id: origin.channel_id.get(),
-                },
-                config.random_chance_percent,
-            )
-        {
+        } else if captured && config.random_chance_percent > 0.0 {
             // Random chime-in: same delivery path as a mention reply - the
             // answer is assembled from the context the message just joined
             // and recorded as an assistant turn. Only CAPTURED messages are
@@ -204,17 +213,7 @@ impl ChatEngine {
             // look like answering nothing. Unprompted, so a failed chime-in
             // stays silent - the guaranteed-answer contract covers only
             // messages addressed to the bot.
-            self.note_chime(origin);
-            self.answer(
-                origin,
-                config,
-                &state,
-                &live_records,
-                usage_stats.tokens_per_char,
-                calibrated,
-                services,
-            )
-            .await;
+            self.maybe_chime(origin, request, services).await;
         }
 
         // Compaction runs after the reply (the triggering turn used the
@@ -261,13 +260,10 @@ impl ChatEngine {
     async fn answer(
         &self,
         origin: &Origin,
-        config: &ChannelConfig,
-        state: &ConversationState,
-        live: &[ConversationRecord],
-        tokens_per_char: f64,
-        calibrated: bool,
+        request: AnswerRequest<'_>,
         services: &KernelServices,
     ) -> bool {
+        let AnswerRequest { config, state, live, usage_stats, trigger } = request;
         // The answer may take tens of seconds: hold the platform typing
         // indicator across generation and delivery. The guard drops on every
         // return path - failure included, the caller's fallback follows
@@ -275,20 +271,17 @@ impl ChatEngine {
         let _typing = services.chat_output_factory.start_typing(origin);
         let channel_id = origin.channel_id.get();
         let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
-        let window: &[ConversationRecord] = if live.len() > depth {
-            let (_, tail) = live.split_at(live.len() - depth);
-            tail
-        } else {
-            live
-        };
-        let budget = conversation::resolve_budget(config, &self.settings, calibrated);
+        let skip = live.len().saturating_sub(depth);
+        let window: &[ConversationRecord] = live.get(skip..).unwrap_or(live);
+        let budget =
+            conversation::resolve_budget(config, &self.settings, usage_stats.last.is_some());
 
         let messages = conversation::assemble_context(
             config,
             &self.settings,
             state,
             window,
-            tokens_per_char,
+            usage_stats.tokens_per_char,
             budget,
         );
         // The endpoint's usage report is measured against exactly this
@@ -301,6 +294,7 @@ impl ChatEngine {
             messages,
             params: config.params.clone(),
         };
+        let started = Instant::now();
         let response = match self.completion.complete(request).await {
             Ok(response) => response,
             Err(err) => {
@@ -319,18 +313,47 @@ impl ChatEngine {
                 return false;
             }
         };
+        // Per-completion audit: usage, latency and context shape.
+        self.log_answer_audit(
+            channel_id,
+            AnswerAudit {
+                trigger,
+                started,
+                model: config.model.as_str(),
+                usage: response.usage,
+                window: live.len(),
+                window_used: window.len(),
+                context_chars,
+                calibrated: usage_stats.last.is_some(),
+            },
+        );
         self.record_usage(
             services,
             channel_id,
             response.usage,
             context_chars,
-            tokens_per_char,
+            usage_stats.tokens_per_char,
             budget,
         )
         .await;
 
+        self.deliver_reply(origin, config, channel_id, &response.content, services).await
+    }
+
+    /// Delivery half of [`ChatEngine::answer`]: splits the reply to the
+    /// channel's length cap (on line boundaries), streams or plain-sends it,
+    /// and records the bot turn. Returns whether delivery could start - the
+    /// caller's fallback follows when it did not.
+    async fn deliver_reply(
+        &self,
+        origin: &Origin,
+        config: &ChannelConfig,
+        channel_id: u64,
+        content: &str,
+        services: &KernelServices,
+    ) -> bool {
         let max_length = config.max_length.unwrap_or(self.settings.max_message_length);
-        let chunks = conversation::split_reply(&response.content, max_length);
+        let chunks = conversation::split_reply(content, max_length);
         if chunks.is_empty() {
             tracing::warn!(channel = channel_id, "completion returned no deliverable content");
             return false;
@@ -368,7 +391,7 @@ impl ChatEngine {
             message_id: first_message_id,
             role: RecordRole::Assistant,
             author: None,
-            content: response.content,
+            content: content.to_owned(),
             reply_to: None,
             captured_at: unix_now(),
         };
@@ -378,6 +401,71 @@ impl ChatEngine {
             tracing::error!(channel = channel_id, %err, "failed to record bot turn into history");
         }
         true
+    }
+
+    /// Per-completion audit record: usage, latency and context shape.
+    /// Contents never log - sizes and counters only (info-grade: rides along
+    /// to GlitchTip as a log item).
+    fn log_answer_audit(&self, channel_id: u64, audit: AnswerAudit<'_>) {
+        let AnswerAudit {
+            trigger,
+            started,
+            model,
+            usage,
+            window,
+            window_used,
+            context_chars,
+            calibrated,
+        } = audit;
+        tracing::info!(
+            channel = channel_id,
+            model,
+            trigger,
+            elapsed_ms = started.elapsed().as_millis(),
+            prompt_tokens = usage.map_or(0, |usage| usage.prompt_tokens),
+            completion_tokens = usage.map_or(0, |usage| usage.completion_tokens),
+            cached_tokens = ?usage.and_then(|usage| usage.cached_tokens),
+            window,
+            window_used,
+            context_chars,
+            calibrated,
+            "LLM answer generated"
+        );
+    }
+
+    /// Random chime-in decision for one captured, non-triggering message:
+    /// cooldown gate, deck-based roll, then the same delivery path as a
+    /// triggered answer. Silent on every negative decision - only the roll
+    /// trace at debug explains why the bot stayed quiet.
+    async fn maybe_chime(
+        &self,
+        origin: &Origin,
+        mut request: AnswerRequest<'_>,
+        services: &KernelServices,
+    ) {
+        if !self.chime_allowed(origin) {
+            tracing::debug!(channel = origin.channel_id.get(), "chime skipped - cooldown active");
+            return;
+        }
+        let rolled = self.rng.chance_percent(
+            RandomScope {
+                platform: origin.platform.as_str(),
+                guild_id: origin.guild_id.map_or(0, GuildId::get),
+                channel_id: origin.channel_id.get(),
+            },
+            request.config.random_chance_percent,
+        );
+        tracing::debug!(
+            channel = origin.channel_id.get(),
+            chance = request.config.random_chance_percent,
+            rolled,
+            "chime roll"
+        );
+        if rolled {
+            self.note_chime(origin);
+            request.trigger = "chime";
+            self.answer(origin, request, services).await;
+        }
     }
 
     /// The guaranteed-answer contract: a message that explicitly addresses

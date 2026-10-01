@@ -223,6 +223,7 @@ impl<E: EventBusPort> RequestHandlerPort for KernelService<E> {
         let span = tracing::info_span!(
             "handle_event",
             platform = ?event.origin.platform,
+            kind = ?event.kind,
             guild_id = event.origin.guild_id.map(GuildId::get),
             channel_id = event.origin.channel_id.get(),
             user_id = event.origin.user_id.get(),
@@ -248,8 +249,11 @@ impl<E: EventBusPort> KernelService<E> {
     async fn process(&self, mut event: RequestContext) {
         let services = self.scoped_services(&event.origin);
 
+        tracing::debug!(kind = ?event.kind, "event entering middleware pipeline");
+
         let mut ran = 0usize;
         let mut aborted = false;
+        let mut stopped_by: Option<&str> = None;
 
         for step in &self.middleware {
             let outcome =
@@ -259,10 +263,12 @@ impl<E: EventBusPort> KernelService<E> {
                 Ok(Next::Continue) => ran += 1,
                 Ok(Next::Stop) => {
                     ran += 1;
+                    stopped_by = Some(step.name());
                     break;
                 }
                 Ok(Next::Abort) => {
                     aborted = true;
+                    stopped_by = Some(step.name());
                     break;
                 }
                 Err(panic) => {
@@ -277,6 +283,8 @@ impl<E: EventBusPort> KernelService<E> {
                 }
             }
         }
+
+        tracing::debug!(ran, aborted, ?stopped_by, "middleware pre-traversal finished");
 
         if aborted {
             return;

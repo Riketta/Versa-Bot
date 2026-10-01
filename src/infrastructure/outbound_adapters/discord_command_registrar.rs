@@ -25,14 +25,25 @@ impl DiscordCommandRegistrar {
     /// Bulk-overwrites global application commands with the registry's
     /// descriptors. Resolved entities (users, roles, ...) arrive as ID
     /// strings; string arguments may carry plugin-declared choices.
+    ///
+    /// # Errors
+    /// Fails when Discord rejects the bulk overwrite; the caller aborts boot.
     pub async fn sync(&self, descriptors: &[CommandDescriptor]) -> Result<(), OutboundError> {
         let commands: Vec<serde_json::Value> =
             descriptors.iter().map(application_command_json).collect();
 
+        let started = std::time::Instant::now();
         self.http
             .create_global_commands(&serde_json::json!(commands))
             .await
             .map_err(|err| OutboundError::Send(err.to_string()))?;
+        // The registration trail: each local registration is logged by the
+        // registry; this is the platform-side completion of the same event.
+        tracing::info!(
+            count = descriptors.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "global slash commands synced to Discord"
+        );
         Ok(())
     }
 }

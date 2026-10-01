@@ -63,7 +63,12 @@ a slash command from any other reply path.
   reporting (DSN-driven) with release tagging; every event is traced with
   its origin, an optional sample rate feeds performance transactions, and
   warn/info/error ship as Sentry log items while error-grade failures
-  (storage, LLM provider) surface as Issues.
+  (storage, LLM provider) surface as Issues. Audit-grade records at `info`
+  cover command dispatch (who ran what, argument shapes - never contents),
+  the command registration trail (per-plugin registrations plus the
+  completed Discord sync) and every LLM answer (model, trigger, latency,
+  token usage, window sizes); `debug` adds pipeline traversal, provider
+  request/response traces, scheduler ticks and chime roll decisions.
 - Fault isolation: a panicking plugin cannot crash the bot - pipeline hooks
   and event-bus subscribers are caught and logged (plugin + event), the
   event is dropped, and the rest of the chain or bus keeps working.
@@ -344,6 +349,14 @@ per service channel) carries the error classification only - endpoint
 response bodies can name operator accounts or projects, so they stay in
 the logs.
 
+**Logging.** Every generated answer leaves an `info` audit record in the
+logs: model, trigger (`triggered` vs `chime`), latency, prompt/completion
+token usage (cached when the endpoint reports it), live-window and
+currently-used sizes. Sizes and counters only - message text and prompts
+never log. At `debug`, chime roll decisions (cooldown skips and deck
+draws) and per-request LLM traces (provider, model, status, duration)
+explain why the bot stayed quiet or answered slowly.
+
 ## Docker
 
 CI builds the image on every push to `main` and on `v*` git tags -
@@ -367,7 +380,10 @@ docker run -d --name versa-bot \
 
 For production, point `VERSABOT__STORAGE__URL` at PostgreSQL. To use a
 config file instead of env vars, mount it at `/app/versabot.toml:ro`.
-Set `RUST_LOG` to tune log verbosity (default `info`).
+Set `RUST_LOG` to tune log verbosity (default `info`);
+`RUST_LOG=versa_bot=debug` adds the bot's own breadcrumbs - pipeline
+traversal, LLM request/response traces, chime roll decisions - on top of
+the `info`-grade audit records.
 
 A ready-made Compose deployment ships as `docker-compose.yaml`: it passes
 `.env` (copy `.env.example`) into the container, keeps the SQLite file in
