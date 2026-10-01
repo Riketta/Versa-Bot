@@ -15,14 +15,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use tokio::sync::mpsc;
 
 use crate::kernel::{
     models::{ChannelId, Embed, GuildId, MessageId, MessagePayload, Origin, OutboundMessage},
     services::KernelServices,
-    spi_ports::{ChatStreamPort, GuildStorage},
+    spi_ports::GuildStorage,
 };
 
-use super::completion_port::{CompletionRequest, LlmCompletionPort, TokenUsage};
+use super::completion_port::{
+    CompletionRequest, CompletionResponse, LlmCompletionPort, LlmError, TokenUsage,
+};
 use super::conversation::{self, ConversationRecord, RecordRole};
 use super::model::{
     CaptureMode, ChannelConfig, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY,
@@ -69,10 +72,16 @@ struct AnswerAudit<'a> {
     calibrated: bool,
 }
 
-/// Upper bound of in-place edits while progressively revealing an answer;
-/// the reveal step derives from the content length, so this bounds the whole
-/// reveal regardless of `max_length`.
-const MAX_STREAM_EDITS: usize = 10;
+/// Outcome of a streaming completion attempt: `Done` carries the full
+/// authoritative response; `Partial` means the stream died after content
+/// was already revealed (the shown text is what the endpoint produced - it
+/// is delivered as-is, never patched over with the fallback notice);
+/// `Failed` means nothing was shown and the regular failure policy applies.
+enum LiveOutcome {
+    Done(CompletionResponse),
+    Partial(String),
+    Failed(LlmError),
+}
 
 /// Generic public notice when a message that explicitly addresses the bot
 /// cannot receive a generated answer. Deliberately detail-free: the error
@@ -295,9 +304,54 @@ impl ChatEngine {
             params: config.params.clone(),
         };
         let started = Instant::now();
-        let response = match self.completion.complete(request).await {
-            Ok(response) => response,
-            Err(err) => {
+
+        // Streaming channels pull the answer live off the endpoint (SSE
+        // deltas reveal on one message); everything else stays single-shot.
+        let (live_id, outcome) = if config.streaming {
+            self.complete_live(origin, request, services).await
+        } else {
+            (
+                None,
+                match self.completion.complete(request).await {
+                    Ok(response) => LiveOutcome::Done(response),
+                    Err(err) => LiveOutcome::Failed(err),
+                },
+            )
+        };
+
+        let response = match outcome {
+            LiveOutcome::Done(response) => response,
+            LiveOutcome::Partial(partial) => {
+                // The stream died with content already on screen. The
+                // channel sees a (partial) answer - the generic fallback
+                // would contradict visible text. Finalize the partial,
+                // log, and report through the service channel.
+                tracing::error!(
+                    channel = channel_id,
+                    model = %config.model,
+                    content_chars = partial.chars().count(),
+                    "LLM stream interrupted - partial answer delivered"
+                );
+                if let Some(storage) = &services.guild_storage {
+                    self.notify_service(
+                        services,
+                        origin,
+                        storage,
+                        "LLM stream interrupted",
+                        format!(
+                            "Model `{}`: the connection dropped mid-answer; a partial reply \
+                             was delivered.",
+                            config.model
+                        ),
+                        true,
+                    )
+                    .await;
+                }
+                return self
+                    .deliver_reply(origin, config, channel_id, &partial, live_id, services)
+                    .await;
+            }
+            LiveOutcome::Failed(err) => {
                 tracing::error!(channel = channel_id, model = %config.model, %err, "LLM completion failed - no generated reply");
                 if let Some(storage) = &services.guild_storage {
                     self.notify_service(
@@ -337,19 +391,162 @@ impl ChatEngine {
         )
         .await;
 
-        self.deliver_reply(origin, config, channel_id, &response.content, services).await
+        self.deliver_reply(origin, config, channel_id, &response.content, live_id, services).await
+    }
+
+    /// Streaming completion half: pulls content deltas off the endpoint and
+    /// reveals them live on one channel message - begun with the first
+    /// delta, edits throttled to the configured cadence. Returns the live
+    /// message id (when the reveal started) plus the outcome: the full
+    /// authoritative response, a partial answer (stream died after content
+    /// was shown), or the failure of a stream that never showed anything.
+    async fn complete_live(
+        &self,
+        origin: &Origin,
+        request: CompletionRequest,
+        services: &KernelServices,
+    ) -> (Option<MessageId>, LiveOutcome) {
+        let (tx, mut rx) = mpsc::channel::<String>(32);
+        let mut completion = Box::pin(self.completion.complete_streaming(request, tx));
+        let stream = services.chat_output_factory.stream_output(origin);
+        let mut live_id: Option<MessageId> = None;
+        let mut revealed = String::new();
+        let interval = Duration::from_millis(self.settings.stream_interval_ms.max(1));
+        let mut next_edit = Instant::now() + interval;
+        // A failed `begin` (platform hiccup) stops live revealing; the
+        // completion still finishes and delivers through the plain path.
+        let mut revealing = true;
+
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                delta = rx.recv() => match delta {
+                    Some(delta) => {
+                        revealed.push_str(&delta);
+                        if !revealing {
+                            continue;
+                        }
+                        match live_id {
+                            Some(id) => {
+                                if Instant::now() >= next_edit {
+                                    next_edit = Instant::now() + interval;
+                                    if let Err(err) = stream.update(id, revealed.clone()).await {
+                                        tracing::warn!(
+                                            channel = origin.channel_id.get(),
+                                            %err,
+                                            "streaming update failed - continuing"
+                                        );
+                                    }
+                                }
+                            }
+                            None => {
+                                match stream.begin(OutboundMessage::text(revealed.clone())).await {
+                                    Ok(id) => {
+                                        live_id = Some(id);
+                                        next_edit = Instant::now() + interval;
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            channel = origin.channel_id.get(),
+                                            %err,
+                                            "stream begin failed - delivering without live reveal"
+                                        );
+                                        revealing = false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // The adapter dropped the sender: the authoritative
+                    // result is ready.
+                    None => {
+                        let result = completion.as_mut().await;
+                        break match result {
+                            Ok(response) => LiveOutcome::Done(response),
+                            Err(err) if live_id.is_some() => {
+                                tracing::warn!(
+                                    channel = origin.channel_id.get(),
+                                    %err,
+                                    "stream failed after content was revealed"
+                                );
+                                LiveOutcome::Partial(revealed)
+                            }
+                            Err(err) => LiveOutcome::Failed(err),
+                        };
+                    }
+                },
+                res = &mut completion => {
+                    // The adapter's future can resolve before the engine's
+                    // first recv poll (tiny streams, single-poll fakes):
+                    // drain whatever was buffered and reveal it - the
+                    // outcome mapping below depends on knowing whether
+                    // content was already on screen.
+                    if revealing {
+                        while let Ok(delta) = rx.try_recv() {
+                            revealed.push_str(&delta);
+                            match live_id {
+                                None => {
+                                    match stream
+                                        .begin(OutboundMessage::text(revealed.clone()))
+                                        .await
+                                    {
+                                        Ok(id) => live_id = Some(id),
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                channel = origin.channel_id.get(),
+                                                %err,
+                                                "stream begin failed - delivering without live reveal"
+                                            );
+                                            revealing = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                Some(id) => {
+                                    if let Err(err) =
+                                        stream.update(id, revealed.clone()).await
+                                    {
+                                        tracing::warn!(
+                                            channel = origin.channel_id.get(),
+                                            %err,
+                                            "streaming update failed - continuing"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    break match res {
+                        Ok(response) => LiveOutcome::Done(response),
+                        Err(err) if live_id.is_some() => {
+                            tracing::warn!(
+                                channel = origin.channel_id.get(),
+                                %err,
+                                "stream failed after content was revealed"
+                            );
+                            LiveOutcome::Partial(revealed)
+                        }
+                        Err(err) => LiveOutcome::Failed(err),
+                    };
+                }
+            }
+        };
+        (live_id, outcome)
     }
 
     /// Delivery half of [`ChatEngine::answer`]: splits the reply to the
-    /// channel's length cap (on line boundaries), streams or plain-sends it,
-    /// and records the bot turn. Returns whether delivery could start - the
-    /// caller's fallback follows when it did not.
+    /// channel's length cap (on line boundaries), delivers it, and records
+    /// the bot turn. `live_id` carries an already-streaming message from
+    /// [`Self::complete_live`] - its final edit pins the exact first chunk;
+    /// without one, `begin` posts the first chunk directly. Returns whether
+    /// delivery could start - the caller's fallback follows when it did not.
     async fn deliver_reply(
         &self,
         origin: &Origin,
         config: &ChannelConfig,
         channel_id: u64,
         content: &str,
+        live_id: Option<MessageId>,
         services: &KernelServices,
     ) -> bool {
         let max_length = config.max_length.unwrap_or(self.settings.max_message_length);
@@ -361,23 +558,31 @@ impl ChatEngine {
 
         // The streaming port doubles as the plain reply path: `begin`
         // delivers the first chunk and yields the platform message id the
-        // assistant record needs for reply-chain detection. Streaming mode
-        // starts from a placeholder and reveals the first chunk in place;
-        // plain mode delivers the full first chunk immediately.
+        // assistant record needs for reply-chain detection.
         let stream = services.chat_output_factory.stream_output(origin);
         let first_chunk = chunks.first().expect("non-empty chunks checked").clone();
-        let placeholder = if config.streaming { "…" } else { first_chunk.as_str() };
-        let mut first_message_id: Option<u64> = None;
-        match stream.begin(OutboundMessage::text(placeholder.to_owned())).await {
-            Ok(id) => first_message_id = Some(id.get()),
-            Err(err) => {
-                tracing::warn!(channel = channel_id, %err, "stream begin failed - falling back to plain sends");
+        let first_message_id: Option<u64> = match live_id {
+            Some(id) => {
+                // The live message already shows prefixes of the answer;
+                // the final edit pins it to the authoritative first chunk
+                // (reasoning stripping may have shortened the raw deltas).
+                if let Err(err) = stream.update(id, first_chunk.clone()).await {
+                    tracing::warn!(channel = channel_id, %err, "final stream update failed");
+                }
+                Some(id.get())
             }
-        }
-
-        if let (true, Some(id)) = (config.streaming, first_message_id) {
-            self.reveal_progressively(&stream, MessageId(id), &first_chunk).await;
-        }
+            None => match stream.begin(OutboundMessage::text(first_chunk.clone())).await {
+                Ok(id) => Some(id.get()),
+                Err(err) => {
+                    tracing::warn!(
+                        channel = channel_id,
+                        %err,
+                        "stream begin failed - falling back to plain sends"
+                    );
+                    None
+                }
+            },
+        };
 
         let delivered_first = usize::from(first_message_id.is_some());
         for chunk in chunks.iter().skip(delivered_first) {
@@ -828,31 +1033,6 @@ impl ChatEngine {
             .and_then(|raw| serde_json::from_value(raw).ok())
             .unwrap_or_default()
     }
-
-    /// Reveals `content` in place on `message`, at the configured cadence,
-    /// in at most [`MAX_STREAM_EDITS`] edits - the last one carries the
-    /// exact full text. Failed updates are logged and skipped: the next
-    /// tick re-sends a longer prefix, so a transient edit failure heals
-    /// itself; the message is only ever behind, never wrong.
-    async fn reveal_progressively(
-        &self,
-        stream: &Arc<dyn ChatStreamPort>,
-        message: MessageId,
-        content: &str,
-    ) {
-        let interval = Duration::from_millis(self.settings.stream_interval_ms.max(1));
-        let total = content.chars().count();
-        let step = total.div_ceil(MAX_STREAM_EDITS).max(1);
-        let mut revealed = 0;
-        while revealed < total {
-            tokio::time::sleep(interval).await;
-            revealed = (revealed + step).min(total);
-            let text: String = content.chars().take(revealed).collect();
-            if let Err(err) = stream.update(message, text).await {
-                tracing::warn!(%err, "streaming update failed - continuing");
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -995,6 +1175,76 @@ mod tests {
         fn chance_percent(&self, _scope: RandomScope, _percent: f64) -> bool {
             self.0
         }
+    }
+
+    /// Streaming fake: emits its chunks as real deltas, pausing between them
+    /// so the engine's throttled reveal ticks, and resolves to the assembled
+    /// text. `fail_at_start` / `fail_after` model endpoints that fail before
+    /// any content or mid-stream.
+    struct DeltaCompletion {
+        chunks: Vec<String>,
+        delay_ms: u64,
+        fail_at_start: bool,
+        fail_after: Option<usize>,
+    }
+
+    #[async_trait]
+    impl LlmCompletionPort for DeltaCompletion {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            Ok(CompletionResponse { content: self.chunks.join(""), usage: None })
+        }
+
+        async fn complete_streaming(
+            &self,
+            _request: CompletionRequest,
+            deltas: mpsc::Sender<String>,
+        ) -> Result<CompletionResponse, LlmError> {
+            if self.fail_at_start {
+                return Err(LlmError::Request("endpoint down".to_owned()));
+            }
+            for (index, chunk) in self.chunks.iter().enumerate() {
+                tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+                let _ = deltas.send(chunk.clone()).await;
+                if self.fail_after.is_some_and(|after| index + 1 == after) {
+                    return Err(LlmError::Request("stream aborted".to_owned()));
+                }
+            }
+            Ok(CompletionResponse { content: self.chunks.join(""), usage: None })
+        }
+    }
+
+    /// Wiring for tests that drive the streaming path directly - same
+    /// fixtures as [`ctx`], but with a custom completion port.
+    struct DeltaCtx {
+        engine: ChatEngine,
+        storage: Arc<InMemoryStorage>,
+        output: Arc<RecordingChatOutput>,
+        begins: Arc<Mutex<Vec<String>>>,
+        updates: Arc<Mutex<Vec<String>>>,
+        services: KernelServices,
+    }
+
+    fn ctx_delta(settings: LlmSettings, completion: Arc<dyn LlmCompletionPort>) -> DeltaCtx {
+        let engine = ChatEngine::new(Arc::new(settings), completion, Arc::new(FixedRandom(false)));
+        let storage = Arc::new(InMemoryStorage::new());
+        let output = RecordingChatOutput::new();
+        let begins = Arc::new(Mutex::new(Vec::new()));
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let factory = Arc::new(StreamRecordingFactory {
+            begins: Arc::clone(&begins),
+            updates: Arc::clone(&updates),
+            output: Arc::clone(&output),
+            typing_starts: AtomicUsize::new(0),
+        });
+        let services = KernelServices {
+            chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
+            chat_output_factory: Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
+            guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
+        };
+        DeltaCtx { engine, storage, output, begins, updates, services }
     }
 
     /// Storage whose document half delegates to an in-memory storage but
@@ -1226,7 +1476,11 @@ mod tests {
     }
 
     async fn stored_records(ctx: &TestCtx) -> Vec<ConversationRecord> {
-        ctx.storage
+        stored_records_in(&ctx.storage).await
+    }
+
+    async fn stored_records_in(storage: &Arc<InMemoryStorage>) -> Vec<ConversationRecord> {
+        storage
             .guild_scoped(Platform::Discord, GuildId(1))
             .list_after(&records_namespace(2), 0, 100)
             .await
@@ -1876,26 +2130,95 @@ mod tests {
         assert_eq!(stored_records(&ctx).await.len(), 3);
     }
 
+    /// Streaming channels reveal real deltas: the message begins with the
+    /// first delta, live edits land between deltas (the fake pauses past
+    /// the throttle cadence), and the final edit pins the authoritative
+    /// text. Updates are always prefixes of it - behind, never wrong.
     #[tokio::test]
-    async fn streaming_reveals_progressively_then_finalizes() {
+    async fn streaming_reveals_live_deltas() {
         let settings = LlmSettings { stream_interval_ms: 1, ..LlmSettings::default() };
-        let ctx = ctx_with(settings, vec![Ok("answer text".to_owned())]);
+        let ctx = ctx_delta(
+            settings,
+            Arc::new(DeltaCompletion {
+                chunks: vec!["Answer".to_owned(), " continues".to_owned()],
+                delay_ms: 5,
+                fail_at_start: false,
+                fail_after: None,
+            }),
+        );
         let config = ChannelConfig { streaming: true, ..assigned_config() };
         seed_config(&ctx.storage, &config);
 
         ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
 
-        // Placeholder begin, then prefix reveals ending on the exact chunk.
-        assert_eq!(ctx.begins.lock().clone(), vec!["…".to_owned()]);
+        assert_eq!(ctx.begins.lock().clone(), vec!["Answer".to_owned()]);
         let updates = ctx.updates.lock().clone();
-        assert_eq!(updates.last().map(String::as_str), Some("answer text"));
-        assert!(updates.len() <= MAX_STREAM_EDITS);
-        let first = updates.first().expect("at least one update expected");
-        assert!(first.chars().count() < "answer text".chars().count());
-        // Reveals are prefixes of the final text - never wrong, only behind.
+        assert_eq!(updates.last().map(String::as_str), Some("Answer continues"));
         for update in &updates {
-            assert!("answer text".starts_with(update.as_str()));
+            assert!("Answer continues".starts_with(update.as_str()));
         }
+        // The bot turn is recorded from the authoritative assembled text.
+        let records = stored_records_in(&ctx.storage).await;
+        let last = records.last().expect("bot turn recorded");
+        assert_eq!(last.role, RecordRole::Assistant);
+        assert_eq!(last.content, "Answer continues");
+    }
+
+    /// A stream that fails before the first delta shows nothing: the
+    /// triggered message gets the guaranteed fallback, nothing is recorded.
+    #[tokio::test]
+    async fn stream_failure_before_first_delta_falls_back() {
+        let ctx = ctx_delta(
+            LlmSettings::default(),
+            Arc::new(DeltaCompletion {
+                chunks: vec![],
+                delay_ms: 1,
+                fail_at_start: true,
+                fail_after: None,
+            }),
+        );
+        let config = ChannelConfig { streaming: true, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+
+        assert_eq!(ctx.output.messages(), vec![FALLBACK_MESSAGE.to_owned()]);
+        assert!(ctx.begins.lock().is_empty());
+        // The user's own turn is captured before the answer attempt - it
+        // stays; nothing else may appear.
+        let records = stored_records_in(&ctx.storage).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records.first().map(|record| record.role), Some(RecordRole::User));
+    }
+
+    /// A stream that dies after content was revealed keeps that content
+    /// visible and recorded - the generic fallback would contradict text
+    /// the channel has already seen.
+    #[tokio::test]
+    async fn stream_failure_after_partial_keeps_partial_visible() {
+        let ctx = ctx_delta(
+            LlmSettings::default(),
+            Arc::new(DeltaCompletion {
+                chunks: vec!["partial answer".to_owned()],
+                delay_ms: 1,
+                fail_at_start: false,
+                fail_after: Some(1),
+            }),
+        );
+        let config = ChannelConfig { streaming: true, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+
+        // No fallback: partial text is already on screen.
+        assert!(ctx.output.messages().is_empty());
+        assert_eq!(ctx.begins.lock().clone(), vec!["partial answer".to_owned()]);
+        let updates = ctx.updates.lock().clone();
+        assert_eq!(updates.last().map(String::as_str), Some("partial answer"));
+        let records = stored_records_in(&ctx.storage).await;
+        let last = records.last().expect("bot turn recorded");
+        assert_eq!(last.role, RecordRole::Assistant);
+        assert_eq!(last.content, "partial answer");
     }
 
     #[tokio::test]

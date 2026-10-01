@@ -9,9 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 
 use super::completion_port::{
     ChatMessage, CompletionRequest, CompletionResponse, LlmCompletionPort, LlmError, TokenUsage,
@@ -301,6 +303,147 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
         );
         Ok(parsed)
     }
+
+    /// Streaming half of the port: `stream: true` over SSE, content deltas
+    /// forwarded as they arrive, the reasoning-aware authoritative text and
+    /// usage resolved once the stream ends.
+    async fn complete_streaming(
+        &self,
+        request: CompletionRequest,
+        deltas: mpsc::Sender<String>,
+    ) -> Result<CompletionResponse, LlmError> {
+        let (provider_name, model_name) = split_model_ref(&request.model)?;
+        let provider = self
+            .providers
+            .get(provider_name)
+            .ok_or_else(|| LlmError::UnknownProvider(provider_name.to_owned()))?;
+        let supports_reasoning = self.reasoning_capability(&request.model);
+        let mut body = completion_body(
+            provider.settings.reasoning_style,
+            model_name,
+            &request.messages,
+            &request.params,
+            supports_reasoning,
+            &provider.settings.extra_body,
+        );
+        if let Some(map) = body.as_object_mut() {
+            map.insert("stream".to_owned(), json!(true));
+        }
+
+        let url = format!("{}/chat/completions", provider.settings.api_url.trim_end_matches('/'));
+        let mut request_builder = provider.client.post(url).json(&body);
+        if let Some(api_key) = &provider.api_key {
+            request_builder = request_builder.bearer_auth(api_key);
+        }
+        let started = std::time::Instant::now();
+        tracing::debug!(
+            provider = provider_name,
+            model = model_name,
+            messages = request.messages.len(),
+            "LLM request dispatched (stream)"
+        );
+        if self.settings.log_raw_traffic {
+            tracing::debug!(
+                provider = provider_name,
+                model = model_name,
+                body = %body,
+                "LLM raw request"
+            );
+        }
+        let response =
+            request_builder.send().await.map_err(|err| LlmError::Request(err.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.map_err(|err| LlmError::Request(err.to_string()))?;
+            if self.settings.log_raw_traffic {
+                tracing::debug!(
+                    provider = provider_name,
+                    model = model_name,
+                    status = %status,
+                    body = %text,
+                    "LLM raw response"
+                );
+            }
+            return Err(LlmError::Request(format!("HTTP {status}: {}", truncate(&text, 300))));
+        }
+
+        // SSE reading is byte-buffered: only complete lines are decoded, so
+        // a multi-byte character split across TCP chunks stays intact.
+        let mut bytes = response.bytes_stream();
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut content = String::new();
+        let mut usage: Option<TokenUsage> = None;
+        // Opt-in diagnostic: the raw SSE body, reassembled line by line.
+        // Without the flag the stream is never stored anywhere.
+        let mut raw = if self.settings.log_raw_traffic { Some(String::new()) } else { None };
+        let mut done = false;
+        while !done {
+            let Some(chunk) = bytes.next().await else { break };
+            let chunk =
+                chunk.map_err(|err| LlmError::Request(format!("stream read failed: {err}")))?;
+            buffer.extend_from_slice(&chunk);
+            while let Some(pos) = buffer.iter().position(|&byte| byte == b'\n') {
+                let line_bytes = buffer.drain(..=pos).collect::<Vec<u8>>();
+                let line_len = line_bytes.len().saturating_sub(1); // the newline
+                let decoded =
+                    String::from_utf8_lossy(line_bytes.get(..line_len).unwrap_or(&line_bytes));
+                let line = decoded.trim_end_matches('\r');
+                if let Some(raw) = raw.as_mut() {
+                    raw.push_str(line);
+                    raw.push('\n');
+                }
+                let Some(data) = line.strip_prefix("data:") else { continue };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    done = true;
+                    break;
+                }
+                let Some((delta, event_usage)) = parse_sse_data(data) else { continue };
+                if event_usage.is_some() {
+                    usage = event_usage;
+                }
+                if let Some(delta) = delta.filter(|delta| !delta.is_empty()) {
+                    content.push_str(&delta);
+                    // The engine consumes promptly - it throttles Discord
+                    // edits, not receives. A closed channel means the engine
+                    // task died; finish reading the authoritative response
+                    // anyway.
+                    let _ = deltas.send(delta).await;
+                }
+            }
+        }
+        if self.settings.log_raw_traffic {
+            tracing::debug!(
+                provider = provider_name,
+                model = model_name,
+                body = %raw.unwrap_or_default(),
+                "LLM raw response (stream)"
+            );
+        }
+        if !done {
+            // The endpoint vanished mid-stream: the assembled prefix is
+            // incomplete by definition - it must never pass as a full
+            // answer. The engine finalizes what was already revealed.
+            return Err(LlmError::Request(format!(
+                "stream ended without [DONE] after {} content chars",
+                content.chars().count()
+            )));
+        }
+        let content = strip_think_blocks(&content);
+        if content.is_empty() {
+            // A reasoning-only stream is no answer, same as non-streaming.
+            return Err(LlmError::EmptyResponse);
+        }
+        tracing::debug!(
+            provider = provider_name,
+            model = model_name,
+            status = %status,
+            elapsed_ms = started.elapsed().as_millis(),
+            content_chars = content.chars().count(),
+            "LLM stream completed"
+        );
+        Ok(CompletionResponse { content, usage })
+    }
 }
 
 /// Splits `provider/model` at the FIRST slash - provider ids never contain
@@ -506,7 +649,12 @@ fn strip_think_blocks(content: &str) -> String {
 /// token stats simply get `None`. A partial `usage` block is treated as
 /// absent rather than guessed at.
 fn parse_usage(response: &Value) -> Option<TokenUsage> {
-    let usage = response.get("usage")?;
+    parse_usage_value(response.get("usage")?)
+}
+
+/// Parses one `usage` object of the `OpenAI` shape (shared by the
+/// single-shot response and the stream's final chunk).
+fn parse_usage_value(usage: &Value) -> Option<TokenUsage> {
     Some(TokenUsage {
         prompt_tokens: usage.get("prompt_tokens").and_then(Value::as_u64)?,
         completion_tokens: usage.get("completion_tokens").and_then(Value::as_u64)?,
@@ -520,6 +668,24 @@ fn parse_usage(response: &Value) -> Option<TokenUsage> {
             .and_then(|details| details.get("reasoning_tokens"))
             .and_then(Value::as_u64),
     })
+}
+
+/// Parses one `data:` payload of the OpenAI SSE stream into an owned
+/// content delta and/or usage block. `reasoning_content` deltas are
+/// deliberately NOT represented - they are cut at this boundary and never
+/// surface. Unknown shapes (keep-alives, empty choices) parse to a pair of
+/// `None`s and are ignored by the caller.
+fn parse_sse_data(data: &str) -> Option<(Option<String>, Option<TokenUsage>)> {
+    let value: Value = serde_json::from_str(data).ok()?;
+    let content = value
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("content"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let usage = value.get("usage").filter(|usage| usage.is_object()).and_then(parse_usage_value);
+    Some((content, usage))
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -872,5 +1038,129 @@ mod tests {
         };
         let result = OpenAiCompatibleAdapter::from_settings(Arc::new(settings));
         assert!(result.is_ok());
+    }
+
+    /// Minimal SSE fixture: a one-shot TCP server that swallows the request
+    /// head, writes the scripted payload, and closes (EOF). Deliberately no
+    /// HTTP framework - the adapter only needs status line + body.
+    async fn raw_http_server(script: String) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let _ = socket.read(&mut buf).await;
+            socket.write_all(script.as_bytes()).await.expect("write");
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
+    /// A successful SSE response head + the given frames.
+    fn sse_response(frames: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{frames}"
+        )
+    }
+
+    fn streaming_adapter(api_url: String) -> OpenAiCompatibleAdapter {
+        let settings = LlmSettings {
+            providers: BTreeMap::from([(
+                "local".to_owned(),
+                ProviderSettings { api_url, ..ProviderSettings::default() },
+            )]),
+            ..LlmSettings::default()
+        };
+        OpenAiCompatibleAdapter::from_settings(Arc::new(settings)).expect("adapter builds")
+    }
+
+    fn sse_frame(payload: &str) -> String {
+        format!("data: {payload}\n\n")
+    }
+
+    fn stream_request() -> CompletionRequest {
+        CompletionRequest {
+            model: "local/m".to_owned(),
+            messages: sample_messages(),
+            params: GenParams::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_forwards_content_deltas_and_final_usage() {
+        let script = String::new()
+            + &sse_frame(r#"{"choices":[{"delta":{"content":"He"}}]}"#)
+            + &sse_frame(r#"{"choices":[{"delta":{"reasoning_content":"secret thoughts"}}]}"#)
+            + &sse_frame(r#"{"choices":[{"delta":{"content":"y"}}]}"#)
+            + &sse_frame(
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}"#,
+            )
+            + "data: [DONE]\n\n";
+        let (api_url, server) = raw_http_server(sse_response(&script)).await;
+        let adapter = streaming_adapter(api_url);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let response = adapter
+            .complete_streaming(stream_request(), tx)
+            .await
+            .expect("stream expected to succeed");
+        server.await.expect("server task");
+
+        // Only content deltas surface - reasoning is cut at this boundary.
+        let mut deltas = Vec::new();
+        while let Ok(delta) = rx.try_recv() {
+            deltas.push(delta);
+        }
+        assert_eq!(deltas, vec!["He".to_owned(), "y".to_owned()]);
+        assert_eq!(response.content, "Hey");
+        assert_eq!(
+            response.usage,
+            Some(TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 3,
+                total_tokens: 13,
+                cached_tokens: None,
+                reasoning_tokens: None,
+            })
+        );
+    }
+
+    /// An abrupt end of stream (no `[DONE]`) is a failure: the assembled
+    /// prefix is incomplete by definition and must not pass as an answer.
+    #[tokio::test]
+    async fn stream_without_done_marker_is_an_error() {
+        let script = sse_response(&sse_frame(r#"{"choices":[{"delta":{"content":"par"}}]}"#));
+        let (api_url, server) = raw_http_server(script).await;
+        let adapter = streaming_adapter(api_url);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = adapter.complete_streaming(stream_request(), tx).await;
+        server.await.expect("server task");
+
+        let Err(LlmError::Request(message)) = result else {
+            panic!("expected a stream failure, got {result:?}")
+        };
+        assert!(message.contains("without [DONE]"), "unexpected: {message}");
+    }
+
+    /// A non-success status before any SSE body is the regular request
+    /// failure, carrying the classification-bearing status line.
+    #[tokio::test]
+    async fn streaming_error_status_is_reported() {
+        let script = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 8\r\n\
+                      Connection: close\r\n\r\nslow down"
+            .to_owned();
+        let (api_url, server) = raw_http_server(script).await;
+        let adapter = streaming_adapter(api_url);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let result = adapter.complete_streaming(stream_request(), tx).await;
+        server.await.expect("server task");
+
+        let Err(LlmError::Request(message)) = result else {
+            panic!("expected a request failure, got {result:?}")
+        };
+        assert!(message.contains("HTTP 429"), "unexpected: {message}");
     }
 }

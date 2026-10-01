@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use super::model::GenParams;
 
@@ -111,4 +112,22 @@ impl LlmError {
 #[async_trait]
 pub trait LlmCompletionPort: Send + Sync {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError>;
+
+    /// Streaming completion for channels with `streaming` enabled: forwards
+    /// visible content deltas as they arrive and resolves to the FULL
+    /// assembled response once the endpoint is done - the returned content
+    /// (reasoning-stripped) and usage are authoritative, the deltas only
+    /// drive the live reveal. Reasoning deltas are cut at the adapter
+    /// boundary and never surface. The default implementation degrades to
+    /// [`Self::complete`] with a single delta, so providers without SSE
+    /// support work unchanged everywhere.
+    async fn complete_streaming(
+        &self,
+        request: CompletionRequest,
+        deltas: mpsc::Sender<String>,
+    ) -> Result<CompletionResponse, LlmError> {
+        let response = self.complete(request).await?;
+        let _ = deltas.send(response.content.clone()).await;
+        Ok(response)
+    }
 }
