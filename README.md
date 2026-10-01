@@ -261,9 +261,13 @@ message-count based.
   bites first - the newest turn is always included.
 - **Reasoning** is never exposed: thinking output (`reasoning_content`
   fields, inline `<think>` blocks) is cut at the provider adapter before
-  it can be recorded or rendered - the final message and the streaming
-  reveal both draw from the clean content only. A reasoning-only answer
-  (nothing but thinking) counts as no answer.
+  it can be recorded or rendered - complete `<think>...</think>` pairs
+  anywhere (thinking models interleave them mid-answer) and leading
+  unclosed blocks (thinking-only or cut-off answers) are stripped; the
+  final message and the streaming reveal both draw from the clean
+  content only. A reasoning-only answer counts as no answer. An
+  unclosed `<think>` mentioned mid-sentence stays literal text, so
+  answers can discuss the tag.
 - **Compaction** runs after a reply once the live window outgrows
   `depth` (100 messages by default): everything except the newest
   `compaction_keep_tail` (10) records folds into a rolling summary via

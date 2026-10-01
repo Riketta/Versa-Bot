@@ -343,15 +343,22 @@ fn parse_completion_content(text: &str) -> Result<CompletionResponse, LlmError> 
     Ok(CompletionResponse { content, usage: parse_usage(&value) })
 }
 
-/// Cuts every `<think>...</think>` block from a completion (ASCII
-/// case-insensitive) plus everything after an unclosed `<think>` - a
-/// missing closer means the model never got past thinking. Whitespace
-/// around the cuts is trimmed so answers do not start with the newline
-/// that followed the block; content without any `<think>` tag is returned
-/// byte-identical. A literal discussion of the tag in an answer is the
-/// accepted false-positive cost (same trade-off as mainstream reasoning
-/// UIs). The paired `reasoning_content`/`reasoning` response fields are
-/// separate - they are never read in the first place.
+/// Cuts model reasoning from a completion so it can never reach a channel.
+/// Separate `reasoning_content`/`reasoning` fields are never read in the
+/// first place; inline `<think>` blocks follow three rules:
+/// - a complete `<think>...</think>` pair anywhere is reasoning (leading
+///   R1-style or interleaved mid-answer, GLM/Qwen thinking models) - cut;
+/// - an opener that STARTS the content (nothing but whitespace before it,
+///   chained blocks included) with no closer means the model never got
+///   past thinking - everything from the opener on is dropped, and a
+///   reasoning-only answer becomes empty (`EmptyResponse` upstream);
+/// - an unclosed opener MID-TEXT is literal: answers may discuss the tag,
+///   and cutting from it would truncate real content - it stays.
+///
+/// Whitespace around cuts is trimmed; content without any opener is
+/// returned byte-identical. Residual false positive: prose containing both
+/// tags in order still loses the span between them (same cost mainstream
+/// reasoning UIs pay).
 fn strip_think_blocks(content: &str) -> String {
     if !content.to_ascii_lowercase().contains("<think>") {
         return content.to_owned();
@@ -363,23 +370,46 @@ fn strip_think_blocks(content: &str) -> String {
     // a multi-byte UTF-8 sequence, and `to_ascii_lowercase` preserves the
     // byte layout) - the `get` + `expect` makes that invariant explicit.
     let mut cursor = 0usize;
-    while let Some(open) = lowered.get(cursor..).and_then(|rest| rest.find("<think>")) {
+    loop {
+        let Some(open) = lowered.get(cursor..).and_then(|rest| rest.find("<think>")) else {
+            kept.push_str(content.get(cursor..).expect("tag match offsets are char boundaries"));
+            break;
+        };
         let open = cursor + open;
-        kept.push_str(
-            content.get(cursor..open).expect("tag match offsets are char boundaries").trim_end(),
-        );
+        let leading = content
+            .get(cursor..open)
+            .expect("tag match offsets are char boundaries")
+            .trim()
+            .is_empty();
         let after_open = open + "<think>".len();
-        let after_close = lowered
+        let closer = lowered
             .get(after_open..)
             .and_then(|rest| rest.find("</think>"))
             .map(|close| after_open + close + "</think>".len());
-        match after_close {
-            Some(after_close) => cursor = after_close,
-            // Unclosed block: the remainder is all reasoning - drop it.
-            None => return kept.trim().to_owned(),
+        match closer {
+            // Complete pair anywhere: interleaved reasoning - cut it.
+            Some(after_close) => {
+                kept.push_str(
+                    content
+                        .get(cursor..open)
+                        .expect("tag match offsets are char boundaries")
+                        .trim_end(),
+                );
+                cursor = after_close;
+            }
+            // Unclosed opener at the start: the model never got past
+            // thinking - no answer follows.
+            None if leading => return kept.trim().to_owned(),
+            // Unclosed opener mid-text: literal text, not reasoning. Keep
+            // the tag itself and keep scanning after it.
+            None => {
+                kept.push_str(
+                    content.get(cursor..after_open).expect("tag match offsets are char boundaries"),
+                );
+                cursor = after_open;
+            }
         }
     }
-    kept.push_str(content.get(cursor..).expect("tag match offsets are char boundaries"));
     kept.trim().to_owned()
 }
 
@@ -533,20 +563,39 @@ mod tests {
         .expect("response expected to parse");
         assert_eq!(response.content, "One two three.");
 
-        // Unclosed block: the hidden tail is dropped. Text written BEFORE
-        // the tag is genuine content and stays; a reasoning-only answer is
-        // empty and counts as no answer.
+        // Unclosed opener MID-TEXT is literal: answers may discuss the tag
+        // without being truncated from it onward.
+        for content in ["Visible<think>hidden forever", "Wrap it in <think> tags to reason."] {
+            let response = parse_completion_content(&format!(
+                r#"{{"choices":[{{"message":{{"content":"{content}"}}}}]}}"#
+            ))
+            .expect("response expected to parse");
+            assert_eq!(response.content, content);
+        }
+
+        // Chained leading blocks are all reasoning.
         let response = parse_completion_content(
-            r#"{"choices":[{"message":{"content":"Visible<think>hidden forever"}}]}"#,
+            r#"{"choices":[{"message":{"content":"<think>a</think><think>b</think>The answer."}}]}"#,
         )
         .expect("response expected to parse");
-        assert_eq!(response.content, "Visible");
+        assert_eq!(response.content, "The answer.");
+
+        // A leading unclosed block means the model never got past thinking:
+        // a reasoning-only answer is empty and counts as no answer.
         assert!(matches!(
             parse_completion_content(
                 r#"{"choices":[{"message":{"content":"<think>only reasoning"}}]}"#
             ),
             Err(LlmError::EmptyResponse)
         ));
+
+        // Residual false positive, pinned on purpose: prose containing BOTH
+        // tags in order loses the span between them.
+        let response = parse_completion_content(
+            r#"{"choices":[{"message":{"content":"Compare <think> with </think> syntax."}}]}"#,
+        )
+        .expect("response expected to parse");
+        assert_eq!(response.content, "Compare syntax.");
 
         // No tag: byte-identical passthrough - even odd whitespace.
         let response =
