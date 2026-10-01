@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -17,9 +18,15 @@ use crate::kernel::{
 use super::chat_engine::ChatEngine;
 use super::commands::{
     AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler, CutoffLlmHandler,
-    PromptLlmHandler, SET_KEYS, SetLlmHandler, StatusLlmHandler, UnassignLlmHandler,
+    PromptFileLlmHandler, PromptLlmHandler, SET_KEYS, SetLlmHandler, StatusLlmHandler,
+    UnassignLlmHandler,
 };
 use super::model::{ChannelConfig, NAMESPACE, channel_config_key};
+
+/// Whole-request timeout for prompt-file downloads from the Discord CDN -
+/// deliberately shorter than provider timeouts: the fetch is interactive
+/// (the invoking admin waits for the answer).
+const PROMPT_FETCH_TIMEOUT_SECS: u64 = 30;
 
 /// Identifies one channel's processing lock: platform, guild, channel.
 type ChannelKey = (String, u64, u64);
@@ -62,12 +69,24 @@ pub struct LlmPlugin {
     registry: Arc<dyn CommandRegistryPort>,
     engine: Arc<ChatEngine>,
     channel_locks: Arc<ChannelLocks>,
+    /// Keyless client for prompt-file downloads - Discord CDN only (host
+    /// pinned in the handler), never a provider endpoint.
+    prompt_fetch: reqwest::Client,
 }
 
 impl LlmPlugin {
+    /// Builds the plugin with its prompt-file download client.
+    ///
+    /// # Panics
+    /// Only if reqwest cannot build a client from purely static settings
+    /// (TLS backend unavailable) - a process-level defect, not config.
     #[must_use]
     pub fn new(registry: Arc<dyn CommandRegistryPort>, engine: Arc<ChatEngine>) -> Self {
-        Self { registry, engine, channel_locks: ChannelLocks::new() }
+        let prompt_fetch = reqwest::Client::builder()
+            .timeout(Duration::from_secs(PROMPT_FETCH_TIMEOUT_SECS))
+            .build()
+            .expect("static prompt-fetch client config expected to build");
+        Self { registry, engine, channel_locks: ChannelLocks::new(), prompt_fetch }
     }
 
     fn channel_lock(&self, origin: &Origin) -> Arc<AsyncMutex<()>> {
@@ -90,6 +109,43 @@ impl LlmPlugin {
             required_permission: Some(Permission { name: "manage_guild".to_owned() }),
             guild_only: true,
         }
+    }
+
+    /// The two system-prompt commands: inline text (Discord option limit)
+    /// and attachment upload (long prompts, formatting-preserving).
+    fn register_prompt_commands(&self) {
+        self.registry.register(
+            self.descriptor(
+                "llm_prompt",
+                "Set this channel's system prompt",
+                vec![ArgDescriptor {
+                    name: "prompt".to_owned(),
+                    description: "Prompt text, or `clear`".to_owned(),
+                    required: true,
+                    kind: ArgKind::String,
+                    choices: None,
+                }],
+            ),
+            Arc::new(PromptLlmHandler::new(Arc::clone(&self.channel_locks))),
+        );
+        self.registry.register(
+            self.descriptor(
+                "llm_prompt_file",
+                "Set this channel's system prompt from an uploaded text file",
+                vec![ArgDescriptor {
+                    name: "file".to_owned(),
+                    description: "Attached .txt/.md file with the prompt text".to_owned(),
+                    required: true,
+                    kind: ArgKind::Attachment,
+                    choices: None,
+                }],
+            ),
+            Arc::new(PromptFileLlmHandler::new(
+                Arc::clone(&self.channel_locks),
+                self.prompt_fetch.clone(),
+                self.engine.settings().max_prompt_file_bytes,
+            )),
+        );
     }
 }
 
@@ -168,20 +224,7 @@ impl PluginPort for LlmPlugin {
             ),
             Arc::new(SetLlmHandler::new(Arc::clone(&self.channel_locks))),
         );
-        self.registry.register(
-            self.descriptor(
-                "llm_prompt",
-                "Set this channel's system prompt",
-                vec![ArgDescriptor {
-                    name: "prompt".to_owned(),
-                    description: "Prompt text, or `clear`".to_owned(),
-                    required: true,
-                    kind: ArgKind::String,
-                    choices: None,
-                }],
-            ),
-            Arc::new(PromptLlmHandler::new(Arc::clone(&self.channel_locks))),
-        );
+        self.register_prompt_commands();
         Ok(())
     }
 }
@@ -361,6 +404,7 @@ mod tests {
                 "llm_assign",
                 "llm_cutoff",
                 "llm_prompt",
+                "llm_prompt_file",
                 "llm_set",
                 "llm_status",
                 "llm_unassign"

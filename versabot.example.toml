@@ -43,6 +43,8 @@ url = "sqlite://versabot.db"
 # compaction_keep_tail = 10
 # max_message_length = 2000
 # stream_interval_ms = 2000
+# Cap for /llm_prompt_file attachment downloads, in bytes.
+# max_prompt_file_bytes = 131072
 
 # Providers are OpenAI-compatible endpoints. `api_key_env` NAMES the
 # environment variable holding the key - it must never contain the key

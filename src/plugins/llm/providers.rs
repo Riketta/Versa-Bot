@@ -37,7 +37,9 @@ pub struct LlmSettings {
     pub max_message_length: usize,
     /// Streaming edit cadence in milliseconds.
     pub stream_interval_ms: u64,
-    /// Declared providers (`[llm.providers.<name>]`).
+    /// Cap for `/llm_prompt_file` attachment downloads, in bytes.
+    pub max_prompt_file_bytes: u64,
+    /// Declared providers (`[llm.providers.<name]`).
     pub providers: BTreeMap<String, ProviderSettings>,
     /// Declared model capabilities (`[llm.models."<provider/model>"]`).
     /// Undeclared models are usable but get default (no reasoning)
@@ -57,6 +59,7 @@ impl Default for LlmSettings {
             compaction_keep_tail: 10,
             max_message_length: 2000,
             stream_interval_ms: 2000,
+            max_prompt_file_bytes: 131_072,
             providers: BTreeMap::new(),
             models: BTreeMap::new(),
         }

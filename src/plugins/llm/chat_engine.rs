@@ -81,6 +81,13 @@ impl ChatEngine {
         }
     }
 
+    /// Plugin-facing read access to the operator settings (command handlers
+    /// need e.g. the prompt-file cap at registration time).
+    #[must_use]
+    pub fn settings(&self) -> &LlmSettings {
+        &self.settings
+    }
+
     /// Processes one inbound message of an assigned channel. Always
     /// returns normally - failures are logged, never propagated.
     pub async fn handle_message(

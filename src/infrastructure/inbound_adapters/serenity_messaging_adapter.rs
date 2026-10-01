@@ -1,9 +1,9 @@
 use std::sync::{Arc, OnceLock};
 
 use serenity::all::{
-    ChannelId as SerenityChannelId, CommandDataOption, CommandDataOptionValue, Context,
-    CreateMessage, EditMessage, EventHandler, GuildId as SerenityGuildId, Http, Interaction,
-    Member, Message, Ready, User,
+    ChannelId as SerenityChannelId, CommandDataOption, CommandDataOptionValue, CommandDataResolved,
+    Context, CreateMessage, EditMessage, EventHandler, GuildId as SerenityGuildId, Http,
+    Interaction, Member, Message, Ready, User,
 };
 use serenity::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -149,7 +149,7 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
             origin,
             payload: EventPayload::Command(CommandPayload {
                 name: command.data.name.clone(),
-                args: flatten_options(&command.data.options),
+                args: flatten_options(&command.data.options, &command.data.resolved),
                 author_roles,
                 author_permissions,
             }),
@@ -206,9 +206,18 @@ fn member_origin(guild_id: SerenityGuildId, user: &User) -> Origin {
 
 /// Flattens Discord's option tree into `name -> value` string pairs.
 /// Subcommand boundaries are flattened away; resolved entities (users,
-/// channels, roles) arrive as their IDs.
-fn flatten_options(options: &[CommandDataOption]) -> Vec<(String, String)> {
-    fn walk(options: &[CommandDataOption], args: &mut Vec<(String, String)>) {
+/// channels, roles) arrive as their IDs. Attachment options resolve to the
+/// attachment's CDN URL - a pinned trusted host (Discord's CDN), which is
+/// the only network peer an attachment argument may ever name.
+fn flatten_options(
+    options: &[CommandDataOption],
+    resolved: &CommandDataResolved,
+) -> Vec<(String, String)> {
+    fn walk(
+        options: &[CommandDataOption],
+        resolved: &CommandDataResolved,
+        args: &mut Vec<(String, String)>,
+    ) {
         fn push_id(name: &str, id: impl std::fmt::Display, args: &mut Vec<(String, String)>) {
             args.push((name.to_owned(), id.to_string()));
         }
@@ -216,7 +225,7 @@ fn flatten_options(options: &[CommandDataOption]) -> Vec<(String, String)> {
         for option in options {
             match &option.value {
                 CommandDataOptionValue::SubCommand(inner)
-                | CommandDataOptionValue::SubCommandGroup(inner) => walk(inner, args),
+                | CommandDataOptionValue::SubCommandGroup(inner) => walk(inner, resolved, args),
                 CommandDataOptionValue::String(value) => {
                     args.push((option.name.clone(), value.clone()));
                 }
@@ -241,8 +250,17 @@ fn flatten_options(options: &[CommandDataOption]) -> Vec<(String, String)> {
                 CommandDataOptionValue::Mentionable(value) => {
                     push_id(&option.name, *value, args);
                 }
-                CommandDataOptionValue::Attachment(_)
-                | CommandDataOptionValue::Unknown(_)
+                CommandDataOptionValue::Attachment(value) => {
+                    if let Some(attachment) = resolved.attachments.get(value) {
+                        args.push((option.name.clone(), attachment.url.clone()));
+                    } else {
+                        tracing::warn!(
+                            argument = %option.name,
+                            "attachment option without resolved metadata - argument dropped"
+                        );
+                    }
+                }
+                CommandDataOptionValue::Unknown(_)
                 | CommandDataOptionValue::Autocomplete { .. }
                 | _ => {}
             }
@@ -250,7 +268,7 @@ fn flatten_options(options: &[CommandDataOption]) -> Vec<(String, String)> {
     }
 
     let mut args = Vec::new();
-    walk(options, &mut args);
+    walk(options, resolved, &mut args);
     args
 }
 
@@ -526,7 +544,7 @@ mod tests {
         ]))
         .expect("test options expected to deserialize");
 
-        let args = flatten_options(&options);
+        let args = flatten_options(&options, &CommandDataResolved::default());
 
         assert_eq!(
             args,
@@ -536,6 +554,38 @@ mod tests {
                 ("target".to_owned(), "130000000000000000".to_owned()),
                 ("inner".to_owned(), "value".to_owned()),
             ]
+        );
+    }
+
+    /// Attachment options resolve to the attachment's CDN URL - the pinned
+    /// trusted host the downloading plugin may fetch.
+    #[test]
+    fn attachment_options_resolve_to_their_cdn_url() {
+        let options: Vec<CommandDataOption> = serde_json::from_value(serde_json::json!([
+            { "name": "file", "type": 11, "value": "130000000000000001" }
+        ]))
+        .expect("test options expected to deserialize");
+        let resolved: CommandDataResolved = serde_json::from_value(serde_json::json!({
+            "attachments": {
+                "130000000000000001": {
+                    "id": "130000000000000001",
+                    "filename": "prompt.md",
+                    "size": 42,
+                    "url": "https://cdn.discordapp.com/attachments/1/2/prompt.md",
+                    "proxy_url": "https://media.discordapp.net/attachments/1/2/prompt.md"
+                }
+            }
+        }))
+        .expect("resolved attachments expected to deserialize");
+
+        let args = flatten_options(&options, &resolved);
+
+        assert_eq!(
+            args,
+            vec![(
+                "file".to_owned(),
+                "https://cdn.discordapp.com/attachments/1/2/prompt.md".to_owned()
+            )]
         );
     }
 }

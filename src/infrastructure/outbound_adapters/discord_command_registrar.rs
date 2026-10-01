@@ -108,6 +108,7 @@ fn option_type(kind: ArgKind) -> u8 {
         ArgKind::String => 3,
         ArgKind::User => 6,
         ArgKind::Role => 8,
+        ArgKind::Attachment => 11,
     }
 }
 

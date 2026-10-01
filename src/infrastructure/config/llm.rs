@@ -25,7 +25,9 @@ pub struct LlmConfig {
     pub max_message_length: usize,
     /// Streaming edit cadence in milliseconds.
     pub stream_interval_ms: u64,
-    /// Declared providers (`[llm.providers.<name>]`).
+    /// Cap for `/llm_prompt_file` attachment downloads, in bytes.
+    pub max_prompt_file_bytes: u64,
+    /// Declared providers (`[llm.providers.<name>`).
     pub providers: BTreeMap<String, LlmProviderConfig>,
     /// Declared model capabilities (`[llm.models."<provider/model>"]`).
     /// Undeclared models are usable but get default (no reasoning)
@@ -44,6 +46,7 @@ impl Default for LlmConfig {
             compaction_keep_tail: 10,
             max_message_length: 2000,
             stream_interval_ms: 2000,
+            max_prompt_file_bytes: 131_072,
             providers: BTreeMap::new(),
             models: BTreeMap::new(),
         }
@@ -124,6 +127,7 @@ mod tests {
                 "compaction_keep_tail": 5,
                 "max_message_length": 1500,
                 "stream_interval_ms": 1500,
+                "max_prompt_file_bytes": 4096,
                 "providers": {
                     "zai": {
                         "api_url": "https://api.z.ai/api/coding/paas/v4",
@@ -140,6 +144,7 @@ mod tests {
         assert_eq!(config.default_system_prompt, "custom");
         assert_eq!(config.compaction_model.as_deref(), Some("zai/glm-5.3-flash"));
         assert_eq!(config.compaction_keep_tail, 5);
+        assert_eq!(config.max_prompt_file_bytes, 4096);
         let zai = config.providers.get("zai").expect("zai provider expected");
         assert_eq!(zai.reasoning_style, LlmReasoningStyle::GlmThinking);
         assert_eq!(zai.timeout_secs, 120);

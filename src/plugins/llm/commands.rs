@@ -774,6 +774,132 @@ impl CommandHandler for PromptLlmHandler {
     }
 }
 
+/// `/llm_prompt_file`: sets the channel's system prompt from an uploaded
+/// attachment - for prompts longer than Discord's inline option limit.
+/// The adapter normalizes the attachment to its Discord CDN URL; this
+/// handler re-validates the pinned host (the CDN is the only network peer
+/// guild input may ever point the bot at - no arbitrary URL fetches),
+/// downloads with the configured byte cap, and stores the decoded text.
+/// Like every state-mutating LLM command, it runs under the channel's
+/// processing lock.
+pub(super) struct PromptFileLlmHandler {
+    locks: Arc<ChannelLocks>,
+    client: reqwest::Client,
+    max_prompt_file_bytes: u64,
+}
+
+impl PromptFileLlmHandler {
+    pub(super) fn new(
+        locks: Arc<ChannelLocks>,
+        client: reqwest::Client,
+        max_prompt_file_bytes: u64,
+    ) -> Self {
+        Self { locks, client, max_prompt_file_bytes }
+    }
+
+    /// Downloads and decodes the attachment with the configured byte cap.
+    /// `Err` carries the user-facing reason; transport details go to logs.
+    async fn download(&self, url: &str) -> Result<String, String> {
+        let response = self.client.get(url).send().await.map_err(|err| {
+            tracing::warn!(%err, "prompt file download failed");
+            "the attachment could not be downloaded".to_owned()
+        })?;
+        if !response.status().is_success() {
+            return Err(format!("the attachment host returned HTTP {}", response.status()));
+        }
+        if let Some(len) = response.content_length()
+            && len > self.max_prompt_file_bytes
+        {
+            return Err(format!(
+                "the attachment exceeds the limit ({len} > {} bytes, `max_prompt_file_bytes`)",
+                self.max_prompt_file_bytes
+            ));
+        }
+        let bytes = response.bytes().await.map_err(|err| {
+            tracing::warn!(%err, "prompt file download failed");
+            "the attachment could not be downloaded".to_owned()
+        })?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > self.max_prompt_file_bytes {
+            return Err(format!(
+                "the attachment exceeds the limit ({} > {} bytes, `max_prompt_file_bytes`)",
+                bytes.len(),
+                self.max_prompt_file_bytes
+            ));
+        }
+        let text = String::from_utf8(bytes.to_vec())
+            .map_err(|_| "the attachment is not valid UTF-8 text".to_owned())?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Err("the attachment is empty".to_owned());
+        }
+        Ok(trimmed.to_owned())
+    }
+}
+
+/// The attachment argument must name Discord's CDN - the only network peer
+/// guild input may ever point the bot at. Rejected before any network I/O.
+fn validate_prompt_file_url(url: &str) -> Result<(), String> {
+    const CDN_PREFIX: &str = "https://cdn.discordapp.com/";
+    if url.starts_with(CDN_PREFIX) {
+        Ok(())
+    } else {
+        Err("the `file` argument must be this command's own attachment - pick the \
+             uploaded file in the slash command UI."
+            .to_owned())
+    }
+}
+
+#[async_trait]
+impl CommandHandler for PromptFileLlmHandler {
+    async fn invoke(
+        &self,
+        event: &RequestContext,
+        args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
+        let Some(url) = args.get("file") else {
+            services
+                .chat_output
+                .send(OutboundMessage::text(
+                    "Usage: `/llm_prompt_file file` - attach a .txt/.md file with the prompt text.",
+                ))
+                .await?;
+            return Ok(());
+        };
+        if let Err(usage) = validate_prompt_file_url(url) {
+            services.chat_output.send(OutboundMessage::text(usage)).await?;
+            return Ok(());
+        }
+
+        let channel = self.locks.lock_for(&event.origin);
+        let _channel = channel.lock().await;
+        let Some(mut config) = load_assigned_config(event, services).await? else {
+            return Ok(());
+        };
+
+        let prompt = match self.download(url).await {
+            Ok(prompt) => prompt,
+            Err(reason) => {
+                services
+                    .chat_output
+                    .send(OutboundMessage::text(format!("Could not load the attachment: {reason}")))
+                    .await?;
+                return Ok(());
+            }
+        };
+        let characters = prompt.chars().count();
+        config.system_prompt = Some(prompt);
+        save_config(event, services, config).await?;
+        services
+            .chat_output
+            .send(OutboundMessage::text(format!(
+                "System prompt set from file ({characters} characters)."
+            )))
+            .await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,6 +908,22 @@ mod tests {
     use crate::plugins::llm::RecordRole;
     use crate::plugins::llm::completion_port::TokenUsage;
     use crate::test_support::InMemoryStorage;
+
+    /// The attachment argument must name Discord's CDN - https and the exact
+    /// pinned host. Anything else (other hosts, other schemes, lookalike
+    /// domains) is rejected before any network I/O: no arbitrary URL fetches.
+    #[test]
+    fn prompt_file_url_must_be_the_discord_cdn() {
+        assert!(
+            validate_prompt_file_url(
+                "https://cdn.discordapp.com/attachments/1/2/prompt.txt?ex=1&is=2&hm=3"
+            )
+            .is_ok()
+        );
+        assert!(validate_prompt_file_url("http://cdn.discordapp.com/a.txt").is_err());
+        assert!(validate_prompt_file_url("https://cdn.discordapp.com.evil.com/a.txt").is_err());
+        assert!(validate_prompt_file_url("https://example.com/prompt.txt").is_err());
+    }
 
     #[test]
     fn float_params_set_and_clear() {

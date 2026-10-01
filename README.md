@@ -294,7 +294,8 @@ permission (Discord hides them from members without it):
 |---|---|
 | `/llm_assign model:<provider/model>` | assign the bot to this channel; re-assigning retunes in place |
 | `/llm_unassign` | remove the bot from this channel (history is kept) |
-| `/llm_prompt prompt:<text>` | set the channel system prompt; `clear` falls back to the plugin default |
+| `/llm_prompt prompt:<text>` | set the channel system prompt; `clear` falls back to the plugin default (inline limit: Discord's ~6000-character option cap) |
+| `/llm_prompt_file file:<attachment>` | set the system prompt from an uploaded text/markdown file - for prompts beyond the inline limit; fetched from Discord's CDN only, capped by `[llm] max_prompt_file_bytes` (128 KiB default) |
 | `/llm_set key:<key> value:<value>` | tune one channel setting (table below); value `clear`/`none`/`default` resets it |
 | `/llm_cutoff` | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
 | `/llm_status` | ephemeral report: model, window usage, summary preview, link to the context start, last-request token stats |

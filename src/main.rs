@@ -215,6 +215,7 @@ fn llm_settings_from(config: &LlmConfig) -> LlmSettings {
         compaction_keep_tail: config.compaction_keep_tail,
         max_message_length: config.max_message_length,
         stream_interval_ms: config.stream_interval_ms,
+        max_prompt_file_bytes: config.max_prompt_file_bytes,
         providers: config
             .providers
             .iter()
