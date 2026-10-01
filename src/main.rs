@@ -232,6 +232,7 @@ fn llm_settings_from(config: &LlmConfig) -> LlmSettings {
                             LlmReasoningStyle::OpenaiEffort => ReasoningStyle::OpenaiEffort,
                             LlmReasoningStyle::GlmThinking => ReasoningStyle::GlmThinking,
                         },
+                        extra_body: provider.extra_body.clone(),
                     },
                 )
             })

@@ -87,6 +87,12 @@ pub struct ProviderSettings {
     /// Request timeout in seconds.
     pub timeout_secs: u64,
     pub reasoning_style: ReasoningStyle,
+    /// Provider-specific fields merged verbatim into every completion
+    /// request body (llama.cpp `chat_template_kwargs` / `reasoning_budget`,
+    /// vendor sampling extensions - knobs the adapter does not model).
+    /// `model` and `messages` are engine-owned and cannot be overridden;
+    /// other keys win over the standard rendering.
+    pub extra_body: BTreeMap<String, Value>,
 }
 
 impl Default for ProviderSettings {
@@ -97,6 +103,7 @@ impl Default for ProviderSettings {
             proxy: None,
             timeout_secs: 120,
             reasoning_style: ReasoningStyle::default(),
+            extra_body: BTreeMap::new(),
         }
     }
 }
@@ -237,6 +244,7 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
             &request.messages,
             &request.params,
             supports_reasoning,
+            &provider.settings.extra_body,
         );
 
         let url = format!("{}/chat/completions", provider.settings.api_url.trim_end_matches('/'));
@@ -316,12 +324,18 @@ fn split_model_ref(model_ref: &str) -> Result<(&str, &str), LlmError> {
 /// - `glm_thinking`: `thinking: {"type": ...}`. Non-`off` effort renders
 ///   `enabled`; `off` renders an explicit `disabled` (honored by GLM-4.5
 ///   through 5.2; GLM-5.3 series thinks forcibly regardless).
+///
+/// Finally, the provider's static `extra_body` is merged in: operator-owned
+/// passthrough for endpoint-specific knobs (llama.cpp template switches,
+/// vendor sampling fields). `model`/`messages` cannot be overridden; other
+/// keys win over the standard rendering.
 fn completion_body(
     style: ReasoningStyle,
     model: &str,
     messages: &[ChatMessage],
     params: &GenParams,
     supports_reasoning: bool,
+    extra_body: &BTreeMap<String, Value>,
 ) -> Value {
     let GenParams {
         temperature,
@@ -377,6 +391,14 @@ fn completion_body(
                 let kind = if effort == "off" { "disabled" } else { "enabled" };
                 body.insert("thinking".to_owned(), json!({"type": kind}));
             }
+        }
+    }
+    // Operator passthrough, last so it can override the standard rendering.
+    // `model`/`messages` stay engine-owned: a mistyped extra key must not be
+    // able to swap the model or inject a foreign conversation.
+    for (key, value) in extra_body {
+        if key != "model" && key != "messages" {
+            body.insert(key.clone(), value.clone());
         }
     }
     Value::Object(body)
@@ -541,6 +563,7 @@ mod tests {
             &sample_messages(),
             &GenParams { temperature: Some(0.7), max_tokens: Some(512), ..GenParams::default() },
             false,
+            &BTreeMap::new(),
         );
 
         assert_eq!(body.get("model").and_then(Value::as_str), Some("glm-5.3-flash"));
@@ -563,18 +586,57 @@ mod tests {
         let params =
             GenParams { reasoning_effort: Some("high".to_owned()), ..GenParams::default() };
 
-        let body =
-            completion_body(ReasoningStyle::OpenaiEffort, "m", &sample_messages(), &params, true);
+        let body = completion_body(
+            ReasoningStyle::OpenaiEffort,
+            "m",
+            &sample_messages(),
+            &params,
+            true,
+            &BTreeMap::new(),
+        );
         assert_eq!(body.get("reasoning_effort").and_then(Value::as_str), Some("high"));
 
-        let body =
-            completion_body(ReasoningStyle::OpenaiEffort, "m", &sample_messages(), &params, false);
+        let body = completion_body(
+            ReasoningStyle::OpenaiEffort,
+            "m",
+            &sample_messages(),
+            &params,
+            false,
+            &BTreeMap::new(),
+        );
         assert!(body.get("reasoning_effort").is_none());
 
-        let body =
-            completion_body(ReasoningStyle::GlmThinking, "m", &sample_messages(), &params, true);
+        let body = completion_body(
+            ReasoningStyle::GlmThinking,
+            "m",
+            &sample_messages(),
+            &params,
+            true,
+            &BTreeMap::new(),
+        );
         let thinking = body.get("thinking").expect("thinking expected");
         assert_eq!(thinking.get("type").and_then(Value::as_str), Some("enabled"));
+    }
+
+    /// The operator passthrough rides into every body - and engine-owned
+    /// fields cannot be hijacked from provider config.
+    #[test]
+    fn extra_body_passes_provider_fields_through() {
+        let extra = BTreeMap::from([
+            ("chat_template_kwargs".to_owned(), json!({"enable_thinking": false})),
+            ("model".to_owned(), json!("hijack")),
+        ]);
+        let body = completion_body(
+            ReasoningStyle::OpenaiEffort,
+            "m",
+            &sample_messages(),
+            &GenParams::default(),
+            false,
+            &extra,
+        );
+        let kwargs = body.get("chat_template_kwargs").expect("passthrough expected");
+        assert_eq!(kwargs.get("enable_thinking").and_then(Value::as_bool), Some(false));
+        assert_eq!(body.get("model").and_then(Value::as_str), Some("m"));
     }
 
     /// `off` on the boolean-switch style is a real wire value: an explicit
@@ -582,8 +644,14 @@ mod tests {
     #[test]
     fn off_renders_explicit_disable_for_thinking_switch_style() {
         let params = GenParams { reasoning_effort: Some("off".to_owned()), ..GenParams::default() };
-        let body =
-            completion_body(ReasoningStyle::GlmThinking, "m", &sample_messages(), &params, true);
+        let body = completion_body(
+            ReasoningStyle::GlmThinking,
+            "m",
+            &sample_messages(),
+            &params,
+            true,
+            &BTreeMap::new(),
+        );
         let thinking = body.get("thinking").expect("explicit disable expected");
         assert_eq!(thinking.get("type").and_then(Value::as_str), Some("disabled"));
     }
@@ -595,8 +663,14 @@ mod tests {
     #[test]
     fn off_omits_the_parameter_for_effort_style() {
         let params = GenParams { reasoning_effort: Some("off".to_owned()), ..GenParams::default() };
-        let body =
-            completion_body(ReasoningStyle::OpenaiEffort, "m", &sample_messages(), &params, true);
+        let body = completion_body(
+            ReasoningStyle::OpenaiEffort,
+            "m",
+            &sample_messages(),
+            &params,
+            true,
+            &BTreeMap::new(),
+        );
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("thinking").is_none());
     }

@@ -259,6 +259,21 @@ Undeclared models remain usable but get default capabilities: no
 reasoning parameter is ever sent for them, and context filling stays
 message-count based.
 
+**Provider-specific request fields.** `[llm.providers.<name>.extra_body]`
+merges arbitrary JSON fields into every completion body - for endpoint
+knobs the adapter does not model. `model` and `messages` are
+engine-owned and cannot be overridden; other keys take precedence over
+the standard rendering. Typical use: switching thinking off on a local
+llama.cpp server, whose templates ignore the `reasoning_effort` scale
+entirely (`off` therefore cannot reach it as a wire value):
+
+```toml
+[llm.providers.local]
+api_url = "http://192.168.1.35:8001/v1"
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+# or, on servers supporting the budget field: extra_body = { reasoning_budget = 0 }
+```
+
 **How conversations work.**
 
 - **Capture** decides what enters the channel's history. `bot_related`

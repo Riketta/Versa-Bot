@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 /// Global `[llm]` section: LLM provider connections, model capability
 /// declarations and engine-wide defaults. This is the bot operator's domain
@@ -72,6 +73,13 @@ pub struct LlmProviderConfig {
     /// Request timeout in seconds.
     pub timeout_secs: u64,
     pub reasoning_style: LlmReasoningStyle,
+    /// Provider-specific fields merged verbatim into every completion
+    /// request body - knobs the adapter does not model (llama.cpp
+    /// `chat_template_kwargs` / `reasoning_budget`, vendor sampling
+    /// extensions). `model` and `messages` are engine-owned and cannot be
+    /// overridden; other keys win over the standard rendering. Startup-only.
+    #[serde(default)]
+    pub extra_body: BTreeMap<String, Value>,
 }
 
 impl Default for LlmProviderConfig {
@@ -82,6 +90,7 @@ impl Default for LlmProviderConfig {
             proxy: None,
             timeout_secs: 120,
             reasoning_style: LlmReasoningStyle::default(),
+            extra_body: BTreeMap::new(),
         }
     }
 }
@@ -142,7 +151,10 @@ mod tests {
                         "api_key_env": "VERSABOT_LLM_ZAI_KEY",
                         "reasoning_style": "glm_thinking"
                     },
-                    "local": { "api_url": "http://127.0.0.1:8001/v1" }
+                    "local": {
+                        "api_url": "http://127.0.0.1:8001/v1",
+                        "extra_body": { "reasoning_budget": 0 }
+                    }
                 },
                 "models": { "zai/glm-5.3-flash": { "reasoning": true } }
             }"#,
@@ -157,6 +169,8 @@ mod tests {
         let zai = config.providers.get("zai").expect("zai provider expected");
         assert_eq!(zai.reasoning_style, LlmReasoningStyle::GlmThinking);
         assert_eq!(zai.timeout_secs, 120);
+        let local = config.providers.get("local").expect("local provider expected");
+        assert_eq!(local.extra_body.get("reasoning_budget").and_then(Value::as_i64), Some(0));
         assert!(config.models.get("zai/glm-5.3-flash").is_some_and(|model| model.reasoning));
     }
 }

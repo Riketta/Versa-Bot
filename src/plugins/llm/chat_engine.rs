@@ -1162,7 +1162,15 @@ mod tests {
     }
 
     fn assigned_config() -> ChannelConfig {
-        ChannelConfig::assigned("local/gemma".to_owned())
+        // Chime chance is zero unless a test opts in: the chime-path tests
+        // set an explicit percent next to their FixedRandom. Every other
+        // untriggered capture then skips the roll entirely - the default
+        // ctx() wires a real 2% coin (RandRandom), which made capture tests
+        // flake when the coin landed.
+        ChannelConfig {
+            random_chance_percent: 0.0,
+            ..ChannelConfig::assigned("local/gemma".to_owned())
+        }
     }
 
     fn seed_config(storage: &InMemoryStorage, config: &ChannelConfig) {
@@ -1769,7 +1777,11 @@ mod tests {
             Arc::new(FixedRandom(true)),
             vec![Ok("random thought".to_owned())],
         );
-        let config = ChannelConfig { capture_mode: CaptureMode::AllMessages, ..assigned_config() };
+        let config = ChannelConfig {
+            capture_mode: CaptureMode::AllMessages,
+            random_chance_percent: 2.0,
+            ..assigned_config()
+        };
         seed_config(&ctx.storage, &config);
 
         ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
@@ -1791,7 +1803,11 @@ mod tests {
             Arc::new(FixedRandom(true)),
             vec![Err(LlmError::Request("provider down".to_owned()))],
         );
-        let config = ChannelConfig { capture_mode: CaptureMode::AllMessages, ..assigned_config() };
+        let config = ChannelConfig {
+            capture_mode: CaptureMode::AllMessages,
+            random_chance_percent: 2.0,
+            ..assigned_config()
+        };
         seed_config(&ctx.storage, &config);
 
         ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
@@ -1806,7 +1822,11 @@ mod tests {
     #[tokio::test]
     async fn random_reply_miss_leaves_only_the_capture() {
         let ctx = ctx_random(LlmSettings::default(), Arc::new(FixedRandom(false)), vec![]);
-        let config = ChannelConfig { capture_mode: CaptureMode::AllMessages, ..assigned_config() };
+        let config = ChannelConfig {
+            capture_mode: CaptureMode::AllMessages,
+            random_chance_percent: 2.0,
+            ..assigned_config()
+        };
         seed_config(&ctx.storage, &config);
 
         ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
@@ -1837,7 +1857,11 @@ mod tests {
             Arc::new(FixedRandom(true)),
             vec![Ok("chime".to_owned())],
         );
-        let config = ChannelConfig { capture_mode: CaptureMode::AllMessages, ..assigned_config() };
+        let config = ChannelConfig {
+            capture_mode: CaptureMode::AllMessages,
+            random_chance_percent: 2.0,
+            ..assigned_config()
+        };
         seed_config(&ctx.storage, &config);
 
         for _ in 0..2 {

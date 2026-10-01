@@ -73,6 +73,13 @@ url = "sqlite://versabot.db"
 # [llm.providers.local]
 # api_url = "http://192.168.1.35:8001/v1"
 # timeout_secs = 180
+# Provider-specific fields merged into every completion body - knobs the
+# adapter does not model. llama.cpp example: stop a thinking template from
+# thinking (the per-channel reasoning_effort scale means nothing to it).
+# `model`/`messages` cannot be overridden.
+# extra_body = { chat_template_kwargs = { enable_thinking = false } }
+# or, on servers that support the budget field:
+# extra_body = { reasoning_budget = 0 }
 
 # Model capability declarations. Undeclared models are usable but get
 # default capabilities (no reasoning parameter is ever sent for them).
