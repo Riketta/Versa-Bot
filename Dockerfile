@@ -11,6 +11,10 @@ FROM rust:1.98-bookworm AS build
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# Compile-time input: migrations are embedded into the binary via
+# `include_str!` (sqlx 0.9 has no `migrate!` macro), so the build needs the
+# directory even though the runtime image does not.
+COPY migrations ./migrations
 
 # Cache mounts keep the cargo registry/git checkouts and the build tree warm
 # between runs (the Forgejo packaging job builds against the host daemon, so
