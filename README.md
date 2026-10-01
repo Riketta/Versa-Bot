@@ -234,14 +234,19 @@ history.
 [llm]
 # Optional defaults: default_system_prompt, default_compaction_prompt,
 # compaction_model, compaction_keep_tail, max_message_length,
-# stream_interval_ms.
+# stream_interval_ms. `log_raw_traffic = true` dumps every LLM request
+# and response body at DEBUG level (stdout only) while debugging a
+# provider - it carries conversation content, so it stays off by default.
 
 [llm.providers.zai]
 api_url = "https://api.z.ai/api/coding/paas/v4"
 api_key_env = "VERSABOT_LLM_ZAI_KEY"
 # How the reasoning parameter is rendered: "openai_effort" sends
-# reasoning_effort: "<value>"; "glm_thinking" sends the boolean
-# thinking: {"type": "enabled"} switch.
+# reasoning_effort: "<value>" (no off value exists - omitted means the
+# provider default, and Z.ai GLM defaults to `max` effort, with `low` as
+# the GLM-5.3 minimum); "glm_thinking" sends the boolean
+# thinking: {"type": "enabled"|"disabled"} switch, where `off` renders a
+# real disable (GLM-4.5 through 5.2; GLM-5.3 thinks forcibly).
 reasoning_style = "openai_effort"
 
 [llm.models."zai/glm-5.3-flash"]
@@ -309,7 +314,7 @@ confirmations, usage notices and reports never appear in the channel.
 | `/llm_prompt_file file:<attachment>` | set the system prompt from an uploaded text/markdown file - for prompts beyond the inline limit; fetched from Discord's CDN only, capped by `[llm] max_prompt_file_bytes` (128 KiB default) |
 | `/llm_set key:<key> value:<value>` | tune one channel setting (table below); value `clear`/`none`/`default` resets it |
 | `/llm_cutoff` | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
-| `/llm_status` | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, window usage, summary preview, link to the context start, last-request token stats |
+| `/llm_status` | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported) |
 | `/llm_admin` | make this channel the guild's service channel for error notices (one per guild, last write wins) |
 | `/llm_admin_clear` | stop service notices |
 
@@ -321,7 +326,7 @@ saved):
 | `model` | provider/model reference - declared models only (see `/llm_models`) | set by `/llm_assign` |
 | `temperature` `top_p` `top_k` `min_p` `frequency_penalty` `presence_penalty` | sampling parameters; cleared = not sent | provider defaults |
 | `max_tokens` | completion size cap | provider default |
-| `reasoning_effort` | reasoning hint sent only when the model declares `reasoning = true`; `off`/`clear` sends no reasoning parameter at all (provider default applies) | none |
+| `reasoning_effort` | reasoning hint sent only when the model declares `reasoning = true`; any value is sent as-is for effort-style providers (Z.ai GLM: `low`/`high`/`max` on GLM-5.3) and enables thinking for switch-style providers; `off` explicitly disables thinking where the provider supports a switch; `clear`/`none`/`default` sends no reasoning parameter at all (provider default applies - on Z.ai GLM that default is `max`, so prefer `low` over `off` on GLM-5.3) | none |
 | `depth` | live-window size in messages; reaching it triggers compaction | 100 |
 | `context_budget` | prompt-side token budget; cleared = auto (model window) once calibrated | auto |
 | `capture_mode` | `bot_related` or `all_messages` | `bot_related` |
@@ -357,11 +362,21 @@ the logs.
 
 **Logging.** Every generated answer leaves an `info` audit record in the
 logs: model, trigger (`triggered` vs `chime`), latency, prompt/completion
-token usage (cached when the endpoint reports it), live-window and
-currently-used sizes. Sizes and counters only - message text and prompts
-never log. At `debug`, chime roll decisions (cooldown skips and deck
-draws) and per-request LLM traces (provider, model, status, duration)
-explain why the bot stayed quiet or answered slowly.
+token usage (cached and reasoning-token breakdowns when the endpoint
+reports them), live-window and currently-used sizes. Sizes and counters
+only - message text and prompts never log. At `debug`, chime roll
+decisions (cooldown skips and deck draws) and per-request LLM traces
+(provider, model, status, duration) explain why the bot stayed quiet or
+answered slowly.
+
+**Raw traffic dump.** For provider debugging, `[llm] log_raw_traffic = true`
+dumps the unmodified request and response bodies of every completion at
+`debug` level - what parameters were actually sent (e.g. whether a
+reasoning parameter made it onto the wire) and what the endpoint returned
+(reasoning content is visible only there; it is otherwise cut at the
+adapter). DEBUG stays on stdout and never ships to Sentry/GlitchTip, but
+the bodies carry full conversation content: operator diagnostic, off by
+default, flip it off when done.
 
 ## Docker
 

@@ -215,7 +215,8 @@ impl PluginPort for LlmPlugin {
                 vec![
                     ArgDescriptor {
                         name: "key".to_owned(),
-                        description: "Setting to change; reasoning_effort=off disables reasoning"
+                        description: "Setting to change; reasoning_effort=off disables thinking \
+                             where supported"
                             .to_owned(),
                         required: true,
                         kind: ArgKind::String,
@@ -223,7 +224,8 @@ impl PluginPort for LlmPlugin {
                     },
                     ArgDescriptor {
                         name: "value".to_owned(),
-                        description: "New value; `clear` resets; `off` disables reasoning"
+                        description: "New value; `clear` = provider default; `off` disables \
+                             thinking where supported"
                             .to_owned(),
                         required: true,
                         kind: ArgKind::String,

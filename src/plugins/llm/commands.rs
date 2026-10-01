@@ -121,16 +121,23 @@ fn apply_set(config: &mut ChannelConfig, key: &str, value: &str) -> Result<Strin
         "reasoning_effort" => {
             if cleared {
                 config.params.reasoning_effort = None;
-                return Ok("`reasoning_effort` cleared (no reasoning parameter sent).".to_owned());
+                return Ok(
+                    "`reasoning_effort` cleared (no reasoning parameter is sent - the provider's \
+                     default applies)."
+                        .to_owned(),
+                );
             }
             if value == "off" {
-                // Same stored state as a reset - there is no "explicit off"
-                // wire value - but the reply should acknowledge the choice
-                // instead of claiming something was cleared.
-                config.params.reasoning_effort = None;
+                // Distinct from a reset: `off` is a real choice. Thinking-
+                // switch providers (glm_thinking style) get an explicit
+                // `thinking: disabled`; effort-style endpoints have no off
+                // wire value, so their default applies - on Z.ai GLM that
+                // default is heavy thinking (GLM-5.3: minimum is `low`).
+                config.params.reasoning_effort = Some("off".to_owned());
                 return Ok(
-                    "`reasoning_effort` off: no reasoning parameter is sent (the provider's \
-                     default applies)."
+                    "`reasoning_effort` off: thinking-switch providers get an explicit disable; \
+                     effort-style endpoints have no off value, so their default applies (on Z.ai \
+                     GLM the default is heavy thinking - `low` is the minimum for GLM-5.3)."
                         .to_owned(),
                 );
             }
@@ -572,8 +579,12 @@ async fn usage_lines(
 
     let cached =
         last.cached_tokens.map(|cached| format!(" (+{cached} cached)")).unwrap_or_default();
+    let reasoning = last
+        .reasoning_tokens
+        .map(|reasoning| format!(" ({reasoning} reasoning)"))
+        .unwrap_or_default();
     let last_request = Some(format!(
-        "Last request: {} prompt / {} completion / {} total tokens{cached}",
+        "Last request: {} prompt / {} completion{reasoning} / {} total tokens{cached}",
         last.prompt_tokens, last.completion_tokens, last.total_tokens
     ));
     UsageLines { estimate, last_request }
@@ -677,8 +688,16 @@ impl CommandHandler for StatusLlmHandler {
             None => "none".to_owned(),
         };
         let context_start = first_link.unwrap_or_else(|| "no messages after the cutoff".to_owned());
+        let reasoning = match &config.params.reasoning_effort {
+            Some(effort) if effort == "off" => {
+                "off (explicit disable where the provider supports one)".to_owned()
+            }
+            Some(effort) => effort.clone(),
+            None => "provider default (nothing sent)".to_owned(),
+        };
         let mut description = format!(
             "Model: `{}`
+Reasoning: {reasoning}
 Prompt: {prompt_source} ({} chars, {})
 Prompt head: {prompt_head}
 Context: {live}/{} messages ({total} kept)
@@ -1109,9 +1128,10 @@ mod tests {
         assert!(apply_set(&mut config, "streaming", "maybe").is_err());
     }
 
-    /// `off` is an explicit choice with its own acknowledgment; the reset
-    /// words keep the "cleared" reply - all of them store `None` (there is
-    /// no "send an explicit off" wire value).
+    /// `off` is an explicit choice with its own acknowledgment and its own
+    /// stored state (`Some("off")`) - thinking-switch providers render a
+    /// real wire disable from it. The reset words keep the "cleared" reply
+    /// and store `None` (provider default, nothing sent).
     #[test]
     fn reasoning_effort_distinguishes_off_from_reset() {
         let mut config = ChannelConfig::assigned("m".to_owned());
@@ -1122,7 +1142,8 @@ mod tests {
 
         let off = apply_set(&mut config, "reasoning_effort", "off").expect("off expected");
         assert!(off.contains("`reasoning_effort` off"));
-        assert_eq!(config.params.reasoning_effort, None);
+        assert!(off.contains("explicit disable"));
+        assert_eq!(config.params.reasoning_effort.as_deref(), Some("off"));
 
         let cleared = apply_set(&mut config, "reasoning_effort", "clear").expect("clear expected");
         assert!(cleared.contains("cleared"));
@@ -1289,6 +1310,7 @@ mod tests {
                 completion_tokens: 10,
                 total_tokens: 110,
                 cached_tokens: Some(40),
+                reasoning_tokens: Some(6),
             }),
             tokens_per_char: 1.0,
             last_budget: Some(500),
@@ -1302,12 +1324,15 @@ mod tests {
         assert_eq!(lines.estimate.as_deref(), Some("Est. context: ~36 / 500 tokens"));
         assert_eq!(
             lines.last_request.as_deref(),
-            Some("Last request: 100 prompt / 10 completion / 110 total tokens (+40 cached)")
+            Some(
+                "Last request: 100 prompt / 10 completion (6 reasoning) / 110 total tokens (+40 cached)"
+            )
         );
 
         let plain = UsageStats { last_budget: None, ..stats };
         let mut bare = stats.last.expect("usage expected");
         bare.cached_tokens = None;
+        bare.reasoning_tokens = None;
         let plain = UsageStats { last: Some(bare), ..plain };
         let lines =
             usage_lines(&guild, &records_namespace(2), &ConversationState::default(), 2, &plain)

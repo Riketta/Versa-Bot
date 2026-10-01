@@ -39,6 +39,10 @@ pub struct LlmSettings {
     pub stream_interval_ms: u64,
     /// Cap for `/llm_prompt_file` attachment downloads, in bytes.
     pub max_prompt_file_bytes: u64,
+    /// Diagnostic dump: log the raw request and response bodies of every
+    /// completion at DEBUG level (stdout only, never shipped to Sentry).
+    /// Off by default - the bodies carry full conversation content.
+    pub log_raw_traffic: bool,
     /// Declared providers (`[llm.providers.<name]`).
     pub providers: BTreeMap<String, ProviderSettings>,
     /// Declared model capabilities (`[llm.models."<provider/model>"]`).
@@ -62,6 +66,7 @@ impl Default for LlmSettings {
             max_message_length: 2000,
             stream_interval_ms: 2000,
             max_prompt_file_bytes: 131_072,
+            log_raw_traffic: false,
             providers: BTreeMap::new(),
             models: BTreeMap::new(),
         }
@@ -97,14 +102,24 @@ impl Default for ProviderSettings {
 }
 
 /// How the reasoning/thinking parameter is rendered on the wire.
+///
+/// Both styles only render when the model declares reasoning support;
+/// `reasoning_effort: "off"` differs per style: the boolean switch style
+/// sends an explicit disable, the effort style has no off wire value and
+/// falls back to the provider default (which on Z.ai GLM is heavy thinking
+/// - for GLM-5.3 series the minimum is `low`, thinking is forced).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningStyle {
-    /// `reasoning_effort: "<value>"` (`OpenAI` o-series, GLM coding endpoints).
+    /// `reasoning_effort: "<value>"` (`OpenAI` o-series, Z.ai GLM). The
+    /// effort scale has no universal off: omitted = provider default (Z.ai
+    /// GLM defaults to `max`).
     #[default]
     OpenaiEffort,
-    /// `thinking: {"type": "enabled"}` (GLM boolean thinking switch; any
-    /// non-`off` effort enables it).
+    /// `thinking: {"type": "enabled"|"disabled"}` (GLM boolean thinking
+    /// switch; any non-`off` effort enables it, `off` disables it). Not
+    /// every model honors the disable - GLM-5.3 series thinks forcibly and
+    /// is throttled via `reasoning_effort` instead.
     GlmThinking,
 }
 
@@ -236,10 +251,34 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
             messages = request.messages.len(),
             "LLM request dispatched"
         );
+        // Operator opt-in dump: what exactly went on the wire (proves which
+        // reasoning/sampling parameters were actually sent). DEBUG stays on
+        // stdout and never reaches Sentry; the body carries the full
+        // conversation, hence the config gate.
+        if self.settings.log_raw_traffic {
+            tracing::debug!(
+                provider = provider_name,
+                model = model_name,
+                body = %body,
+                "LLM raw request"
+            );
+        }
         let response =
             request_builder.send().await.map_err(|err| LlmError::Request(err.to_string()))?;
         let status = response.status();
         let text = response.text().await.map_err(|err| LlmError::Request(err.to_string()))?;
+        // Dumped before the status check so rejected requests are dumped too
+        // - the response body is usually the only explanation an endpoint
+        // gives (and the only place reasoning_content is ever visible).
+        if self.settings.log_raw_traffic {
+            tracing::debug!(
+                provider = provider_name,
+                model = model_name,
+                status = %status,
+                body = %text,
+                "LLM raw response"
+            );
+        }
         if !status.is_success() {
             return Err(LlmError::Request(format!("HTTP {status}: {}", truncate(&text, 300))));
         }
@@ -269,7 +308,14 @@ fn split_model_ref(model_ref: &str) -> Result<(&str, &str), LlmError> {
 
 /// Builds the `chat/completions` request body. Absent params are omitted
 /// (strict endpoints reject unknown fields); reasoning is rendered only when
-/// the model declares support, in the provider's style.
+/// the model declares support, in the provider's style:
+/// - `openai_effort`: `reasoning_effort: "<value>"`. Any effort renders as
+///   sent; `off` is NOT rendered - the effort scale has no universal off
+///   value, so off means "omit and let the provider default apply" (Z.ai
+///   GLM defaults to `max`, GLM-5.3's minimum is `low`).
+/// - `glm_thinking`: `thinking: {"type": ...}`. Non-`off` effort renders
+///   `enabled`; `off` renders an explicit `disabled` (honored by GLM-4.5
+///   through 5.2; GLM-5.3 series thinks forcibly regardless).
 fn completion_body(
     style: ReasoningStyle,
     model: &str,
@@ -320,16 +366,16 @@ fn completion_body(
     if let Some(value) = max_tokens {
         body.insert("max_tokens".to_owned(), json!(value));
     }
-    if supports_reasoning
-        && let Some(effort) = reasoning_effort
-        && effort != "off"
-    {
+    if supports_reasoning && let Some(effort) = reasoning_effort {
         match style {
             ReasoningStyle::OpenaiEffort => {
-                body.insert("reasoning_effort".to_owned(), json!(effort));
+                if effort != "off" {
+                    body.insert("reasoning_effort".to_owned(), json!(effort));
+                }
             }
             ReasoningStyle::GlmThinking => {
-                body.insert("thinking".to_owned(), json!({"type": "enabled"}));
+                let kind = if effort == "off" { "disabled" } else { "enabled" };
+                body.insert("thinking".to_owned(), json!({"type": kind}));
             }
         }
     }
@@ -447,6 +493,10 @@ fn parse_usage(response: &Value) -> Option<TokenUsage> {
             .get("prompt_tokens_details")
             .and_then(|details| details.get("cached_tokens"))
             .and_then(Value::as_u64),
+        reasoning_tokens: usage
+            .get("completion_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64),
     })
 }
 
@@ -527,12 +577,28 @@ mod tests {
         assert_eq!(thinking.get("type").and_then(Value::as_str), Some("enabled"));
     }
 
+    /// `off` on the boolean-switch style is a real wire value: an explicit
+    /// disable (honored by GLM-4.5 through 5.2; GLM-5.3 thinks forcibly).
     #[test]
-    fn effort_off_is_never_rendered() {
+    fn off_renders_explicit_disable_for_thinking_switch_style() {
+        let params = GenParams { reasoning_effort: Some("off".to_owned()), ..GenParams::default() };
+        let body =
+            completion_body(ReasoningStyle::GlmThinking, "m", &sample_messages(), &params, true);
+        let thinking = body.get("thinking").expect("explicit disable expected");
+        assert_eq!(thinking.get("type").and_then(Value::as_str), Some("disabled"));
+    }
+
+    /// The effort scale has no universal off value (sending an unsupported
+    /// level could hard-reject on strict endpoints), so `off` omits the
+    /// parameter and the provider default applies - which on Z.ai GLM is
+    /// heavy thinking. The docs say so; operators pick `low` instead.
+    #[test]
+    fn off_omits_the_parameter_for_effort_style() {
         let params = GenParams { reasoning_effort: Some("off".to_owned()), ..GenParams::default() };
         let body =
             completion_body(ReasoningStyle::OpenaiEffort, "m", &sample_messages(), &params, true);
         assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("thinking").is_none());
     }
 
     #[test]
@@ -634,7 +700,8 @@ mod tests {
                     "prompt_tokens": 1200,
                     "completion_tokens": 34,
                     "total_tokens": 1234,
-                    "prompt_tokens_details": {"cached_tokens": 800}
+                    "prompt_tokens_details": {"cached_tokens": 800},
+                    "completion_tokens_details": {"reasoning_tokens": 2050}
                 }
             }"#,
         )
@@ -646,10 +713,11 @@ mod tests {
                 completion_tokens: 34,
                 total_tokens: 1234,
                 cached_tokens: Some(800),
+                reasoning_tokens: Some(2050),
             })
         );
 
-        // No cached-token breakdown: the core fields still parse.
+        // No cached/reasoning breakdown: the core fields still parse.
         let response = parse_completion_content(
             r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#,
         )
@@ -661,6 +729,7 @@ mod tests {
                 completion_tokens: 2,
                 total_tokens: 3,
                 cached_tokens: None,
+                reasoning_tokens: None,
             })
         );
 

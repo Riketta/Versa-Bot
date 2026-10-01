@@ -425,6 +425,7 @@ impl ChatEngine {
             prompt_tokens = usage.map_or(0, |usage| usage.prompt_tokens),
             completion_tokens = usage.map_or(0, |usage| usage.completion_tokens),
             cached_tokens = ?usage.and_then(|usage| usage.cached_tokens),
+            reasoning_tokens = ?usage.and_then(|usage| usage.reasoning_tokens),
             window,
             window_used,
             context_chars,
@@ -1558,12 +1559,14 @@ mod tests {
                 completion_tokens: 10,
                 total_tokens: 110,
                 cached_tokens: None,
+                reasoning_tokens: None,
             }),
             Some(TokenUsage {
                 prompt_tokens: 50_000,
                 completion_tokens: 20,
                 total_tokens: 50_020,
                 cached_tokens: None,
+                reasoning_tokens: None,
             }),
         ]);
         let config = ChannelConfig { history_depth: 3, ..assigned_config() };
@@ -1879,6 +1882,7 @@ mod tests {
             completion_tokens: 5,
             total_tokens: 1205,
             cached_tokens: None,
+            reasoning_tokens: None,
         }));
         seed_config(&ctx.storage, &assigned_config());
 

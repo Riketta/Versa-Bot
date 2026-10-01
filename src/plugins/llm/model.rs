@@ -72,9 +72,12 @@ pub struct GenParams {
     pub frequency_penalty: Option<f64>,
     pub presence_penalty: Option<f64>,
     pub max_tokens: Option<u32>,
-    /// Reasoning/thinking effort hint (e.g. `low`/`medium`/`high`). Sent
-    /// only when the requested model declares reasoning support; ignored
-    /// otherwise.
+    /// Reasoning/thinking effort hint. `Some(value)` with anything but
+    /// `off` is sent as-is (effort style) or enables thinking (switch
+    /// style); `Some("off")` requests an explicit disable where the wire
+    /// supports one; `None` sends no reasoning parameter at all - the
+    /// provider default applies (Z.ai GLM defaults to `max` effort). Sent
+    /// only when the requested model declares reasoning support.
     pub reasoning_effort: Option<String>,
 }
 
@@ -324,6 +327,7 @@ mod tests {
                 completion_tokens: 10,
                 total_tokens: 110,
                 cached_tokens: Some(40),
+                reasoning_tokens: None,
             }),
             tokens_per_char: 0.31,
             last_budget: Some(6176),

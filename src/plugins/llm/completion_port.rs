@@ -67,6 +67,13 @@ pub struct TokenUsage {
     /// byte-stable-prefix design is actually hitting.
     #[serde(default)]
     pub cached_tokens: Option<u64>,
+    /// Tokens the endpoint reports as reasoning/thinking output
+    /// (`completion_tokens_details.reasoning_tokens`). A completion can cost
+    /// thousands of reasoning tokens for a one-line answer - thinking
+    /// models burn them silently; this is the receipt. Absent when the
+    /// endpoint does not report the breakdown.
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]

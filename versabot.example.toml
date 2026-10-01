@@ -45,6 +45,10 @@ url = "sqlite://versabot.db"
 # stream_interval_ms = 2000
 # Cap for /llm_prompt_file attachment downloads, in bytes.
 # max_prompt_file_bytes = 131072
+# Diagnostic: dump every LLM request and response body at DEBUG level
+# (stdout only, never Sentry). The bodies carry full conversation
+# content - enable only while debugging a provider.
+# log_raw_traffic = false
 
 # Providers are OpenAI-compatible endpoints. `api_key_env` NAMES the
 # environment variable holding the key - it must never contain the key
@@ -53,7 +57,14 @@ url = "sqlite://versabot.db"
 # [llm.providers.zai]
 # api_url = "https://api.z.ai/api/coding/paas/v4"
 # api_key_env = "VERSABOT_LLM_ZAI_KEY"   # then: VERSABOT_LLM_ZAI_KEY=<key> in the environment
-# reasoning_style = "openai_effort"   # or "glm_thinking"
+# How the reasoning parameter is rendered. "openai_effort" sends
+# reasoning_effort: "<value>"; the effort scale has no off wire value, so
+# per-channel `off` omits it and the endpoint default applies - Z.ai GLM
+# defaults to `max` effort (heavy thinking; GLM-5.3 series thinks
+# forcibly, `low` is the minimum). "glm_thinking" sends the boolean
+# thinking: {"type": "enabled"|"disabled"} switch, where `off` renders a
+# real disable (honored by GLM-4.5 through 5.2).
+# reasoning_style = "openai_effort"
 #
 # [llm.providers.local]
 # api_url = "http://192.168.1.35:8001/v1"
