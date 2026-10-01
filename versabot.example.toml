@@ -1,7 +1,11 @@
 # Checked-in configuration template. Copy it to `versabot.toml`
 # (gitignored) and fill in the real values.
 
-# Verbose (debug-level) logging; RUST_LOG overrides it entirely.
+# Verbose logging for the bot's own internals. The third-party HTTP stack
+# (reqwest/hyper) stays at warn even in debug mode - its per-request logs
+# embed full client dumps and drown everything else. RUST_LOG overrides
+# this entirely: RUST_LOG=debug brings the noise back, or tune per crate,
+# e.g. RUST_LOG="info,versa_bot=debug,serenity=debug".
 debug = true
 
 [discord]

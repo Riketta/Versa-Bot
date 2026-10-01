@@ -1,12 +1,20 @@
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
+/// Fallback directives when `RUST_LOG` is unset. Target directives are
+/// more specific than the global level and win for their crate.
+const FALLBACK_INFO_FILTER: &str = "info";
+const FALLBACK_DEBUG_FILTER: &str = "info,versa_bot=debug,reqwest=warn,hyper=warn,hyper_util=warn";
+
 /// Installs the global tracing subscriber: stdout fmt layer plus an optional
 /// Sentry/GlitchTip layer. The Sentry endpoint is any Sentry-protocol DSN
 /// (GlitchTip included), so "address" is just the DSN host - nothing else to
 /// configure. Without a DSN - or with a malformed one, which is reported and
 /// skipped instead of aborting startup - the app logs to stdout only.
 /// `RUST_LOG` overrides everything; when unset, `debug` picks the fallback
-/// verbosity.
+/// verbosity. The debug fallback keeps only the bot's own breadcrumbs at
+/// debug and pins the third-party HTTP stack to warn: `reqwest`/`hyper`
+/// emit per-request connect/frame lines whose span context embeds the
+/// entire client dump - pure volume, no signal for operators.
 ///
 /// Error events carry the crate release (`versa-bot@<version>`, via
 /// `sentry::release_name!`) so the backend can group by release; performance
@@ -24,7 +32,7 @@ pub fn init(
     sentry_environment: Option<&str>,
     sentry_traces_sample_rate: Option<f32>,
 ) -> Option<sentry::ClientInitGuard> {
-    let fallback = if debug { "debug" } else { "info" };
+    let fallback = if debug { FALLBACK_DEBUG_FILTER } else { FALLBACK_INFO_FILTER };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(fallback));
     let registry =
         tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer());

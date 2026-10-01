@@ -8,7 +8,8 @@ use super::storage::StorageConfig;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct Configuration {
-    /// Verbose (debug-level) logging fallback when `RUST_LOG` is unset.
+    /// Verbose logging fallback when `RUST_LOG` is unset: the bot's own
+    /// internals at debug, third-party HTTP stack (reqwest/hyper) at warn.
     #[serde(default)]
     pub debug: bool,
     pub discord: DiscordConfig,
