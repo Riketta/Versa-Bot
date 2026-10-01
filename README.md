@@ -123,7 +123,7 @@ Prerequisites: Rust 1.88+ (edition 2024).
    # reasoning = false
    ```
 
-2. `cargo run` from the project root (migrations load from `./migrations`).
+2. `cargo run` from anywhere (migrations are embedded in the binary).
    Migrations apply automatically, slash commands are published, and the
    bot comes online.
 

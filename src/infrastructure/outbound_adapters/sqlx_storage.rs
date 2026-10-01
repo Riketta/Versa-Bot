@@ -1,11 +1,13 @@
-use std::path::Path;
+use std::borrow::Cow;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::PgPool;
+use sqlx::migrate::{Migration, MigrationType, Migrator};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::{SqlSafeStr, sqlite::SqlitePool};
 
 use crate::kernel::{
     models::{GuildId, Platform, StorageError},
@@ -16,8 +18,36 @@ use crate::kernel::{
 /// instead of `AnyPool`: every query carries its dialect visibly, so guild
 /// scoping stays auditable per engine.
 enum Db {
-    Sqlite(sqlx::SqlitePool),
+    Sqlite(SqlitePool),
     Postgres(PgPool),
+}
+
+/// Compile-time-embedded migrations: sqlx 0.9 dropped the `migrate!` macro,
+/// so the set is assembled by hand from `include_str!` sources. The binary
+/// stays CWD-independent (it used to break when launched outside the project
+/// root), and `Migration::new` computes the same checksums the directory
+/// loader did, so already-migrated databases validate cleanly.
+fn embedded_migrations() -> Vec<Migration> {
+    vec![
+        migration(
+            1,
+            "guild_documents",
+            include_str!("../../../migrations/0001_guild_documents.sql"),
+        ),
+        migration(2, "guild_records", include_str!("../../../migrations/0002_guild_records.sql")),
+    ]
+}
+
+/// The `embedded_migrations` entry: mirrors the directory loader's parse of
+/// `000<version>_<description>.sql` (plain, transactional migrations).
+fn migration(version: i64, description: &'static str, sql: &'static str) -> Migration {
+    Migration::new(
+        version,
+        Cow::Borrowed(description),
+        MigrationType::Simple,
+        sql.into_sql_str(),
+        false,
+    )
 }
 
 /// Plain-SQL storage adapter. One `guild_documents` table, one query shape
@@ -44,22 +74,20 @@ impl SqlxStorage {
                 .connect_with(options)
                 .await
                 .map_err(|err| StorageError::Database(err.to_string()))?;
-            // sqlx 0.9 has no `migrate!` facade macro - migrations load from
-            // the runtime path (CWD-relative: project root in dev, workdir in
-            // the container image).
-            let migrator = sqlx::migrate::Migrator::new(Path::new("./migrations"))
+            // Migrations are embedded at compile time - no runtime path.
+            Migrator::with_migrations(embedded_migrations())
+                .run(&pool)
                 .await
                 .map_err(|err| StorageError::Database(err.to_string()))?;
-            migrator.run(&pool).await.map_err(|err| StorageError::Database(err.to_string()))?;
             Ok(Self { db: Arc::new(Db::Sqlite(pool)) })
         } else {
             let pool = PgPool::connect(url)
                 .await
                 .map_err(|err| StorageError::Database(err.to_string()))?;
-            let migrator = sqlx::migrate::Migrator::new(Path::new("./migrations"))
+            Migrator::with_migrations(embedded_migrations())
+                .run(&pool)
                 .await
                 .map_err(|err| StorageError::Database(err.to_string()))?;
-            migrator.run(&pool).await.map_err(|err| StorageError::Database(err.to_string()))?;
             Ok(Self { db: Arc::new(Db::Postgres(pool)) })
         }
     }

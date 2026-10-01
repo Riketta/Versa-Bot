@@ -39,8 +39,7 @@ RUN useradd --system --create-home --home-dir /app versa \
 
 WORKDIR /app
 COPY --from=build /usr/local/bin/versa-bot versa-bot
-# The sqlx migrator loads from the CWD-relative ./migrations.
-COPY migrations migrations
+# Migrations are embedded in the binary; only the example config ships.
 COPY versabot.example.toml versabot.example.toml
 
 USER versa
