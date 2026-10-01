@@ -21,6 +21,7 @@ use super::model::{
     CaptureMode, ChannelConfig, ConversationState, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats,
     channel_config_key, channel_state_key, channel_stats_key, records_namespace, unix_now,
 };
+use super::providers::{LlmSettings, ModelSettings};
 
 /// Recognized `/llm_set` keys, in display order. Doubles as the Discord
 /// choices dropdown for the `key` argument.
@@ -319,7 +320,69 @@ fn set_float(config: &mut ChannelConfig, key: &str, value: Option<f64>) {
 
 /// `/llm_assign`: assigns the chat bot to the channel the command is run in,
 /// with the given provider/model reference. Re-assigning retunes in place.
-pub(super) struct AssignLlmHandler;
+/// Discord caps one option's `choices` at 25 entries.
+pub(super) const MAX_DISCORD_CHOICES: usize = 25;
+
+/// Declared model refs for the `/llm_assign` dropdown: registry order
+/// (sorted), truncated to Discord's choice cap. The dropdown is discovery
+/// only - runtime validation enforces the full registry regardless of the
+/// truncation.
+pub(super) fn model_choices(settings: &LlmSettings) -> Vec<String> {
+    let mut refs: Vec<String> = settings.models.keys().cloned().collect();
+    if refs.len() > MAX_DISCORD_CHOICES {
+        tracing::warn!(
+            total = refs.len(),
+            cap = MAX_DISCORD_CHOICES,
+            "declared models exceed Discord's choice cap - dropdown truncated; \
+             runtime validation still accepts every declared ref"
+        );
+        refs.truncate(MAX_DISCORD_CHOICES);
+    }
+    refs
+}
+
+/// Assignments accept only operator-declared models: guild admins choose
+/// among declared refs, so guild config can never introduce an endpoint or
+/// an alias. `Err(reply)` is the ephemeral correction.
+pub(super) fn validate_model_ref(settings: &LlmSettings, model: &str) -> Result<(), String> {
+    if settings.models.contains_key(model) {
+        return Ok(());
+    }
+    let declared: Vec<&str> = settings.models.keys().map(String::as_str).collect();
+    let list = if declared.is_empty() {
+        "nothing is declared in `[llm.models]` - ask the operator".to_owned()
+    } else {
+        format!("Declared models: {}.", declared.join(", "))
+    };
+    Err(format!("Unknown model `{model}` - only declared models can be assigned. {list}"))
+}
+
+/// One catalog line: the ref plus the declared capabilities that actually
+/// change behavior (reasoning acceptance, context window).
+fn model_catalog_line(reference: &str, model: &ModelSettings) -> String {
+    let mut parts = vec![format!("`{reference}`")];
+    if model.reasoning {
+        parts.push("reasoning".to_owned());
+    }
+    if let Some(window) = model.context_window {
+        parts.push(format!("{window} token context"));
+    }
+    parts.join(" - ")
+}
+
+/// `/llm_assign`: the channel the command is run in becomes a chat channel
+/// for the given model. Only operator-declared models are legal - the
+/// registry is the guild-facing isolation boundary, so a typo cannot
+/// silently run with default capabilities.
+pub(super) struct AssignLlmHandler {
+    engine: Arc<ChatEngine>,
+}
+
+impl AssignLlmHandler {
+    pub(super) fn new(engine: Arc<ChatEngine>) -> Self {
+        Self { engine }
+    }
+}
 
 #[async_trait]
 impl CommandHandler for AssignLlmHandler {
@@ -343,6 +406,10 @@ impl CommandHandler for AssignLlmHandler {
                 .await?;
             return Ok(());
         };
+        if let Err(reply) = validate_model_ref(self.engine.settings(), model) {
+            services.chat_output.send(OutboundMessage::text(reply).ephemeral()).await?;
+            return Ok(());
+        }
 
         let config = ChannelConfig::assigned(model.to_owned());
         storage
@@ -702,6 +769,44 @@ impl CommandHandler for ClearServiceChannelHandler {
     }
 }
 
+/// `/llm_models`: ephemeral catalog of the operator-declared models - the
+/// complete legal assignment set. Read-only: no channel lock, no storage.
+pub(super) struct ModelsLlmHandler {
+    engine: Arc<ChatEngine>,
+}
+
+impl ModelsLlmHandler {
+    pub(super) fn new(engine: Arc<ChatEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+#[async_trait]
+impl CommandHandler for ModelsLlmHandler {
+    async fn invoke(
+        &self,
+        _event: &RequestContext,
+        _args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
+        let settings = self.engine.settings();
+        let lines: Vec<String> = settings
+            .models
+            .iter()
+            .map(|(reference, model)| model_catalog_line(reference, model))
+            .collect();
+        let body = if lines.is_empty() {
+            "No models are declared in `[llm.models]` - the bot cannot be assigned to a \
+             channel until the operator declares at least one."
+                .to_owned()
+        } else {
+            format!("Declared models:\n{}", lines.join("\n"))
+        };
+        services.chat_output.send(OutboundMessage::text(body).ephemeral()).await?;
+        Ok(())
+    }
+}
+
 /// `/llm_set`: tunes one setting of the channel's chat configuration by
 /// `key`/`value`. Values of `clear`/`none`/`default` reset the setting to
 /// its default; malformed values are answered with usage and never saved.
@@ -711,11 +816,12 @@ impl CommandHandler for ClearServiceChannelHandler {
 /// concurrent admin commands cannot lose an update.
 pub(super) struct SetLlmHandler {
     locks: Arc<ChannelLocks>,
+    engine: Arc<ChatEngine>,
 }
 
 impl SetLlmHandler {
-    pub(super) fn new(locks: Arc<ChannelLocks>) -> Self {
-        Self { locks }
+    pub(super) fn new(locks: Arc<ChannelLocks>, engine: Arc<ChatEngine>) -> Self {
+        Self { locks, engine }
     }
 }
 
@@ -744,6 +850,16 @@ impl CommandHandler for SetLlmHandler {
                 .await?;
             return Ok(());
         };
+        // Same registry boundary as `/llm_assign`: only declared models are
+        // legal. Clear-words are not assignments - `apply_set` answers them
+        // with its own "cannot be cleared" usage.
+        if key == "model"
+            && !matches!(value, "clear" | "none" | "default")
+            && let Err(reply) = validate_model_ref(self.engine.settings(), value)
+        {
+            services.chat_output.send(OutboundMessage::text(reply).ephemeral()).await?;
+            return Ok(());
+        }
 
         match apply_set(&mut config, key, value) {
             Ok(message) => {
@@ -1044,6 +1160,56 @@ mod tests {
         let before = config.random_chance_percent;
         assert!(apply_set(&mut config, "random_chance", "NaN").is_err());
         assert!((config.random_chance_percent - before).abs() < f64::EPSILON);
+    }
+
+    fn settings_with_models(refs: &[&str]) -> LlmSettings {
+        let mut settings = LlmSettings::default();
+        for reference in refs {
+            settings.models.insert((*reference).to_owned(), ModelSettings::default());
+        }
+        settings
+    }
+
+    /// The registry boundary: declared refs pass; anything else is rejected
+    /// with a correction that lists the legal set.
+    #[test]
+    fn only_declared_models_validate() {
+        let settings = settings_with_models(&["zai/glm-5.3", "local/gemma"]);
+        assert!(validate_model_ref(&settings, "zai/glm-5.3").is_ok());
+
+        let err = validate_model_ref(&settings, "zai/typo").unwrap_err();
+        assert!(err.contains("Unknown model `zai/typo`"));
+        // BTreeMap order: the legal set renders sorted.
+        assert!(err.contains("local/gemma, zai/glm-5.3"));
+    }
+
+    #[test]
+    fn empty_registry_names_the_config_section() {
+        let err = validate_model_ref(&LlmSettings::default(), "zai/glm").unwrap_err();
+        assert!(err.contains("[llm.models]"));
+    }
+
+    /// Dropdown truncation is deterministic (sorted registry order) and
+    /// capped at Discord's limit.
+    #[test]
+    fn dropdown_choices_truncate_to_discords_cap() {
+        let mut settings = LlmSettings::default();
+        for index in 0..30 {
+            settings.models.insert(format!("p/m{index}"), ModelSettings::default());
+        }
+
+        let choices = model_choices(&settings);
+        assert_eq!(choices.len(), MAX_DISCORD_CHOICES);
+        assert_eq!(choices.first().expect("choice expected"), "p/m0");
+    }
+
+    #[test]
+    fn catalog_line_lists_declared_capabilities() {
+        let plain = ModelSettings::default();
+        assert_eq!(model_catalog_line("p/m", &plain), "`p/m`");
+
+        let full = ModelSettings { reasoning: true, context_window: Some(4096) };
+        assert_eq!(model_catalog_line("p/m", &full), "`p/m` - reasoning - 4096 token context");
     }
 
     fn user_record(content: &str) -> serde_json::Value {

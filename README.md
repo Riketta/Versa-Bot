@@ -217,7 +217,9 @@ split of responsibilities is deliberate:
   changes require a restart.
 - **Guild admins** assign the bot to channels and tune each channel via
   slash commands - picking among the declared models, never configuring
-  endpoints. Keys never appear in config files or guild storage; they
+  endpoints. Only declared models are legal: `/llm_assign` and
+  `/llm_set model=` reject anything else, and `/llm_models` lists the
+  catalog. Keys never appear in config files or guild storage; they
   are resolved from environment variables at boot.
 
 Every channel's conversation lives in its own storage namespace inside
@@ -297,7 +299,8 @@ permission (Discord hides them from members without it):
 
 | Command | Effect |
 |---|---|
-| `/llm_assign model:<provider/model>` | assign the bot to this channel; re-assigning retunes in place |
+| `/llm_assign model:<provider/model>` | assign the bot to this channel - `model` must be one of the operator-declared models (offered as a dropdown, listed by `/llm_models`); re-assigning retunes in place |
+| `/llm_models` | ephemeral list of the declared models - the legal assignment set, with declared capabilities (reasoning, context window) |
 | `/llm_unassign` | remove the bot from this channel (history is kept) |
 | `/llm_prompt prompt:<text>` | set the channel system prompt; `clear` falls back to the plugin default (inline limit: Discord's ~6000-character option cap) |
 | `/llm_prompt_file file:<attachment>` | set the system prompt from an uploaded text/markdown file - for prompts beyond the inline limit; fetched from Discord's CDN only, capped by `[llm] max_prompt_file_bytes` (128 KiB default) |
@@ -312,7 +315,7 @@ saved):
 
 | Key | Meaning | Default |
 |---|---|---|
-| `model` | provider/model reference | set by `/llm_assign` |
+| `model` | provider/model reference - declared models only (see `/llm_models`) | set by `/llm_assign` |
 | `temperature` `top_p` `top_k` `min_p` `frequency_penalty` `presence_penalty` | sampling parameters; cleared = not sent | provider defaults |
 | `max_tokens` | completion size cap | provider default |
 | `reasoning_effort` | reasoning hint sent only when the model declares `reasoning = true`; `off` sends nothing | none |

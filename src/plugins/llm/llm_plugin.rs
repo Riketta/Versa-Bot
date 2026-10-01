@@ -18,8 +18,8 @@ use crate::kernel::{
 use super::chat_engine::ChatEngine;
 use super::commands::{
     AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler, CutoffLlmHandler,
-    PromptFileLlmHandler, PromptLlmHandler, SET_KEYS, SetLlmHandler, StatusLlmHandler,
-    UnassignLlmHandler,
+    ModelsLlmHandler, PromptFileLlmHandler, PromptLlmHandler, SET_KEYS, SetLlmHandler,
+    StatusLlmHandler, UnassignLlmHandler, model_choices,
 };
 use super::model::{ChannelConfig, NAMESPACE, channel_config_key};
 
@@ -155,6 +155,9 @@ impl PluginPort for LlmPlugin {
     }
 
     fn init(&self) -> Result<(), PluginError> {
+        // Discord renders the declared refs as a native dropdown (capped at
+        // 25); runtime validation enforces the full registry either way.
+        let model_refs = model_choices(self.engine.settings());
         self.registry.register(
             self.descriptor(
                 "llm_assign",
@@ -164,10 +167,14 @@ impl PluginPort for LlmPlugin {
                     description: "Provider/model ref, e.g. `local/gemma`".to_owned(),
                     required: true,
                     kind: ArgKind::String,
-                    choices: None,
+                    choices: (!model_refs.is_empty()).then_some(model_refs),
                 }],
             ),
-            Arc::new(AssignLlmHandler),
+            Arc::new(AssignLlmHandler::new(Arc::clone(&self.engine))),
+        );
+        self.registry.register(
+            self.descriptor("llm_models", "List the models available for assignment", Vec::new()),
+            Arc::new(ModelsLlmHandler::new(Arc::clone(&self.engine))),
         );
         self.registry.register(
             self.descriptor("llm_unassign", "Remove the chat bot from this channel", Vec::new()),
@@ -222,7 +229,7 @@ impl PluginPort for LlmPlugin {
                     },
                 ],
             ),
-            Arc::new(SetLlmHandler::new(Arc::clone(&self.channel_locks))),
+            Arc::new(SetLlmHandler::new(Arc::clone(&self.channel_locks), Arc::clone(&self.engine))),
         );
         self.register_prompt_commands();
         Ok(())
@@ -293,6 +300,7 @@ mod tests {
         ChannelConfig, ConversationState, NAMESPACE, SERVICE_CHANNEL_KEY, channel_config_key,
         channel_state_key, records_namespace,
     };
+    use crate::plugins::llm::providers::ModelSettings;
     use crate::plugins::llm::{
         ChatEngine, CompletionRequest, CompletionResponse, ConversationRecord, LlmCompletionPort,
         LlmError, LlmSettings, RandRandom, RandomPort, RecordRole,
@@ -372,8 +380,12 @@ mod tests {
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
         };
+        let mut settings = LlmSettings::default();
+        for reference in ["local/gemma", "zai/glm-5.3-flash"] {
+            settings.models.insert(reference.to_owned(), ModelSettings::default());
+        }
         let engine = Arc::new(ChatEngine::new(
-            Arc::new(LlmSettings::default()),
+            Arc::new(settings),
             Arc::new(StubCompletion) as Arc<dyn LlmCompletionPort>,
             Arc::new(RandRandom) as Arc<dyn RandomPort>,
         ));
@@ -407,6 +419,7 @@ mod tests {
                 "llm_admin_clear",
                 "llm_assign",
                 "llm_cutoff",
+                "llm_models",
                 "llm_prompt",
                 "llm_prompt_file",
                 "llm_set",
@@ -429,7 +442,7 @@ mod tests {
         let (plugin, fixture) = fixture();
         plugin.init().expect("init expected to succeed");
 
-        AssignLlmHandler
+        AssignLlmHandler::new(Arc::clone(&fixture.engine))
             .invoke(
                 &command_event(Some(1)),
                 &CommandArgs(vec![("model".to_owned(), "local/gemma".to_owned())]),
@@ -459,11 +472,11 @@ mod tests {
         plugin.init().expect("init expected to succeed");
         let args = |model: &str| CommandArgs(vec![("model".to_owned(), model.to_owned())]);
 
-        AssignLlmHandler
+        AssignLlmHandler::new(Arc::clone(&fixture.engine))
             .invoke(&command_event(Some(1)), &args("local/gemma"), &fixture.services)
             .await
             .expect("first assign expected to succeed");
-        AssignLlmHandler
+        AssignLlmHandler::new(Arc::clone(&fixture.engine))
             .invoke(&command_event(Some(1)), &args("zai/glm-5.3-flash"), &fixture.services)
             .await
             .expect("second assign expected to succeed");
@@ -483,7 +496,7 @@ mod tests {
         let (plugin, fixture) = fixture();
         plugin.init().expect("init expected to succeed");
 
-        AssignLlmHandler
+        AssignLlmHandler::new(Arc::clone(&fixture.engine))
             .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
             .await
             .expect("assign expected to succeed");
@@ -496,13 +509,104 @@ mod tests {
         );
     }
 
+    /// The registry boundary holds at the handler level: an undeclared model
+    /// is rejected with a correction and nothing is stored.
+    #[tokio::test]
+    async fn assign_undeclared_model_is_rejected_and_writes_nothing() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+
+        AssignLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("model".to_owned(), "nope/model".to_owned())]),
+                &fixture.services,
+            )
+            .await
+            .expect("assign expected to be handled");
+
+        assert!(fixture.output.messages().iter().any(|m| m.contains("Unknown model `nope/model`")));
+        let storage = fixture.services.guild_storage.as_ref().expect("guild storage expected");
+        assert_eq!(
+            storage.list_keys(NAMESPACE).await.expect("keys readable"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn set_model_undeclared_is_rejected_and_saves_nothing() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&fixture.storage);
+
+        SetLlmHandler::new(ChannelLocks::new(), Arc::clone(&fixture.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![
+                    ("key".to_owned(), "model".to_owned()),
+                    ("value".to_owned(), "nope/model".to_owned()),
+                ]),
+                &fixture.services,
+            )
+            .await
+            .expect("set expected to be handled");
+
+        assert!(fixture.output.messages().iter().any(|m| m.contains("Unknown model")));
+        let raw = fixture
+            .services
+            .guild_storage
+            .as_ref()
+            .expect("guild storage expected")
+            .get(NAMESPACE, &channel_config_key(2))
+            .await
+            .expect("config readable")
+            .expect("config expected");
+        // The rejected set must not have touched the stored model.
+        assert_eq!(raw.get("model").and_then(|v| v.as_str()), Some("local/gemma"));
+    }
+
+    /// The model argument ships the declared refs as Discord choices - the
+    /// discovery half of the registry boundary.
+    #[test]
+    fn assign_argument_carries_declared_models_as_choices() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+
+        let assign = fixture
+            .registry
+            .descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.name == "llm_assign")
+            .expect("llm_assign expected registered");
+        let model_argument = assign.arguments.first().expect("model argument expected");
+        assert_eq!(
+            model_argument.choices.as_deref(),
+            Some(["local/gemma".to_owned(), "zai/glm-5.3-flash".to_owned()].as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn models_command_lists_declared_refs() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+
+        ModelsLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("models expected to succeed");
+
+        let messages = fixture.output.messages();
+        assert!(messages.iter().any(|m| m.contains("Declared models:")));
+        assert!(messages.iter().any(|m| m.contains("`local/gemma`")));
+    }
+
     #[tokio::test]
     async fn unassign_clears_config_and_is_idempotent() {
         let (plugin, fixture) = fixture();
         plugin.init().expect("init expected to succeed");
         let storage = Arc::clone(&fixture.storage);
 
-        AssignLlmHandler
+        AssignLlmHandler::new(Arc::clone(&fixture.engine))
             .invoke(
                 &command_event(Some(1)),
                 &CommandArgs(vec![("model".to_owned(), "local/gemma".to_owned())]),
@@ -572,7 +676,7 @@ mod tests {
         plugin.init().expect("init expected to succeed");
         let services = dm_services(&fixture.output);
 
-        AssignLlmHandler
+        AssignLlmHandler::new(Arc::clone(&fixture.engine))
             .invoke(
                 &command_event(None),
                 &CommandArgs(vec![("model".to_owned(), "local/gemma".to_owned())]),
@@ -914,7 +1018,7 @@ mod tests {
         plugin.init().expect("init expected to succeed");
         seed_config_in(&fixture.storage);
 
-        SetLlmHandler::new(ChannelLocks::new())
+        SetLlmHandler::new(ChannelLocks::new(), Arc::clone(&fixture.engine))
             .invoke(
                 &command_event(Some(1)),
                 &CommandArgs(vec![
@@ -947,7 +1051,7 @@ mod tests {
         plugin.init().expect("init expected to succeed");
         seed_config_in(&fixture.storage);
 
-        SetLlmHandler::new(ChannelLocks::new())
+        SetLlmHandler::new(ChannelLocks::new(), Arc::clone(&fixture.engine))
             .invoke(
                 &command_event(Some(1)),
                 &CommandArgs(vec![
@@ -980,7 +1084,7 @@ mod tests {
         let (plugin, fixture) = fixture();
         plugin.init().expect("init expected to succeed");
 
-        SetLlmHandler::new(ChannelLocks::new())
+        SetLlmHandler::new(ChannelLocks::new(), Arc::clone(&fixture.engine))
             .invoke(
                 &command_event(Some(1)),
                 &CommandArgs(vec![
