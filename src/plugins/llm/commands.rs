@@ -119,9 +119,20 @@ fn apply_set(config: &mut ChannelConfig, key: &str, value: &str) -> Result<Strin
             Ok(format!("`model` set to `{value}`."))
         }
         "reasoning_effort" => {
-            if cleared || value == "off" {
+            if cleared {
                 config.params.reasoning_effort = None;
                 return Ok("`reasoning_effort` cleared (no reasoning parameter sent).".to_owned());
+            }
+            if value == "off" {
+                // Same stored state as a reset - there is no "explicit off"
+                // wire value - but the reply should acknowledge the choice
+                // instead of claiming something was cleared.
+                config.params.reasoning_effort = None;
+                return Ok(
+                    "`reasoning_effort` off: no reasoning parameter is sent (the provider's \
+                     default applies)."
+                        .to_owned(),
+                );
             }
             config.params.reasoning_effort = Some(value.to_owned());
             Ok(format!(
@@ -1096,6 +1107,26 @@ mod tests {
         apply_set(&mut config, "compaction", "false").expect("false expected");
         assert!(!config.compaction_enabled);
         assert!(apply_set(&mut config, "streaming", "maybe").is_err());
+    }
+
+    /// `off` is an explicit choice with its own acknowledgment; the reset
+    /// words keep the "cleared" reply - all of them store `None` (there is
+    /// no "send an explicit off" wire value).
+    #[test]
+    fn reasoning_effort_distinguishes_off_from_reset() {
+        let mut config = ChannelConfig::assigned("m".to_owned());
+
+        let set = apply_set(&mut config, "reasoning_effort", "low").expect("set expected");
+        assert!(set.contains("set to `low`"));
+        assert_eq!(config.params.reasoning_effort.as_deref(), Some("low"));
+
+        let off = apply_set(&mut config, "reasoning_effort", "off").expect("off expected");
+        assert!(off.contains("`reasoning_effort` off"));
+        assert_eq!(config.params.reasoning_effort, None);
+
+        let cleared = apply_set(&mut config, "reasoning_effort", "clear").expect("clear expected");
+        assert!(cleared.contains("cleared"));
+        assert_eq!(config.params.reasoning_effort, None);
     }
 
     #[test]
