@@ -316,7 +316,14 @@ fn completion_body(
 }
 
 /// Extracts `choices[0].message.content` plus the optional `usage` block
-/// from an OpenAI-compatible response.
+/// from an OpenAI-compatible response, cutting model reasoning so it can
+/// never reach a channel: separate `reasoning_content`/`reasoning` fields
+/// are simply never read, and inline `<think>...</think>` blocks (the
+/// interleaved-reasoning shape emitted by llama.cpp/LM Studio/vLLM) are
+/// stripped from the content itself. This is also what keeps reasoning out
+/// of the progressive reveal - the reveal only ever shows prefixes of the
+/// returned content. A reasoning-only answer (empty after the strip) is no
+/// answer: [`LlmError::EmptyResponse`].
 fn parse_completion_content(text: &str) -> Result<CompletionResponse, LlmError> {
     let value: Value = serde_json::from_str(text)
         .map_err(|err| LlmError::Request(format!("malformed JSON: {err}")))?;
@@ -329,7 +336,51 @@ fn parse_completion_content(text: &str) -> Result<CompletionResponse, LlmError> 
     let Some(content) = content.filter(|content| !content.is_empty()) else {
         return Err(LlmError::EmptyResponse);
     };
-    Ok(CompletionResponse { content: content.to_owned(), usage: parse_usage(&value) })
+    let content = strip_think_blocks(content);
+    if content.is_empty() {
+        return Err(LlmError::EmptyResponse);
+    }
+    Ok(CompletionResponse { content, usage: parse_usage(&value) })
+}
+
+/// Cuts every `<think>...</think>` block from a completion (ASCII
+/// case-insensitive) plus everything after an unclosed `<think>` - a
+/// missing closer means the model never got past thinking. Whitespace
+/// around the cuts is trimmed so answers do not start with the newline
+/// that followed the block; content without any `<think>` tag is returned
+/// byte-identical. A literal discussion of the tag in an answer is the
+/// accepted false-positive cost (same trade-off as mainstream reasoning
+/// UIs). The paired `reasoning_content`/`reasoning` response fields are
+/// separate - they are never read in the first place.
+fn strip_think_blocks(content: &str) -> String {
+    if !content.to_ascii_lowercase().contains("<think>") {
+        return content.to_owned();
+    }
+    let lowered = content.to_ascii_lowercase();
+    let mut kept = String::with_capacity(content.len());
+    // Byte cursor into both strings. It only ever lands on ASCII-tag match
+    // offsets, which are char boundaries (an ASCII byte cannot match inside
+    // a multi-byte UTF-8 sequence, and `to_ascii_lowercase` preserves the
+    // byte layout) - the `get` + `expect` makes that invariant explicit.
+    let mut cursor = 0usize;
+    while let Some(open) = lowered.get(cursor..).and_then(|rest| rest.find("<think>")) {
+        let open = cursor + open;
+        kept.push_str(
+            content.get(cursor..open).expect("tag match offsets are char boundaries").trim_end(),
+        );
+        let after_open = open + "<think>".len();
+        let after_close = lowered
+            .get(after_open..)
+            .and_then(|rest| rest.find("</think>"))
+            .map(|close| after_open + close + "</think>".len());
+        match after_close {
+            Some(after_close) => cursor = after_close,
+            // Unclosed block: the remainder is all reasoning - drop it.
+            None => return kept.trim().to_owned(),
+        }
+    }
+    kept.push_str(content.get(cursor..).expect("tag match offsets are char boundaries"));
+    kept.trim().to_owned()
 }
 
 /// `usage` is optional in the `OpenAI` shape: endpoints that do not report
@@ -453,6 +504,55 @@ mod tests {
             Err(LlmError::EmptyResponse)
         ));
         assert!(matches!(parse_completion_content("not json"), Err(LlmError::Request(_))));
+    }
+
+    /// Reasoning output never reaches a channel: separate reasoning fields
+    /// are ignored by construction, inline `<think>` blocks are cut, and a
+    /// reasoning-only answer is `EmptyResponse` (silence policy takes over).
+    #[test]
+    fn reasoning_is_cut_from_responses() {
+        // Separate field (GLM/DeepSeek shape): never read, content stands alone.
+        let response = parse_completion_content(
+            r#"{"choices":[{"message":{"content":"The answer is 4.",
+                "reasoning_content":"secret chain of thought"}}]}"#,
+        )
+        .expect("response expected to parse");
+        assert_eq!(response.content, "The answer is 4.");
+
+        // Leading block (R1/llama.cpp shape): the trailing newline goes too.
+        let response = parse_completion_content(
+            r#"{"choices":[{"message":{"content":"<think>reasoning here</think>\n\nThe answer is 4."}}]}"#,
+        )
+        .expect("response expected to parse");
+        assert_eq!(response.content, "The answer is 4.");
+
+        // Interleaved blocks, case-insensitive tags.
+        let response = parse_completion_content(
+            r#"{"choices":[{"message":{"content":"One <think>a</think> two <THINK>b</THINK> three."}}]}"#,
+        )
+        .expect("response expected to parse");
+        assert_eq!(response.content, "One two three.");
+
+        // Unclosed block: the hidden tail is dropped. Text written BEFORE
+        // the tag is genuine content and stays; a reasoning-only answer is
+        // empty and counts as no answer.
+        let response = parse_completion_content(
+            r#"{"choices":[{"message":{"content":"Visible<think>hidden forever"}}]}"#,
+        )
+        .expect("response expected to parse");
+        assert_eq!(response.content, "Visible");
+        assert!(matches!(
+            parse_completion_content(
+                r#"{"choices":[{"message":{"content":"<think>only reasoning"}}]}"#
+            ),
+            Err(LlmError::EmptyResponse)
+        ));
+
+        // No tag: byte-identical passthrough - even odd whitespace.
+        let response =
+            parse_completion_content(r#"{"choices":[{"message":{"content":"  keep\nthis  "}}]}"#)
+                .expect("response expected to parse");
+        assert_eq!(response.content, "  keep\nthis  ");
     }
 
     #[test]

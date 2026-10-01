@@ -259,6 +259,11 @@ message-count based.
   default); bot turns are plain assistant messages. The window is
   selected newest-first under the token budget and `depth`, whichever
   bites first - the newest turn is always included.
+- **Reasoning** is never exposed: thinking output (`reasoning_content`
+  fields, inline `<think>` blocks) is cut at the provider adapter before
+  it can be recorded or rendered - the final message and the streaming
+  reveal both draw from the clean content only. A reasoning-only answer
+  (nothing but thinking) counts as no answer.
 - **Compaction** runs after a reply once the live window outgrows
   `depth` (100 messages by default): everything except the newest
   `compaction_keep_tail` (10) records folds into a rolling summary via
