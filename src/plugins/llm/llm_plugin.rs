@@ -199,7 +199,7 @@ impl PluginPort for LlmPlugin {
                 "Show this channel's chat configuration and context state",
                 Vec::new(),
             ),
-            Arc::new(StatusLlmHandler),
+            Arc::new(StatusLlmHandler::new(Arc::clone(&self.engine))),
         );
         self.registry.register(
             self.descriptor(
@@ -360,6 +360,7 @@ mod tests {
         storage: Arc<InMemoryStorage>,
         services: KernelServices,
         output: Arc<RecordingChatOutput>,
+        engine: Arc<ChatEngine>,
     }
 
     fn fixture() -> (LlmPlugin, Fixture) {
@@ -376,8 +377,11 @@ mod tests {
             Arc::new(StubCompletion) as Arc<dyn LlmCompletionPort>,
             Arc::new(RandRandom) as Arc<dyn RandomPort>,
         ));
-        let plugin = LlmPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>, engine);
-        (plugin, Fixture { registry, storage, services, output })
+        let plugin = LlmPlugin::new(
+            Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
+            Arc::clone(&engine),
+        );
+        (plugin, Fixture { registry, storage, services, output, engine })
     }
 
     fn dm_services(output: &Arc<RecordingChatOutput>) -> KernelServices {
@@ -845,7 +849,7 @@ mod tests {
             serde_json::json!({"summary": "the gist", "cutoff_seq": 0, "cutoff_at": 1_717_000_000}),
         );
 
-        StatusLlmHandler
+        StatusLlmHandler::new(Arc::clone(&fixture.engine))
             .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
             .await
             .expect("status expected to succeed");
@@ -856,6 +860,39 @@ mod tests {
         assert!(messages.iter().any(|m| m.contains("the gist")));
         // The record log is empty - the context-start line degrades honestly.
         assert!(messages.iter().any(|m| m.contains("no messages after the cutoff")));
+        // No channel override: the report names the effective plugin default.
+        assert!(messages.iter().any(|m| m.contains("Prompt: plugin default")));
+        assert!(messages.iter().any(|m| m.contains("You are a helpful chat assistant.")));
+    }
+
+    /// An override is reported as such - and its head preview + fingerprint
+    /// let an admin verify the active version without printing the whole
+    /// prompt.
+    #[tokio::test]
+    async fn status_shows_the_channel_prompt_override() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&fixture.storage);
+
+        PromptLlmHandler::new(ChannelLocks::new())
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("prompt".to_owned(), "You are a pirate.".to_owned())]),
+                &fixture.services,
+            )
+            .await
+            .expect("prompt expected to succeed");
+
+        StatusLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("status expected to succeed");
+
+        let messages = fixture.output.messages();
+        assert!(messages.iter().any(|m| m.contains("Prompt: channel override")));
+        assert!(messages.iter().any(|m| m.contains("You are a pirate.")));
+        // 17 chars, fingerprint present in the same line.
+        assert!(messages.iter().any(|m| m.contains("17 chars, #")));
     }
 
     #[tokio::test]
@@ -863,7 +900,7 @@ mod tests {
         let (plugin, fixture) = fixture();
         plugin.init().expect("init expected to succeed");
 
-        StatusLlmHandler
+        StatusLlmHandler::new(Arc::clone(&fixture.engine))
             .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
             .await
             .expect("status expected to succeed");

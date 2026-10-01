@@ -14,6 +14,7 @@ use crate::kernel::{
     spi_ports::GuildStorage,
 };
 
+use super::chat_engine::ChatEngine;
 use super::conversation::ConversationRecord;
 use super::llm_plugin::ChannelLocks;
 use super::model::{
@@ -512,8 +513,28 @@ struct UsageLines {
 
 /// `/llm_status`: inspect the channel's chat configuration and conversation
 /// state. Ephemeral where the platform allows (slash invocations), since the
-/// summary preview may be considered sensitive.
-pub(super) struct StatusLlmHandler;
+/// summary preview and the system-prompt head may be considered sensitive.
+pub(super) struct StatusLlmHandler {
+    engine: Arc<ChatEngine>,
+}
+
+impl StatusLlmHandler {
+    pub(super) fn new(engine: Arc<ChatEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+/// Short identity fingerprint of the active system prompt: lets an admin
+/// verify "same prompt as before / as that channel / as the file I uploaded"
+/// without printing the whole text. NOT cryptographic - std's `DefaultHasher`,
+/// stable only within one process; equality checks only.
+fn prompt_fingerprint(text: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("#{:016x}", hasher.finish())
+}
 
 #[async_trait]
 impl CommandHandler for StatusLlmHandler {
@@ -569,6 +590,14 @@ impl CommandHandler for StatusLlmHandler {
             .unwrap_or_default();
         let usage = usage_lines(storage, &records_ns, &state, live, &usage_stats).await;
 
+        // The effective prompt: what the model will actually see as slot 1,
+        // override or not - with length, identity fingerprint and a head
+        // preview so an admin can verify the version without printing it all.
+        let (prompt_source, prompt_text) = match &config.system_prompt {
+            Some(prompt) => ("channel override", prompt.as_str()),
+            None => ("plugin default", self.engine.settings().default_system_prompt.as_str()),
+        };
+        let prompt_head = preview(prompt_text, 200);
         let summary = match &state.summary {
             Some(summary) => preview(summary, 200),
             None => "none".to_owned(),
@@ -576,11 +605,15 @@ impl CommandHandler for StatusLlmHandler {
         let context_start = first_link.unwrap_or_else(|| "no messages after the cutoff".to_owned());
         let mut description = format!(
             "Model: `{}`
+Prompt: {prompt_source} ({} chars, {})
+Prompt head: {prompt_head}
 Context: {live}/{} messages ({total} kept)
 Compaction: {}
 Summary: {summary}
 Context start: {context_start}",
             config.model,
+            prompt_text.chars().count(),
+            prompt_fingerprint(prompt_text),
             config.history_depth,
             if config.compaction_enabled { "on" } else { "off" },
         );
