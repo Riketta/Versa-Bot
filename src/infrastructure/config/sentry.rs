@@ -7,8 +7,8 @@ pub struct SentryConfig {
     pub dsn: String,
     pub environment: Option<String>,
     /// Performance-transaction sample rate (0.0..=1.0). Absent = performance
-    /// monitoring off (only error events are reported). GlitchTip suggests a
-    /// low rate like 0.01 in production to keep data volume down.
+    /// monitoring off (only error events are reported). `GlitchTip` suggests
+    /// a low rate like 0.01 in production to keep data volume down.
     pub traces_sample_rate: Option<f32>,
 }
 

@@ -97,7 +97,10 @@ mod tests {
     /// A zero interval cannot drive a ticker (`tokio::time::interval` would
     /// panic inside the spawned task): the adapter must return a dead handle
     /// without spawning - the job never runs, cancelling stays a no-op.
-    #[tokio::test]
+    ///
+    /// Paused (virtual) time: the clock only advances while the runtime is
+    /// idle, so the wait is deterministic and immune to real-time stalls.
+    #[tokio::test(start_paused = true)]
     async fn zero_interval_yields_dead_handle_without_running() {
         let scheduler = TokioScheduler::new();
         let counter = Arc::new(AtomicUsize::new(0));
@@ -117,7 +120,11 @@ mod tests {
     /// The live happy path: a nonzero-interval job ticks (first run is
     /// immediate) and keeps ticking - the heartbeat behind config hot
     /// reload and status rotation.
-    #[tokio::test]
+    ///
+    /// Paused time: virtual 80ms cover exactly the ticks a 10ms interval
+    /// owes, no wall-clock scheduling involved - this test used to flake
+    /// under load when the second real tick missed its 80ms window.
+    #[tokio::test(start_paused = true)]
     async fn live_job_ticks_repeatedly() {
         let scheduler = TokioScheduler::new();
         let counter = Arc::new(AtomicUsize::new(0));
@@ -138,7 +145,12 @@ mod tests {
     }
 
     /// Cancelling stops future runs; a run already in flight completes.
-    #[tokio::test]
+    ///
+    /// Paused time closes the in-flight race: task polling is deterministic
+    /// on the single-threaded runtime, so a tick that fired before the
+    /// baseline has always finished counting by the time it is taken - a
+    /// run can no longer land after the baseline and fail `assert_eq`.
+    #[tokio::test(start_paused = true)]
     async fn cancel_stops_future_runs() {
         let scheduler = TokioScheduler::new();
         let counter = Arc::new(AtomicUsize::new(0));
@@ -168,7 +180,9 @@ mod tests {
     /// Same failure policy as the pipeline and the bus: a panicking job is
     /// logged and keeps being scheduled - one broken job must not silently
     /// kill the scheduler loop for itself or others.
-    #[tokio::test]
+    ///
+    /// Paused time, same rationale as `live_job_ticks_repeatedly`.
+    #[tokio::test(start_paused = true)]
     async fn panicking_job_keeps_being_scheduled() {
         let scheduler = TokioScheduler::new();
         let counter = Arc::new(AtomicUsize::new(0));

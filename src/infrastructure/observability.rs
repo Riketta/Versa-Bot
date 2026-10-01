@@ -13,7 +13,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 /// transactions are only sampled when `traces_sample_rate` (0.0..=1.0) is
 /// configured - out-of-range values are reported and treated as off, in the
 /// same spirit as a malformed DSN. Session tracking stays off (the SDK
-/// default; GlitchTip does not support it).
+/// default; `GlitchTip` does not support it).
 ///
 /// Returns the Sentry client guard; the caller must keep it alive for the
 /// whole process lifetime, otherwise events are dropped on shutdown.
@@ -43,13 +43,13 @@ pub fn init(
                 options.environment = sentry_environment.map(String::from).map(Into::into);
                 options.release = sentry::release_name!();
                 if let Some(rate) = sentry_traces_sample_rate {
-                    if !(0.0..=1.0).contains(&rate) {
+                    if (0.0..=1.0).contains(&rate) {
+                        options = options.traces_sample_rate(rate);
+                    } else {
                         eprintln!(
                             "warning: sentry.traces_sample_rate {rate} is outside 0.0..=1.0 \
                              - performance monitoring disabled"
                         );
-                    } else {
-                        options = options.traces_sample_rate(rate);
                     }
                 }
                 Some(sentry::init(options))

@@ -48,6 +48,10 @@ tokio-util = "0.7.19"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+[dev-dependencies]
+# Virtual tokio time (`start_paused = true`) for deterministic scheduler tests.
+tokio = { version = "1.53.1", features = ["test-util"] }
+
 [lints.clippy]
 cargo = { level = "warn", priority = -1 }
 cargo_common_metadata = "allow"
