@@ -112,7 +112,9 @@ impl ChatEngine {
             Err(err) => {
                 // Same policy as the unreadable state doc above: history
                 // integrity unknown - never answer from a degraded context.
-                tracing::warn!(channel = channel_id, %err, "llm record log unreadable - skipping message");
+                // Storage/LLM failures are error-grade: they surface as
+                // GlitchTip issues (warn/info only ride along as log items).
+                tracing::error!(channel = channel_id, %err, "llm record log unreadable - skipping message");
                 if payload.mentions_bot {
                     self.send_fallback(origin, services).await;
                 }
@@ -147,7 +149,7 @@ impl ChatEngine {
                 // to have seen never entered the log. Answering anyway
                 // would fabricate context - the trigger below degrades to
                 // the fallback instead of a model answer.
-                tracing::warn!(
+                tracing::error!(
                     channel = channel_id,
                     %err,
                     "failed to capture message into history - skipping"
@@ -290,7 +292,7 @@ impl ChatEngine {
         let response = match self.completion.complete(request).await {
             Ok(response) => response,
             Err(err) => {
-                tracing::warn!(channel = channel_id, model = %config.model, %err, "LLM completion failed - no generated reply");
+                tracing::error!(channel = channel_id, model = %config.model, %err, "LLM completion failed - no generated reply");
                 if let Some(storage) = &services.guild_storage {
                     self.notify_service(
                         services,
@@ -361,7 +363,7 @@ impl ChatEngine {
         if let Some(storage) = &services.guild_storage
             && let Err(err) = Self::append_record(storage, channel_id, &assistant).await
         {
-            tracing::warn!(channel = channel_id, %err, "failed to record bot turn into history");
+            tracing::error!(channel = channel_id, %err, "failed to record bot turn into history");
         }
         true
     }
@@ -406,7 +408,7 @@ impl ChatEngine {
             ),
             Ok(None) => Some(ConversationState::default()),
             Err(err) => {
-                tracing::warn!(channel = channel_id, %err, "llm conversation state unreadable - skipping message");
+                tracing::error!(channel = channel_id, %err, "llm conversation state unreadable - skipping message");
                 None
             }
         }
@@ -513,7 +515,7 @@ impl ChatEngine {
         let response = match self.completion.complete(request).await {
             Ok(response) => response,
             Err(err) => {
-                tracing::warn!(channel = channel_id, %err, "LLM compaction failed - window keeps growing");
+                tracing::error!(channel = channel_id, %err, "LLM compaction failed - window keeps growing");
                 if let Some(storage) = &services.guild_storage {
                     self.notify_service(
                         services,
@@ -590,7 +592,7 @@ impl ChatEngine {
                 .await;
             }
             Err(err) => {
-                tracing::warn!(channel = channel_id, %err, "failed to persist compacted state");
+                tracing::error!(channel = channel_id, %err, "failed to persist compacted state");
                 self.notify_service(
                     services,
                     origin,

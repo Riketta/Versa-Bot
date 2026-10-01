@@ -61,7 +61,9 @@ a slash command from any other reply path.
   conversation history. SQLite (default) and PostgreSQL.
 - Observability: `tracing` logging to stdout plus optional Sentry/GlitchTip
   reporting (DSN-driven) with release tagging; every event is traced with
-  its origin, and an optional sample rate feeds performance transactions.
+  its origin, an optional sample rate feeds performance transactions, and
+  warn/info/error ship as Sentry log items while error-grade failures
+  (storage, LLM provider) surface as Issues.
 - Fault isolation: a panicking plugin cannot crash the bot - pipeline hooks
   and event-bus subscribers are caught and logged (plugin + event), the
   event is dropped, and the rest of the chain or bus keeps working.
