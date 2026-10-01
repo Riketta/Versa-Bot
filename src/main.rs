@@ -45,6 +45,16 @@ async fn main() -> ExitCode {
 
     // Application id: required by Discord HTTP calls that are not authorized
     // by the bot token alone (command registration, interaction followups).
+    // The proxy covers REST only: serenity's gateway WebSocket uses its own
+    // connector and bypasses it - on proxy-only networks the bot would hang
+    // silently at shard start. Route the container instead (see README).
+    if config.discord.proxy.is_some() {
+        tracing::warn!(
+            "discord.proxy applies to REST calls only - the Discord gateway \
+             WebSocket bypasses it; on proxy-only networks route the whole \
+             container through the proxy (see README, proxy section)"
+        );
+    }
     let bootstrap = build_http(&config.discord.token, config.discord.proxy.clone(), None);
     let app_id = bootstrap
         .get_current_application_info()

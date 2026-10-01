@@ -358,6 +358,51 @@ A ready-made Compose deployment ships as `docker-compose.yaml`: it passes
 the `versa-bot-data` volume, and carries a commented PostgreSQL stack -
 `cp .env.example .env`, fill in the token, then `docker compose up -d`.
 
+### Running behind a proxy
+
+The bot's outbound traffic splits in two, and only one half can be
+proxied from the config:
+
+- **REST** (slash-command registration, replies, presence) honors
+  `[discord] proxy` (SOCKS/HTTP).
+- **The gateway WebSocket** bypasses it: serenity's gateway uses its own
+  connector with no proxy support, and proxy environment variables are
+  ignored. On a network where Discord is reachable only through a proxy,
+  the bot boots normally and then hangs silently at shard start - the log
+  ends after `Telling shard queuer to start shard 0` and the
+  `connected as ...` line never appears. A warning is logged at startup
+  whenever `discord.proxy` is set.
+
+The fix is to route the whole container through the proxy at the network
+level so both paths ride it. For a SOCKS5 proxy, a tun2socks sidecar
+works (check the image README for exact env names):
+
+```yaml
+services:
+  tun2socks:
+    image: xjasonlyu/tun2socks:latest
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    environment:
+      TUN: tun0
+      TUN_ADDR: 198.18.0.2
+      TUN_GW: 198.18.0.1
+      PROXY: socks5://192.168.1.35:8081
+
+  versa-bot:
+    # ...unchanged, except the network:
+    network_mode: "service:tun2socks"
+```
+
+With transparent routing in place, `[discord] proxy` becomes redundant.
+A VPN endpoint works the same way via a gluetun sidecar
+(`network_mode: "service:gluetun"`, no tun2socks needed). To see where a
+shard is stuck, set `RUST_LOG: versa_bot=info,serenity=debug` - serenity
+logs gateway state only at debug level.
+
 ## Development
 
 Verify changes with the same gates CI runs - same commands, same order,

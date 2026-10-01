@@ -6,7 +6,9 @@ debug = true
 
 [discord]
 token = "YOUR_TOKEN"
-# SOCKS/HTTP proxy for the Discord API, if your network needs one.
+# SOCKS/HTTP proxy for Discord REST calls. REST only - the gateway WebSocket
+# bypasses it; on proxy-only networks route the whole container through the
+# proxy at network level (see README, "Running behind a proxy").
 # proxy = "socks5://127.0.0.1:1080"
 
 [storage]
