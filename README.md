@@ -324,14 +324,16 @@ fire on messages the bot actually captured; the chance draws from a
 per-channel deck, so hits balance out over each 100-draw cycle instead
 of clumping.
 
-**Failures.** Users see silence, never error spam: when the provider
-is unreachable or rejects a request, the triggering channel gets no
-answer, and a rate-limited embed (at most one per 5 minutes per
-service channel) carries the error classification only - endpoint
-response bodies can name operator accounts or projects, so they stay
-in the logs. History integrity is never guessed around: an unreadable
-state or record log skips the message entirely rather than answering
-from a degraded context.
+**Failures.** A message that tags the bot or replies to it is guaranteed a
+visible response: if the generated answer is impossible (provider
+unreachable or rejecting, reasoning-only response, unreadable history),
+the channel gets a short generic fallback notice instead - never a raw
+error, and never recorded as a bot turn (history stays consistent).
+Random chime-ins are unprompted and stay silent on failure. The operator
+still sees what happened: a rate-limited embed (at most one per 5 minutes
+per service channel) carries the error classification only - endpoint
+response bodies can name operator accounts or projects, so they stay in
+the logs.
 
 ## Docker
 

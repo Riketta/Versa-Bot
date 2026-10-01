@@ -25,8 +25,8 @@ use crate::kernel::{
 use super::completion_port::{CompletionRequest, LlmCompletionPort, TokenUsage};
 use super::conversation::{self, ConversationRecord, RecordRole};
 use super::model::{
-    ChannelConfig, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats,
-    blend_ratio, channel_state_key, channel_stats_key, records_namespace, unix_now,
+    CaptureMode, ChannelConfig, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY,
+    UsageStats, blend_ratio, channel_state_key, channel_stats_key, records_namespace, unix_now,
 };
 use super::providers::LlmSettings;
 use super::rng::{RandomPort, RandomScope};
@@ -48,6 +48,12 @@ const CHIME_COOLDOWN: Duration = Duration::from_secs(300);
 /// the reveal step derives from the content length, so this bounds the whole
 /// reveal regardless of `max_length`.
 const MAX_STREAM_EDITS: usize = 10;
+
+/// Generic public notice when a message that explicitly addresses the bot
+/// cannot receive a generated answer. Deliberately detail-free: the error
+/// classification goes to the service channel, endpoint bodies stay in the
+/// logs.
+const FALLBACK_MESSAGE: &str = "I couldn't process that just now - the language model is unreachable. Please try again in a moment.";
 
 pub struct ChatEngine {
     settings: Arc<LlmSettings>,
@@ -89,9 +95,14 @@ impl ChatEngine {
         };
         let channel_id = origin.channel_id.get();
 
-        // History integrity unknown -> skip the message entirely rather
-        // than answer from a degraded or duplicated context.
+        // History integrity unknown -> no generated answer. A mention is
+        // decidable without any storage read, so the guaranteed-answer
+        // contract still covers it; a reply-chain trigger is undetectable
+        // here and stays silent (logged).
         let Some(state) = self.load_state(storage, channel_id).await else {
+            if payload.mentions_bot {
+                self.send_fallback(origin, services).await;
+            }
             return;
         };
         let usage_stats = self.load_stats(storage, channel_id).await;
@@ -102,6 +113,9 @@ impl ChatEngine {
                 // Same policy as the unreadable state doc above: history
                 // integrity unknown - never answer from a degraded context.
                 tracing::warn!(channel = channel_id, %err, "llm record log unreadable - skipping message");
+                if payload.mentions_bot {
+                    self.send_fallback(origin, services).await;
+                }
                 return;
             }
         };
@@ -110,52 +124,58 @@ impl ChatEngine {
         let mut live_records: Vec<ConversationRecord> =
             live.iter().map(|(_, record)| record.clone()).collect();
         let mut captured = false;
-        if conversation::should_capture(
-            config.capture_mode,
-            payload.mentions_bot,
-            reply_to,
-            &live_records,
-        ) {
-            let record = ConversationRecord {
-                message_id: origin.message_id.map(MessageId::get),
-                role: RecordRole::User,
-                author: payload.author_name.clone(),
-                content: payload.content.clone(),
+        let mut capture_failed = false;
+        match self
+            .capture_message(
+                storage,
+                origin,
+                payload,
                 reply_to,
-                captured_at: unix_now(),
-            };
-            match Self::append_record(storage, channel_id, &record).await {
-                Ok(seq) => {
-                    live.push((seq, record.clone()));
-                    // The triggering message must be part of the context.
-                    live_records.push(record);
-                    captured = true;
-                }
-                Err(err) => {
-                    // History integrity unknown: the message the user
-                    // expects the bot to have seen never entered the log.
-                    // Answering anyway would fabricate context - skip.
-                    tracing::warn!(
-                        channel = channel_id,
-                        %err,
-                        "failed to capture message into history - skipping"
-                    );
-                    return;
-                }
+                &config.capture_mode,
+                &live_records,
+            )
+            .await
+        {
+            Some(Ok((seq, record))) => {
+                live.push((seq, record.clone()));
+                // The triggering message must be part of the context.
+                live_records.push(record);
+                captured = true;
             }
+            Some(Err(err)) => {
+                // History integrity: the message the user expects the bot
+                // to have seen never entered the log. Answering anyway
+                // would fabricate context - the trigger below degrades to
+                // the fallback instead of a model answer.
+                tracing::warn!(
+                    channel = channel_id,
+                    %err,
+                    "failed to capture message into history - skipping"
+                );
+                capture_failed = true;
+            }
+            None => {}
         }
 
         if conversation::should_trigger(payload.mentions_bot, reply_to, &live_records) {
-            self.answer(
-                origin,
-                config,
-                &state,
-                &live_records,
-                usage_stats.tokens_per_char,
-                calibrated,
-                services,
-            )
-            .await;
+            if capture_failed {
+                self.send_fallback(origin, services).await;
+            } else if !self
+                .answer(
+                    origin,
+                    config,
+                    &state,
+                    &live_records,
+                    usage_stats.tokens_per_char,
+                    calibrated,
+                    services,
+                )
+                .await
+            {
+                // The generated answer is impossible - the triggered message
+                // still gets a visible response.
+                self.send_fallback(origin, services).await;
+            }
         } else if captured
             && config.random_chance_percent > 0.0
             && self.chime_allowed(origin)
@@ -172,7 +192,9 @@ impl ChatEngine {
             // answer is assembled from the context the message just joined
             // and recorded as an assistant turn. Only CAPTURED messages are
             // eligible: chiming in on a message the bot never tracked would
-            // look like answering nothing.
+            // look like answering nothing. Unprompted, so a failed chime-in
+            // stays silent - the guaranteed-answer contract covers only
+            // messages addressed to the bot.
             self.note_chime(origin);
             self.answer(
                 origin,
@@ -192,9 +214,41 @@ impl ChatEngine {
         self.maybe_compact(origin, config, &state, &live, services).await;
     }
 
+    /// Capture half of the intake: `None` when the channel's mode does not
+    /// want the message, `Some(result)` for the append attempt - `Err` means
+    /// the message never entered the log (history integrity unknown).
+    async fn capture_message(
+        &self,
+        storage: &Arc<dyn GuildStorage>,
+        origin: &Origin,
+        payload: &MessagePayload,
+        reply_to: Option<u64>,
+        mode: &CaptureMode,
+        live_records: &[ConversationRecord],
+    ) -> Option<Result<(u64, ConversationRecord), crate::kernel::models::StorageError>> {
+        if !conversation::should_capture(*mode, payload.mentions_bot, reply_to, live_records) {
+            return None;
+        }
+        let record = ConversationRecord {
+            message_id: origin.message_id.map(MessageId::get),
+            role: RecordRole::User,
+            author: payload.author_name.clone(),
+            content: payload.content.clone(),
+            reply_to,
+            captured_at: unix_now(),
+        };
+        Some(
+            Self::append_record(storage, origin.channel_id.get(), &record)
+                .await
+                .map(|seq| (seq, record)),
+        )
+    }
+
     /// Completes and delivers the answer for a triggering message. The
     /// triggering message is already part of `live`, so the context ends
-    /// with what the user just said.
+    /// with what the user just said. Returns whether a generated answer was
+    /// actually delivered - `false` lets the caller honor the
+    /// guaranteed-answer contract with the fallback notice.
     async fn answer(
         &self,
         origin: &Origin,
@@ -204,7 +258,7 @@ impl ChatEngine {
         tokens_per_char: f64,
         calibrated: bool,
         services: &KernelServices,
-    ) {
+    ) -> bool {
         let channel_id = origin.channel_id.get();
         let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
         let window: &[ConversationRecord] = if live.len() > depth {
@@ -236,23 +290,19 @@ impl ChatEngine {
         let response = match self.completion.complete(request).await {
             Ok(response) => response,
             Err(err) => {
-                tracing::warn!(channel = channel_id, model = %config.model, %err, "LLM completion failed - no reply sent");
+                tracing::warn!(channel = channel_id, model = %config.model, %err, "LLM completion failed - no generated reply");
                 if let Some(storage) = &services.guild_storage {
                     self.notify_service(
                         services,
                         origin,
                         storage,
                         "LLM completion failed",
-                        format!(
-                            "Model `{}`: {}.\nNo reply was sent.",
-                            config.model,
-                            err.classify()
-                        ),
+                        format!("Model `{}`: {}.", config.model, err.classify()),
                         true,
                     )
                     .await;
                 }
-                return;
+                return false;
             }
         };
         self.record_usage(
@@ -269,7 +319,7 @@ impl ChatEngine {
         let chunks = conversation::split_reply(&response.content, max_length);
         if chunks.is_empty() {
             tracing::warn!(channel = channel_id, "completion returned no deliverable content");
-            return;
+            return false;
         }
 
         // The streaming port doubles as the plain reply path: `begin`
@@ -312,6 +362,25 @@ impl ChatEngine {
             && let Err(err) = Self::append_record(storage, channel_id, &assistant).await
         {
             tracing::warn!(channel = channel_id, %err, "failed to record bot turn into history");
+        }
+        true
+    }
+
+    /// The guaranteed-answer contract: a message that explicitly addresses
+    /// the bot (a mention, or a reply to a bot turn) never disappears
+    /// silently. When the generated answer is impossible - provider failure,
+    /// reasoning-only response, untrustworthy history - the channel gets
+    /// this generic notice instead. It is never recorded as a bot turn and
+    /// never carries error detail.
+    async fn send_fallback(&self, origin: &Origin, services: &KernelServices) {
+        if let Err(err) =
+            services.chat_output.send(OutboundMessage::text(FALLBACK_MESSAGE.to_owned())).await
+        {
+            tracing::warn!(
+                channel = origin.channel_id.get(),
+                %err,
+                "fallback notice delivery failed"
+            );
         }
     }
 
@@ -870,6 +939,59 @@ mod tests {
         }
     }
 
+    /// Storage whose record-log READS work but whose appends always fail -
+    /// isolates the failed-capture-append branch from the unreadable-log
+    /// branch (which `RecordsFailStorage` covers).
+    struct AppendFailStorage {
+        documents: Arc<InMemoryStorage>,
+    }
+
+    struct AppendFailView {
+        guild: Arc<dyn GuildStorage>,
+    }
+
+    #[async_trait]
+    impl GuildStorage for AppendFailView {
+        async fn get(&self, namespace: &str, key: &str) -> Result<Option<Value>, StorageError> {
+            self.guild.get(namespace, key).await
+        }
+
+        async fn set(&self, namespace: &str, key: &str, value: Value) -> Result<(), StorageError> {
+            self.guild.set(namespace, key, value).await
+        }
+
+        async fn delete(&self, namespace: &str, key: &str) -> Result<(), StorageError> {
+            self.guild.delete(namespace, key).await
+        }
+
+        async fn list_keys(&self, namespace: &str) -> Result<Vec<String>, StorageError> {
+            self.guild.list_keys(namespace).await
+        }
+
+        async fn append(&self, _namespace: &str, _payload: Value) -> Result<u64, StorageError> {
+            Err(StorageError::Database("records unavailable".to_owned()))
+        }
+
+        async fn list_after(
+            &self,
+            namespace: &str,
+            after_seq: u64,
+            limit: u32,
+        ) -> Result<Vec<StoredRecord>, StorageError> {
+            self.guild.list_after(namespace, after_seq, limit).await
+        }
+
+        async fn count_after(&self, namespace: &str, after_seq: u64) -> Result<u64, StorageError> {
+            self.guild.count_after(namespace, after_seq).await
+        }
+    }
+
+    impl StoragePort for AppendFailStorage {
+        fn guild_scoped(&self, platform: Platform, guild_id: GuildId) -> Arc<dyn GuildStorage> {
+            Arc::new(AppendFailView { guild: self.documents.guild_scoped(platform, guild_id) })
+        }
+    }
+
     struct TestCtx {
         engine: ChatEngine,
         fake: Arc<FakeCompletion>,
@@ -1101,7 +1223,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completion_failure_sends_nothing_and_records_no_bot_turn() {
+    async fn completion_failure_sends_fallback_and_records_no_bot_turn() {
         let ctx = ctx(vec![Err(LlmError::Request("provider down".to_owned()))]);
         seed_config(&ctx.storage, &assigned_config());
 
@@ -1109,8 +1231,10 @@ mod tests {
             .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
             .await;
 
+        // The generated answer is gone, but the triggered message gets the
+        // visible generic fallback - and no bot turn is recorded.
         assert!(ctx.begins.lock().is_empty());
-        assert!(ctx.output.messages().is_empty());
+        assert_eq!(ctx.output.messages(), vec![FALLBACK_MESSAGE.to_owned()]);
         let records = stored_records(&ctx).await;
         assert_eq!(records.len(), 1);
         assert_eq!(records.first().map(|r| r.role), Some(RecordRole::User));
@@ -1235,7 +1359,8 @@ mod tests {
         engine.handle_message(&origin(), &payload(true, None), &assigned_config(), &services).await;
 
         assert!(fake.requests().is_empty());
-        assert!(output.messages().is_empty());
+        // A mention is decidable without the state doc - the guarantee holds.
+        assert_eq!(output.messages(), vec![FALLBACK_MESSAGE.to_owned()]);
     }
 
     #[tokio::test]
@@ -1355,11 +1480,12 @@ mod tests {
         assert!(ctx.output.messages().iter().any(|message| message.contains("compaction failed")));
     }
 
-    /// An unreadable record log degrades to skipping the message - the same
+    /// An unreadable record log degrades to no generated answer - the same
     /// policy as an unreadable state doc. The bot must not answer from a
-    /// context that may be silently empty.
+    /// context that may be silently empty, but a mention still gets the
+    /// visible fallback.
     #[tokio::test]
-    async fn unreadable_record_log_skips_the_message() {
+    async fn unreadable_record_log_falls_back_for_mentions() {
         let mut ctx = ctx(vec![Ok("should not answer".to_owned())]);
         ctx.services.guild_storage = Some(
             RecordsFailStorage { documents: Arc::clone(&ctx.storage) }
@@ -1372,16 +1498,18 @@ mod tests {
             .await;
 
         assert!(ctx.fake.requests().is_empty());
-        assert!(ctx.output.messages().is_empty());
+        assert_eq!(ctx.output.messages(), vec![FALLBACK_MESSAGE.to_owned()]);
     }
 
-    /// A failed capture append skips the reply: the message never entered
-    /// the log, so answering would fabricate a context that never saw it.
+    /// A failed capture append cannot produce a generated answer: the
+    /// message never entered the log, so answering would fabricate a
+    /// context that never saw it. The mention still gets the visible
+    /// fallback, and the model is never called.
     #[tokio::test]
-    async fn failed_capture_skips_the_reply() {
+    async fn failed_capture_falls_back_without_answering() {
         let mut ctx = ctx(vec![Ok("fabricated answer".to_owned())]);
         ctx.services.guild_storage = Some(
-            RecordsFailStorage { documents: Arc::clone(&ctx.storage) }
+            AppendFailStorage { documents: Arc::clone(&ctx.storage) }
                 .guild_scoped(Platform::Discord, GuildId(1)),
         );
         seed_config(&ctx.storage, &assigned_config());
@@ -1391,7 +1519,8 @@ mod tests {
             .await;
 
         assert!(ctx.fake.requests().is_empty());
-        assert!(ctx.output.messages().is_empty());
+        assert_eq!(ctx.output.messages(), vec![FALLBACK_MESSAGE.to_owned()]);
+        assert!(stored_records(&ctx).await.is_empty());
     }
 
     /// Service-channel embeds carry the error classification only: the
@@ -1408,8 +1537,12 @@ mod tests {
             .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
             .await;
 
-        let text = ctx.output.messages().into_iter().next().expect("service notice expected");
-        assert!(text.contains("could not be reached"));
+        let text = ctx
+            .output
+            .messages()
+            .into_iter()
+            .find(|message| message.contains("could not be reached"))
+            .expect("service notice expected");
         assert!(
             !text.contains("secret-org"),
             "the endpoint body must not reach guild-visible embeds"
@@ -1428,8 +1561,11 @@ mod tests {
                 .await;
         }
 
-        // Three failed completions - one rate-limited error embed.
-        assert_eq!(ctx.output.messages().len(), 1);
+        // Three failed completions - one rate-limited error embed for the
+        // operator, plus a visible fallback per triggered message.
+        let messages = ctx.output.messages();
+        assert_eq!(messages.iter().filter(|m| m.contains("LLM completion failed")).count(), 1);
+        assert_eq!(messages.iter().filter(|m| m.contains(FALLBACK_MESSAGE)).count(), 3);
     }
 
     /// The cooldown keys on the SERVICE channel, not the origin: an outage
@@ -1453,11 +1589,13 @@ mod tests {
                 .await;
         }
 
+        let messages = ctx.output.messages();
         assert_eq!(
-            ctx.output.messages().len(),
+            messages.iter().filter(|m| m.contains("LLM completion failed")).count(),
             1,
             "one outage window = one embed, regardless of origin channels"
         );
+        assert_eq!(messages.iter().filter(|m| m.contains(FALLBACK_MESSAGE)).count(), 2);
     }
 
     #[tokio::test]
@@ -1501,6 +1639,28 @@ mod tests {
         let records = stored_records(&ctx).await;
         assert_eq!(records.len(), 2);
         assert_eq!(records.get(1).map(|record| record.role), Some(RecordRole::Assistant));
+    }
+
+    /// A chime-in is unprompted: when its completion fails, silence is the
+    /// right outcome - the guaranteed-answer contract covers only messages
+    /// addressed to the bot.
+    #[tokio::test]
+    async fn chime_failure_stays_silent() {
+        let ctx = ctx_random(
+            LlmSettings::default(),
+            Arc::new(FixedRandom(true)),
+            vec![Err(LlmError::Request("provider down".to_owned()))],
+        );
+        let config = ChannelConfig { capture_mode: CaptureMode::AllMessages, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
+
+        // The capture stays, no answer is delivered, nothing is said.
+        assert_eq!(ctx.fake.requests().len(), 1);
+        assert!(ctx.begins.lock().is_empty());
+        assert!(ctx.output.messages().is_empty());
+        assert_eq!(stored_records(&ctx).await.len(), 1);
     }
 
     #[tokio::test]
