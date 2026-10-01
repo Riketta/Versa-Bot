@@ -22,8 +22,9 @@ services:
       VERSABOT__STORAGE__URL: sqlite:///data/versabot.db
       # PostgreSQL, together with the db service below; password from .env:
       # VERSABOT__STORAGE__URL: postgres://versa_bot:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/versa_bot
-      # Debug logging for troubleshooting; default is info.
-      # RUST_LOG: debug
+      # Log levels: default is info. Serenity logs shard/gateway state only
+      # at debug - use this preset when troubleshooting the gateway.
+      # RUST_LOG: versa_bot=info,serenity=debug
     volumes:
       - versa-bot-data:/data
       # Config-file style instead of env vars: the bot reads ./versabot.toml
