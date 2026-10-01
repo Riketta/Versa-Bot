@@ -8,6 +8,13 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 /// `RUST_LOG` overrides everything; when unset, `debug` picks the fallback
 /// verbosity.
 ///
+/// Error events carry the crate release (`versa-bot@<version>`, via
+/// `sentry::release_name!`) so the backend can group by release; performance
+/// transactions are only sampled when `traces_sample_rate` (0.0..=1.0) is
+/// configured - out-of-range values are reported and treated as off, in the
+/// same spirit as a malformed DSN. Session tracking stays off (the SDK
+/// default; GlitchTip does not support it).
+///
 /// Returns the Sentry client guard; the caller must keep it alive for the
 /// whole process lifetime, otherwise events are dropped on shutdown.
 #[must_use]
@@ -15,6 +22,7 @@ pub fn init(
     debug: bool,
     sentry_dsn: Option<&str>,
     sentry_environment: Option<&str>,
+    sentry_traces_sample_rate: Option<f32>,
 ) -> Option<sentry::ClientInitGuard> {
     let fallback = if debug { "debug" } else { "info" };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(fallback));
@@ -33,6 +41,17 @@ pub fn init(
                 // Cow<'static, str> - the borrowed &str outlives nothing here,
                 // so take ownership first.
                 options.environment = sentry_environment.map(String::from).map(Into::into);
+                options.release = sentry::release_name!();
+                if let Some(rate) = sentry_traces_sample_rate {
+                    if !(0.0..=1.0).contains(&rate) {
+                        eprintln!(
+                            "warning: sentry.traces_sample_rate {rate} is outside 0.0..=1.0 \
+                             - performance monitoring disabled"
+                        );
+                    } else {
+                        options = options.traces_sample_rate(rate);
+                    }
+                }
                 Some(sentry::init(options))
             }
             Err(err) => {

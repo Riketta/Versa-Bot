@@ -40,6 +40,7 @@ async fn main() -> ExitCode {
         config.debug,
         config.sentry.as_ref().map(|s| s.dsn.as_str()),
         config.sentry.as_ref().and_then(|s| s.environment.as_deref()),
+        config.sentry.as_ref().and_then(|s| s.traces_sample_rate),
     );
 
     // Application id: required by Discord HTTP calls that are not authorized

@@ -60,7 +60,8 @@ a slash command from any other reply path.
   sits alongside the documents for high-volume ordered data such as
   conversation history. SQLite (default) and PostgreSQL.
 - Observability: `tracing` logging to stdout plus optional Sentry/GlitchTip
-  reporting (DSN-driven); every event is traced with its origin.
+  reporting (DSN-driven) with release tagging; every event is traced with
+  its origin, and an optional sample rate feeds performance transactions.
 - Fault isolation: a panicking plugin cannot crash the bot - pipeline hooks
   and event-bus subscribers are caught and logged (plugin + event), the
   event is dropped, and the rest of the chain or bus keeps working.
@@ -99,6 +100,7 @@ Prerequisites: Rust 1.88+ (edition 2024).
    # [sentry]
    # dsn = "http://your-key@localhost:9000/1"
    # environment = "development"
+   # traces_sample_rate = 0.01  # performance sampling; omit for error-only
 
    # Optional: status rotator - cycles the bot's activity.
    # [status]
