@@ -5,7 +5,7 @@ mod config_port;
 mod presence_port;
 mod storage_ports;
 
-pub use chat_output_factory_port::ChatOutputFactoryPort;
+pub use chat_output_factory_port::{ChatOutputFactoryPort, ChatTypingGuard};
 pub use chat_output_port::ChatOutputPort;
 pub use chat_stream_port::ChatStreamPort;
 pub use config_port::{ConfigChangeHandler, ConfigPort};

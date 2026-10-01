@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use tokio_util::sync::CancellationToken;
+
 use super::{ChatOutputPort, ChatStreamPort};
 use crate::kernel::models::{ChannelId, MessageId, Origin};
 
@@ -36,4 +38,39 @@ pub trait ChatOutputFactoryPort: Send + Sync + 'static {
         channel_id: ChannelId,
         message_id: MessageId,
     ) -> Option<String>;
+
+    /// Starts the platform typing indicator for the event's origin channel
+    /// and keeps refreshing it on the platform's cadence until the returned
+    /// guard is dropped - long operations (LLM answer generation) hold it so
+    /// users see the bot composing instead of frozen. Channel-less origins
+    /// (member lifecycle) yield an already-dead guard. Fire-and-forget:
+    /// indicator failures are the adapter's log concern, never the caller's.
+    fn start_typing(&self, origin: &Origin) -> ChatTypingGuard;
+}
+
+/// RAII token for a platform typing indicator: dropping it stops the
+/// adapter's refresh. Deliberately opaque - callers hold it, adapters own
+/// everything behind it.
+#[derive(Debug)]
+pub struct ChatTypingGuard {
+    cancel: CancellationToken,
+}
+
+impl ChatTypingGuard {
+    pub(crate) fn new(cancel: CancellationToken) -> Self {
+        Self { cancel }
+    }
+
+    /// A guard that never started typing (and stopping it is a no-op).
+    pub(crate) fn dead() -> Self {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        Self { cancel }
+    }
+}
+
+impl Drop for ChatTypingGuard {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }

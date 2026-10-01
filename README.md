@@ -321,7 +321,9 @@ saved):
 | `max_length` | per-channel reply-splitting limit | 2000 (`max_message_length`) |
 | `turn_template` | user-turn rendering; must contain `{sender}` and `{message}` | `{sender}: {message}` |
 
-**Delivery.** Long answers split on line boundaries - a line that does
+**Delivery.** While an answer generates and delivers, the bot holds the
+channel's typing indicator - users see it composing, not frozen. Long
+answers split on line boundaries - a line that does
 not fit moves whole to the next message. With `streaming` on, the
 answer is created once and edited in place (throttled by
 `stream_interval_ms`, bounded number of edits) until the final full

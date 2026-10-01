@@ -3,16 +3,18 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::Value;
+
+use async_trait::async_trait;
 
 use crate::kernel::{
     models::{GuildId, OutboundError, OutboundMessage, Platform, StorageError},
     spi_ports::{
-        ChatOutputFactoryPort, ChatOutputPort, GUILD_SETTINGS, GuildStorage, StoragePort,
-        StoredRecord,
+        ChatOutputFactoryPort, ChatOutputPort, ChatTypingGuard, GUILD_SETTINGS, GuildStorage,
+        StoragePort, StoredRecord,
     },
 };
 
@@ -292,12 +294,20 @@ impl StoragePort for FailingStorage {
 /// every origin and channel - channel-agnostic, so assertions can stay flat.
 pub struct RecordingChatOutputFactory {
     output: Arc<RecordingChatOutput>,
+    typing_starts: AtomicUsize,
 }
 
 impl RecordingChatOutputFactory {
     #[must_use]
     pub fn new(output: Arc<RecordingChatOutput>) -> Self {
-        Self { output }
+        Self { output, typing_starts: AtomicUsize::new(0) }
+    }
+
+    /// How many times the typing indicator was started (the Discord adapter
+    /// refreshes it internally; tests only see the start).
+    #[must_use]
+    pub fn typing_starts(&self) -> usize {
+        self.typing_starts.load(Ordering::SeqCst)
     }
 
     #[must_use]
@@ -309,6 +319,11 @@ impl RecordingChatOutputFactory {
 impl ChatOutputFactoryPort for RecordingChatOutputFactory {
     fn chat_output(&self, _origin: &crate::kernel::models::Origin) -> Arc<dyn ChatOutputPort> {
         Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
+    }
+
+    fn start_typing(&self, _origin: &crate::kernel::models::Origin) -> ChatTypingGuard {
+        self.typing_starts.fetch_add(1, Ordering::SeqCst);
+        ChatTypingGuard::dead()
     }
 
     fn channel_output(

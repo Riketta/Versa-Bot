@@ -264,7 +264,8 @@ mod tests {
         },
         plugin_ports::EventHandler,
         spi_ports::{
-            ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, GUILD_SETTINGS, StoragePort,
+            ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard, GUILD_SETTINGS,
+            StoragePort,
         },
     };
     use crate::test_support::{InMemoryStorage, RecordingChatOutput};
@@ -323,6 +324,10 @@ mod tests {
             _message_id: MessageId,
         ) -> Option<String> {
             None
+        }
+
+        fn start_typing(&self, _origin: &Origin) -> ChatTypingGuard {
+            ChatTypingGuard::dead()
         }
     }
 

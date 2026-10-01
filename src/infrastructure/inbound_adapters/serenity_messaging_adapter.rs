@@ -6,6 +6,7 @@ use serenity::all::{
     Member, Message, Ready, User,
 };
 use serenity::async_trait;
+use tokio_util::sync::CancellationToken;
 
 use crate::kernel::{
     api_ports::RequestHandlerPort,
@@ -13,7 +14,7 @@ use crate::kernel::{
         ChannelId, CommandPayload, Embed, EventKind, EventPayload, GuildId, MemberPayload,
         MessageId, Origin, OutboundError, OutboundMessage, Platform, RequestContext, UserId,
     },
-    spi_ports::{ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort},
+    spi_ports::{ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard},
 };
 
 /// Kernel driving adapter: normalizes Discord gateway events onto the
@@ -334,6 +335,27 @@ impl ChatOutputFactoryPort for SerenityChatOutputFactory {
             channel_id.get(),
             message_id.get()
         ))
+    }
+
+    /// Typing refresh rides serenity's own `Typing` handle (re-broadcasts on
+    /// its internal cadence, stops when dropped); the kernel guard's drop
+    /// cancels the bridge task holding it. Channel-less origins get a dead
+    /// guard - a typing call for channel 0 is a guaranteed 404.
+    fn start_typing(&self, origin: &Origin) -> ChatTypingGuard {
+        // Member lifecycle origins carry no channel - nothing to type into.
+        if origin.channel_id.get() == 0 {
+            return ChatTypingGuard::dead();
+        }
+        let http = Arc::clone(&self.http);
+        let channel = SerenityChannelId::new(origin.channel_id.get());
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        tokio::spawn(async move {
+            let typing = http.start_typing(channel);
+            cancel.cancelled().await;
+            drop(typing);
+        });
+        ChatTypingGuard::new(token)
     }
 }
 

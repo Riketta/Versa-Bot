@@ -261,6 +261,11 @@ impl ChatEngine {
         calibrated: bool,
         services: &KernelServices,
     ) -> bool {
+        // The answer may take tens of seconds: hold the platform typing
+        // indicator across generation and delivery. The guard drops on every
+        // return path - failure included, the caller's fallback follows
+        // right after.
+        let _typing = services.chat_output_factory.start_typing(origin);
         let channel_id = origin.channel_id.get();
         let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
         let window: &[ConversationRecord] = if live.len() > depth {
@@ -761,8 +766,8 @@ mod tests {
         ChannelId, GuildId, MessageId, OutboundError, Platform, StorageError, UserId,
     };
     use crate::kernel::spi_ports::{
-        ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, GuildStorage, StoragePort,
-        StoredRecord,
+        ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard, GuildStorage,
+        StoragePort, StoredRecord,
     };
     use crate::plugins::llm::completion_port::{
         ChatRole, CompletionResponse, LlmError, TokenUsage,
@@ -774,7 +779,7 @@ mod tests {
     use parking_lot::Mutex;
     use serde_json::Value;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     struct FakeCompletion {
         responses: Mutex<Vec<Result<String, LlmError>>>,
@@ -822,11 +827,23 @@ mod tests {
         begins: Arc<Mutex<Vec<String>>>,
         updates: Arc<Mutex<Vec<String>>>,
         output: Arc<RecordingChatOutput>,
+        typing_starts: AtomicUsize,
+    }
+
+    impl StreamRecordingFactory {
+        fn typing_starts(&self) -> usize {
+            self.typing_starts.load(Ordering::SeqCst)
+        }
     }
 
     impl ChatOutputFactoryPort for StreamRecordingFactory {
         fn chat_output(&self, _origin: &Origin) -> Arc<dyn ChatOutputPort> {
             Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
+        }
+
+        fn start_typing(&self, _origin: &Origin) -> ChatTypingGuard {
+            self.typing_starts.fetch_add(1, Ordering::SeqCst);
+            ChatTypingGuard::dead()
         }
 
         fn channel_output(
@@ -1001,6 +1018,7 @@ mod tests {
         output: Arc<RecordingChatOutput>,
         begins: Arc<Mutex<Vec<String>>>,
         updates: Arc<Mutex<Vec<String>>>,
+        factory: Arc<StreamRecordingFactory>,
         services: KernelServices,
     }
 
@@ -1033,16 +1051,18 @@ mod tests {
         let output = RecordingChatOutput::new();
         let begins = Arc::new(Mutex::new(Vec::new()));
         let updates = Arc::new(Mutex::new(Vec::new()));
+        let factory = Arc::new(StreamRecordingFactory {
+            begins: Arc::clone(&begins),
+            updates: Arc::clone(&updates),
+            output: Arc::clone(&output),
+            typing_starts: AtomicUsize::new(0),
+        });
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
-            chat_output_factory: Arc::new(StreamRecordingFactory {
-                begins: Arc::clone(&begins),
-                updates: Arc::clone(&updates),
-                output: Arc::clone(&output),
-            }),
+            chat_output_factory: Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
             guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
         };
-        TestCtx { engine, fake, storage, output, begins, updates, services }
+        TestCtx { engine, fake, storage, output, begins, updates, factory, services }
     }
 
     fn assigned_config() -> ChannelConfig {
@@ -1160,6 +1180,26 @@ mod tests {
         assert_eq!(assistant.role, RecordRole::Assistant);
         assert!(assistant.message_id.is_some());
         assert_eq!(assistant.content, "hi alice");
+    }
+
+    /// Every generated answer holds the platform typing indicator across
+    /// generation and delivery - users see the bot composing, not frozen.
+    #[tokio::test]
+    async fn answer_holds_the_typing_indicator() {
+        let ctx = ctx(vec![Ok("hi alice".to_owned())]);
+        seed_config(&ctx.storage, &assigned_config());
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .await;
+
+        assert_eq!(ctx.factory.typing_starts(), 1);
+
+        // The next answer starts it again - one guard per answer.
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .await;
+        assert_eq!(ctx.factory.typing_starts(), 2);
     }
 
     #[tokio::test]
