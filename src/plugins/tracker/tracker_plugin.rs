@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::common::command_reply;
 use crate::kernel::{
     models::{
         ChannelId, Event, EventKind, EventPayload, OutboundMessage, PluginError, RequestContext,
@@ -198,7 +199,7 @@ impl CommandHandler for AssignTrackerHandler {
         let Some(storage) = &services.guild_storage else {
             services
                 .chat_output
-                .send(OutboundMessage::text("This command only works inside a server."))
+                .send(command_reply("This command only works inside a server."))
                 .await?;
             return Ok(());
         };
@@ -215,7 +216,7 @@ impl CommandHandler for AssignTrackerHandler {
 
         services
             .chat_output
-            .send(OutboundMessage::text(
+            .send(command_reply(
                 "Tracker assigned: member joins and leaves will be logged in this channel.",
             ))
             .await?;
@@ -237,7 +238,7 @@ impl CommandHandler for UnassignTrackerHandler {
         let Some(storage) = &services.guild_storage else {
             services
                 .chat_output
-                .send(OutboundMessage::text("This command only works inside a server."))
+                .send(command_reply("This command only works inside a server."))
                 .await?;
             return Ok(());
         };
@@ -246,7 +247,7 @@ impl CommandHandler for UnassignTrackerHandler {
 
         services
             .chat_output
-            .send(OutboundMessage::text(
+            .send(command_reply(
                 "Tracker unassigned: member joins and leaves are no longer logged.",
             ))
             .await?;

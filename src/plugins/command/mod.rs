@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::FutureExt;
 
-use crate::common::panic_message;
+use crate::common::{command_reply, panic_message};
 use crate::kernel::{
     models::{Embed, EventPayload, OutboundMessage, RequestContext},
     plugin_ports::{
@@ -131,7 +131,7 @@ impl CommandHandler for PingHandler {
         _args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
-        services.chat_output.send(OutboundMessage::text("Pong!")).await?;
+        services.chat_output.send(command_reply("Pong!")).await?;
         Ok(())
     }
 }

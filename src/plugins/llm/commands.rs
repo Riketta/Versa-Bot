@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::common::command_reply;
 use crate::kernel::{
     models::{Embed, MessageId, OutboundMessage, RequestContext},
     plugin_ports::{CommandArgs, CommandHandler},
@@ -56,7 +57,7 @@ async fn load_assigned_config(
     let Some(storage) = &services.guild_storage else {
         services
             .chat_output
-            .send(OutboundMessage::text("This command only works inside a server."))
+            .send(command_reply("This command only works inside a server."))
             .await?;
         return Ok(None);
     };
@@ -65,7 +66,7 @@ async fn load_assigned_config(
     else {
         services
             .chat_output
-            .send(OutboundMessage::text("LLM chat is not assigned to this channel."))
+            .send(command_reply("LLM chat is not assigned to this channel."))
             .await?;
         return Ok(None);
     };
@@ -395,19 +396,19 @@ impl CommandHandler for AssignLlmHandler {
         let Some(storage) = &services.guild_storage else {
             services
                 .chat_output
-                .send(OutboundMessage::text("This command only works inside a server."))
+                .send(command_reply("This command only works inside a server."))
                 .await?;
             return Ok(());
         };
         let Some(model) = args.get("model") else {
             services
                 .chat_output
-                .send(OutboundMessage::text("Usage: `/llm_assign model` - e.g. `local/gemma`."))
+                .send(command_reply("Usage: `/llm_assign model` - e.g. `local/gemma`."))
                 .await?;
             return Ok(());
         };
         if let Err(reply) = validate_model_ref(self.engine.settings(), model) {
-            services.chat_output.send(OutboundMessage::text(reply).ephemeral()).await?;
+            services.chat_output.send(command_reply(reply)).await?;
             return Ok(());
         }
 
@@ -422,9 +423,7 @@ impl CommandHandler for AssignLlmHandler {
 
         services
             .chat_output
-            .send(OutboundMessage::text(format!(
-                "LLM chat assigned to this channel (model `{model}`)."
-            )))
+            .send(command_reply(format!("LLM chat assigned to this channel (model `{model}`).")))
             .await?;
         Ok(())
     }
@@ -445,17 +444,14 @@ impl CommandHandler for UnassignLlmHandler {
         let Some(storage) = &services.guild_storage else {
             services
                 .chat_output
-                .send(OutboundMessage::text("This command only works inside a server."))
+                .send(command_reply("This command only works inside a server."))
                 .await?;
             return Ok(());
         };
 
         storage.delete(NAMESPACE, &channel_config_key(event.origin.channel_id.get())).await?;
 
-        services
-            .chat_output
-            .send(OutboundMessage::text("LLM chat unassigned for this channel."))
-            .await?;
+        services.chat_output.send(command_reply("LLM chat unassigned for this channel.")).await?;
         Ok(())
     }
 }
@@ -488,7 +484,7 @@ impl CommandHandler for CutoffLlmHandler {
         let Some(storage) = &services.guild_storage else {
             services
                 .chat_output
-                .send(OutboundMessage::text("This command only works inside a server."))
+                .send(command_reply("This command only works inside a server."))
                 .await?;
             return Ok(());
         };
@@ -509,7 +505,7 @@ impl CommandHandler for CutoffLlmHandler {
 
         services
             .chat_output
-            .send(OutboundMessage::text(
+            .send(command_reply(
                 "Context cleared: this channel starts a fresh conversation (stored history is kept).",
             ))
             .await?;
@@ -614,7 +610,7 @@ impl CommandHandler for StatusLlmHandler {
         let Some(storage) = &services.guild_storage else {
             services
                 .chat_output
-                .send(OutboundMessage::text("This command only works inside a server."))
+                .send(command_reply("This command only works inside a server."))
                 .await?;
             return Ok(());
         };
@@ -623,7 +619,7 @@ impl CommandHandler for StatusLlmHandler {
         let Some(raw) = storage.get(NAMESPACE, &channel_config_key(channel_id)).await? else {
             services
                 .chat_output
-                .send(OutboundMessage::text("LLM chat is not assigned to this channel."))
+                .send(command_reply("LLM chat is not assigned to this channel."))
                 .await?;
             return Ok(());
         };
@@ -720,7 +716,7 @@ impl CommandHandler for AssignServiceChannelHandler {
         let Some(storage) = &services.guild_storage else {
             services
                 .chat_output
-                .send(OutboundMessage::text("This command only works inside a server."))
+                .send(command_reply("This command only works inside a server."))
                 .await?;
             return Ok(());
         };
@@ -735,7 +731,7 @@ impl CommandHandler for AssignServiceChannelHandler {
 
         services
             .chat_output
-            .send(OutboundMessage::text(
+            .send(command_reply(
                 "Service channel assigned: LLM errors and notices will be reported here.",
             ))
             .await?;
@@ -757,14 +753,14 @@ impl CommandHandler for ClearServiceChannelHandler {
         let Some(storage) = &services.guild_storage else {
             services
                 .chat_output
-                .send(OutboundMessage::text("This command only works inside a server."))
+                .send(command_reply("This command only works inside a server."))
                 .await?;
             return Ok(());
         };
 
         storage.delete(NAMESPACE, SERVICE_CHANNEL_KEY).await?;
 
-        services.chat_output.send(OutboundMessage::text("Service channel cleared.")).await?;
+        services.chat_output.send(command_reply("Service channel cleared.")).await?;
         Ok(())
     }
 }
@@ -802,7 +798,7 @@ impl CommandHandler for ModelsLlmHandler {
         } else {
             format!("Declared models:\n{}", lines.join("\n"))
         };
-        services.chat_output.send(OutboundMessage::text(body).ephemeral()).await?;
+        services.chat_output.send(command_reply(body)).await?;
         Ok(())
     }
 }
@@ -843,7 +839,7 @@ impl CommandHandler for SetLlmHandler {
         let (Some(key), Some(value)) = (args.get("key"), args.get("value")) else {
             services
                 .chat_output
-                .send(OutboundMessage::text(format!(
+                .send(command_reply(format!(
                     "Usage: `/llm_set key value`. Keys: {}.",
                     SET_KEYS.join(", ")
                 )))
@@ -857,17 +853,17 @@ impl CommandHandler for SetLlmHandler {
             && !matches!(value, "clear" | "none" | "default")
             && let Err(reply) = validate_model_ref(self.engine.settings(), value)
         {
-            services.chat_output.send(OutboundMessage::text(reply).ephemeral()).await?;
+            services.chat_output.send(command_reply(reply)).await?;
             return Ok(());
         }
 
         match apply_set(&mut config, key, value) {
             Ok(message) => {
                 save_config(event, services, config).await?;
-                services.chat_output.send(OutboundMessage::text(message)).await?;
+                services.chat_output.send(command_reply(message)).await?;
             }
             Err(usage) => {
-                services.chat_output.send(OutboundMessage::text(usage)).await?;
+                services.chat_output.send(command_reply(usage)).await?;
             }
         }
         Ok(())
@@ -903,7 +899,7 @@ impl CommandHandler for PromptLlmHandler {
         let Some(prompt) = args.get("prompt") else {
             services
                 .chat_output
-                .send(OutboundMessage::text(
+                .send(command_reply(
                     "Usage: `/llm_prompt text` - or `/llm_prompt clear` to fall back to the default.",
                 ))
                 .await?;
@@ -918,7 +914,7 @@ impl CommandHandler for PromptLlmHandler {
             "System prompt updated."
         };
         save_config(event, services, config).await?;
-        services.chat_output.send(OutboundMessage::text(message)).await?;
+        services.chat_output.send(command_reply(message)).await?;
         Ok(())
     }
 }
@@ -1009,14 +1005,14 @@ impl CommandHandler for PromptFileLlmHandler {
         let Some(url) = args.get("file") else {
             services
                 .chat_output
-                .send(OutboundMessage::text(
+                .send(command_reply(
                     "Usage: `/llm_prompt_file file` - attach a .txt/.md file with the prompt text.",
                 ))
                 .await?;
             return Ok(());
         };
         if let Err(usage) = validate_prompt_file_url(url) {
-            services.chat_output.send(OutboundMessage::text(usage)).await?;
+            services.chat_output.send(command_reply(usage)).await?;
             return Ok(());
         }
 
@@ -1031,7 +1027,7 @@ impl CommandHandler for PromptFileLlmHandler {
             Err(reason) => {
                 services
                     .chat_output
-                    .send(OutboundMessage::text(format!("Could not load the attachment: {reason}")))
+                    .send(command_reply(format!("Could not load the attachment: {reason}")))
                     .await?;
                 return Ok(());
             }
@@ -1041,9 +1037,7 @@ impl CommandHandler for PromptFileLlmHandler {
         save_config(event, services, config).await?;
         services
             .chat_output
-            .send(OutboundMessage::text(format!(
-                "System prompt set from file ({characters} characters)."
-            )))
+            .send(command_reply(format!("System prompt set from file ({characters} characters).")))
             .await?;
         Ok(())
     }

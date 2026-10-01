@@ -38,7 +38,8 @@ a slash command from any other reply path.
   domain events on the plugin bus for other plugins to react to. Channel
   assignment is self-service: `/assign_tracker` run in a channel makes it
   the audit channel, `/unassign_tracker` turns tracking off (both require
-  the Manage Server permission, enforced by Discord itself).
+  the Manage Server permission, enforced by Discord itself; replies are
+  visible only to the invoker).
 - Audit trail (`audit_log` plugin): the event bus's first consumer - logs
   membership changes published on the bus as structured `audit` tracing
   events (stdout + Sentry/GlitchTip), with origin fields, no per-guild
@@ -295,18 +296,20 @@ without a declared window) only the message limit applies.
 `/llm_status` shows which mechanism is active.
 
 **Commands.** All are guild-only and require the **Manage Server**
-permission (Discord hides them from members without it):
+permission (Discord hides them from members without it). Every reply is
+**ephemeral** - visible only to the admin who ran the command: config
+confirmations, usage notices and reports never appear in the channel.
 
 | Command | Effect |
 |---|---|
 | `/llm_assign model:<provider/model>` | assign the bot to this channel - `model` must be one of the operator-declared models (offered as a dropdown, listed by `/llm_models`); re-assigning retunes in place |
-| `/llm_models` | ephemeral list of the declared models - the legal assignment set, with declared capabilities (reasoning, context window) |
+| `/llm_models` | lists the declared models - the legal assignment set, with declared capabilities (reasoning, context window) |
 | `/llm_unassign` | remove the bot from this channel (history is kept) |
 | `/llm_prompt prompt:<text>` | set the channel system prompt; `clear` falls back to the plugin default (inline limit: Discord's ~6000-character option cap) |
 | `/llm_prompt_file file:<attachment>` | set the system prompt from an uploaded text/markdown file - for prompts beyond the inline limit; fetched from Discord's CDN only, capped by `[llm] max_prompt_file_bytes` (128 KiB default) |
 | `/llm_set key:<key> value:<value>` | tune one channel setting (table below); value `clear`/`none`/`default` resets it |
 | `/llm_cutoff` | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
-| `/llm_status` | ephemeral report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, window usage, summary preview, link to the context start, last-request token stats |
+| `/llm_status` | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, window usage, summary preview, link to the context start, last-request token stats |
 | `/llm_admin` | make this channel the guild's service channel for error notices (one per guild, last write wins) |
 | `/llm_admin_clear` | stop service notices |
 
