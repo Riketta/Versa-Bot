@@ -403,6 +403,106 @@ mod tests {
         assert_eq!(messages.get(2).map(|m| m.content.as_str()), Some("<alice> hello"));
     }
 
+    /// Serializes the assembled context the way a provider prompt cache sees
+    /// it: role + content per line, in order. Prefix stability of this string
+    /// across message intake is the cache-viability contract.
+    fn render(messages: &[ChatMessage]) -> String {
+        let mut rendered = String::new();
+        for message in messages {
+            let role = match message.role {
+                ChatRole::System => "system",
+                ChatRole::User => "user",
+                ChatRole::Assistant => "assistant",
+            };
+            let _ = writeln!(rendered, "{role}:{}", message.content);
+        }
+        rendered
+    }
+
+    fn no_compaction_config() -> ChannelConfig {
+        let mut config = ChannelConfig::assigned("p/m".to_owned());
+        config.compaction_enabled = false;
+        config.history_depth = 100;
+        config
+    }
+
+    /// Cache viability without compaction: appending captured user turns and
+    /// produced bot turns only ever EXTENDS the assembled context - every
+    /// earlier byte stays put (append-only growth), and the fixed slots
+    /// (system prompt + summary placeholder) never move or change, so the
+    /// provider's prompt cache keeps hitting.
+    #[test]
+    fn context_grows_append_only_within_depth() {
+        let config = no_compaction_config();
+        let settings = LlmSettings::default();
+        let state = ConversationState::default();
+
+        let steps = [
+            user_record(1, "alice", "first question"),
+            user_record(2, "bob", "second question"),
+            assistant_record(3, "first answer"),
+            user_record(4, "alice", "third — with ünicode ✓"),
+            assistant_record(5, "second answer"),
+        ];
+
+        let mut previous = render(&assemble_context(&config, &settings, &state, &[], 0.0, None));
+        for (index, _) in steps.iter().enumerate() {
+            let visible = steps.get(..=index).expect("index below steps length");
+            let current = render(&assemble_context(&config, &settings, &state, visible, 0.0, None));
+            assert!(
+                current.starts_with(previous.as_str()),
+                "step {index} rewrote the context prefix:\n\
+                 --- previous ---\n{previous}\n--- current ---\n{current}"
+            );
+            previous = current;
+        }
+
+        // Depth 100 and no budget: all five turns made it in after the two
+        // fixed slots.
+        assert_eq!(previous.lines().count(), 7);
+    }
+
+    /// Record metadata (message ids, reply targets, capture timestamps) and
+    /// state metadata (summary bookkeeping, cutoff timestamp) are storage
+    /// bookkeeping - none of it may leak into the rendered prompt, or every
+    /// new capture would rewrite prefix bytes and kill the cache. User turns
+    /// render to exactly the template over author+content; assistant turns
+    /// pass through verbatim.
+    #[test]
+    fn rendered_context_carries_no_dynamic_record_fields() {
+        let config = no_compaction_config();
+        let settings = LlmSettings::default();
+
+        let mut user = user_record(987_654_321, "alice", "what time is it");
+        user.captured_at = 1_735_689_600;
+        user.reply_to = Some(555);
+        let mut bot = assistant_record(999_999_999, "noon");
+        bot.captured_at = 1_735_689_601;
+        let records = vec![user, bot];
+
+        let state = ConversationState {
+            summary: Some("earlier facts".to_owned()),
+            cutoff_seq: 777_777,
+            cutoff_at: Some(1_735_600_000),
+        };
+
+        let messages = assemble_context(&config, &settings, &state, &records, 0.0, None);
+        assert_eq!(messages.len(), 4, "two fixed slots + two turns");
+        assert!(matches!(messages.first().expect("system expected").role, ChatRole::System));
+        assert!(matches!(messages.get(1).expect("summary expected").role, ChatRole::System));
+
+        let rendered = render(&messages);
+        assert!(rendered.contains("user:alice: what time is it\n"));
+        assert!(rendered.contains("assistant:noon\n"));
+
+        for leaked in ["987654321", "1735689600", "555", "999999999", "777777", "1735600000"] {
+            assert!(
+                !rendered.contains(leaked),
+                "dynamic field {leaked} leaked into the prompt:\n{rendered}"
+            );
+        }
+    }
+
     #[test]
     fn token_budget_fills_newest_first() {
         let settings = LlmSettings::default();
