@@ -51,6 +51,11 @@ url = "sqlite://versabot.db"
 # the final edit always carries the exact full text.
 # Cap for /llm_prompt_file attachment downloads, in bytes.
 # max_prompt_file_bytes = 131072
+# Collapse runs of consecutive newlines in completions down to this many
+# (e.g. 2 = at most one blank line between paragraphs). Absent = responses
+# left untouched. Applied to the authoritative final text - a streaming
+# message may briefly show more blank lines than the final edit keeps.
+# max_consecutive_newlines = 2
 # Diagnostic: dump every LLM request and response body at DEBUG level
 # (stdout only, never Sentry). The bodies carry full conversation
 # content - enable only while debugging a provider.

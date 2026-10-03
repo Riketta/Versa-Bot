@@ -28,6 +28,9 @@ pub struct LlmConfig {
     pub stream_interval_ms: u64,
     /// Cap for `/llm_prompt_file` attachment downloads, in bytes.
     pub max_prompt_file_bytes: u64,
+    /// Collapses runs of consecutive newlines in completions down to this
+    /// many; absent = responses left untouched.
+    pub max_consecutive_newlines: Option<usize>,
     /// Diagnostic dump of raw LLM request/response bodies at DEBUG level
     /// (stdout only, never Sentry). Off by default: the bodies carry full
     /// conversation content.
@@ -52,6 +55,7 @@ impl Default for LlmConfig {
             max_message_length: 2000,
             stream_interval_ms: 2000,
             max_prompt_file_bytes: 131_072,
+            max_consecutive_newlines: None,
             log_raw_traffic: false,
             providers: BTreeMap::new(),
             models: BTreeMap::new(),
@@ -144,6 +148,7 @@ mod tests {
                 "max_message_length": 1500,
                 "stream_interval_ms": 1500,
                 "max_prompt_file_bytes": 4096,
+                "max_consecutive_newlines": 2,
                 "log_raw_traffic": true,
                 "providers": {
                     "zai": {
@@ -165,6 +170,7 @@ mod tests {
         assert_eq!(config.compaction_model.as_deref(), Some("zai/glm-5.3-flash"));
         assert_eq!(config.compaction_keep_tail, 5);
         assert_eq!(config.max_prompt_file_bytes, 4096);
+        assert_eq!(config.max_consecutive_newlines, Some(2));
         assert!(config.log_raw_traffic);
         let zai = config.providers.get("zai").expect("zai provider expected");
         assert_eq!(zai.reasoning_style, LlmReasoningStyle::GlmThinking);

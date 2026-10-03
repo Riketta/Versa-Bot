@@ -42,6 +42,10 @@ pub struct LlmSettings {
     pub stream_interval_ms: u64,
     /// Cap for `/llm_prompt_file` attachment downloads, in bytes.
     pub max_prompt_file_bytes: u64,
+    /// Collapses runs of consecutive newlines in completions down to this
+    /// many (applied at the adapter boundary, chat answers and compaction
+    /// summaries alike); `None` leaves responses untouched.
+    pub max_consecutive_newlines: Option<usize>,
     /// Diagnostic dump: log the raw request and response bodies of every
     /// completion at DEBUG level (stdout only, never shipped to Sentry).
     /// Off by default - the bodies carry full conversation content.
@@ -69,6 +73,7 @@ impl Default for LlmSettings {
             max_message_length: 2000,
             stream_interval_ms: 2000,
             max_prompt_file_bytes: 131_072,
+            max_consecutive_newlines: None,
             log_raw_traffic: false,
             providers: BTreeMap::new(),
             models: BTreeMap::new(),
@@ -166,6 +171,17 @@ pub struct OpenAiCompatibleAdapter {
 }
 
 impl OpenAiCompatibleAdapter {
+    /// Response normalization applied after reasoning stripping: collapses
+    /// newline runs down to the configured maximum (operator option, off by
+    /// default). Applied to the authoritative assembled content - the live
+    /// reveal may briefly show more blank lines than the final edit keeps.
+    fn normalize(&self, content: &str) -> String {
+        match self.settings.max_consecutive_newlines {
+            Some(max) => collapse_newlines(content, max),
+            None => content.to_owned(),
+        }
+    }
+
     /// Builds one reqwest client per declared provider (connection pooling,
     /// per-provider proxy and timeout). API keys are resolved from the
     /// environment once, at construction.
@@ -293,7 +309,8 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
         if !status.is_success() {
             return Err(LlmError::Request(format!("HTTP {status}: {}", truncate(&text, 300))));
         }
-        let parsed = parse_completion_content(&text, wall_ms(started))?;
+        let mut parsed = parse_completion_content(&text, wall_ms(started))?;
+        parsed.content = self.normalize(&parsed.content);
         tracing::debug!(
             provider = provider_name,
             model = model_name,
@@ -392,6 +409,7 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
             )));
         }
         let content = strip_think_blocks(&read.content);
+        let content = self.normalize(&content);
         if content.is_empty() {
             // A reasoning-only stream is no answer, same as non-streaming.
             return Err(LlmError::EmptyResponse);
@@ -760,6 +778,27 @@ fn truncate(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Collapses runs of more than `max` consecutive newlines down to exactly
+/// `max` - some models pad answers with blank lines, which wastes message
+/// length and renders as huge gaps. Only `\n` runs are counted; a `\r` in
+/// `\r\n` pairs breaks the run and passes through unchanged.
+fn collapse_newlines(content: &str, max: usize) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut run = 0usize;
+    for ch in content.chars() {
+        if ch == '\n' {
+            run += 1;
+            if run > max {
+                continue;
+            }
+        } else {
+            run = 0;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,6 +1083,88 @@ mod tests {
         )
         .expect("response expected to parse");
         assert_eq!(response.usage, None);
+    }
+
+    #[test]
+    fn newline_runs_collapse_to_the_maximum() {
+        assert_eq!(collapse_newlines("a\n\n\n\n\nb", 2), "a\n\nb");
+        // Under and at the cap: untouched.
+        assert_eq!(collapse_newlines("a\nb", 2), "a\nb");
+        assert_eq!(collapse_newlines("a\n\nb", 2), "a\n\nb");
+        // Max 1 = no blank lines at all.
+        assert_eq!(collapse_newlines("a\n\n\n\nb", 1), "a\nb");
+        // No newlines: unchanged.
+        assert_eq!(collapse_newlines("plain text", 2), "plain text");
+        // A `\r` breaks the run and passes through.
+        assert_eq!(collapse_newlines("a\r\n\r\nb", 1), "a\r\n\r\nb");
+    }
+
+    /// A plain-JSON HTTP fixture for the single-shot path (the SSE fixture
+    /// carries content-type headers only, so it serves both).
+    fn json_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn collapsing_adapter(api_url: String, max: Option<usize>) -> OpenAiCompatibleAdapter {
+        let settings = LlmSettings {
+            max_consecutive_newlines: max,
+            providers: BTreeMap::from([(
+                "local".to_owned(),
+                ProviderSettings { api_url, ..ProviderSettings::default() },
+            )]),
+            ..LlmSettings::default()
+        };
+        OpenAiCompatibleAdapter::from_settings(Arc::new(settings)).expect("adapter builds")
+    }
+
+    #[tokio::test]
+    async fn newline_runs_collapse_when_the_option_is_set() {
+        let body = r#"{"choices":[{"message":{"content":"a\n\n\n\n\nb"}}]}"#;
+        let (api_url, server) = raw_http_server(json_response(body)).await;
+        let adapter = collapsing_adapter(api_url, Some(2));
+
+        let response = adapter.complete(stream_request()).await.expect("completion expected");
+        server.await.expect("server task");
+
+        assert_eq!(response.content, "a\n\nb");
+    }
+
+    #[tokio::test]
+    async fn newline_runs_survive_when_the_option_is_absent() {
+        let body = r#"{"choices":[{"message":{"content":"a\n\n\n\n\nb"}}]}"#;
+        let (api_url, server) = raw_http_server(json_response(body)).await;
+        let adapter = collapsing_adapter(api_url, None);
+
+        let response = adapter.complete(stream_request()).await.expect("completion expected");
+        server.await.expect("server task");
+
+        assert_eq!(response.content, "a\n\n\n\n\nb");
+    }
+
+    /// The authoritative assembled stream content is collapsed - the live
+    /// deltas may carry the raw runs until the final edit pins the clean
+    /// text (same class as reasoning stripping).
+    #[tokio::test]
+    async fn streaming_final_content_collapses_newline_runs() {
+        let script = String::new()
+            + &sse_frame(r#"{"choices":[{"delta":{"content":"a\n"}}]}"#)
+            + &sse_frame(r#"{"choices":[{"delta":{"content":"\n\n\nb"}}]}"#)
+            + "data: [DONE]\n\n";
+        let (api_url, server) = raw_http_server(sse_response(&script)).await;
+        let adapter = collapsing_adapter(api_url, Some(1));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let response = adapter
+            .complete_streaming(stream_request(), tx)
+            .await
+            .expect("stream expected to succeed");
+        server.await.expect("server task");
+
+        assert_eq!(response.content, "a\nb");
     }
 
     /// llama.cpp reports its own complete time (the `timings` block: prompt

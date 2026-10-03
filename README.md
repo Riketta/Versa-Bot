@@ -235,9 +235,11 @@ history.
 [llm]
 # Optional defaults: default_system_prompt, default_compaction_prompt,
 # compaction_model, compaction_keep_tail, max_message_length,
-# stream_interval_ms. `log_raw_traffic = true` dumps every LLM request
-# and response body at DEBUG level (stdout only) while debugging a
-# provider - it carries conversation content, so it stays off by default.
+# stream_interval_ms, max_consecutive_newlines (collapse blank-line runs
+# in answers down to N; absent = untouched). `log_raw_traffic = true`
+# dumps every LLM request and response body at DEBUG level (stdout only)
+# while debugging a provider - it carries conversation content, so it
+# stays off by default.
 
 [llm.providers.zai]
 api_url = "https://api.z.ai/api/coding/paas/v4"
