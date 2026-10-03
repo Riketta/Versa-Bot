@@ -356,6 +356,7 @@ saved):
 | `compaction_prompt` | summarization instruction | plugin default |
 | `streaming` | stream the answer live from the provider (SSE, `stream: true`); the message is created with the first tokens and edited at `stream_interval_ms` - needs a streaming-capable endpoint | off |
 | `random_chance` | percent chance to chime in on a captured non-trigger message | 2 |
+| `random_cooldown` | minimum seconds between chime-ins (`0` = none) | 5 |
 | `max_length` | per-channel reply-splitting limit | 2000 (`max_message_length`) |
 | `turn_template` | user-turn rendering; must contain `{sender}` and `{message}` | `{sender}: {message}` |
 
@@ -371,9 +372,9 @@ first tokens and is edited in place (throttled by `stream_interval_ms`)
 while the model writes; the final edit carries the exact full text, and
 answers longer than one message still split. Providers without SSE
 degrade gracefully: the answer then arrives as one piece (and a
-non-streaming channel always does). Chime-ins are cooldown-guarded (5
-minutes per channel) and only
-fire on messages the bot actually captured; the chance draws from a
+non-streaming channel always does). Chime-ins are cooldown-guarded
+(default 5 seconds between them, per-channel `random_cooldown`) and
+only fire on messages the bot actually captured; the chance draws from a
 per-channel deck, so hits balance out over each 100-draw cycle instead
 of clumping.
 

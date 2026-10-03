@@ -42,11 +42,6 @@ type ChannelKey = (String, u64, u64);
 /// provider must not turn every triggering message into an admin ping.
 const NOTICE_COOLDOWN: Duration = Duration::from_secs(300);
 
-/// Minimum interval between random chime-ins for the same channel: the deck
-/// already prevents statistical clumping, this prevents two chime-ins on
-/// consecutive messages.
-const CHIME_COOLDOWN: Duration = Duration::from_secs(300);
-
 /// One answer attempt's inputs, grouped so [`ChatEngine::answer`] and the
 /// chime helper keep flat signatures.
 struct AnswerRequest<'a> {
@@ -214,7 +209,8 @@ pub struct ChatEngine {
     rng: Arc<dyn RandomPort>,
     /// Last error-notice time per channel (see [`NOTICE_COOLDOWN`]).
     notices: Mutex<HashMap<ChannelKey, Instant>>,
-    /// Last random chime-in time per channel (see [`CHIME_COOLDOWN`]).
+    /// Last random chime-in time per channel; the cooldown length is the
+    /// channel's `random_cooldown_secs` setting.
     chimes: Mutex<HashMap<ChannelKey, Instant>>,
 }
 
@@ -704,16 +700,17 @@ impl ChatEngine {
     }
 
     /// Random chime-in decision for one captured, non-triggering message:
-    /// cooldown gate, deck-based roll, then the same delivery path as a
-    /// triggered answer. Silent on every negative decision - only the roll
-    /// trace at debug explains why the bot stayed quiet.
+    /// cooldown gate (the channel's `random_cooldown_secs`), deck-based
+    /// roll, then the same delivery path as a triggered answer. Silent on
+    /// every negative decision - only the roll trace at debug explains why
+    /// the bot stayed quiet.
     async fn maybe_chime(
         &self,
         origin: &Origin,
         mut request: AnswerRequest<'_>,
         services: &KernelServices,
     ) {
-        if !self.chime_allowed(origin) {
+        if !self.chime_allowed(origin, request.config.random_cooldown_secs) {
             tracing::debug!(channel = origin.channel_id.get(), "chime skipped - cooldown active");
             return;
         }
@@ -1034,13 +1031,14 @@ impl ChatEngine {
         }
     }
 
-    fn chime_allowed(&self, origin: &Origin) -> bool {
+    fn chime_allowed(&self, origin: &Origin, cooldown_secs: u64) -> bool {
         let key: ChannelKey = (
             origin.platform.as_str().to_owned(),
             origin.guild_id.map_or(0, GuildId::get),
             origin.channel_id.get(),
         );
-        !matches!(self.chimes.lock().get(&key), Some(last) if last.elapsed() < CHIME_COOLDOWN)
+        let cooldown = Duration::from_secs(cooldown_secs);
+        !matches!(self.chimes.lock().get(&key), Some(last) if last.elapsed() < cooldown)
     }
 
     fn note_chime(&self, origin: &Origin) {
@@ -2211,6 +2209,9 @@ mod tests {
         let config = ChannelConfig {
             capture_mode: CaptureMode::AllMessages,
             random_chance_percent: 2.0,
+            // Explicit long cooldown: back-to-back messages can never both
+            // roll, independent of how fast the test machine runs.
+            random_cooldown_secs: 300,
             ..assigned_config()
         };
         seed_config(&ctx.storage, &config);
@@ -2225,6 +2226,35 @@ mod tests {
         assert_eq!(ctx.fake.requests().len(), 1);
         // Two captures + one assistant turn.
         assert_eq!(stored_records(&ctx).await.len(), 3);
+    }
+
+    /// `random_cooldown = 0` disables the gate entirely: consecutive
+    /// eligible messages may each roll (and with a always-true deck, each
+    /// chime).
+    #[tokio::test]
+    async fn zero_cooldown_lets_consecutive_messages_chime() {
+        let ctx = ctx_random(
+            LlmSettings::default(),
+            Arc::new(FixedRandom(true)),
+            // Popped back-to-front: the first answer handed out is "chime 1".
+            vec![Ok("chime 2".to_owned()), Ok("chime 1".to_owned())],
+        );
+        let config = ChannelConfig {
+            capture_mode: CaptureMode::AllMessages,
+            random_chance_percent: 2.0,
+            random_cooldown_secs: 0,
+            ..assigned_config()
+        };
+        seed_config(&ctx.storage, &config);
+
+        for _ in 0..2 {
+            ctx.engine
+                .handle_message(&origin(), &payload(false, None), &config, &ctx.services)
+                .await;
+        }
+
+        assert_eq!(ctx.fake.requests().len(), 2);
+        assert_eq!(begin_texts(&ctx.begins), vec!["chime 1".to_owned(), "chime 2".to_owned()]);
     }
 
     /// Streaming channels reveal real deltas: the message begins with the

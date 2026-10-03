@@ -20,7 +20,8 @@ use super::conversation::ConversationRecord;
 use super::llm_plugin::ChannelLocks;
 use super::model::{
     CaptureMode, ChannelConfig, ConversationState, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats,
-    channel_config_key, channel_state_key, channel_stats_key, records_namespace, unix_now,
+    channel_config_key, channel_state_key, channel_stats_key, default_random_cooldown,
+    records_namespace, unix_now,
 };
 use super::providers::{LlmSettings, ModelSettings};
 
@@ -40,6 +41,7 @@ pub(super) const SET_KEYS: &[&str] = &[
     "context_budget",
     "streaming",
     "random_chance",
+    "random_cooldown",
     "capture_mode",
     "compaction",
     "compaction_model",
@@ -264,6 +266,22 @@ fn apply_numeric(
                 _ => Some(Err(format!(
                     "`random_chance` expects a finite number (percent), got `{value}`."
                 ))),
+            }
+        }
+        "random_cooldown" => {
+            if cleared {
+                let default = default_random_cooldown();
+                config.random_cooldown_secs = default;
+                return Some(Ok(format!("`{key}` cleared (default {default} seconds).")));
+            }
+            match value.parse::<u64>() {
+                Ok(parsed) => {
+                    config.random_cooldown_secs = parsed;
+                    Some(Ok(format!("`{key}` set to {parsed} seconds.")))
+                }
+                Err(_) => {
+                    Some(Err(format!("`{key}` expects a whole number of seconds, got `{value}`.")))
+                }
             }
         }
         _ => None,
@@ -651,10 +669,14 @@ fn capture_label(mode: CaptureMode) -> &'static str {
     }
 }
 
-/// `/llm_status` label of the chime-in roll chance: the percent, or `off`
-/// when set to zero.
-fn chime_label(chance: f64) -> String {
-    if chance > 0.0 { format!("{chance:.1}%") } else { "off".to_owned() }
+/// `/llm_status` label of the chime-in roll chance and cooldown: the
+/// percent plus the per-channel minimum interval, or `off` at zero chance.
+fn chime_label(chance: f64, cooldown_secs: u64) -> String {
+    if chance > 0.0 {
+        format!("{chance:.1}% · {cooldown_secs}s cooldown")
+    } else {
+        "off".to_owned()
+    }
 }
 
 #[async_trait]
@@ -747,7 +769,7 @@ Context start: {context_start}",
             config.history_depth,
             if config.compaction_enabled { "on" } else { "off" },
             capture_label(config.capture_mode),
-            chime_label(config.random_chance_percent),
+            chime_label(config.random_chance_percent, config.random_cooldown_secs),
         );
         if let Some(line) = usage.estimate {
             description.push('\n');
@@ -1205,6 +1227,12 @@ mod tests {
         assert!((config.random_chance_percent - 100.0).abs() < f64::EPSILON);
         apply_set(&mut config, "random_chance", "clear").expect("clear expected");
         assert!((config.random_chance_percent).abs() < f64::EPSILON);
+
+        apply_set(&mut config, "random_cooldown", "30").expect("cooldown expected");
+        assert_eq!(config.random_cooldown_secs, 30);
+        apply_set(&mut config, "random_cooldown", "clear").expect("cooldown clear expected");
+        assert_eq!(config.random_cooldown_secs, 5);
+        apply_set(&mut config, "random_cooldown", "not-a-number").unwrap_err();
 
         apply_set(&mut config, "max_tokens", "not-a-number").unwrap_err();
     }

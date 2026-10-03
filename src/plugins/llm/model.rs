@@ -115,9 +115,15 @@ pub struct ChannelConfig {
     #[serde(default)]
     pub streaming: bool,
     /// Chance the bot chimes in on an unrelated user message, percent
-    /// (`0` = off). Cooldown-guarded by the plugin.
+    /// (`0` = off).
     #[serde(default = "default_random_chance")]
     pub random_chance_percent: f64,
+    /// Minimum seconds between random chime-ins in this channel; `0` =
+    /// every eligible message may roll. The deck already balances hits
+    /// out per cycle - this prevents two chime-ins on consecutive
+    /// messages.
+    #[serde(default = "default_random_cooldown")]
+    pub random_cooldown_secs: u64,
     /// Reply splitting limit override; `None` = plugin-wide default.
     #[serde(default)]
     pub max_length: Option<usize>,
@@ -150,6 +156,7 @@ impl ChannelConfig {
             capture_mode: CaptureMode::default(),
             streaming: false,
             random_chance_percent: default_random_chance(),
+            random_cooldown_secs: default_random_cooldown(),
             max_length: None,
             turn_template: None,
             context_budget_tokens: None,
@@ -215,6 +222,12 @@ fn default_random_chance() -> f64 {
     2.0
 }
 
+/// Plugin default of the per-channel chime cooldown (`/llm_set
+/// random_cooldown clear` resets to this).
+pub(crate) fn default_random_cooldown() -> u64 {
+    5
+}
+
 /// Live conversation state of one channel. One document per channel, so the
 /// compaction commit (new summary + advanced cutoff) is a single atomic
 /// write: a crash mid-compaction leaves the old state intact.
@@ -253,6 +266,7 @@ mod tests {
         assert_eq!(config.history_depth, 100);
         assert!(config.compaction_enabled);
         assert!((config.random_chance_percent - 2.0).abs() < f64::EPSILON);
+        assert_eq!(config.random_cooldown_secs, 5);
         assert_eq!(config.capture_mode, CaptureMode::BotRelated);
         assert_eq!(config.context_budget_tokens, None);
     }
@@ -269,6 +283,7 @@ mod tests {
         assert!(config.compaction_enabled);
         assert!(!config.streaming);
         assert!((config.random_chance_percent - 2.0).abs() < f64::EPSILON);
+        assert_eq!(config.random_cooldown_secs, 5);
         assert_eq!(config.max_length, None);
     }
 
