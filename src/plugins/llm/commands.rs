@@ -1238,6 +1238,74 @@ mod tests {
         assert!(validate_prompt_file_url("https://example.com/prompt.txt").is_err());
     }
 
+    /// Minimal one-shot TCP server (the same pattern as the provider
+    /// tests): swallows the request head, writes the scripted bytes, closes
+    /// the connection. Deliberately no HTTP framework.
+    async fn raw_http_server(script: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            socket.write_all(&script).await.expect("write");
+        });
+        (format!("http://{addr}/attachment.md"), handle)
+    }
+
+    fn prompt_file_handler(cap: u64) -> PromptFileLlmHandler {
+        PromptFileLlmHandler::new(ChannelLocks::new(), reqwest::Client::new(), cap)
+    }
+
+    /// The download happy path and the HTTP-status branch: 200 decodes the
+    /// body (trimmed), a non-2xx surfaces the status in the reply.
+    #[tokio::test]
+    async fn prompt_file_download_success_and_status_error() {
+        let handler = prompt_file_handler(10_000);
+
+        let (url, server) =
+            raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n  prompt".to_vec()).await;
+        let prompt = handler.download(&url).await.expect("download expected to succeed");
+        let _ = server.await;
+        assert_eq!(prompt, "prompt");
+
+        let (url, server) =
+            raw_http_server(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec()).await;
+        let err = handler.download(&url).await.expect_err("404 expected to fail");
+        let _ = server.await;
+        assert!(err.contains("404"), "{err}");
+    }
+
+    /// The size cap aborts a close-delimited body mid-transfer - a missing
+    /// or lying Content-Length cannot make the handler buffer the whole
+    /// body (the streaming cap is the point of this test).
+    #[tokio::test]
+    async fn prompt_file_download_cap_aborts_oversized_body() {
+        let handler = prompt_file_handler(64);
+        let script = format!("HTTP/1.0 200 OK\r\nConnection: close\r\n\r\n{}", "x".repeat(500));
+        let (url, server) = raw_http_server(script.into_bytes()).await;
+
+        let err = handler.download(&url).await.expect_err("oversized body expected to fail");
+        let _ = server.await;
+
+        assert!(err.contains("exceeds the limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn prompt_file_download_rejects_non_utf8() {
+        let handler = prompt_file_handler(10_000);
+        let mut script = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n".to_vec();
+        script.extend_from_slice(&[0xFF, 0xFE]);
+        let (url, server) = raw_http_server(script).await;
+
+        let err = handler.download(&url).await.expect_err("invalid UTF-8 expected to fail");
+        let _ = server.await;
+
+        assert!(err.contains("UTF-8"), "{err}");
+    }
+
     #[test]
     fn float_params_set_and_clear() {
         let mut config = ChannelConfig::assigned("m".to_owned());

@@ -1772,6 +1772,26 @@ mod tests {
         )
     }
 
+    /// A non-2xx status is a Request error carrying the status AND the body
+    /// (truncated) - the body is usually the only explanation an endpoint
+    /// gives for a rejection.
+    #[tokio::test]
+    async fn single_shot_non_2xx_is_an_error_with_status_and_body() {
+        let script = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\n\
+                      Content-Length: 5\r\n\r\noops!"
+            .to_owned();
+        let (api_url, server) = raw_http_server(script).await;
+        let adapter = streaming_adapter(api_url);
+
+        let err = adapter.complete(stream_request()).await.expect_err("non-2xx expected to fail");
+        server.await.expect("server task");
+
+        assert!(matches!(err, LlmError::Request(_)));
+        let rendered = err.to_string();
+        assert!(rendered.contains("500"), "status expected in the error: {rendered}");
+        assert!(rendered.contains("oops"), "body expected in the error: {rendered}");
+    }
+
     fn streaming_adapter(api_url: String) -> OpenAiCompatibleAdapter {
         let settings = LlmSettings {
             providers: BTreeMap::from([(

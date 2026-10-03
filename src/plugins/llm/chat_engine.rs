@@ -2780,6 +2780,40 @@ mod tests {
         assert_eq!(begin_texts(&ctx.begins), vec!["chime 1".to_owned(), "chime 2".to_owned()]);
     }
 
+    /// Cooldown expiry: a chime recorded longer ago than the cooldown no
+    /// longer blocks - the "still cooling" side is covered by the cooldown
+    /// tests. Seeded directly (no sleeps, no virtual clock).
+    #[tokio::test]
+    async fn chime_cooldown_expires() {
+        let ctx = ctx(vec![]);
+        let key: ChannelKey = ("discord".to_owned(), 1, 2);
+        ctx.engine.chimes.lock().insert(
+            key,
+            Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .expect("cooldown offset expected to fit"),
+        );
+
+        assert!(ctx.engine.chime_allowed(&origin(), 1));
+    }
+
+    /// The notice rate limit RESETS after the window: a notice older than
+    /// the cooldown un-blocks the next one and re-arms the timer.
+    #[tokio::test]
+    async fn error_notice_rate_limit_resets_after_the_window() {
+        let ctx = ctx(vec![]);
+        let key: ChannelKey = ("discord".to_owned(), 1, 9);
+        let expired = Instant::now()
+            .checked_sub(NOTICE_COOLDOWN)
+            .and_then(|instant| instant.checked_sub(Duration::from_secs(5)))
+            .expect("cooldown offset expected to fit");
+        ctx.engine.notices.lock().insert(key, expired);
+
+        assert!(ctx.engine.error_notice_allowed(&origin(), 9));
+        // Re-armed: an immediate second notice is blocked again.
+        assert!(!ctx.engine.error_notice_allowed(&origin(), 9));
+    }
+
     /// Streaming channels reveal real deltas: the message begins with the
     /// first delta, live edits land between deltas (the fake pauses past
     /// the throttle cadence), and the final edit pins the authoritative

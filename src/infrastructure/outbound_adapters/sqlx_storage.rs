@@ -638,6 +638,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrations_reopen_keeps_data_and_reapply_is_idempotent() {
+        // A FILE-backed database (in-memory cannot re-open): connect and
+        // migrate, write, drop the pool, connect again - the migration set
+        // re-applies as no-ops (checksummed) and the data survives. This is
+        // the realistic upgrade-path regression: an existing database must
+        // never be clobbered by a re-open.
+        let path = std::env::temp_dir().join(format!(
+            "versabot-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let url = format!("sqlite://{}", path.display());
+        {
+            let storage = SqlxStorage::connect(&url).await.expect("connect expected");
+            let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+            guild.set("llm", "k", Value::String("v".to_owned())).await.unwrap();
+            guild.append("llm", Value::from(7)).await.unwrap();
+        }
+
+        let reopened = SqlxStorage::connect(&url).await.expect("reopen expected");
+        let guild = reopened.guild_scoped(Platform::Discord, GuildId(1));
+        assert_eq!(guild.get("llm", "k").await.unwrap(), Some(Value::String("v".to_owned())));
+        assert_eq!(guild.list_last("llm", 10).await.unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
     async fn records_do_not_mix_across_namespaces_and_guilds() {
         let storage = sqlite_storage().await;
         let guild = storage.guild_scoped(Platform::Discord, GuildId(1));

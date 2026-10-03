@@ -141,19 +141,27 @@ impl VisionService {
         if !image.url.starts_with(DISCORD_CDN_PREFIX) {
             return Err(VisionError::UntrustedHost);
         }
-        let mut response = self
+        let response = self
             .fetch
             .get(&image.url)
             .send()
             .await
             .map_err(|err| VisionError::Download(err.to_string()))?;
+        Self::read_capped(response, max_source_bytes).await
+    }
+
+    /// Stream-reads at most `max_source_bytes` bytes: the cap aborts the
+    /// transfer mid-flight, so a missing or lying Content-Length cannot
+    /// make the handler buffer a whole oversized body.
+    async fn read_capped(
+        mut response: reqwest::Response,
+        max_source_bytes: u64,
+    ) -> Result<Vec<u8>, VisionError> {
         if let Some(length) = response.content_length()
             && length > max_source_bytes
         {
             return Err(VisionError::TooLarge);
         }
-        // Stream-read so the cap bounds memory even when the header lies or
-        // is absent (chunked responses buffer the whole body otherwise).
         let mut body = Vec::new();
         while let Some(chunk) =
             response.chunk().await.map_err(|err| VisionError::Download(err.to_string()))?
@@ -318,6 +326,49 @@ mod tests {
         assert!("https://cdn.discordapp.com/attachments/1/2/a.png".starts_with(DISCORD_CDN_PREFIX));
         assert!(!"https://cdn.discordapp.com.evil.test/a.png".starts_with(DISCORD_CDN_PREFIX));
         assert!(!"http://cdn.discordapp.com/a.png".starts_with(DISCORD_CDN_PREFIX));
+    }
+
+    /// Minimal one-shot TCP server (the provider-test pattern): swallows
+    /// the request head, writes the scripted bytes, closes the connection.
+    async fn raw_http_server(script: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            socket.write_all(&script).await.expect("write");
+        });
+        (format!("http://{addr}/a.png"), handle)
+    }
+
+    /// The streaming cap bounds memory on a close-delimited body (no
+    /// Content-Length to pre-check): the transfer aborts once the cap is
+    /// exceeded instead of buffering the whole body.
+    #[tokio::test]
+    async fn read_capped_aborts_oversized_close_delimited_body() {
+        let script = format!("HTTP/1.0 200 OK\r\nConnection: close\r\n\r\n{}", "x".repeat(500));
+        let (url, server) = raw_http_server(script.into_bytes()).await;
+        let response = reqwest::get(&url).await.expect("fetch expected to succeed");
+
+        let err = VisionService::read_capped(response, 64).await.expect_err("cap expected");
+        let _ = server.await;
+
+        assert!(matches!(err, VisionError::TooLarge));
+    }
+
+    #[tokio::test]
+    async fn read_capped_passes_a_fitting_body_through() {
+        let script = b"HTTP/1.0 200 OK\r\nConnection: close\r\n\r\npng-bytes".to_vec();
+        let (url, server) = raw_http_server(script).await;
+        let response = reqwest::get(&url).await.expect("fetch expected to succeed");
+
+        let body = VisionService::read_capped(response, 64).await.expect("body expected");
+        let _ = server.await;
+
+        assert_eq!(body, b"png-bytes");
     }
 
     fn encode_png(image: &image::RgbImage) -> Vec<u8> {

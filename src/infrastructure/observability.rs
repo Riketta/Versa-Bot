@@ -1,3 +1,4 @@
+use sentry_tracing::EventFilter;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Fallback directives when `RUST_LOG` is unset. Target directives are
@@ -69,7 +70,17 @@ pub fn init(
         });
 
     match &guard {
-        Some(_) => registry.with(sentry_tracing::layer()).init(),
+        Some(_) => registry
+            .with(sentry_tracing::layer().event_filter(|metadata| match *metadata.level() {
+                // Pinned contract: error-grade events surface as Issues (the
+                // always-delivered path), warn/info ride along as log items,
+                // debug/trace never ship - stdout only. Explicit so a default
+                // change upstream cannot silently leak breadcrumbs.
+                tracing::Level::ERROR => EventFilter::Event | EventFilter::Log,
+                tracing::Level::WARN | tracing::Level::INFO => EventFilter::Log,
+                tracing::Level::DEBUG | tracing::Level::TRACE => EventFilter::Ignore,
+            }))
+            .init(),
         None => registry.init(),
     }
 

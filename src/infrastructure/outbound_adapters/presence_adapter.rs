@@ -119,6 +119,35 @@ mod tests {
         );
     }
 
+    /// The taxonomy maps onto Discord's wire shapes: each activity kind
+    /// keeps its name and maps to the matching Discord activity type, the
+    /// status is always Online, and an activity-less presence clears the
+    /// activity. (The `attach`/`apply` half needs a live gateway `Context`
+    /// and is exercised in production only - the serenity boundary.)
+    #[test]
+    fn presence_parts_map_the_taxonomy_onto_discord_shapes() {
+        let cases = [
+            (ActivityKind::Playing, serenity::all::ActivityType::Playing),
+            (ActivityKind::Listening, serenity::all::ActivityType::Listening),
+            (ActivityKind::Watching, serenity::all::ActivityType::Watching),
+            (ActivityKind::Competing, serenity::all::ActivityType::Competing),
+        ];
+        for (kind, expected) in cases {
+            let presence = Presence {
+                activity: Some(crate::kernel::models::Activity { kind, name: "versa".to_owned() }),
+            };
+            let (activity, status) = presence_parts(&presence);
+            let activity = activity.expect("activity expected");
+            assert_eq!(activity.kind, expected, "kind {kind:?}");
+            assert_eq!(activity.name, "versa");
+            assert_eq!(status, OnlineStatus::Online);
+        }
+
+        let (activity, status) = presence_parts(&Presence::default());
+        assert!(activity.is_none(), "no activity expected");
+        assert_eq!(status, OnlineStatus::Online);
+    }
+
     /// A direct set (no gateway race) applies immediately - nothing queued.
     /// The context is absent here, so both checks miss and the queue holds
     /// the latest request: queueing keeps only the newest presence.

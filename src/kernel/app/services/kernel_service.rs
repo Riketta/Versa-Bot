@@ -34,6 +34,10 @@ pub struct KernelService<E: EventBusPort> {
     /// One-shot guard: the explicit `shutdown()` and the `Drop` fallback
     /// together must stop plugins exactly once.
     shutdown_started: AtomicBool,
+    /// One-shot guard for [`Self::boot`]: init/start must never re-run on
+    /// already-live plugins (a second call is a warned no-op, mirroring
+    /// shutdown's idempotence).
+    boot_started: AtomicBool,
     /// Plugins that reached a successful `start()` under a successful boot -
     /// the only ones `shutdown` may ever stop. Drained by `shutdown`; a
     /// failed boot leaves it empty (rolled-back plugins were already stopped
@@ -58,6 +62,7 @@ impl<E: EventBusPort> KernelService<E> {
             chat_output_factory,
             storage,
             shutdown_started: AtomicBool::new(false),
+            boot_started: AtomicBool::new(false),
             started: Mutex::new(Vec::new()),
         }
     }
@@ -80,6 +85,12 @@ impl<E: EventBusPort> KernelService<E> {
     /// Propagates the first plugin `init`/`start` failure, or
     /// `PluginError::Invalid` on registration conflicts.
     pub fn boot(&self) -> Result<(), PluginError> {
+        // One-shot like `shutdown`: re-running init/start on live plugins is
+        // always a bug, and plugins that guard themselves must not have to.
+        if self.boot_started.swap(true, Ordering::SeqCst) {
+            tracing::warn!("kernel boot called twice - ignoring, plugins are already booted");
+            return Ok(());
+        }
         let plugins = self.validated_plugins()?;
 
         for plugin in &plugins {
@@ -584,6 +595,27 @@ mod tests {
             1,
             "dual-registered plugin must start exactly once"
         );
+    }
+
+    /// The boot one-shot guard: a second `boot` is a warned no-op - init and
+    /// start never re-run on live plugins, and the started set is left
+    /// untouched so shutdown still stops everything exactly once.
+    #[tokio::test]
+    async fn boot_twice_starts_plugins_once() {
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pong = Arc::new(PongPlugin { started: Arc::clone(&started) });
+
+        let (kernel, _output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![Arc::clone(&pong) as Arc<dyn PluginPort>],
+            vec![Arc::clone(&pong) as Arc<dyn MiddlewarePluginPort>],
+        );
+
+        kernel.boot().expect("first boot should succeed");
+        kernel.boot().expect("second boot is a warned no-op");
+
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(kernel.started.lock().len(), 1, "started set must survive the second boot");
     }
 
     /// Registration validation: a middleware step that is not registered as
