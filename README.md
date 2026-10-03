@@ -288,6 +288,24 @@ extra_body = { chat_template_kwargs = { enable_thinking = false } }
 # or, on servers supporting the budget field: extra_body = { reasoning_budget = 0 }
 ```
 
+**Template variables** make the passthrough per-channel reactive. A
+string that is exactly `${enable_reasoning}` or `${reasoning_effort}` is
+substituted at request time from the channel's reasoning setting:
+`enable_reasoning` renders a JSON boolean (`false` only when
+`reasoning_effort` is `off`, `true` otherwise - unset means the provider
+default applies, which for thinking templates is on);
+`reasoning_effort` renders the effort string (`"high"`, ...) or `null`
+when unset or `off`. Placeholders embedded in longer strings substitute
+textually; unknown variables stay literally in place and warn in the
+logs. The variables ignore the model's declared reasoning capability -
+the operator decides per provider where the knob applies:
+
+```toml
+# `/llm_set reasoning_effort=off` in a channel now reaches llama.cpp
+# templates too:
+extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" } }
+```
+
 **How conversations work.**
 
 - **Capture** decides what enters the channel's history. `bot_related`

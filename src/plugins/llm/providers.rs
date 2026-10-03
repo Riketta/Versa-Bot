@@ -454,10 +454,11 @@ fn split_model_ref(model_ref: &str) -> Result<(&str, &str), LlmError> {
 ///   `enabled`; `off` renders an explicit `disabled` (honored by GLM-4.5
 ///   through 5.2; GLM-5.3 series thinks forcibly regardless).
 ///
-/// Finally, the provider's static `extra_body` is merged in: operator-owned
+/// Finally, the provider's `extra_body` is merged in: operator-owned
 /// passthrough for endpoint-specific knobs (llama.cpp template switches,
-/// vendor sampling fields). `model`/`messages` cannot be overridden; other
-/// keys win over the standard rendering.
+/// vendor sampling fields), with `${name}` template variables resolved per
+/// request (see [`render_extra_body`]). `model`/`messages` cannot be
+/// overridden; other keys win over the standard rendering.
 fn completion_body(
     style: ReasoningStyle,
     model: &str,
@@ -527,10 +528,96 @@ fn completion_body(
     // able to swap the model or inject a foreign conversation.
     for (key, value) in extra_body {
         if key != "model" && key != "messages" {
-            body.insert(key.clone(), value.clone());
+            body.insert(key.clone(), render_extra_body(value, reasoning_effort.as_deref()));
         }
     }
     Value::Object(body)
+}
+
+/// Runtime values usable as `${name}` placeholders inside `extra_body`
+/// template strings. They mirror the channel's reasoning setting so an
+/// operator can route it into endpoint-specific knobs the adapter does not
+/// model (llama.cpp `chat_template_kwargs`, vendor fields):
+/// - `enable_reasoning`: boolean, `false` only when the channel's
+///   `reasoning_effort` is `off`; `true` otherwise (an effort value, or
+///   unset - "unset" means the provider default applies, which for thinking
+///   templates is on).
+/// - `reasoning_effort`: the channel's effort string (`"low"`, ...), or
+///   `null` when unset or `off`.
+///
+/// Deliberately independent of the model's declared reasoning capability:
+/// the operator decides per provider whether the knob applies at all.
+fn template_value(name: &str, effort: Option<&str>) -> Option<Value> {
+    match name {
+        "enable_reasoning" => Some(json!(effort != Some("off"))),
+        "reasoning_effort" => Some(match effort {
+            Some(value) if value != "off" => json!(value),
+            _ => Value::Null,
+        }),
+        _ => None,
+    }
+}
+
+/// Renders `extra_body` for one request: `${name}` placeholders resolve at
+/// runtime (see [`template_value`]). A string that is exactly one
+/// placeholder takes the variable's typed JSON value - a boolean stays a
+/// boolean, which is what llama.cpp template kwargs expect. Placeholders
+/// embedded in longer strings substitute textually (string form; `null`
+/// becomes empty). Unknown variables are left as-is with a warning: an
+/// operator typo must show up in the logs, not vanish silently.
+fn render_extra_body(value: &Value, effort: Option<&str>) -> Value {
+    match value {
+        Value::String(text) => render_template_string(text, effort),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|item| render_extra_body(item, effort)).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.iter().map(|(key, item)| (key.clone(), render_extra_body(item, effort))).collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn render_template_string(text: &str, effort: Option<&str>) -> Value {
+    if let Some(name) = text.strip_prefix("${").and_then(|rest| rest.strip_suffix('}')) {
+        if let Some(value) = template_value(name, effort) {
+            return value;
+        }
+        tracing::warn!(variable = name, "extra_body template variable unknown - left as-is");
+        return json!(text);
+    }
+    json!(substitute_embedded(text, effort))
+}
+
+fn substitute_embedded(text: &str, effort: Option<&str>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((before, tail)) = rest.split_once("${") {
+        out.push_str(before);
+        if let Some((name, remainder)) = tail.split_once('}') {
+            out.push_str(&template_string_form(name, effort));
+            rest = remainder;
+        } else {
+            // Unterminated placeholder: keep the literal text.
+            out.push_str("${");
+            rest = tail;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn template_string_form(name: &str, effort: Option<&str>) -> String {
+    match template_value(name, effort) {
+        Some(Value::Bool(value)) => value.to_string(),
+        Some(Value::String(value)) => value,
+        Some(Value::Null) => String::new(),
+        Some(other) => other.to_string(),
+        None => {
+            tracing::warn!(variable = name, "extra_body template variable unknown - left as-is");
+            format!("${{{name}}}")
+        }
+    }
 }
 
 /// Extracts `choices[0].message.content` plus the optional `usage` and
@@ -912,6 +999,90 @@ mod tests {
         let kwargs = body.get("chat_template_kwargs").expect("passthrough expected");
         assert_eq!(kwargs.get("enable_thinking").and_then(Value::as_bool), Some(false));
         assert_eq!(body.get("model").and_then(Value::as_str), Some("m"));
+    }
+
+    /// `${enable_reasoning}` routes the channel's off-switch into template
+    /// kwargs as a real JSON boolean - the wire value llama.cpp expects.
+    /// `off` is the only false; unset stays true (provider default = on).
+    #[test]
+    fn extra_body_template_renders_enable_reasoning() {
+        let extra = BTreeMap::from([(
+            "chat_template_kwargs".to_owned(),
+            json!({"enable_thinking": "${enable_reasoning}"}),
+        )]);
+        let body_for = |effort: Option<&str>| {
+            completion_body(
+                ReasoningStyle::OpenaiEffort,
+                "m",
+                &sample_messages(),
+                &GenParams { reasoning_effort: effort.map(str::to_owned), ..GenParams::default() },
+                false,
+                &extra,
+            )
+        };
+        let flag = |body: &Value| {
+            body.pointer("/chat_template_kwargs/enable_thinking").and_then(Value::as_bool)
+        };
+
+        assert_eq!(flag(&body_for(Some("off"))), Some(false));
+        assert_eq!(flag(&body_for(Some("low"))), Some(true));
+        assert_eq!(flag(&body_for(None)), Some(true));
+    }
+
+    /// `${reasoning_effort}` passes the effort through verbatim; unset and
+    /// `off` render `null` (no meaningful effort exists for either).
+    #[test]
+    fn extra_body_template_renders_effort_variable() {
+        let extra = BTreeMap::from([("vendor_effort".to_owned(), json!("${reasoning_effort}"))]);
+        let body_for = |effort: Option<&str>| {
+            completion_body(
+                ReasoningStyle::OpenaiEffort,
+                "m",
+                &sample_messages(),
+                &GenParams { reasoning_effort: effort.map(str::to_owned), ..GenParams::default() },
+                false,
+                &extra,
+            )
+        };
+
+        assert_eq!(
+            body_for(Some("high")).get("vendor_effort").and_then(Value::as_str),
+            Some("high")
+        );
+        assert_eq!(body_for(None).get("vendor_effort"), Some(&Value::Null));
+        assert_eq!(body_for(Some("off")).get("vendor_effort"), Some(&Value::Null));
+    }
+
+    /// Placeholders resolve inside nested arrays/objects, substitute
+    /// textually when embedded in longer strings, and unknown variables are
+    /// left as-is (with a log warning) instead of silently vanishing.
+    #[test]
+    fn extra_body_template_handles_nesting_and_unknown_variables() {
+        let extra = BTreeMap::from([(
+            "nested".to_owned(),
+            json!([
+                {"mixed": "thinking=${enable_reasoning}?"},
+                "${enable_reasoning}",
+                "${wizard}",
+                42,
+            ]),
+        )]);
+        let body = completion_body(
+            ReasoningStyle::OpenaiEffort,
+            "m",
+            &sample_messages(),
+            &GenParams { reasoning_effort: Some("off".to_owned()), ..GenParams::default() },
+            false,
+            &extra,
+        );
+        let nested = body.get("nested").and_then(Value::as_array).expect("nested expected");
+        assert_eq!(
+            nested.first().and_then(|item| item.get("mixed")).and_then(Value::as_str),
+            Some("thinking=false?")
+        );
+        assert_eq!(nested.get(1), Some(&json!(false)));
+        assert_eq!(nested.get(2).and_then(Value::as_str), Some("${wizard}"));
+        assert_eq!(nested.get(3), Some(&json!(42)));
     }
 
     /// `off` on the boolean-switch style is a real wire value: an explicit
