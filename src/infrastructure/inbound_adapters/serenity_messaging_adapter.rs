@@ -113,6 +113,13 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
         // carries EPHEMERAL (64) and the loading state already shows to the
         // invoker alone. (A future public-reply command would follow up a
         // second time with its own flags.)
+        //
+        // The age/duration pair in the logs below separates the two ways
+        // this deadline can blow: a large `interaction_age_ms` means the
+        // gateway event arrived late (network path), a large `defer_ms`
+        // means the callback POST itself crawled.
+        let age_ms = interaction_age_ms(command.id.get());
+        let defer_started = std::time::Instant::now();
         if let Err(err) = ctx
             .http
             .create_interaction_response(
@@ -123,9 +130,17 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
             )
             .await
         {
-            tracing::error!(%err, "failed to defer interaction");
+            let defer_ms = u64::try_from(defer_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            tracing::error!(
+                %err,
+                interaction_age_ms = age_ms,
+                defer_ms,
+                "failed to defer interaction"
+            );
             return;
         }
+        let defer_ms = u64::try_from(defer_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        tracing::debug!(interaction_age_ms = age_ms, defer_ms, "interaction deferred");
 
         let author_roles: Vec<String> = command
             .member
@@ -218,6 +233,22 @@ fn member_origin(guild_id: SerenityGuildId, user: &User) -> Origin {
 /// (and with it every command reply) public.
 fn deferred_ephemeral_response() -> serde_json::Value {
     serde_json::json!({ "type": 5, "data": { "flags": 64 } })
+}
+
+/// The Discord epoch: snowflakes count milliseconds from 2015-01-01.
+const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
+
+/// An interaction's age at handling time, decoded from its snowflake id
+/// (top 42 bits are the creation timestamp). The ~3s acknowledge deadline
+/// runs from the CREATION moment, not from when we see the event - so this
+/// number, logged next to the defer duration, tells late gateway delivery
+/// apart from a slow callback.
+fn interaction_age_ms(id: u64) -> u64 {
+    let created_ms = (id >> 22).saturating_add(DISCORD_EPOCH_MS);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(u64::MAX, |duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+    now_ms.saturating_sub(created_ms)
 }
 
 /// Flattens Discord's option tree into `name -> value` string pairs.
@@ -561,6 +592,27 @@ fn reply_reference(channel_id: SerenityChannelId, reply_to: MessageId) -> Messag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The snowflake's embedded birth time drives the age: a snowflake born
+    /// now is moments old; the zero id (born 2015) is over a decade old.
+    #[test]
+    fn interaction_age_reflects_the_snowflake_birth_time() {
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after 1970")
+                .as_millis(),
+        )
+        .expect("millis fit u64");
+        let born_now = (now_ms.saturating_sub(DISCORD_EPOCH_MS)) << 22;
+
+        let age = interaction_age_ms(born_now);
+        assert!(age < 1_000, "an interaction born now is moments old, got {age}ms");
+        assert!(
+            interaction_age_ms(0) > age,
+            "the zero snowflake (born 2015) must be older than one born now"
+        );
+    }
 
     /// The defer carries EPHEMERAL inside `data` - Discord ignores a
     /// top-level `flags` field, and a public defer makes every command
