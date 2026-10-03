@@ -529,6 +529,21 @@ impl ChatEngine {
                 // would contradict visible text. Finalize the partial,
                 // log, and report through the service channel.
                 self.report_stream_interrupted(origin, config, services).await;
+                // Reduced audit row: a partial answer WAS delivered (and
+                // deliver_reply records it as a bot turn), so the
+                // per-completion trail must not skip it. Usage and provider
+                // timings died with the stream - chars and wall clock only.
+                tracing::info!(
+                    channel = channel_id,
+                    trigger,
+                    model = %config.model,
+                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    content_chars = partial.chars().count(),
+                    window = live.len(),
+                    window_used = window.len(),
+                    partial = true,
+                    "LLM answer generated (partial - stream interrupted)"
+                );
                 return self
                     .deliver_reply(origin, config, channel_id, &partial, live_id, services)
                     .await;
@@ -850,7 +865,7 @@ impl ChatEngine {
     /// this generic notice instead, natively replying to the triggering
     /// message so it is unambiguous what failed. It is never recorded as a
     /// bot turn and never carries error detail.
-    async fn send_fallback(&self, origin: &Origin, services: &KernelServices) {
+    pub(crate) async fn send_fallback(&self, origin: &Origin, services: &KernelServices) {
         let mut notice = OutboundMessage::text(FALLBACK_MESSAGE.to_owned());
         if let Some(reply_to) = origin.message_id {
             notice = notice.replying_to(reply_to);

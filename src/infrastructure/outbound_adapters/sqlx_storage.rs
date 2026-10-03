@@ -153,7 +153,10 @@ impl GuildStorage for ScopedGuildStorage {
         // them, so writes from any scoped handle are rejected. Reads stay
         // permitted.
         if namespace == GUILD_SETTINGS {
-            tracing::error!(
+            // Warn, not error: this is policy enforcement, not a storage
+            // failure - a plugin bug must not raise a Sentry Issue per
+            // rejected write. The warn still ships as a log item.
+            tracing::warn!(
                 namespace = GUILD_SETTINGS,
                 key,
                 "rejected write to the reserved guild namespace"
@@ -202,7 +205,8 @@ impl GuildStorage for ScopedGuildStorage {
 
     async fn delete(&self, namespace: &str, key: &str) -> Result<(), StorageError> {
         if namespace == GUILD_SETTINGS {
-            tracing::error!(
+            // Same level as `set`: policy enforcement, not a failure.
+            tracing::warn!(
                 namespace = GUILD_SETTINGS,
                 key,
                 "rejected delete in the reserved guild namespace"
@@ -272,7 +276,8 @@ impl GuildStorage for ScopedGuildStorage {
         // Same reserved-namespace policy as document writes: plugins record
         // into their own namespaces, never into guild settings.
         if namespace == GUILD_SETTINGS {
-            tracing::error!(
+            // Same level as `set`/`delete`: policy enforcement, not a failure.
+            tracing::warn!(
                 namespace = GUILD_SETTINGS,
                 "rejected append to the reserved guild namespace"
             );

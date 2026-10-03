@@ -3,10 +3,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use crate::common::panic_message;
 use crate::kernel::{
     models::{EventKind, EventPayload, GuildId, Origin, PluginError, RequestContext},
     plugin_ports::{
@@ -379,6 +381,12 @@ impl MiddlewarePluginPort for LlmPlugin {
             return Next::Continue;
         };
 
+        // Read OUTSIDE the channel lock by design: intake must not queue
+        // behind an in-flight run just to read config (the admin commands
+        // hold that lock). A `/llm_set` or `/llm_cutoff` landing between
+        // this read and the lock below therefore applies one message late -
+        // the in-flight run executes on the stale snapshot. Self-limited to
+        // that one message; accepted.
         let raw = match storage.get(NAMESPACE, &channel_config_key(origin.channel_id.get())).await {
             Ok(Some(raw)) => raw,
             Ok(None) => return Next::Continue, // channel not assigned
@@ -405,7 +413,32 @@ impl MiddlewarePluginPort for LlmPlugin {
                 return;
             }
             let _guard = lock.lock().await;
-            engine.handle_message(&origin, &payload, &config, &services).await;
+            // Last-resort panic isolation: the pipeline catches panics in
+            // every hook, but the engine runs here, off-pipeline - an
+            // uncaught panic would silently drop a guaranteed answer. The
+            // channel lock and the admission permit drop with the unwound
+            // task, so the channel stays usable.
+            let run = std::panic::AssertUnwindSafe(
+                engine.handle_message(&origin, &payload, &config, &services),
+            )
+            .catch_unwind()
+            .await;
+            if let Err(panic) = run {
+                tracing::error!(
+                    channel = origin.channel_id.get(),
+                    panic = panic_message(&panic),
+                    "LLM engine panicked - run aborted"
+                );
+                // The guaranteed-answer contract survives the panic: a
+                // triggered message still receives the generic fallback
+                // (the engine's state is intact - only the call frame
+                // unwound). The rare panic after content was already
+                // revealed may place the notice after a partial answer -
+                // acceptable noise for an internal bug.
+                if payload.mentions_bot {
+                    engine.send_fallback(&origin, &services).await;
+                }
+            }
         });
 
         Next::Continue
@@ -465,6 +498,19 @@ mod tests {
                 usage: None,
                 timing: ResponseTiming::measured(0),
             })
+        }
+    }
+
+    /// Completion whose call panics - the fixture for the engine panic guard.
+    struct PanickingCompletion;
+
+    #[async_trait]
+    impl LlmCompletionPort for PanickingCompletion {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            panic!("completion exploded");
         }
     }
 
@@ -881,6 +927,50 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(fixture.output.messages().iter().any(|m| m.contains("stub reply")));
+    }
+
+    /// A panic anywhere in an engine run must not silently drop a
+    /// guaranteed answer: the spawned task isolates the panic and a
+    /// triggered message still receives the generic fallback notice.
+    #[tokio::test]
+    async fn engine_panic_still_delivers_the_triggered_fallback() {
+        let registry = Arc::new(InMemoryCommandRegistry::new());
+        let storage = Arc::new(InMemoryStorage::new());
+        let output = RecordingChatOutput::new();
+        let services = KernelServices {
+            chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
+            chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
+            guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
+        };
+        let engine = Arc::new(ChatEngine::new(
+            Arc::new(LlmSettings::default()),
+            Arc::new(PanickingCompletion) as Arc<dyn LlmCompletionPort>,
+            Arc::new(RandRandom) as Arc<dyn RandomPort>,
+            Arc::new(FakeDescriber) as Arc<dyn ImageDescriber>,
+        ));
+        let plugin = LlmPlugin::new(
+            Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
+            Arc::clone(&engine),
+        );
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&storage);
+
+        let mut event = message_event(2, true);
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+
+        // The engine runs on a spawned task - yield until the fallback lands.
+        for _ in 0..1000 {
+            if !output.messages().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let messages = output.messages();
+        assert_eq!(messages.len(), 1, "exactly the fallback was sent: {messages:?}");
+        assert!(
+            messages.first().is_some_and(|m| m.contains("couldn't process")),
+            "unexpected messages: {messages:?}"
+        );
     }
 
     #[tokio::test]
