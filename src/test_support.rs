@@ -378,3 +378,34 @@ impl crate::kernel::spi_ports::ChatStreamPort for NoopChatStream {
         ))
     }
 }
+
+/// Guards the Discord presentation limits for registered commands:
+/// descriptions are the users' only in-app documentation, and the Discord
+/// registrar's sync rejects anything over 100 characters with a 400. Call
+/// from each plugin's registration test so a too-long mini-doc fails the
+/// build, not the production command sync.
+///
+/// # Panics
+/// When any command or argument description exceeds Discord's 100-character
+/// cap - the panic names the offending command, argument and text.
+pub fn assert_descriptions_fit_discord(
+    descriptors: &[crate::kernel::plugin_ports::CommandDescriptor],
+) {
+    for descriptor in descriptors {
+        assert!(
+            descriptor.description.chars().count() <= 100,
+            "command `{}`: description over Discord's 100-character cap: {:?}",
+            descriptor.name,
+            descriptor.description
+        );
+        for argument in &descriptor.arguments {
+            assert!(
+                argument.description.chars().count() <= 100,
+                "argument `{}` of command `{}`: description over Discord's 100-character cap: {:?}",
+                argument.name,
+                descriptor.name,
+                argument.description
+            );
+        }
+    }
+}

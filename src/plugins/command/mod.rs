@@ -44,7 +44,7 @@ impl PluginPort for CommandPlugin {
             CommandDescriptor {
                 plugin_id: self.name().to_owned(),
                 name: "ping".to_owned(),
-                description: "Replies with Pong!".to_owned(),
+                description: "Check that the bot is alive - it replies with Pong".to_owned(),
                 arguments: Vec::new(),
                 required_permission: None,
                 guild_only: false,

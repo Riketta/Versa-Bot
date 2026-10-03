@@ -74,7 +74,9 @@ impl<B: EventBusPort> PluginPort for UserActivityTrackerPlugin<B> {
             CommandDescriptor {
                 plugin_id: self.name().to_owned(),
                 name: "assign_tracker".to_owned(),
-                description: "Log member joins/leaves in this channel".to_owned(),
+                description: "Send member join/leave notices to this channel (one audit channel \
+                     per guild)"
+                    .to_owned(),
                 arguments: Vec::new(),
                 // Platform-interpreted: the Discord adapter publishes this as
                 // `default_member_permissions` (Manage Server).
@@ -87,7 +89,7 @@ impl<B: EventBusPort> PluginPort for UserActivityTrackerPlugin<B> {
             CommandDescriptor {
                 plugin_id: self.name().to_owned(),
                 name: "unassign_tracker".to_owned(),
-                description: "Stop logging member joins/leaves in this guild".to_owned(),
+                description: "Stop member join/leave notices for this guild".to_owned(),
                 arguments: Vec::new(),
                 required_permission: Some(Permission { name: "manage_guild".to_owned() }),
                 guild_only: true,
@@ -679,6 +681,7 @@ mod tests {
         let descriptors = registry.descriptors();
         assert_eq!(descriptors.len(), 2);
         assert!(descriptors.iter().all(|d| d.plugin_id == "tracker"));
+        crate::test_support::assert_descriptions_fit_discord(&descriptors);
         let names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"assign_tracker"));
         assert!(names.contains(&"unassign_tracker"));

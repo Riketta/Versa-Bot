@@ -117,10 +117,12 @@ impl LlmPlugin {
         self.registry.register(
             self.descriptor(
                 "llm_prompt",
-                "Set this channel's system prompt",
+                "Set the chat bot's persona for this channel (clear = plugin default)",
                 vec![ArgDescriptor {
                     name: "prompt".to_owned(),
-                    description: "Prompt text, or `clear`".to_owned(),
+                    description: "Prompt text; `clear` restores the default (long prompts: \
+                         /llm_prompt_file)"
+                        .to_owned(),
                     required: true,
                     kind: ArgKind::String,
                     choices: None,
@@ -131,10 +133,12 @@ impl LlmPlugin {
         self.registry.register(
             self.descriptor(
                 "llm_prompt_file",
-                "Set this channel's system prompt from an uploaded text file",
+                "Set this channel's persona from an uploaded text file (formatting is kept)",
                 vec![ArgDescriptor {
                     name: "file".to_owned(),
-                    description: "Attached .txt/.md file with the prompt text".to_owned(),
+                    description: "Text (.txt/.md) file holding the prompt; size-capped by the \
+                         operator"
+                        .to_owned(),
                     required: true,
                     kind: ArgKind::Attachment,
                     choices: None,
@@ -161,10 +165,12 @@ impl PluginPort for LlmPlugin {
         self.registry.register(
             self.descriptor(
                 "llm_assign",
-                "Assign the chat bot to this channel",
+                "Turn the LLM chat bot on in this channel (starts with an empty context)",
                 vec![ArgDescriptor {
                     name: "model".to_owned(),
-                    description: "Provider/model ref, e.g. `local/gemma`".to_owned(),
+                    description: "Model to answer with; the dropdown lists the operator-declared \
+                         models"
+                        .to_owned(),
                     required: true,
                     kind: ArgKind::String,
                     choices: (!model_refs.is_empty()).then_some(model_refs),
@@ -173,29 +179,41 @@ impl PluginPort for LlmPlugin {
             Arc::new(AssignLlmHandler::new(Arc::clone(&self.engine))),
         );
         self.registry.register(
-            self.descriptor("llm_models", "List the models available for assignment", Vec::new()),
+            self.descriptor(
+                "llm_models",
+                "List the models the bot operator has made available for channels",
+                Vec::new(),
+            ),
             Arc::new(ModelsLlmHandler::new(Arc::clone(&self.engine))),
         );
         self.registry.register(
-            self.descriptor("llm_unassign", "Remove the chat bot from this channel", Vec::new()),
+            self.descriptor(
+                "llm_unassign",
+                "Turn the LLM chat bot off in this channel (stored history is kept)",
+                Vec::new(),
+            ),
             Arc::new(UnassignLlmHandler),
         );
         self.registry.register(
             self.descriptor(
                 "llm_admin",
-                "Report LLM errors and service notices in this channel",
+                "Send LLM errors and service notices to this channel (one per guild)",
                 Vec::new(),
             ),
             Arc::new(AssignServiceChannelHandler),
         );
         self.registry.register(
-            self.descriptor("llm_admin_clear", "Stop reporting LLM service notices", Vec::new()),
+            self.descriptor(
+                "llm_admin_clear",
+                "Stop sending LLM service notices for this guild",
+                Vec::new(),
+            ),
             Arc::new(ClearServiceChannelHandler),
         );
         self.registry.register(
             self.descriptor(
                 "llm_cutoff",
-                "Reset this channel's conversation context (history is kept)",
+                "Reset this channel's conversation context (stored history is kept)",
                 Vec::new(),
             ),
             Arc::new(CutoffLlmHandler::new(Arc::clone(&self.channel_locks))),
@@ -203,7 +221,7 @@ impl PluginPort for LlmPlugin {
         self.registry.register(
             self.descriptor(
                 "llm_status",
-                "Show this channel's chat configuration and context state",
+                "Show this channel's chat bot settings, context state and usage stats",
                 Vec::new(),
             ),
             Arc::new(StatusLlmHandler::new(Arc::clone(&self.engine))),
@@ -211,12 +229,12 @@ impl PluginPort for LlmPlugin {
         self.registry.register(
             self.descriptor(
                 "llm_set",
-                "Tune this channel's chat bot (model, reasoning, sampling, depth, streaming)",
+                "Change a channel chat setting (model, reasoning, sampling, depth, chime-ins)",
                 vec![
                     ArgDescriptor {
                         name: "key".to_owned(),
-                        description: "Setting to change; reasoning_effort=off disables thinking \
-                             where supported"
+                        description: "Setting to change - see the dropdown (reasoning_effort=off \
+                             disables thinking)"
                             .to_owned(),
                         required: true,
                         kind: ArgKind::String,
@@ -224,8 +242,8 @@ impl PluginPort for LlmPlugin {
                     },
                     ArgDescriptor {
                         name: "value".to_owned(),
-                        description: "New value; `clear` = provider default; `off` disables \
-                             thinking where supported"
+                        description: "New value; `clear` = default (for reasoning_effort, `off` \
+                             disables thinking)"
                             .to_owned(),
                         required: true,
                         kind: ArgKind::String,
@@ -417,8 +435,9 @@ mod tests {
         let (plugin, fixture) = fixture();
         plugin.init().expect("init expected to succeed");
 
-        let mut names: Vec<String> =
-            fixture.registry.descriptors().into_iter().map(|d| d.name).collect();
+        let descriptors = fixture.registry.descriptors();
+        crate::test_support::assert_descriptions_fit_discord(&descriptors);
+        let mut names: Vec<String> = descriptors.into_iter().map(|d| d.name).collect();
         names.sort();
         assert_eq!(
             names,

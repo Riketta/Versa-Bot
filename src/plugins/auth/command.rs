@@ -554,6 +554,7 @@ mod tests {
         let descriptors = registry.descriptors();
         assert_eq!(descriptors.len(), 1);
         let descriptor = descriptors.first().expect("descriptor expected");
+        crate::test_support::assert_descriptions_fit_discord(&descriptors);
         assert_eq!(descriptor.name, "auth");
         assert_eq!(descriptor.plugin_id, "auth");
         assert!(descriptor.guild_only);

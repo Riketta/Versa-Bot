@@ -82,11 +82,12 @@ impl PluginPort for AuthPlugin {
             CommandDescriptor {
                 plugin_id: self.name().to_owned(),
                 name: "auth".to_owned(),
-                description: "Manage who can use the bot in this guild".to_owned(),
+                description: "Manage who can use the bot in this server".to_owned(),
                 arguments: vec![
                     ArgDescriptor {
                         name: "action".to_owned(),
-                        description: "What to do".to_owned(),
+                        description: "allow or deny a user/role, or show the current rules"
+                            .to_owned(),
                         required: true,
                         kind: ArgKind::String,
                         choices: Some(vec![
@@ -97,14 +98,16 @@ impl PluginPort for AuthPlugin {
                     },
                     ArgDescriptor {
                         name: "user".to_owned(),
-                        description: "User to allow or deny".to_owned(),
+                        description: "User to allow or deny (show ignores it; one target per call)"
+                            .to_owned(),
                         required: false,
                         kind: ArgKind::User,
                         choices: None,
                     },
                     ArgDescriptor {
                         name: "role".to_owned(),
-                        description: "Role to allow or deny".to_owned(),
+                        description: "Role to allow or deny (show ignores it; one target per call)"
+                            .to_owned(),
                         required: false,
                         kind: ArgKind::Role,
                         choices: None,
