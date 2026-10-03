@@ -29,17 +29,17 @@ a slash command from any other reply path.
 
 - Native Discord slash commands, auto-registered at startup from plugin
   declarations (`/ping` ships as the demo command).
-- Per-guild authorization (`auth` plugin): user and role allow-lists,
-  administered from Discord via `/auth` - unconfigured guilds are open,
-  an empty policy means guild-administrators-only, corruption fails
+- Per-guild authorization (`auth` plugin): a five-tier access ladder
+  (banned / guest / user / moderator / admin) with per-user, per-role and
+  default assignments, administered from Discord via `/auth` - guild
+  administrators are always admin, bans are silent, corruption fails
   closed. Details in [Plugins](#plugins).
 - User activity tracker (`tracker` plugin): logs member joins/leaves to the
   guild's audit channel and publishes `UserJoinedGuild` / `UserLeftGuild`
   domain events on the plugin bus for other plugins to react to. Channel
   assignment is self-service: `/assign_tracker` run in a channel makes it
-  the audit channel, `/unassign_tracker` turns tracking off (both require
-  the Manage Server permission, enforced by Discord itself; replies are
-  visible only to the invoker).
+  the audit channel, `/unassign_tracker` turns tracking off (both need the
+  `moderator` tier; replies are visible only to the invoker).
 - Audit trail (`audit_log` plugin): the event bus's first consumer - logs
   membership changes published on the bus as structured `audit` tracing
   events (stdout + Sentry/GlitchTip), with origin fields, no per-guild
@@ -47,8 +47,8 @@ a slash command from any other reply path.
 - LLM chat bot (`llm` plugin): per-channel chat with conversation history,
   compaction, streaming, token-budget context filling and random
   chime-ins. Operators declare OpenAI-compatible providers in `[llm]`
-  (keys via env); guild admins assign and tune each channel via `/llm_*`
-  commands. The guild message content the bot reads is why
+  (keys via env); guild moderators assign and tune each channel via
+  `/llm_*` commands. The guild message content the bot reads is why
   `MESSAGE_CONTENT` is requested. Full manual in
   [Plugins](#llm-chat-bot-llm-plugin).
 - Status rotator (`status_rotator` plugin): cycles the bot's activity
@@ -161,24 +161,30 @@ The auth plugin is the bot's per-guild access gate. It runs first in the
 middleware pipeline on every guild message and slash command; whatever it
 rejects never reaches the other plugins.
 
-**Policy model.** Per guild, two allow-lists: allowed **users** and
-allowed **roles**. A member passes when they are listed by user or hold
-any listed role. There are no deny-lists - `deny` removes an entry from
-the allow-lists. The policy is stored in the guild's own storage
-namespace, so guilds never see each other's configuration.
+**Policy model.** Per guild, a tier policy: every member has an effective
+tier on a five-step ladder -
 
-Three policy states with deliberately different defaults:
-
-| State | Who can use the bot |
+| Tier | What it allows |
 |---|---|
-| No policy (fresh guild) | everyone - open by default, otherwise the gate would deny the very commands that configure it |
-| Policy exists, both lists empty | only Discord guild administrators - there is always at least one admin |
-| Policy has at least one entry | exactly the listed users and holders of listed roles - guild administrators are not special |
+| `banned` | nothing - the bot ignores their messages and commands entirely, without any reply |
+| `guest` | talk to the bot (chat interactions), no commands |
+| `user` | basic commands (`/ping`, `/llm_status`, `/llm_models`) |
+| `moderator` | every service command (`/assign_tracker`, `/llm_assign`, `/llm_set`, ...) |
+| `admin` | everything, including `/auth` tier management |
 
-The third row is the one to remember: **adding the first entry switches
-the guild to list-only mode.** Make sure the first `allow` includes
-yourself (or a role you hold), or you lock yourself out until someone
-still allowed re-adds you.
+The policy assigns tiers three ways: per **user**, per **role** (holding
+the role grants at least that tier), and a **default tier** for everyone
+else. The effective tier is the best of what applies. Two overrides sit
+above the stored data:
+
+- An explicit `banned` user assignment beats every role grant.
+- **Discord guild administrators are always `admin`**, by construction -
+  the clamp cannot be removed, so an admin can never be locked out.
+
+A fresh guild starts open (default tier `user`), so the commands that
+configure the bot are usable on day one. The policy is stored in the
+guild's own storage namespace, so guilds never see each other's
+configuration.
 
 Robustness rules:
 
@@ -186,28 +192,34 @@ Robustness rules:
   denied with a "policy is unreadable" notice - corruption never widens
   access.
 - Denied slash commands get an ephemeral embed, visible to the invoker
-  only, naming the group that rejected them (`users` group / `roles`
-  group / "only guild administrators while the policy is empty"). Denied
-  plain messages are rejected silently - a public "no" would be a spam
-  vector, and ephemeral replies are impossible there.
+  only, naming the required and the actual tier. Denied plain messages
+  are rejected silently - a public "no" would be a spam vector, and
+  ephemeral replies are impossible there. Banned members get no answer
+  anywhere.
+- Commands carry their required tier in their declaration. The Discord
+  adapter does not hide tier-gated commands (only `/auth` keeps the
+  native Manage Server gate as defense in depth) - enforcement is
+  kernel-side, so a moderator without Discord permissions can still run
+  service commands.
 - Passive events (member joins/leaves, presence) and DMs are not gated:
-  auth decides who may *command* the bot, not what happens in the guild.
+  auth decides who may *use* the bot, not what happens in the guild.
 
-**Usage.** `/auth` is guild-only and requires the **Manage Server**
-permission (Discord hides it from members without it); every answer is
-ephemeral, so policy data stays between the bot and the admin.
+**Usage.** `/auth` is guild-only, requires the `admin` tier, and is
+additionally hidden behind Discord's **Manage Server** permission. Every
+answer is ephemeral, so policy data stays between the bot and the admin.
 
 | Command | Effect |
 |---|---|
-| `/auth action:show` | show the current policy as mention lists |
-| `/auth action:allow user:@member` | allow a user |
-| `/auth action:allow role:@role` | allow everyone holding the role |
-| `/auth action:deny user:@member` | remove a user; warns when this empties the policy |
-| `/auth action:deny role:@role` | remove a role |
+| `/auth action:show` | show the current policy: default tier, user and role assignments |
+| `/auth action:set tier:<tier> user:@member` | assign a tier to a user |
+| `/auth action:set tier:<tier> role:@role` | grant a tier to everyone holding the role |
+| `/auth action:clear user:@member` or `role:@role` | remove an assignment |
+| `/auth action:default tier:<tier>` | set the default tier for unlisted members |
 
-Specify either `user` or `role`, never both. Managing the policy is
-itself gated by the policy: whoever runs `/auth` must already be allowed
-to use the bot - do not deny yourself out.
+Specify either `user` or `role`, never both. Managing the policy requires
+the `admin` tier. Lowering your own tier is possible and warns in the
+reply: Discord administrators keep `admin` regardless, but without that
+you may need another admin to undo it.
 
 ### LLM chat bot (`llm` plugin)
 
@@ -321,10 +333,12 @@ margin - with `depth` remaining the secondary cap. Until then (or
 without a declared window) only the message limit applies.
 `/llm_status` shows which mechanism is active.
 
-**Commands.** All are guild-only and require the **Manage Server**
-permission (Discord hides them from members without it). Every reply is
-**ephemeral** - visible only to the admin who ran the command: config
-confirmations, usage notices and reports never appear in the channel.
+**Commands.** All are guild-only. `/llm_status` and `/llm_models` need
+the `user` tier; every other `/llm_*` command needs `moderator` (see the
+[auth plugin](#authorization-who-can-use-the-bot-auth-plugin)). Every
+reply is **ephemeral** - visible only to the member who ran the command:
+config confirmations, usage notices and reports never appear in the
+channel; tier denials are ephemeral too.
 
 | Command | Effect |
 |---|---|

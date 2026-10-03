@@ -138,7 +138,7 @@ fn permission_bits(name: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::plugin_ports::{ArgDescriptor, Permission};
+    use crate::kernel::plugin_ports::{AccessTier, ArgDescriptor, Permission};
 
     /// Panic-free field access: the deny-level `indexing_slicing` lint also
     /// applies to `serde_json::Value` indexing in tests.
@@ -169,6 +169,7 @@ mod tests {
                 },
             ],
             required_permission: Some(Permission { name: "manage_guild".to_owned() }),
+            required_tier: Some(AccessTier::Admin),
             guild_only: true,
         };
 
@@ -196,12 +197,16 @@ mod tests {
             description: "Pong".to_owned(),
             arguments: Vec::new(),
             required_permission: None,
+            required_tier: Some(AccessTier::Moderator),
             guild_only: false,
         };
 
         let json = application_command_json(&descriptor);
 
         assert_eq!(field(&json, "dm_permission").as_bool(), Some(true));
+        // A tier-gated command without a platform permission publishes
+        // ungated - the auth plugin owns enforcement kernel-side.
+        assert!(json.get("default_member_permissions").is_none());
         assert!(json.get("options").is_none());
         assert!(json.get("default_member_permissions").is_none());
     }
@@ -231,6 +236,7 @@ mod tests {
                 },
             ],
             required_permission: None,
+            required_tier: Some(AccessTier::User),
             guild_only: false,
         };
 

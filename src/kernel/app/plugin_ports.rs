@@ -5,8 +5,8 @@ mod plugin_port;
 mod scheduler_port;
 
 pub use command_registry_port::{
-    ArgDescriptor, ArgKind, CommandArgs, CommandDescriptor, CommandHandler, CommandRegistryPort,
-    Permission,
+    AccessTier, ArgDescriptor, ArgKind, CommandArgs, CommandDescriptor, CommandHandler,
+    CommandRegistryPort, Permission,
 };
 pub use event_bus_port::EventBusPort;
 pub use event_bus_port::EventBusSubscription;

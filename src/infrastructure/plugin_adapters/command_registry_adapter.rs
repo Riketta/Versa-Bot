@@ -47,6 +47,10 @@ impl CommandRegistryPort for InMemoryCommandRegistry {
         self.commands.read().get(name).map(|(_, handler)| Arc::clone(handler))
     }
 
+    fn descriptor(&self, name: &str) -> Option<CommandDescriptor> {
+        self.commands.read().get(name).map(|(descriptor, _)| descriptor.clone())
+    }
+
     fn descriptors(&self) -> Vec<CommandDescriptor> {
         self.commands.read().values().map(|(d, _)| d.clone()).collect()
     }
@@ -80,6 +84,7 @@ mod tests {
             description: "test command".to_owned(),
             arguments: Vec::new(),
             required_permission: None,
+            required_tier: None,
             guild_only: false,
         }
     }
@@ -92,6 +97,8 @@ mod tests {
 
         assert!(registry.lookup("ping").is_some());
         assert!(registry.lookup("unknown").is_none());
+        assert_eq!(registry.descriptor("ping").map(|d| d.name), Some("ping".to_owned()));
+        assert!(registry.descriptor("unknown").is_none());
         let descriptors = registry.descriptors();
         assert_eq!(descriptors.len(), 1);
         assert_eq!(descriptors.first().expect("command expected registered").name, "ping");

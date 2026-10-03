@@ -3,7 +3,10 @@
 //! interpreting them. Platform command registration (e.g. Discord slash
 //! sync) consumes the registry from the adapter side.
 
+use std::fmt;
 use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
 
 use async_trait::async_trait;
 
@@ -42,6 +45,10 @@ pub trait CommandRegistryPort: Send + Sync {
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn CommandHandler>>;
 
+    /// A registered command's descriptor by name - how the auth plugin reads
+    /// a command's declared tier at dispatch time without owning its meaning.
+    fn descriptor(&self, name: &str) -> Option<CommandDescriptor>;
+
     fn descriptors(&self) -> Vec<CommandDescriptor>;
 }
 
@@ -51,10 +58,67 @@ pub struct CommandDescriptor {
     pub name: String,
     pub description: String,
     pub arguments: Vec<ArgDescriptor>,
+    /// Platform-presentation gate (`default_member_permissions` on Discord).
+    /// Only commands whose audience matches a native platform permission
+    /// (today: only `/auth`) set it; tier-based access uses `required_tier`.
     pub required_permission: Option<Permission>,
+    /// Kernel-side ACL data: the minimum [`AccessTier`] a caller needs. The
+    /// kernel never interprets it - the auth plugin compares it against the
+    /// caller's effective tier and denies with an ephemeral notice. Every
+    /// command declares a tier; absent means any non-banned caller.
+    pub required_tier: Option<AccessTier>,
     /// Command is guild-scoped: adapters hide it from direct messages
     /// (Discord: `dm_permission: false`).
     pub guild_only: bool,
+}
+
+/// Per-guild access ladder, ordered from most to least privileged (derive
+/// order is the rank). Declared by plugins on `CommandDescriptor` as ACL
+/// data; interpreted exclusively by the auth plugin, which computes each
+/// caller's effective tier from the guild policy and compares. Discord
+/// guild administrators are `Admin` by construction (the auth plugin's
+/// resolution clamps them up) - that guarantee lives there, not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessTier {
+    /// Ignored entirely: messages and commands are dropped without any
+    /// output - bans never announce themselves.
+    Banned,
+    /// May talk to the bot (chat interactions) but runs no commands.
+    Guest,
+    /// Basic interactions: chat plus read-only/basic commands.
+    User,
+    /// Service management: every plugin's operational commands, but no
+    /// access-policy management.
+    Moderator,
+    /// Everything, including `/auth` tier management.
+    Admin,
+}
+
+impl AccessTier {
+    /// JSON spelling - also the Discord choice value for `/auth tier=`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccessTier::Banned => "banned",
+            AccessTier::Guest => "guest",
+            AccessTier::User => "user",
+            AccessTier::Moderator => "moderator",
+            AccessTier::Admin => "admin",
+        }
+    }
+}
+
+impl fmt::Display for AccessTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            AccessTier::Banned => "Banned",
+            AccessTier::Guest => "Guest",
+            AccessTier::User => "User",
+            AccessTier::Moderator => "Moderator",
+            AccessTier::Admin => "Admin",
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -85,7 +149,10 @@ pub enum ArgKind {
     Attachment,
 }
 
-/// Placeholder until `AuthPlugin` grows per-command permission checks.
+/// A native platform permission name (`manage_guild` so far), mapped by
+/// adapters onto platform mechanics (Discord: `default_member_permissions`)
+/// to gate command *presentation*. Kernel-side access control is not this -
+/// it is `required_tier`, enforced by the auth plugin.
 #[derive(Debug, Clone)]
 pub struct Permission {
     pub name: String,

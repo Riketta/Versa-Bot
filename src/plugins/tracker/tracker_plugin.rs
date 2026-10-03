@@ -9,8 +9,8 @@ use crate::kernel::{
         ChannelId, Event, EventKind, EventPayload, OutboundMessage, PluginError, RequestContext,
     },
     plugin_ports::{
-        CommandArgs, CommandDescriptor, CommandHandler, CommandRegistryPort, EventBusPort,
-        MiddlewarePluginPort, Next, Permission, PluginPort,
+        AccessTier, CommandArgs, CommandDescriptor, CommandHandler, CommandRegistryPort,
+        EventBusPort, MiddlewarePluginPort, Next, PluginPort,
     },
     services::KernelServices,
 };
@@ -78,9 +78,10 @@ impl<B: EventBusPort> PluginPort for UserActivityTrackerPlugin<B> {
                      per guild)"
                     .to_owned(),
                 arguments: Vec::new(),
-                // Platform-interpreted: the Discord adapter publishes this as
-                // `default_member_permissions` (Manage Server).
-                required_permission: Some(Permission { name: "manage_guild".to_owned() }),
+                // No platform gate: moderators may lack Discord's Manage
+                // Server permission; the auth plugin enforces the tier.
+                required_permission: None,
+                required_tier: Some(AccessTier::Moderator),
                 guild_only: true,
             },
             Arc::new(AssignTrackerHandler),
@@ -91,7 +92,8 @@ impl<B: EventBusPort> PluginPort for UserActivityTrackerPlugin<B> {
                 name: "unassign_tracker".to_owned(),
                 description: "Stop member join/leave notices for this guild".to_owned(),
                 arguments: Vec::new(),
-                required_permission: Some(Permission { name: "manage_guild".to_owned() }),
+                required_permission: None,
+                required_tier: Some(AccessTier::Moderator),
                 guild_only: true,
             },
             Arc::new(UnassignTrackerHandler),
@@ -686,10 +688,11 @@ mod tests {
         assert!(names.contains(&"assign_tracker"));
         assert!(names.contains(&"unassign_tracker"));
         assert!(
-            descriptors
-                .iter()
-                .all(|d| d.required_permission.as_ref().is_some_and(|p| p.name == "manage_guild"))
+            descriptors.iter().all(
+                |d| d.required_tier == Some(crate::kernel::plugin_ports::AccessTier::Moderator)
+            )
         );
+        assert!(descriptors.iter().all(|d| d.required_permission.is_none()));
     }
 
     /// Guards the reserved namespace constant; the tracker must never

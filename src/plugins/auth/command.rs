@@ -1,7 +1,8 @@
-//! `/auth` - the interactive half of the auth plugin. Writes the same policy
-//! document the middleware gate reads; meaning (who may use the bot) lives
-//! in this plugin, not in the dispatcher.
+//! `/auth` - the interactive half of the auth plugin. Writes the same tier
+//! policy document the middleware gate reads; meaning (who holds which
+//! tier) lives in this plugin, not in the dispatcher.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,20 +10,20 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::kernel::{
     models::{Embed, OutboundMessage, RequestContext},
-    plugin_ports::{CommandArgs, CommandHandler},
+    plugin_ports::{AccessTier, CommandArgs, CommandHandler},
     services::KernelServices,
     spi_ports::GuildStorage,
 };
 
 use super::{AuthConfig, CONFIG_KEY, NAMESPACE};
 
-/// `/auth action:[allow|deny|show] [user] [role]` - manage the guild's bot
-/// access policy. Runs through the pipeline like every command, so the auth
-/// gate has already vetted the invoker; Discord additionally hides the
-/// command behind Manage Server (`default_member_permissions`). Every
-/// answer is ephemeral: policy data stays between the bot and the admin.
-/// Policy writes serialize on one plugin-wide lock: the read-modify-write of
-/// the policy document must not lose one of two concurrent admin updates.
+/// `/auth action:[show|set|clear|default] [tier] [user] [role]` - manage the
+/// guild's tier policy. Runs through the pipeline like every command, so the
+/// auth gate has already vetted the invoker (the descriptor requires the
+/// `Admin` tier). Every answer is ephemeral: policy data stays between the
+/// bot and the admin. Policy writes serialize on one plugin-wide lock: the
+/// read-modify-write of the policy document must not lose one of two
+/// concurrent admin updates.
 pub struct AuthCommandHandler {
     policy_writes: Arc<AsyncMutex<()>>,
 }
@@ -44,7 +45,7 @@ impl Default for AuthCommandHandler {
 impl CommandHandler for AuthCommandHandler {
     async fn invoke(
         &self,
-        _event: &RequestContext,
+        event: &RequestContext,
         args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
@@ -54,8 +55,10 @@ impl CommandHandler for AuthCommandHandler {
 
         match args.get("action") {
             Some("show") => show_policy(&**storage, services).await,
-            Some(action @ ("allow" | "deny")) => {
-                mutate_policy(&**storage, &self.policy_writes, services, args, action).await
+            Some("set") => set_tier(&**storage, &self.policy_writes, event, services, args).await,
+            Some("clear") => clear_target(&**storage, &self.policy_writes, services, args).await,
+            Some("default") => {
+                set_default_tier(&**storage, &self.policy_writes, services, args).await
             }
             _ => reply(services, usage()).await,
         }
@@ -67,69 +70,163 @@ enum Target {
     Role(String),
 }
 
-async fn mutate_policy(
+fn all_tiers() -> [AccessTier; 5] {
+    [
+        AccessTier::Banned,
+        AccessTier::Guest,
+        AccessTier::User,
+        AccessTier::Moderator,
+        AccessTier::Admin,
+    ]
+}
+
+fn parse_tier(raw: &str) -> Option<AccessTier> {
+    all_tiers().into_iter().find(|tier| tier.as_str() == raw)
+}
+
+/// `set`/`clear` address exactly one of user/role.
+fn target_of(args: &CommandArgs) -> Result<Target, OutboundMessage> {
+    match (args.get("user"), args.get("role")) {
+        (Some(user), None) => Ok(Target::User(user.to_owned())),
+        (None, Some(role)) => Ok(Target::Role(role.to_owned())),
+        (Some(_), Some(_)) => Err(text("Specify either `user` or `role`, not both.")),
+        (None, None) => Err(usage()),
+    }
+}
+
+/// The `tier` argument, required by `set` and `default`.
+async fn tier_of(services: &KernelServices, args: &CommandArgs) -> Result<AccessTier, ()> {
+    let Some(raw) = args.get("tier") else {
+        reply(services, text("Specify a `tier`: banned, guest, user, moderator, admin."))
+            .await
+            .ok();
+        return Err(());
+    };
+    let Some(tier) = parse_tier(raw) else {
+        reply(
+            services,
+            text(format!(
+                "Unknown tier `{raw}`. Use one of: banned, guest, user, moderator, admin."
+            )),
+        )
+        .await
+        .ok();
+        return Err(());
+    };
+    Ok(tier)
+}
+
+async fn set_tier(
     storage: &dyn GuildStorage,
     policy_writes: &AsyncMutex<()>,
+    event: &RequestContext,
     services: &KernelServices,
     args: &CommandArgs,
-    action: &str,
 ) -> anyhow::Result<()> {
-    // One write at a time: allow/deny is a document read-modify-write, and
-    // two concurrent invocations must not lose one update.
+    // One write at a time: set is a document read-modify-write, and two
+    // concurrent invocations must not lose one update.
     let _write = policy_writes.lock().await;
-    let target = match (args.get("user"), args.get("role")) {
-        (Some(user), None) => Target::User(user.to_owned()),
-        (None, Some(role)) => Target::Role(role.to_owned()),
-        (Some(_), Some(_)) => {
-            return reply(services, text("Specify either `user` or `role`, not both.")).await;
-        }
-        (None, None) => return reply(services, usage()).await,
+    let target = match target_of(args) {
+        Ok(target) => target,
+        Err(message) => return reply(services, message).await,
+    };
+    let Ok(tier) = tier_of(services, args).await else {
+        return Ok(());
     };
 
-    // Read-modify-write of the policy document. The document is never
-    // deleted: an empty policy admits only guild administrators (see the
-    // gate in `super`), a missing one would re-open the guild.
     let mut policy = match read_policy(storage).await {
         Ok(policy) => policy,
         Err(message) => return reply(services, message).await,
     };
 
+    let (map, mention) = match &target {
+        Target::User(id) => (&mut policy.users, format!("<@{id}>")),
+        Target::Role(id) => (&mut policy.roles, format!("<@&{id}>")),
+    };
     let id = match &target {
         Target::User(id) | Target::Role(id) => id.clone(),
     };
-    let (list, mention, noun) = match &target {
-        Target::User(id) => (&mut policy.allowed_users, format!("<@{id}>"), "user"),
-        Target::Role(id) => (&mut policy.allowed_roles, format!("<@&{id}>"), "role"),
-    };
-    let listed = list.iter().any(|candidate| candidate == &id);
 
-    let answer = if action == "allow" {
-        if listed {
-            format!("{noun} {mention} is already allowed.")
-        } else {
-            list.push(id);
-            storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
-            format!("✅ {noun} {mention} can now use the bot.")
-        }
-    } else if listed {
-        list.retain(|candidate| candidate != &id);
-        // An emptied policy silently widens access: the gate's empty-policy
-        // fallback admits every Discord guild administrator. Say so.
-        let emptied = policy.allowed_users.is_empty() && policy.allowed_roles.is_empty();
-        storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
-        if emptied {
-            format!(
-                "🚫 {noun} {mention} is no longer allowed.\n⚠️ The policy is now empty: only \
-                 Discord guild administrators can use the bot."
-            )
-        } else {
-            format!("🚫 {noun} {mention} is no longer allowed.")
-        }
+    let mut answer = if map.get(&id) == Some(&tier) {
+        format!("{mention} already has the {tier} tier.")
     } else {
-        format!("{noun} {mention} was not in the policy.")
+        map.insert(id, tier);
+        storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
+        match &target {
+            Target::User(_) => format!("✅ User {mention} is now {tier}."),
+            Target::Role(_) => format!("✅ Role {mention} now grants {tier}."),
+        }
+    };
+
+    // A self-demotion is possible (the gate already passed), warn before it
+    // locks the invoker out; guild administrators are immune by the clamp.
+    if let Target::User(id) = &target
+        && *id == event.origin.user_id.get().to_string()
+        && tier < AccessTier::Admin
+    {
+        answer.push_str(
+            "\n⚠️ You lowered your own tier. Discord administrators always keep Admin; \
+             without that you may need another admin to undo this.",
+        );
+    }
+
+    reply(services, text(answer)).await
+}
+
+async fn clear_target(
+    storage: &dyn GuildStorage,
+    policy_writes: &AsyncMutex<()>,
+    services: &KernelServices,
+    args: &CommandArgs,
+) -> anyhow::Result<()> {
+    let _write = policy_writes.lock().await;
+    let target = match target_of(args) {
+        Ok(target) => target,
+        Err(message) => return reply(services, message).await,
+    };
+
+    let mut policy = match read_policy(storage).await {
+        Ok(policy) => policy,
+        Err(message) => return reply(services, message).await,
+    };
+
+    let (map, mention) = match &target {
+        Target::User(id) => (&mut policy.users, format!("<@{id}>")),
+        Target::Role(id) => (&mut policy.roles, format!("<@&{id}>")),
+    };
+    let id = match &target {
+        Target::User(id) | Target::Role(id) => id.clone(),
+    };
+
+    let answer = if map.remove(&id).is_some() {
+        storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
+        format!("✅ Removed the tier assignment for {mention}.")
+    } else {
+        format!("{mention} has no tier assignment.")
     };
 
     reply(services, text(answer)).await
+}
+
+async fn set_default_tier(
+    storage: &dyn GuildStorage,
+    policy_writes: &AsyncMutex<()>,
+    services: &KernelServices,
+    args: &CommandArgs,
+) -> anyhow::Result<()> {
+    let Ok(tier) = tier_of(services, args).await else {
+        return Ok(());
+    };
+    let _write = policy_writes.lock().await;
+
+    let mut policy = match read_policy(storage).await {
+        Ok(policy) => policy,
+        Err(message) => return reply(services, message).await,
+    };
+    policy.default_tier = tier;
+    storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
+
+    reply(services, text(format!("✅ Default tier is now {tier}."))).await
 }
 
 async fn show_policy(storage: &dyn GuildStorage, services: &KernelServices) -> anyhow::Result<()> {
@@ -138,17 +235,17 @@ async fn show_policy(storage: &dyn GuildStorage, services: &KernelServices) -> a
         Err(message) => return reply(services, message).await,
     };
 
+    let mut description = format!("Default tier: {}", policy.default_tier);
+    description.push_str("\n\nUsers:");
+    description.push_str(&render_assignments(&policy.users, user_mention));
+    description.push_str("\n\nRoles:");
+    description.push_str(&render_assignments(&policy.roles, role_mention));
+    description.push_str("\n\nDiscord administrators always act as Admin.");
+
     reply(
         services,
-        OutboundMessage::embed(Embed {
-            title: "🛡 Bot access policy".to_owned(),
-            description: format!(
-                "Allowed users: {}\nAllowed roles: {}",
-                render_list(&policy.allowed_users, user_mention),
-                render_list(&policy.allowed_roles, role_mention),
-            ),
-        })
-        .ephemeral(),
+        OutboundMessage::embed(Embed { title: "🛡 Bot access tiers".to_owned(), description })
+            .ephemeral(),
     )
     .await
 }
@@ -165,11 +262,21 @@ async fn read_policy(storage: &dyn GuildStorage) -> Result<AuthConfig, OutboundM
     serde_json::from_value(value).map_err(|_| unavailable())
 }
 
-fn render_list(ids: &[String], mention: fn(&str) -> String) -> String {
-    if ids.is_empty() {
-        return "none".to_owned();
+fn render_assignments(
+    assignments: &BTreeMap<String, AccessTier>,
+    mention: fn(&str) -> String,
+) -> String {
+    if assignments.is_empty() {
+        return " none".to_owned();
     }
-    ids.iter().map(|id| mention(id)).collect::<Vec<_>>().join(", ")
+    let mut rendered = String::new();
+    for (id, tier) in assignments {
+        rendered.push('\n');
+        rendered.push_str(&mention(id));
+        rendered.push_str(": ");
+        rendered.push_str(&tier.to_string());
+    }
+    rendered
 }
 
 fn user_mention(id: &str) -> String {
@@ -187,7 +294,10 @@ fn unavailable() -> OutboundMessage {
 }
 
 fn usage() -> OutboundMessage {
-    text("Usage: `/auth action:show`, or `/auth action:allow|deny` with a `user` or a `role`.")
+    text(
+        "Usage: `/auth action:show`, `/auth action:set` + `tier` + a `user` or a `role`, \
+         `/auth action:clear` + a `user` or a `role`, or `/auth action:default` + `tier`.",
+    )
 }
 
 /// Every `/auth` answer is ephemeral - visible to the invoking admin only.
@@ -236,8 +346,17 @@ mod tests {
         }
     }
 
-    fn auth_args(action: &str, user: Option<&str>, role: Option<&str>) -> CommandArgs {
+    #[allow(clippy::too_many_arguments)]
+    fn auth_args(
+        action: &str,
+        tier: Option<&str>,
+        user: Option<&str>,
+        role: Option<&str>,
+    ) -> CommandArgs {
         let mut pairs = vec![("action".to_owned(), action.to_owned())];
+        if let Some(tier) = tier {
+            pairs.push(("tier".to_owned(), tier.to_owned()));
+        }
         if let Some(user) = user {
             pairs.push(("user".to_owned(), user.to_owned()));
         }
@@ -276,35 +395,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_user_adds_to_policy() {
+    async fn set_user_tier_persists() {
         let (storage, services, output) = fixture();
 
         AuthCommandHandler::default()
-            .invoke(&command_event(), &auth_args("allow", Some("42"), None), &services)
+            .invoke(
+                &command_event(),
+                &auth_args("set", Some("moderator"), Some("42"), None),
+                &services,
+            )
             .await
-            .expect("allow expected to succeed");
+            .expect("set expected to succeed");
 
         assert_eq!(
             stored_policy(&storage).await,
-            Some(serde_json::json!({ "allowed_users": ["42"], "allowed_roles": [] }))
+            Some(serde_json::json!({
+                "default_tier": "user",
+                "users": { "42": "moderator" },
+                "roles": {},
+            }))
         );
         let message = output.messages().into_iter().next().expect("reply expected");
         assert!(message.contains("✅"));
         assert!(message.contains("<@42>"));
+        assert!(message.contains("Moderator"));
     }
 
     #[tokio::test]
-    async fn allow_role_adds_to_policy() {
+    async fn set_role_tier_persists() {
         let (storage, services, output) = fixture();
 
         AuthCommandHandler::default()
-            .invoke(&command_event(), &auth_args("allow", None, Some("7")), &services)
+            .invoke(&command_event(), &auth_args("set", Some("guest"), None, Some("7")), &services)
             .await
-            .expect("allow expected to succeed");
+            .expect("set expected to succeed");
 
         assert_eq!(
             stored_policy(&storage).await,
-            Some(serde_json::json!({ "allowed_users": [], "allowed_roles": ["7"] }))
+            Some(serde_json::json!({
+                "default_tier": "user",
+                "users": {},
+                "roles": { "7": "guest" },
+            }))
         );
         assert!(
             output.messages().into_iter().next().is_some_and(|message| message.contains("<@&7>"))
@@ -312,67 +444,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_duplicate_is_idempotent() {
+    async fn set_same_tier_is_idempotent() {
         let (storage, services, output) = fixture();
         storage.seed(
             Platform::Discord,
             GuildId(1),
             NAMESPACE,
             CONFIG_KEY,
-            serde_json::json!({ "allowed_users": ["42"], "allowed_roles": [] }),
+            serde_json::json!({ "default_tier": "user", "users": { "42": "moderator" }, "roles": {} }),
         );
 
         AuthCommandHandler::default()
-            .invoke(&command_event(), &auth_args("allow", Some("42"), None), &services)
+            .invoke(
+                &command_event(),
+                &auth_args("set", Some("moderator"), Some("42"), None),
+                &services,
+            )
             .await
-            .expect("allow expected to succeed");
+            .expect("set expected to succeed");
 
-        assert_eq!(
-            stored_policy(&storage).await,
-            Some(serde_json::json!({ "allowed_users": ["42"], "allowed_roles": [] }))
-        );
         assert!(
             output.messages().into_iter().next().is_some_and(|message| message.contains("already"))
         );
     }
 
     #[tokio::test]
-    async fn deny_removes_from_policy() {
+    async fn clear_user_removes_assignment() {
         let (storage, services, output) = fixture();
         storage.seed(
             Platform::Discord,
             GuildId(1),
             NAMESPACE,
             CONFIG_KEY,
-            serde_json::json!({ "allowed_users": ["42", "43"], "allowed_roles": [] }),
+            serde_json::json!({
+                "default_tier": "user",
+                "users": { "42": "moderator", "43": "guest" },
+                "roles": {},
+            }),
         );
 
         AuthCommandHandler::default()
-            .invoke(&command_event(), &auth_args("deny", Some("42"), None), &services)
+            .invoke(&command_event(), &auth_args("clear", None, Some("42"), None), &services)
             .await
-            .expect("deny expected to succeed");
+            .expect("clear expected to succeed");
 
         assert_eq!(
             stored_policy(&storage).await,
-            Some(serde_json::json!({ "allowed_users": ["43"], "allowed_roles": [] }))
+            Some(serde_json::json!({
+                "default_tier": "user",
+                "users": { "43": "guest" },
+                "roles": {},
+            }))
         );
         assert!(
             output
                 .messages()
                 .into_iter()
                 .next()
-                .is_some_and(|message| message.contains("no longer allowed"))
+                .is_some_and(|message| message.contains("Removed the tier assignment"))
         );
     }
 
     #[tokio::test]
-    async fn deny_missing_reports_without_saving() {
+    async fn clear_missing_reports_without_saving() {
         let (storage, services, output) = fixture();
 
         AuthCommandHandler::default()
-            .invoke(&command_event(), &auth_args("deny", Some("42"), None), &services)
+            .invoke(&command_event(), &auth_args("clear", None, Some("42"), None), &services)
             .await
-            .expect("deny expected to succeed");
+            .expect("clear expected to succeed");
 
         assert_eq!(stored_policy(&storage).await, None);
         assert!(
@@ -380,60 +520,99 @@ mod tests {
                 .messages()
                 .into_iter()
                 .next()
-                .is_some_and(|message| message.contains("was not in the policy"))
+                .is_some_and(|message| message.contains("no tier assignment"))
         );
     }
 
-    /// Denying the final listed entry empties the policy - which silently
-    /// FLIPS the gate's semantics: every Discord guild administrator becomes
-    /// allowed (empty-policy fallback). The reply must warn about exactly
-    /// that widening.
     #[tokio::test]
-    async fn denying_the_last_entry_warns_about_the_admin_fallback() {
+    async fn default_sets_default_tier() {
         let (storage, services, output) = fixture();
-        storage.seed(
-            Platform::Discord,
-            GuildId(1),
-            NAMESPACE,
-            CONFIG_KEY,
-            serde_json::json!({ "allowed_users": ["42"], "allowed_roles": [] }),
-        );
 
         AuthCommandHandler::default()
-            .invoke(&command_event(), &auth_args("deny", Some("42"), None), &services)
+            .invoke(
+                &command_event(),
+                &auth_args("default", Some("moderator"), None, None),
+                &services,
+            )
             .await
-            .expect("deny expected to succeed");
+            .expect("default expected to succeed");
 
         assert_eq!(
             stored_policy(&storage).await,
-            Some(serde_json::json!({ "allowed_users": [], "allowed_roles": [] }))
+            Some(serde_json::json!({
+                "default_tier": "moderator",
+                "users": {},
+                "roles": {},
+            }))
         );
+        assert!(
+            output
+                .messages()
+                .into_iter()
+                .next()
+                .is_some_and(|message| message.contains("Default tier is now Moderator"))
+        );
+    }
+
+    /// Lowering your own tier is possible (the gate already passed) - the
+    /// reply must warn about the lockout before it happens.
+    #[tokio::test]
+    async fn self_demotion_warns() {
+        let (_storage, services, output) = fixture();
+
+        AuthCommandHandler::default()
+            .invoke(&command_event(), &auth_args("set", Some("banned"), Some("3"), None), &services)
+            .await
+            .expect("set expected to succeed");
+
         let message = output.messages().into_iter().next().expect("reply expected");
-        assert!(message.contains("no longer allowed"));
-        assert!(message.contains("The policy is now empty"));
-        assert!(message.contains("only Discord guild administrators"));
+        assert!(message.contains("lowered your own tier"));
+        assert!(message.contains("Discord administrators"));
     }
 
     #[tokio::test]
-    async fn show_renders_policy_with_mentions() {
+    async fn no_self_demotion_warning_for_other_targets() {
+        let (_storage, services, output) = fixture();
+
+        AuthCommandHandler::default()
+            .invoke(
+                &command_event(),
+                &auth_args("set", Some("banned"), Some("42"), None),
+                &services,
+            )
+            .await
+            .expect("set expected to succeed");
+
+        let message = output.messages().into_iter().next().expect("reply expected");
+        assert!(!message.contains("lowered your own tier"));
+    }
+
+    #[tokio::test]
+    async fn show_renders_tiers_with_mentions() {
         let (storage, services, output) = fixture();
         storage.seed(
             Platform::Discord,
             GuildId(1),
             NAMESPACE,
             CONFIG_KEY,
-            serde_json::json!({ "allowed_users": ["42"], "allowed_roles": ["7"] }),
+            serde_json::json!({
+                "default_tier": "guest",
+                "users": { "42": "moderator" },
+                "roles": { "7": "user" },
+            }),
         );
 
         AuthCommandHandler::default()
-            .invoke(&command_event(), &auth_args("show", None, None), &services)
+            .invoke(&command_event(), &auth_args("show", None, None, None), &services)
             .await
             .expect("show expected to succeed");
 
         let message = output.messages().into_iter().next().expect("reply expected");
-        assert!(message.contains("🛡 Bot access policy"));
-        assert!(message.contains("<@42>"));
-        assert!(message.contains("<@&7>"));
+        assert!(message.contains("🛡 Bot access tiers"));
+        assert!(message.contains("Default tier: Guest"));
+        assert!(message.contains("<@42>: Moderator"));
+        assert!(message.contains("<@&7>: User"));
+        assert!(message.contains("Discord administrators always act as Admin"));
     }
 
     #[tokio::test]
@@ -441,7 +620,7 @@ mod tests {
         let (_storage, services, output) = fixture();
 
         AuthCommandHandler::default()
-            .invoke(&command_event(), &auth_args("show", None, None), &services)
+            .invoke(&command_event(), &auth_args("show", None, None, None), &services)
             .await
             .expect("show expected to succeed");
 
@@ -463,9 +642,13 @@ mod tests {
         );
 
         AuthCommandHandler::default()
-            .invoke(&command_event(), &auth_args("allow", Some("42"), None), &services)
+            .invoke(
+                &command_event(),
+                &auth_args("set", Some("moderator"), Some("42"), None),
+                &services,
+            )
             .await
-            .expect("allow expected to succeed");
+            .expect("set expected to succeed");
 
         assert_eq!(stored_policy(&storage).await, Some(serde_json::json!("not an object")));
         assert!(
@@ -478,11 +661,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_without_tier_shows_hint() {
+        let (_storage, services, output) = fixture();
+
+        AuthCommandHandler::default()
+            .invoke(&command_event(), &auth_args("set", None, Some("42"), None), &services)
+            .await
+            .expect("invoke expected to succeed");
+
+        assert!(
+            output
+                .messages()
+                .into_iter()
+                .next()
+                .is_some_and(|message| message.contains("Specify a `tier`"))
+        );
+    }
+
+    #[tokio::test]
+    async fn set_with_unknown_tier_errors() {
+        let (_storage, services, output) = fixture();
+
+        AuthCommandHandler::default()
+            .invoke(
+                &command_event(),
+                &auth_args("set", Some("wizard"), Some("42"), None),
+                &services,
+            )
+            .await
+            .expect("invoke expected to succeed");
+
+        assert!(
+            output
+                .messages()
+                .into_iter()
+                .next()
+                .is_some_and(|message| message.contains("Unknown tier `wizard`"))
+        );
+    }
+
+    #[tokio::test]
     async fn missing_target_shows_usage() {
         let (_storage, services, output) = fixture();
 
         AuthCommandHandler::default()
-            .invoke(&command_event(), &auth_args("allow", None, None), &services)
+            .invoke(&command_event(), &auth_args("set", Some("moderator"), None, None), &services)
             .await
             .expect("invoke expected to succeed");
 
@@ -496,7 +719,11 @@ mod tests {
         let (_storage, services, output) = fixture();
 
         AuthCommandHandler::default()
-            .invoke(&command_event(), &auth_args("allow", Some("42"), Some("7")), &services)
+            .invoke(
+                &command_event(),
+                &auth_args("set", Some("moderator"), Some("42"), Some("7")),
+                &services,
+            )
             .await
             .expect("invoke expected to succeed");
 
@@ -514,7 +741,11 @@ mod tests {
         let (_storage, services, output) = fixture();
 
         AuthCommandHandler::default()
-            .invoke(&command_event(), &auth_args("teleport", Some("42"), None), &services)
+            .invoke(
+                &command_event(),
+                &auth_args("teleport", Some("moderator"), Some("42"), None),
+                &services,
+            )
             .await
             .expect("invoke expected to succeed");
 
@@ -529,7 +760,11 @@ mod tests {
         let services = dm_services(&output);
 
         AuthCommandHandler::default()
-            .invoke(&command_event(), &auth_args("allow", Some("42"), None), &services)
+            .invoke(
+                &command_event(),
+                &auth_args("set", Some("moderator"), Some("42"), None),
+                &services,
+            )
             .await
             .expect("invoke expected to succeed");
 
@@ -542,8 +777,9 @@ mod tests {
         );
     }
 
-    /// `init` declares the `/auth` descriptor: Manage Server permission,
-    /// guild-only, action choices, typed user/role arguments.
+    /// `init` declares the `/auth` descriptor: Admin tier, Manage Server
+    /// platform gate, guild-only, action/tier choices, typed user/role
+    /// arguments.
     #[test]
     fn init_registers_auth_command() {
         let registry = Arc::new(InMemoryCommandRegistry::new());
@@ -558,18 +794,37 @@ mod tests {
         assert_eq!(descriptor.name, "auth");
         assert_eq!(descriptor.plugin_id, "auth");
         assert!(descriptor.guild_only);
+        assert_eq!(descriptor.required_tier, Some(AccessTier::Admin));
         assert!(
             descriptor
                 .required_permission
                 .as_ref()
                 .is_some_and(|permission| permission.name == "manage_guild")
         );
-        let action = descriptor.arguments.first().expect("action expected");
+        let arguments = &descriptor.arguments;
+        let action = arguments.first().expect("action expected");
         assert_eq!(
             action.choices.as_deref(),
-            Some(["allow".to_owned(), "deny".to_owned(), "show".to_owned()].as_slice())
+            Some(
+                ["show".to_owned(), "set".to_owned(), "clear".to_owned(), "default".to_owned()]
+                    .as_slice()
+            )
         );
-        assert!(descriptor.arguments.iter().any(|argument| argument.kind == ArgKind::User));
-        assert!(descriptor.arguments.iter().any(|argument| argument.kind == ArgKind::Role));
+        let tier = arguments.get(1).expect("tier argument expected");
+        assert_eq!(
+            tier.choices.as_deref(),
+            Some(
+                [
+                    "banned".to_owned(),
+                    "guest".to_owned(),
+                    "user".to_owned(),
+                    "moderator".to_owned(),
+                    "admin".to_owned(),
+                ]
+                .as_slice()
+            )
+        );
+        assert!(arguments.iter().any(|argument| argument.kind == ArgKind::User));
+        assert!(arguments.iter().any(|argument| argument.kind == ArgKind::Role));
     }
 }

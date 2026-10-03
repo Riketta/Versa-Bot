@@ -9,8 +9,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::kernel::{
     models::{EventKind, EventPayload, GuildId, Origin, PluginError, RequestContext},
     plugin_ports::{
-        ArgDescriptor, ArgKind, CommandDescriptor, CommandRegistryPort, MiddlewarePluginPort, Next,
-        Permission, PluginPort,
+        AccessTier, ArgDescriptor, ArgKind, CommandDescriptor, CommandRegistryPort,
+        MiddlewarePluginPort, Next, PluginPort,
     },
     services::KernelServices,
 };
@@ -98,15 +98,18 @@ impl LlmPlugin {
         name: &str,
         description: &str,
         arguments: Vec<ArgDescriptor>,
+        tier: AccessTier,
     ) -> CommandDescriptor {
         CommandDescriptor {
             plugin_id: self.name().to_owned(),
             name: name.to_owned(),
             description: description.to_owned(),
             arguments,
-            // Platform-interpreted: the Discord adapter publishes this as
-            // `default_member_permissions` (Manage Server).
-            required_permission: Some(Permission { name: "manage_guild".to_owned() }),
+            // No platform gate: moderators may lack Discord's Manage Server
+            // permission. The auth plugin enforces the tier kernel-side and
+            // answers with an ephemeral denial.
+            required_permission: None,
+            required_tier: Some(tier),
             guild_only: true,
         }
     }
@@ -127,6 +130,7 @@ impl LlmPlugin {
                     kind: ArgKind::String,
                     choices: None,
                 }],
+                AccessTier::Moderator,
             ),
             Arc::new(PromptLlmHandler::new(Arc::clone(&self.channel_locks))),
         );
@@ -143,6 +147,7 @@ impl LlmPlugin {
                     kind: ArgKind::Attachment,
                     choices: None,
                 }],
+                AccessTier::Moderator,
             ),
             Arc::new(PromptFileLlmHandler::new(
                 Arc::clone(&self.channel_locks),
@@ -151,14 +156,10 @@ impl LlmPlugin {
             )),
         );
     }
-}
 
-impl PluginPort for LlmPlugin {
-    fn name(&self) -> &'static str {
-        "llm"
-    }
-
-    fn init(&self) -> Result<(), PluginError> {
+    /// Channel assignment and inspection: turning the bot on/off per
+    /// channel, the model catalog, and the tune/reset commands.
+    fn register_model_commands(&self) {
         // Discord renders the declared refs as a native dropdown (capped at
         // 25); runtime validation enforces the full registry either way.
         let model_refs = model_choices(self.engine.settings());
@@ -175,6 +176,7 @@ impl PluginPort for LlmPlugin {
                     kind: ArgKind::String,
                     choices: (!model_refs.is_empty()).then_some(model_refs),
                 }],
+                AccessTier::Moderator,
             ),
             Arc::new(AssignLlmHandler::new(Arc::clone(&self.engine))),
         );
@@ -183,6 +185,7 @@ impl PluginPort for LlmPlugin {
                 "llm_models",
                 "List the models the bot operator has made available for channels",
                 Vec::new(),
+                AccessTier::User,
             ),
             Arc::new(ModelsLlmHandler::new(Arc::clone(&self.engine))),
         );
@@ -191,14 +194,26 @@ impl PluginPort for LlmPlugin {
                 "llm_unassign",
                 "Turn the LLM chat bot off in this channel (stored history is kept)",
                 Vec::new(),
+                AccessTier::Moderator,
             ),
             Arc::new(UnassignLlmHandler),
         );
+    }
+}
+
+impl PluginPort for LlmPlugin {
+    fn name(&self) -> &'static str {
+        "llm"
+    }
+
+    fn init(&self) -> Result<(), PluginError> {
+        self.register_model_commands();
         self.registry.register(
             self.descriptor(
                 "llm_admin",
                 "Send LLM errors and service notices to this channel (one per guild)",
                 Vec::new(),
+                AccessTier::Moderator,
             ),
             Arc::new(AssignServiceChannelHandler),
         );
@@ -207,6 +222,7 @@ impl PluginPort for LlmPlugin {
                 "llm_admin_clear",
                 "Stop sending LLM service notices for this guild",
                 Vec::new(),
+                AccessTier::Moderator,
             ),
             Arc::new(ClearServiceChannelHandler),
         );
@@ -215,6 +231,7 @@ impl PluginPort for LlmPlugin {
                 "llm_cutoff",
                 "Reset this channel's conversation context (stored history is kept)",
                 Vec::new(),
+                AccessTier::Moderator,
             ),
             Arc::new(CutoffLlmHandler::new(Arc::clone(&self.channel_locks))),
         );
@@ -223,6 +240,7 @@ impl PluginPort for LlmPlugin {
                 "llm_status",
                 "Show this channel's chat bot settings, context state and usage stats",
                 Vec::new(),
+                AccessTier::User,
             ),
             Arc::new(StatusLlmHandler::new(Arc::clone(&self.engine))),
         );
@@ -250,6 +268,7 @@ impl PluginPort for LlmPlugin {
                         choices: None,
                     },
                 ],
+                AccessTier::Moderator,
             ),
             Arc::new(SetLlmHandler::new(Arc::clone(&self.channel_locks), Arc::clone(&self.engine))),
         );
@@ -457,10 +476,13 @@ mod tests {
         for descriptor in fixture.registry.descriptors() {
             assert_eq!(descriptor.plugin_id, "llm");
             assert!(descriptor.guild_only, "every llm command is guild-only");
-            assert_eq!(
-                descriptor.required_permission.as_ref().map(|p| p.name.as_str()),
-                Some("manage_guild")
-            );
+            assert!(descriptor.required_permission.is_none(), "tier-gated, not platform-gated");
+            let expected = if matches!(descriptor.name.as_str(), "llm_status" | "llm_models") {
+                AccessTier::User
+            } else {
+                AccessTier::Moderator
+            };
+            assert_eq!(descriptor.required_tier, Some(expected), "command {}", descriptor.name);
         }
     }
 

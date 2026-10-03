@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -6,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::kernel::{
     models::{Embed, EventKind, EventPayload, OutboundMessage, PluginError, RequestContext},
     plugin_ports::{
-        ArgDescriptor, ArgKind, CommandDescriptor, CommandRegistryPort, MiddlewarePluginPort, Next,
-        Permission, PluginPort,
+        AccessTier, ArgDescriptor, ArgKind, CommandDescriptor, CommandRegistryPort,
+        MiddlewarePluginPort, Next, Permission, PluginPort,
     },
     services::KernelServices,
 };
@@ -26,38 +27,50 @@ pub(crate) const CONFIG_KEY: &str = "config";
 /// through by the driving adapter, and nothing interprets the other bits.
 const GUILD_ADMINISTRATOR_BIT: u64 = 0x8;
 
-/// Per-guild authorization policy, stored as a JSON document in the
-/// plugin's guild storage namespace. The `/auth` management command (same
-/// plugin, interactive half) writes this document.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Per-guild tier policy, stored as a JSON document in the plugin's guild
+/// storage namespace. The `/auth` management command (same plugin,
+/// interactive half) writes this document. Schema v2 - tier assignments
+/// instead of flat allow-lists; there is no legacy migration: a document
+/// that does not carry the new fields deserializes to the open default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AuthConfig {
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
-    #[serde(default)]
-    pub allowed_roles: Vec<String>,
+    /// Tier for members with no explicit assignment and no qualifying role.
+    /// `User` keeps a fresh guild open by default - otherwise the gate would
+    /// deny the very commands that configure it.
+    pub default_tier: AccessTier,
+    /// Explicit per-user tier assignments (platform user IDs as strings).
+    /// A `Banned` assignment wins over every role grant.
+    pub users: BTreeMap<String, AccessTier>,
+    /// Per-role tier assignments (platform role IDs as strings): holding the
+    /// role grants at least that tier.
+    pub roles: BTreeMap<String, AccessTier>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self { default_tier: AccessTier::User, users: BTreeMap::new(), roles: BTreeMap::new() }
+    }
 }
 
 /// Per-guild bot access control - the first short-circuiting middleware.
 ///
 /// Policy:
-/// - Gates bot *invocation* only (`MessageReceived` and `CommandInvoked`).
+/// - Gates bot *invocation* (`MessageReceived` and `CommandInvoked`).
 ///   Passive events (member join/leave, presence) flow to their plugins
-///   regardless - auth is about who may command the bot, not about what
-///   happens in the guild.
-/// - A user passes when listed in `allowed_users`, or when any of their
-///   roles (provided by the driving adapter, best effort) appears in
-///   `allowed_roles`. Otherwise the event is stopped; commands additionally
-///   get an ephemeral denial answer (see `answer_denial`).
-/// - A policy that exists but lists nobody falls back to Discord guild
-///   administrators (master-admin fallback): an empty policy must not lock
-///   out the admins who would reconfigure it (see `is_allowed`).
-/// - An unconfigured guild is open by default (bootstrap: otherwise auth
-///   would deny the very commands that configure it).
+///   regardless - auth is about who may use the bot, not about what happens
+///   in the guild. Direct messages pass too: no guild scope to protect.
+/// - Every member has an effective [`AccessTier`] (see [`Self::effective_tier`]).
+///   `Banned` members are dropped silently - messages and commands alike,
+///   without any denial output: bans never announce themselves.
+/// - Commands are tier-gated by their descriptor's `required_tier` (looked
+///   up in the command registry); a member below the requirement gets an
+///   ephemeral denial on transactional origins. Unknown commands pass -
+///   the dispatcher ignores them anyway.
+/// - Plain messages only need to not be banned: chatting with the bot is
+///   the `Guest` floor.
 /// - A malformed config document fails closed - corruption never widens
-///   access.
-///
-/// The allow-list also gates `/auth` itself: whoever manages the policy
-/// must stay listed (or hold an allowed role).
+///   access. A storage failure fails closed the same way.
 pub struct AuthPlugin {
     registry: Arc<dyn CommandRegistryPort>,
 }
@@ -76,29 +89,45 @@ impl PluginPort for AuthPlugin {
 
     fn init(&self) -> Result<(), PluginError> {
         // The interactive half of this plugin. Discord additionally hides
-        // the command behind Manage Server (`default_member_permissions`);
-        // the policy gate below remains the kernel-side check.
+        // the command behind Manage Server (`default_member_permissions`) -
+        // defense in depth on top of the `Admin` tier check below.
         self.registry.register(
             CommandDescriptor {
                 plugin_id: self.name().to_owned(),
                 name: "auth".to_owned(),
-                description: "Manage who can use the bot in this server".to_owned(),
+                description: "Manage member tiers for bot access in this server".to_owned(),
                 arguments: vec![
                     ArgDescriptor {
                         name: "action".to_owned(),
-                        description: "allow or deny a user/role, or show the current rules"
-                            .to_owned(),
+                        description: "show, set, clear, or default the tier policy".to_owned(),
                         required: true,
                         kind: ArgKind::String,
                         choices: Some(vec![
-                            "allow".to_owned(),
-                            "deny".to_owned(),
                             "show".to_owned(),
+                            "set".to_owned(),
+                            "clear".to_owned(),
+                            "default".to_owned(),
+                        ]),
+                    },
+                    ArgDescriptor {
+                        name: "tier".to_owned(),
+                        description: "Tier for `set`/`default`: banned, guest, user, moderator, \
+                             admin"
+                            .to_owned(),
+                        required: false,
+                        kind: ArgKind::String,
+                        choices: Some(vec![
+                            "banned".to_owned(),
+                            "guest".to_owned(),
+                            "user".to_owned(),
+                            "moderator".to_owned(),
+                            "admin".to_owned(),
                         ]),
                     },
                     ArgDescriptor {
                         name: "user".to_owned(),
-                        description: "User to allow or deny (show ignores it; one target per call)"
+                        description: "User to assign a tier to (`set`/`clear`; one target per \
+                             call)"
                             .to_owned(),
                         required: false,
                         kind: ArgKind::User,
@@ -106,7 +135,7 @@ impl PluginPort for AuthPlugin {
                     },
                     ArgDescriptor {
                         name: "role".to_owned(),
-                        description: "Role to allow or deny (show ignores it; one target per call)"
+                        description: "Role to grant a tier (`set`/`clear`; one target per call)"
                             .to_owned(),
                         required: false,
                         kind: ArgKind::Role,
@@ -114,6 +143,7 @@ impl PluginPort for AuthPlugin {
                     },
                 ],
                 required_permission: Some(Permission { name: "manage_guild".to_owned() }),
+                required_tier: Some(AccessTier::Admin),
                 guild_only: true,
             },
             Arc::new(AuthCommandHandler::default()),
@@ -134,69 +164,98 @@ impl MiddlewarePluginPort for AuthPlugin {
             return Next::Continue;
         };
 
-        let raw = match storage.get(NAMESPACE, CONFIG_KEY).await {
-            Ok(Some(raw)) => raw,
-            // Unconfigured = open by default (documented policy).
-            Ok(None) => return Next::Continue,
+        let loaded = match storage.get(NAMESPACE, CONFIG_KEY).await {
+            // Unconfigured = the open default policy (default tier `User`).
+            Ok(None) => None,
+            Ok(Some(raw)) => Some(serde_json::from_value::<AuthConfig>(raw)),
             // Unreadable = fail closed, same as a malformed policy: a storage
             // failure must never widen access, for any guild.
             Err(err) => {
                 tracing::error!(namespace = NAMESPACE, %err, "auth config unreadable - failing closed");
-                self.answer_denial(services, event, self.policy_unavailable_embed(event)).await;
+                self.answer_denial(services, event, Self::policy_unavailable_embed(event)).await;
                 return Next::Stop;
             }
         };
 
-        let Ok(config) = serde_json::from_value::<AuthConfig>(raw) else {
-            tracing::warn!(namespace = NAMESPACE, "auth config is malformed - failing closed");
-            self.answer_denial(services, event, self.policy_unavailable_embed(event)).await;
-            return Next::Stop;
+        let config = match loaded {
+            Some(Ok(config)) => config,
+            Some(Err(_)) => {
+                tracing::warn!(namespace = NAMESPACE, "auth config is malformed - failing closed");
+                self.answer_denial(services, event, Self::policy_unavailable_embed(event)).await;
+                return Next::Stop;
+            }
+            None => AuthConfig::default(),
         };
 
-        if self.is_allowed(&config, event) {
-            return Next::Continue;
+        let tier = Self::effective_tier(&config, event);
+
+        if tier == AccessTier::Banned {
+            tracing::info!(user = %event.origin.user_id, guild_id = ?event.origin.guild_id, "event denied by auth: banned (ignored silently)");
+            return Next::Stop;
         }
 
-        tracing::info!(
-            user = %event.origin.user_id,
-            guild_id = ?event.origin.guild_id,
-            "event denied by auth"
-        );
-        self.answer_denial(services, event, self.denial_embed(&config, event)).await;
+        if let EventPayload::Command(command) = &event.payload {
+            match self.registry.descriptor(&command.name) {
+                None => {} // Unknown command: the dispatcher ignores it anyway.
+                Some(descriptor) => {
+                    let required = descriptor.required_tier.unwrap_or(AccessTier::Guest);
+                    if tier < required {
+                        tracing::info!(
+                            user = %event.origin.user_id,
+                            guild_id = ?event.origin.guild_id,
+                            command = %command.name,
+                            required = %required,
+                            effective = %tier,
+                            "command denied by auth tier"
+                        );
+                        let denial = Self::denial_embed(&command.name, required, tier);
+                        self.answer_denial(services, event, denial).await;
+                        return Next::Stop;
+                    }
+                }
+            }
+        }
 
-        // Deliberate rejection: `Stop`, so this plugin's `post` still runs
-        // (audit hook) while downstream plugins never see the event.
-        Next::Stop
+        Next::Continue
     }
 }
 
 impl AuthPlugin {
-    /// Access rule: listed by user or role; a policy that exists but lists
-    /// nobody additionally admits Discord guild administrators - the empty
-    /// policy must not lock the admins who would reconfigure it out.
-    fn is_allowed(&self, config: &AuthConfig, event: &RequestContext) -> bool {
-        if self.user_listed(config, event) || self.role_listed(config, event) {
-            return true;
-        }
-        config.allowed_users.is_empty()
-            && config.allowed_roles.is_empty()
-            && Self::author_is_guild_admin(event)
-    }
-
-    fn author_is_guild_admin(event: &RequestContext) -> bool {
-        let author_permissions = match &event.payload {
-            EventPayload::Message(message) => message.author_permissions,
-            EventPayload::Command(command) => command.author_permissions,
-            _ => return false,
+    /// Effective tier of the event's author:
+    /// - Discord guild administrators are `Admin` by construction - the
+    ///   clamp IS the "cannot be removed" guarantee; there is no stored
+    ///   entry to lose, and no code path anywhere needs a special case.
+    /// - An explicit `Banned` user assignment wins over every role grant.
+    /// - Otherwise: the user's assignment (or the guild default) lifted by
+    ///   the best qualifying role - an explicit assignment below the
+    ///   default (e.g. `Guest`) stays below it until a role lifts it.
+    fn effective_tier(config: &AuthConfig, event: &RequestContext) -> AccessTier {
+        let (author_roles, author_permissions) = match &event.payload {
+            EventPayload::Message(message) => (&message.author_roles, message.author_permissions),
+            EventPayload::Command(command) => (&command.author_roles, command.author_permissions),
+            _ => return config.default_tier,
         };
-        (author_permissions & GUILD_ADMINISTRATOR_BIT) != 0
+
+        if author_permissions & GUILD_ADMINISTRATOR_BIT != 0 {
+            return AccessTier::Admin;
+        }
+
+        let user_id = event.origin.user_id.get().to_string();
+        if config.users.get(&user_id) == Some(&AccessTier::Banned) {
+            return AccessTier::Banned;
+        }
+
+        let base = config.users.get(&user_id).copied().unwrap_or(config.default_tier);
+        let role_tier =
+            author_roles.iter().filter_map(|role| config.roles.get(role)).copied().max();
+        base.max(role_tier.unwrap_or(base))
     }
 
     /// Delivers a denial to transactional events only (slash commands owe
     /// the invoker an answer; make it ephemeral so it never spams the
     /// channel or exposes the policy). Plain messages are not interactions -
     /// ephemeral is impossible there and a public reply would be a spam
-    /// vector - so they stay silent.
+    /// vector - so they stay silent (bans are silent everywhere).
     async fn answer_denial(&self, services: &KernelServices, event: &RequestContext, embed: Embed) {
         if event.origin.reply_token.is_none() {
             return;
@@ -207,9 +266,9 @@ impl AuthPlugin {
         }
     }
 
-    /// Denial when the policy itself is unreadable: no reasons to quote,
+    /// Denial when the policy itself is unreadable: no tiers to quote,
     /// point at the broken configuration instead.
-    fn policy_unavailable_embed(&self, event: &RequestContext) -> Embed {
+    fn policy_unavailable_embed(event: &RequestContext) -> Embed {
         let what = match &event.payload {
             EventPayload::Command(command) => {
                 format!("Command `/{}` could not be authorized.", command.name)
@@ -224,50 +283,12 @@ impl AuthPlugin {
         }
     }
 
-    fn user_listed(&self, config: &AuthConfig, event: &RequestContext) -> bool {
-        config.allowed_users.iter().any(|id| *id == event.origin.user_id.get().to_string())
-    }
-
-    fn role_listed(&self, config: &AuthConfig, event: &RequestContext) -> bool {
-        let author_roles = match &event.payload {
-            EventPayload::Message(message) => &message.author_roles,
-            EventPayload::Command(command) => &command.author_roles,
-            _ => return false,
-        };
-        author_roles.iter().any(|role| config.allowed_roles.contains(role))
-    }
-
-    /// Why the event was denied, in terms of the policy groups: which
-    /// permission group rejected the user, or that a role is missing.
-    fn denial_embed(&self, config: &AuthConfig, event: &RequestContext) -> Embed {
-        let mut reasons: Vec<String> = Vec::new();
-        if !config.allowed_users.is_empty() && !self.user_listed(config, event) {
-            reasons.push("Not authorized for the `users` permissions group.".to_owned());
-        }
-        if !config.allowed_roles.is_empty() && !self.role_listed(config, event) {
-            reasons.push(
-                "Missing role: none of your roles are in the `roles` permissions group.".to_owned(),
-            );
-        }
-        if reasons.is_empty() {
-            // Empty policy: non-admins were just denied; say who is still
-            // allowed.
-            reasons.push(
-                "While the access policy is empty, only Discord guild administrators are allowed."
-                    .to_owned(),
-            );
-        }
-
-        let what = match &event.payload {
-            EventPayload::Command(command) => {
-                format!("Command `/{}` is not allowed here.", command.name)
-            }
-            _ => "This action is not allowed here.".to_owned(),
-        };
-
+    fn denial_embed(command_name: &str, required: AccessTier, effective: AccessTier) -> Embed {
         Embed {
             title: "⛔ Not authorized".to_owned(),
-            description: format!("{what}\n{}", reasons.join("\n")),
+            description: format!(
+                "Command `/{command_name}` requires the {required} tier (you have {effective}).\nAsk a guild admin if you think this is a mistake."
+            ),
         }
     }
 }
@@ -281,16 +302,46 @@ mod tests {
             ChannelId, CommandPayload, GuildId, MemberPayload, MessageId, MessagePayload, Origin,
             Platform, UserId,
         },
+        plugin_ports::{CommandArgs, CommandHandler},
         spi_ports::{GUILD_SETTINGS, StoragePort},
     };
     use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
     use serde_json::json;
     use std::sync::Arc;
 
-    /// The gate under test; init/command tests live in `command.rs` with
-    /// their own registry, so a fresh empty registry is enough here.
-    fn test_plugin() -> AuthPlugin {
-        AuthPlugin::new(Arc::new(InMemoryCommandRegistry::new()))
+    /// Registry fixture carrying the descriptors the gate looks up. The
+    /// `/auth` handler tests live in `command.rs`; handlers here are no-ops.
+    fn test_plugin(commands: &[(&str, AccessTier)]) -> AuthPlugin {
+        struct NoopHandler;
+
+        #[async_trait]
+        impl CommandHandler for NoopHandler {
+            async fn invoke(
+                &self,
+                _event: &RequestContext,
+                _args: &CommandArgs,
+                _services: &KernelServices,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let registry = Arc::new(InMemoryCommandRegistry::new());
+        for (name, tier) in commands {
+            registry.register(
+                CommandDescriptor {
+                    plugin_id: "test".to_owned(),
+                    name: (*name).to_owned(),
+                    description: "test command".to_owned(),
+                    arguments: Vec::new(),
+                    required_permission: None,
+                    required_tier: Some(*tier),
+                    guild_only: true,
+                },
+                Arc::new(NoopHandler),
+            );
+        }
+        AuthPlugin::new(registry)
     }
 
     fn origin(user_id: u64) -> Origin {
@@ -304,12 +355,12 @@ mod tests {
         }
     }
 
-    fn command_event(user_id: u64, roles: &[&str]) -> RequestContext {
+    fn command_event(user_id: u64, name: &str, roles: &[&str]) -> RequestContext {
         RequestContext {
             kind: EventKind::CommandInvoked,
             origin: origin(user_id),
             payload: EventPayload::Command(CommandPayload {
-                name: "ping".to_owned(),
+                name: name.to_owned(),
                 args: Vec::new(),
                 author_roles: roles.iter().map(|role| (*role).to_owned()).collect(),
                 author_permissions: 0,
@@ -335,7 +386,7 @@ mod tests {
     /// Command event carrying explicit platform permission bits (opaque
     /// pass-through data; `0x8` marks a Discord guild administrator).
     fn command_event_with_permissions(user_id: u64, author_permissions: u64) -> RequestContext {
-        let mut event = command_event(user_id, &[]);
+        let mut event = command_event(user_id, "auth", &[]);
         if let EventPayload::Command(payload) = &mut event.payload {
             payload.author_permissions = author_permissions;
         }
@@ -360,7 +411,11 @@ mod tests {
         (services, output)
     }
 
-    fn configured_storage(allowed_users: &[&str], allowed_roles: &[&str]) -> Arc<InMemoryStorage> {
+    fn configured_storage(
+        default_tier: AccessTier,
+        users: &[(&str, AccessTier)],
+        roles: &[(&str, AccessTier)],
+    ) -> Arc<InMemoryStorage> {
         let storage = InMemoryStorage::new();
         storage.seed(
             Platform::Discord,
@@ -368,188 +423,208 @@ mod tests {
             NAMESPACE,
             CONFIG_KEY,
             json!({
-                "allowed_users": allowed_users,
-                "allowed_roles": allowed_roles,
+                "default_tier": default_tier.as_str(),
+                "users": users.iter().map(|(id, tier)| (id.to_string(), tier.as_str()))
+                    .collect::<BTreeMap<_, _>>(),
+                "roles": roles.iter().map(|(id, tier)| (id.to_string(), tier.as_str()))
+                    .collect::<BTreeMap<_, _>>(),
             }),
         );
         Arc::new(storage)
     }
 
     #[tokio::test]
-    async fn unconfigured_guild_is_open() {
+    async fn unconfigured_guild_allows_default_tier() {
         let storage = InMemoryStorage::new();
         let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
-        let mut event = message_event(3, &[]);
+        let plugin = test_plugin(&[("ping", AccessTier::User)]);
+        let mut message = message_event(3, &[]);
+        let mut command = command_event(3, "ping", &[]);
 
-        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+        assert!(matches!(plugin.pre(&mut message, &services).await, Next::Continue));
+        assert!(matches!(plugin.pre(&mut command, &services).await, Next::Continue));
         assert!(output.messages().is_empty());
     }
 
     #[tokio::test]
-    async fn allowed_user_passes() {
-        let storage = configured_storage(&["3"], &[]);
+    async fn user_tier_cannot_run_moderator_commands() {
+        let storage = configured_storage(AccessTier::User, &[], &[]);
         let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
-        let mut event = message_event(3, &[]);
-
-        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
-        assert!(output.messages().is_empty());
-    }
-
-    #[tokio::test]
-    async fn unlisted_user_is_stopped_without_output() {
-        let storage = configured_storage(&["999"], &[]);
-        let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
-        let mut event = message_event(3, &[]);
-
-        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
-        assert!(output.messages().is_empty());
-    }
-
-    /// A denied slash command (transactional origin) answers the invoker
-    /// with an ephemeral embed naming the rejected permission group.
-    #[tokio::test]
-    async fn denied_command_answers_ephemerally_with_user_group_reason() {
-        let storage = configured_storage(&["999"], &[]);
-        let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
-        let mut event = command_event(3, &[]);
+        let plugin = test_plugin(&[("assign_tracker", AccessTier::Moderator)]);
+        let mut event = command_event(3, "assign_tracker", &[]);
         event.origin.reply_token = Some("token".to_owned());
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
 
         let sent = output.sent();
         assert_eq!(sent.len(), 1);
-        let denial = sent.first().expect("denial expected");
-        assert!(denial.ephemeral, "denial must be visible to the invoker only");
+        assert!(sent.first().expect("denial expected").ephemeral);
         let text = output.messages().into_iter().next().expect("denial expected");
         assert!(text.contains("⛔ Not authorized"));
-        assert!(text.contains("Command `/ping` is not allowed here."));
-        assert!(text.contains("Not authorized for the `users` permissions group."));
-        assert!(!text.contains("Missing role"));
+        assert!(text.contains("Command `/assign_tracker` requires the Moderator tier"));
+        assert!(text.contains("you have User"));
     }
 
     #[tokio::test]
-    async fn denied_command_with_roles_config_reports_missing_role() {
-        let storage = configured_storage(&[], &["42"]);
+    async fn moderator_assignment_runs_moderator_commands() {
+        let storage = configured_storage(AccessTier::User, &[("3", AccessTier::Moderator)], &[]);
         let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
-        let mut event = command_event(3, &["7"]);
-        event.origin.reply_token = Some("token".to_owned());
-
-        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
-
-        let text = output.messages().into_iter().next().expect("denial expected");
-        assert!(
-            text.contains("Missing role: none of your roles are in the `roles` permissions group.")
-        );
-        assert!(!text.contains("Not authorized for the"));
-    }
-
-    #[tokio::test]
-    async fn denied_command_lists_every_rejected_group() {
-        let storage = configured_storage(&["999"], &["42"]);
-        let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
-        let mut event = command_event(3, &["7"]);
-        event.origin.reply_token = Some("token".to_owned());
-
-        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
-
-        let text = output.messages().into_iter().next().expect("denial expected");
-        assert!(text.contains("Not authorized for the `users` permissions group."));
-        assert!(text.contains("Missing role"));
-    }
-
-    /// An empty policy denies non-admins, and the denial explains the
-    /// administrator fallback.
-    #[tokio::test]
-    async fn denied_command_with_empty_policy_denies_non_admin() {
-        let storage = configured_storage(&[], &[]);
-        let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
-        // author_permissions: 0 = unknown, in particular not an administrator.
-        let mut event = command_event(3, &[]);
-        event.origin.reply_token = Some("token".to_owned());
-
-        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
-
-        let text = output.messages().into_iter().next().expect("denial expected");
-        assert!(text.contains("While the access policy is empty"));
-        assert!(text.contains("only Discord guild administrators are allowed"));
-    }
-
-    /// Master-admin fallback: a policy that exists but lists nobody keeps
-    /// Discord guild administrators allowed (bit 0x8, opaque pass-through).
-    #[tokio::test]
-    async fn empty_policy_allows_guild_admin() {
-        let storage = configured_storage(&[], &[]);
-        let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
-        let mut event = command_event_with_permissions(3, 0x8);
-
-        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
-        assert!(output.messages().is_empty());
-    }
-
-    /// The inverse master-admin boundary: an administrator is NOT a master
-    /// admin of a configured (non-empty) policy that does not list them.
-    /// Only an EMPTY policy admits admins - never a filled one.
-    #[tokio::test]
-    async fn guild_admin_is_denied_by_a_non_empty_policy_that_omits_them() {
-        let storage = configured_storage(&["1"], &[]);
-        let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
-        let mut event = command_event_with_permissions(3, 0x8);
-        event.origin.reply_token = Some("token".to_owned());
-
-        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
-
-        let text = output.messages().into_iter().next().expect("denial expected");
-        assert!(text.contains("Not authorized for the `users` permissions group."));
-        assert!(
-            !text.contains("While the access policy is empty"),
-            "the policy is not empty - the admin fallback must not apply"
-        );
-    }
-
-    /// The admin fallback reads the administrator bit off BOTH payload kinds:
-    /// a plain message from a guild admin passes an empty policy too.
-    #[tokio::test]
-    async fn empty_policy_admin_fallback_applies_to_plain_messages() {
-        let storage = configured_storage(&[], &[]);
-        let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
-        let mut event = message_event(3, &[]);
-        if let EventPayload::Message(payload) = &mut event.payload {
-            payload.author_permissions = 0x8;
-        }
+        let plugin = test_plugin(&[("assign_tracker", AccessTier::Moderator)]);
+        let mut event = command_event(3, "assign_tracker", &[]);
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
         assert!(output.messages().is_empty());
     }
 
     #[tokio::test]
-    async fn allowed_role_passes_for_unlisted_user() {
-        let storage = configured_storage(&[], &["42"]);
+    async fn role_mapping_lifts_tier() {
+        let storage = configured_storage(AccessTier::User, &[], &[("42", AccessTier::Moderator)]);
         let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
+        let plugin = test_plugin(&[("assign_tracker", AccessTier::Moderator)]);
+        let mut event = command_event(3, "assign_tracker", &["42"]);
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+        assert!(output.messages().is_empty());
+    }
+
+    /// Guests may chat (plain messages pass) but commands above Guest tier
+    /// are denied with the tier named.
+    #[tokio::test]
+    async fn guest_default_allows_chat_but_denies_commands() {
+        let storage = configured_storage(AccessTier::Guest, &[], &[]);
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin(&[("ping", AccessTier::User)]);
+        let mut message = message_event(3, &[]);
+        let mut command = command_event(3, "ping", &[]);
+        command.origin.reply_token = Some("token".to_owned());
+
+        assert!(matches!(plugin.pre(&mut message, &services).await, Next::Continue));
+        assert!(matches!(plugin.pre(&mut command, &services).await, Next::Stop));
+        let text = output.messages().into_iter().next().expect("denial expected");
+        assert!(text.contains("requires the User tier"));
+        assert!(text.contains("you have Guest"));
+    }
+
+    /// An explicit assignment below the default survives: `max()` must not
+    /// let the guild default lift a deliberate demotion.
+    #[tokio::test]
+    async fn explicit_guest_assignment_beats_open_default() {
+        let storage = configured_storage(AccessTier::User, &[("3", AccessTier::Guest)], &[]);
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin(&[("ping", AccessTier::User)]);
+        let mut event = command_event(3, "ping", &[]);
+        event.origin.reply_token = Some("token".to_owned());
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
+        let text = output.messages().into_iter().next().expect("denial expected");
+        assert!(text.contains("you have Guest"));
+    }
+
+    /// Banned members are dropped without any output - bans never announce
+    /// themselves, on messages and on commands alike (even transactional).
+    #[tokio::test]
+    async fn banned_members_are_dropped_silently() {
+        let storage = configured_storage(AccessTier::User, &[("3", AccessTier::Banned)], &[]);
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin(&[("ping", AccessTier::User)]);
+        let mut message = message_event(3, &[]);
+        let mut command = command_event(3, "ping", &[]);
+        command.origin.reply_token = Some("token".to_owned());
+
+        assert!(matches!(plugin.pre(&mut message, &services).await, Next::Stop));
+        assert!(matches!(plugin.pre(&mut command, &services).await, Next::Stop));
+        assert!(output.messages().is_empty());
+    }
+
+    /// An explicit ban wins over role grants: a banned user holding a
+    /// moderator role stays banned.
+    #[tokio::test]
+    async fn ban_beats_role_grants() {
+        let storage = configured_storage(
+            AccessTier::User,
+            &[("3", AccessTier::Banned)],
+            &[("42", AccessTier::Moderator)],
+        );
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin(&[("ping", AccessTier::User)]);
         let mut event = message_event(3, &["42"]);
 
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
+        assert!(output.messages().is_empty());
+    }
+
+    /// Discord guild administrators are Admin by construction: even a
+    /// policy that never mentions them lets them run `/auth`.
+    #[tokio::test]
+    async fn guild_admin_is_admin_by_construction() {
+        let storage = configured_storage(AccessTier::User, &[], &[]);
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin(&[("auth", AccessTier::Admin)]);
+        let mut event = command_event_with_permissions(3, 0x8);
+
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
         assert!(output.messages().is_empty());
     }
 
+    /// The clamp beats an explicit ban, too - removing a guild admin's
+    /// access is impossible by construction, in every code path.
     #[tokio::test]
-    async fn role_mismatch_denies() {
-        let storage = configured_storage(&[], &["42"]);
+    async fn guild_admin_clamp_beats_explicit_ban() {
+        let storage = configured_storage(AccessTier::User, &[("3", AccessTier::Banned)], &[]);
         let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
-        let mut event = message_event(3, &["7"]);
+        let plugin = test_plugin(&[("auth", AccessTier::Admin)]);
+        let mut event = command_event_with_permissions(3, 0x8);
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+        assert!(output.messages().is_empty());
+    }
+
+    /// Non-admins cannot run admin-tier commands; the denial names both
+    /// sides of the comparison.
+    #[tokio::test]
+    async fn non_admin_cannot_run_auth() {
+        let storage = configured_storage(AccessTier::User, &[], &[]);
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin(&[("auth", AccessTier::Admin)]);
+        let mut event = command_event(3, "auth", &[]);
+        event.origin.reply_token = Some("token".to_owned());
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
+        let text = output.messages().into_iter().next().expect("denial expected");
+        assert!(text.contains("Command `/auth` requires the Admin tier"));
+        assert!(text.contains("you have User"));
+    }
+
+    /// Commands without a registered descriptor pass: the dispatcher has no
+    /// handler for them, so gating them would change nothing.
+    #[tokio::test]
+    async fn unknown_command_passes() {
+        let storage = configured_storage(AccessTier::Guest, &[], &[]);
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin(&[]);
+        let mut event = command_event(3, "nonexistent", &[]);
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+        assert!(output.messages().is_empty());
+    }
+
+    /// A legacy pre-tier policy document has no migration: it deserializes
+    /// to the open default (unknown fields ignored, defaults filled in).
+    #[tokio::test]
+    async fn legacy_document_behaves_as_open_default() {
+        let storage = InMemoryStorage::new();
+        storage.seed(
+            Platform::Discord,
+            GuildId(1),
+            NAMESPACE,
+            CONFIG_KEY,
+            json!({ "allowed_users": ["999"], "allowed_roles": [] }),
+        );
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin(&[("ping", AccessTier::User)]);
+        let mut event = message_event(3, &[]);
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
         assert!(output.messages().is_empty());
     }
 
@@ -558,42 +633,43 @@ mod tests {
         let storage = InMemoryStorage::new();
         storage.seed(Platform::Discord, GuildId(1), NAMESPACE, CONFIG_KEY, json!("not an object"));
         let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
+        let plugin = test_plugin(&[("ping", AccessTier::User)]);
         let mut event = message_event(3, &[]);
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
         assert!(output.messages().is_empty());
     }
 
-    /// A broken policy cannot quote reasons, but a slash command still owes
+    /// A broken policy cannot quote tiers, but a slash command still owes
     /// the invoker an ephemeral answer pointing at the configuration.
     #[tokio::test]
     async fn malformed_config_denies_commands_with_policy_unavailable_embed() {
         let storage = InMemoryStorage::new();
         storage.seed(Platform::Discord, GuildId(1), NAMESPACE, CONFIG_KEY, json!("not an object"));
         let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
-        let mut event = command_event(3, &[]);
+        let plugin = test_plugin(&[("ping", AccessTier::User)]);
+        let mut event = command_event(3, "ping", &[]);
         event.origin.reply_token = Some("token".to_owned());
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
 
         let sent = output.sent();
         assert_eq!(sent.len(), 1);
-        let denial = sent.first().expect("denial expected");
-        assert!(denial.ephemeral, "denial must be visible to the invoker only");
+        assert!(sent.first().expect("denial expected").ephemeral);
         let text = output.messages().into_iter().next().expect("denial expected");
         assert!(text.contains("⛔ Not authorized"));
         assert!(text.contains("Command `/ping` could not be authorized."));
         assert!(text.contains("unreadable (malformed)"));
-        assert!(!text.contains("permissions group"), "no policy, no reasons");
+        assert!(!text.contains("tier"), "no policy, no reasons");
     }
 
+    /// Passive events are not gated - even a banned member's join flows to
+    /// the plugins that need it.
     #[tokio::test]
     async fn non_message_events_pass_through() {
-        let storage = configured_storage(&["999"], &[]);
+        let storage = configured_storage(AccessTier::User, &[("3", AccessTier::Banned)], &[]);
         let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
+        let plugin = test_plugin(&[]);
         let mut event = join_event(3);
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
@@ -601,43 +677,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commands_are_gated_like_messages() {
-        let storage = configured_storage(&["999"], &[]);
-        let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
-        let mut event = command_event(3, &[]);
-
-        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
-        assert!(output.messages().is_empty());
-    }
-
-    #[tokio::test]
-    async fn command_with_allowed_role_passes() {
-        let storage = configured_storage(&[], &["42"]);
-        let (services, output) = test_services(&storage);
-        let plugin = test_plugin();
-        let mut event = command_event(3, &["42"]);
-
-        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
-        assert!(output.messages().is_empty());
-    }
-
-    #[tokio::test]
     async fn direct_messages_pass_through() {
-        let _storage = configured_storage(&["999"], &[]);
+        let storage = configured_storage(AccessTier::User, &[("3", AccessTier::Banned)], &[]);
         let output = RecordingChatOutput::new();
-        let chat_output: Arc<dyn crate::kernel::spi_ports::ChatOutputPort> =
-            Arc::clone(&output) as Arc<dyn crate::kernel::spi_ports::ChatOutputPort>;
         let services = KernelServices {
-            chat_output,
+            chat_output: Arc::clone(&output) as Arc<dyn crate::kernel::spi_ports::ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: None,
         };
-        let plugin = test_plugin();
+        let plugin = test_plugin(&[]);
         let mut event = message_event(3, &[]);
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
         assert!(output.messages().is_empty());
+        drop(storage);
     }
 
     /// Guards the reserved namespace constant the guild settings plugin will
@@ -660,8 +713,8 @@ mod tests {
                 crate::test_support::FailingStorage.guild_scoped(Platform::Discord, GuildId(1)),
             ),
         };
-        let plugin = test_plugin();
-        let mut event = command_event(3, &[]);
+        let plugin = test_plugin(&[]);
+        let mut event = command_event(3, "ping", &[]);
         event.origin.reply_token = Some("token".to_owned());
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
