@@ -28,6 +28,17 @@ pub(crate) const DEFAULT_IMAGE_PROMPT: &str = "Describe this image concisely for
 /// same class as prompt-file fetches: interactive work on the capture path.
 const IMAGE_FETCH_TIMEOUT_SECS: u64 = 30;
 
+/// The pinned trusted host for platform CDN fetches - the same pin the
+/// prompt-file path enforces. Attachment URLs are adapter-minted, so this
+/// is defense in depth, not the primary trust boundary.
+pub(crate) const DISCORD_CDN_PREFIX: &str = "https://cdn.discordapp.com/";
+
+/// Hard cap on either decoded dimension: real photos stay far below it, a
+/// decompression bomb (hundreds of megapixels from a small PNG) does not
+/// get past the decoder. Combined with the crate's allocation limit, this
+/// bounds the decode spike on the capture path.
+const MAX_DECODE_DIMENSION: u32 = 8192;
+
 /// One image awaiting description, filtered by the engine from a message's
 /// attachments.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,7 +136,12 @@ impl VisionService {
         image: &ImageSource,
         max_source_bytes: u64,
     ) -> Result<Vec<u8>, VisionError> {
-        let response = self
+        // Trust boundary, enforced (mirrors `/llm_prompt_file`): only the
+        // platform CDN is ever fetched, whatever the payload claims.
+        if !image.url.starts_with(DISCORD_CDN_PREFIX) {
+            return Err(VisionError::UntrustedHost);
+        }
+        let mut response = self
             .fetch
             .get(&image.url)
             .send()
@@ -136,11 +152,18 @@ impl VisionService {
         {
             return Err(VisionError::TooLarge);
         }
-        let bytes = response.bytes().await.map_err(|err| VisionError::Download(err.to_string()))?;
-        if bytes.len() as u64 > max_source_bytes {
-            return Err(VisionError::TooLarge);
+        // Stream-read so the cap bounds memory even when the header lies or
+        // is absent (chunked responses buffer the whole body otherwise).
+        let mut body = Vec::new();
+        while let Some(chunk) =
+            response.chunk().await.map_err(|err| VisionError::Download(err.to_string()))?
+        {
+            body.extend_from_slice(&chunk);
+            if body.len() as u64 > max_source_bytes {
+                return Err(VisionError::TooLarge);
+            }
         }
-        Ok(bytes.to_vec())
+        Ok(body)
     }
 }
 
@@ -160,8 +183,14 @@ impl ImageDescriber for VisionService {
 /// format every vision endpoint accepts, and the smallest post-resize
 /// payload. GIF/WebP/animated input decodes to its first frame.
 fn resize_to_jpeg(bytes: &[u8], max_side: u32, quality: u8) -> Result<Vec<u8>, VisionError> {
-    let decoded =
-        image::load_from_memory(bytes).map_err(|err| VisionError::Decode(err.to_string()))?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|err| VisionError::Decode(err.to_string()))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_DIMENSION);
+    limits.max_image_height = Some(MAX_DECODE_DIMENSION);
+    reader.limits(limits);
+    let decoded = reader.decode().map_err(|err| VisionError::Decode(err.to_string()))?;
     let resized = if decoded.width().max(decoded.height()) > max_side {
         decoded.resize(max_side, max_side, image::imageops::FilterType::Triangle)
     } else {
@@ -178,6 +207,8 @@ fn resize_to_jpeg(bytes: &[u8], max_side: u32, quality: u8) -> Result<Vec<u8>, V
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum VisionError {
+    #[error("image host is outside the pinned platform CDN")]
+    UntrustedHost,
     #[error("image download failed: {0}")]
     Download(String),
     #[error("image exceeds the configured size cap")]
@@ -193,6 +224,8 @@ pub(crate) enum VisionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::llm::completion_port::CompletionResponse;
+    use crate::plugins::llm::completion_port::LlmError;
 
     fn source(mime: Option<&str>) -> ImageSource {
         ImageSource {
@@ -239,6 +272,52 @@ mod tests {
     fn undecodable_bytes_are_rejected_not_panicked_on() {
         let err = resize_to_jpeg(b"not an image", 512, 85).expect_err("garbage expected to fail");
         assert!(matches!(err, VisionError::Decode(_)));
+    }
+
+    /// The trust boundary is enforced at the fetch, not just by convention:
+    /// a non-CDN URL fails before any network I/O - and before the
+    /// completion port is ever touched.
+    struct NeverCompletion;
+
+    #[async_trait]
+    impl LlmCompletionPort for NeverCompletion {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            panic!("host check must fail before the completion port is reached");
+        }
+    }
+
+    #[tokio::test]
+    async fn untrusted_host_is_rejected_without_any_fetch_or_call() {
+        let service = VisionService::new(Arc::new(NeverCompletion));
+        let job = ImageJob {
+            model: "m".to_owned(),
+            prompt: "p".to_owned(),
+            max_side: 512,
+            jpeg_quality: 85,
+            max_source_bytes: 1000,
+        };
+
+        let out = service
+            .describe(
+                &job,
+                vec![ImageSource {
+                    url: "https://evil.test/a.png".to_owned(),
+                    content_type: Some("image/png".to_owned()),
+                }],
+            )
+            .await;
+
+        assert_eq!(out, vec![None]);
+    }
+
+    #[test]
+    fn pinned_cdn_prefix_is_the_only_accepted_shape() {
+        assert!("https://cdn.discordapp.com/attachments/1/2/a.png".starts_with(DISCORD_CDN_PREFIX));
+        assert!(!"https://cdn.discordapp.com.evil.test/a.png".starts_with(DISCORD_CDN_PREFIX));
+        assert!(!"http://cdn.discordapp.com/a.png".starts_with(DISCORD_CDN_PREFIX));
     }
 
     fn encode_png(image: &image::RgbImage) -> Vec<u8> {

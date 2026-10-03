@@ -65,6 +65,25 @@ impl MiddlewarePluginPort for CommandPlugin {
 
         let Some(handler) = self.registry.lookup(&command.name) else {
             tracing::debug!(command = %command.name, "no handler registered - ignoring command");
+            // A deferred interaction must never hang on "thinking": a stale
+            // client can still invoke a command that was renamed/removed
+            // between syncs (or a guild-only command can slip through in a
+            // DM), so transactional origins get an ephemeral not-found
+            // notice. Plain origins stay silent (the no-not-found default).
+            if event.origin.reply_token.is_some() {
+                let notice = OutboundMessage::embed(Embed {
+                    title: "Unknown command".to_owned(),
+                    description: format!(
+                        "`/{}` is not registered - the command list may be out of date; \
+                         reopen the command menu.",
+                        command.name
+                    ),
+                })
+                .ephemeral();
+                if let Err(notice_err) = services.chat_output.send(notice).await {
+                    tracing::warn!(%notice_err, "failed to deliver unknown-command notice");
+                }
+            }
             return Next::Continue;
         };
 
@@ -227,6 +246,43 @@ mod tests {
 
         assert!(matches!(next, Next::Stop));
         assert_eq!(output.messages(), ["hello!"]);
+    }
+
+    /// An unknown command on a transactional origin must not hang the
+    /// deferred interaction on "thinking": an ephemeral not-found notice
+    /// goes out (stale clients can still invoke renamed/removed commands).
+    /// Plain origins stay silent - the no-not-found default.
+    #[tokio::test]
+    async fn unknown_command_answers_the_interaction_ephemerally() {
+        let plugin = CommandPlugin::new(registry_with("greet", "hello!"));
+        let output = RecordingChatOutput::new();
+        let services = test_services(&output);
+        let mut event = command_event("vanished", &[]);
+        if let crate::kernel::models::EventPayload::Command(payload) = &mut event.payload {
+            event.origin.reply_token = Some("interaction-token".to_owned());
+            payload.name = "vanished".to_owned();
+        }
+
+        let next = plugin.pre(&mut event, &services).await;
+
+        assert!(matches!(next, Next::Continue));
+        let sent = output.sent();
+        assert_eq!(sent.len(), 1);
+        assert!(sent.first().is_some_and(|message| message.ephemeral));
+        assert!(output.messages().first().is_some_and(|text| text.contains("vanished")));
+    }
+
+    #[tokio::test]
+    async fn unknown_plain_command_stays_silent() {
+        let plugin = CommandPlugin::new(registry_with("greet", "hello!"));
+        let output = RecordingChatOutput::new();
+        let services = test_services(&output);
+        let mut event = command_event("vanished", &[]);
+
+        let next = plugin.pre(&mut event, &services).await;
+
+        assert!(matches!(next, Next::Continue));
+        assert!(output.messages().is_empty());
     }
 
     #[tokio::test]

@@ -487,9 +487,7 @@ fn flatten_options(
                         );
                     }
                 }
-                CommandDataOptionValue::Unknown(_)
-                | CommandDataOptionValue::Autocomplete { .. }
-                | _ => {}
+                _ => {}
             }
         }
     }
@@ -844,6 +842,12 @@ mod tests {
         );
         assert_eq!(denormalize_mention_tags("[a[b]]<@123>"), "[a[b]]<@123>");
         assert_eq!(denormalize_mention_tags("plain text"), "plain text");
+        // Markdown adjacent to a tag is never mangled: the link's bracket
+        // pair stays untouched, and names containing parentheses still
+        // strip (only nested `[` rejects a candidate).
+        assert_eq!(denormalize_mention_tags("[text](url)<@123>"), "[text](url)<@123>");
+        assert_eq!(denormalize_mention_tags("[Name (x)]<@123>"), "<@123>");
+        assert_eq!(denormalize_mention_tags("[l](u) [Name]<@1>"), "[l](u) <@1>");
     }
 
     /// The snowflake's embedded birth time drives the age: a snowflake born

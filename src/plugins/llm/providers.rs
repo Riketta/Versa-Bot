@@ -787,6 +787,105 @@ fn strip_think_blocks(content: &str) -> String {
     kept.trim().to_owned()
 }
 
+/// Incremental reasoning suppressor for STREAMED content deltas. The live
+/// reveal must never show `<think>` text: without this, a channel with
+/// `streaming` on would watch the model think (the raw deltas go straight
+/// to the reveal), and a stream that died mid-thinking would deliver - and
+/// record - thinking as the final partial answer. The authoritative final
+/// content is stripped separately (see [`strip_think_blocks`]); this
+/// filters only what the reveal shows.
+///
+/// Stream-safe semantics: an opener - leading or mid-text - suppresses
+/// everything until a closer appears (possibly across delta boundaries);
+/// whitespace right after a closer is skipped (mirroring the strip's trim
+/// around cuts). The mid-text-unclosed-means-literal rule cannot be applied
+/// prospectively, so such text stays hidden for the live reveal - the final
+/// edit still shows it ("only ever behind, never wrong"), and a stream that
+/// dies inside it loses it. A leading opener that never closes keeps the
+/// reveal empty, which maps to the no-answer fallback exactly like the
+/// authoritative `EmptyResponse`. Matching is case-sensitive on the
+/// universal lowercase wire form; exotic casing is still cut from the
+/// authoritative text.
+#[derive(Default)]
+pub(crate) struct DeltaThinkStripper {
+    inside_think: bool,
+    /// Held-back characters that may still turn into a tag boundary
+    /// (`<...` while copying, `</...` while suppressing); emitted or
+    /// dropped as soon as the next character resolves the candidate.
+    held: String,
+    /// Set when a think block closes: skip the whitespace run that follows
+    /// the cut.
+    trim_next: bool,
+}
+
+const OPEN_TAG: &str = "<think>";
+const CLOSE_TAG: &str = "</think>";
+
+impl DeltaThinkStripper {
+    /// Consumes one delta and returns the text safe to reveal.
+    pub(crate) fn push(&mut self, delta: &str) -> String {
+        let mut out = String::new();
+        for ch in delta.chars() {
+            self.held.push(ch);
+            self.resolve(&mut out);
+        }
+        out
+    }
+
+    /// Flushes the held-back characters at end of stream: literal when
+    /// copying, discarded when the stream died inside a think block.
+    pub(crate) fn finish(&mut self) -> String {
+        let mut out = String::new();
+        if !self.inside_think {
+            let held = std::mem::take(&mut self.held);
+            for ch in held.chars() {
+                self.emit(&mut out, ch);
+            }
+        }
+        self.held.clear();
+        out
+    }
+
+    /// Resolves the held-back candidate: emits (copy mode) or drops
+    /// (suppress mode) until the held bytes are a resolved tag or a
+    /// possible tag prefix again.
+    fn resolve(&mut self, out: &mut String) {
+        loop {
+            let (tag, suppressing) =
+                if self.inside_think { (CLOSE_TAG, true) } else { (OPEN_TAG, false) };
+            if self.held.starts_with(tag) {
+                self.held.replace_range(..tag.len(), "");
+                self.inside_think = !suppressing;
+                self.trim_next = suppressing;
+                continue;
+            }
+            // Still a possible tag prefix - wait for the next character.
+            if tag.starts_with(self.held.as_str()) {
+                return;
+            }
+            if suppressing {
+                // Inside a think block: non-closer text is dropped, not
+                // revealed - dropping the first character re-exposes the
+                // rest for closer matching.
+                self.held.remove(0);
+            } else {
+                let first = self.held.remove(0);
+                self.emit(out, first);
+            }
+        }
+    }
+
+    fn emit(&mut self, out: &mut String, ch: char) {
+        if self.trim_next {
+            if ch.is_whitespace() {
+                return;
+            }
+            self.trim_next = false;
+        }
+        out.push(ch);
+    }
+}
+
 /// `usage` is optional in the `OpenAI` shape: endpoints that do not report
 /// token stats simply get `None`. A partial `usage` block is treated as
 /// absent rather than guessed at.
@@ -883,6 +982,10 @@ async fn read_sse_stream(
     let mut endpoint_ms: Option<u64> = None;
     let mut raw = String::new();
     let mut done = false;
+    // The reveal never sees reasoning: deltas are filtered through the
+    // incremental suppressor while `content` stays raw for the
+    // authoritative strip below.
+    let mut stripper = DeltaThinkStripper::default();
     while !done {
         let Some(chunk) = bytes.next().await else { break };
         let chunk = chunk.map_err(|err| LlmError::Request(format!("stream read failed: {err}")))?;
@@ -915,9 +1018,16 @@ async fn read_sse_stream(
                 // The engine consumes promptly - it throttles Discord edits,
                 // not receives. A closed channel means the engine task died;
                 // finish reading the authoritative response anyway.
-                let _ = deltas.send(delta).await;
+                let visible = stripper.push(&delta);
+                if !visible.is_empty() {
+                    let _ = deltas.send(visible).await;
+                }
             }
         }
+    }
+    let visible = stripper.finish();
+    if !visible.is_empty() {
+        let _ = deltas.send(visible).await;
     }
     Ok(SseRead { content, usage, endpoint_ms, done, raw })
 }
@@ -955,6 +1065,66 @@ fn collapse_newlines(content: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::plugins::llm::completion_port::{ChatRole, ImagePart};
+
+    /// Feeds the stripper delta-by-delta and appends the finish flush -
+    /// mirrors exactly what `read_sse_stream` does on the wire.
+    fn strip_deltas(deltas: &[&str]) -> String {
+        let mut stripper = DeltaThinkStripper::default();
+        let mut out = String::new();
+        for delta in deltas {
+            out.push_str(&stripper.push(delta));
+        }
+        out.push_str(&stripper.finish());
+        out
+    }
+
+    #[test]
+    fn stripper_passes_plain_text_through() {
+        assert_eq!(strip_deltas(&["hello ✓ world"]), "hello ✓ world");
+        assert_eq!(strip_deltas(&["a < b and c > d"]), "a < b and c > d");
+        assert_eq!(strip_deltas(&["", "more"]), "more");
+    }
+
+    #[test]
+    fn stripper_cuts_leading_think_block_split_across_deltas() {
+        let out = strip_deltas(&["<thi", "nk>reasoning </th", "ink>", "answer"]);
+        assert_eq!(out, "answer");
+    }
+
+    #[test]
+    fn stripper_cuts_mid_text_pair_and_surrounding_whitespace() {
+        let out = strip_deltas(&["answer", "<think>hidden</think>", "\n\nmore"]);
+        assert_eq!(out, "answermore");
+    }
+
+    #[test]
+    fn stripper_leading_unclosed_emits_nothing() {
+        let out = strip_deltas(&["<think>, reasoning forever"]);
+        assert_eq!(out, "");
+        // The reveal stayed empty -> begin is never called -> the engine's
+        // no-reveal failure path fires, matching EmptyResponse semantics.
+    }
+
+    #[test]
+    fn stripper_stream_dying_inside_mid_text_block_keeps_the_answer_prefix() {
+        let out = strip_deltas(&["answer <think>and now hidden"]);
+        assert_eq!(out, "answer ");
+    }
+
+    #[test]
+    fn stripper_partial_tag_at_stream_end_is_literal() {
+        // A trailing '<' that never resolves is literal text.
+        assert_eq!(strip_deltas(&["hi <thi"]), "hi <thi");
+    }
+
+    #[test]
+    fn stripper_handles_tag_lookalikes_and_repeated_blocks() {
+        // The real tag starts at position 5 (`<thin<think>` contains a
+        // genuine `<think>` from there) - identical to the authoritative
+        // strip: literal prefix + suppressed span + tail.
+        assert_eq!(strip_deltas(&["<thin<think>x</think>ok"]), "<thinok");
+        assert_eq!(strip_deltas(&["<think>a</think>one<think>b</think>two"]), "onetwo");
+    }
 
     /// Single-shot parse with a placeholder wall clock - timing assertions
     /// live in the dedicated tests below.

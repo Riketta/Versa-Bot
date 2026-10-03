@@ -57,6 +57,17 @@ pub trait GuildStorage: Send + Sync {
         limit: u32,
     ) -> Result<Vec<StoredRecord>, StorageError>;
 
+    /// The NEWEST `limit` records of the namespace in ascending sequence
+    /// order - the tail read that lets consumers bound their working set
+    /// (the engine's live window) without paging the whole log. May include
+    /// records below a caller's cutoff; callers filter by their own
+    /// watermark.
+    async fn list_last(
+        &self,
+        namespace: &str,
+        limit: u32,
+    ) -> Result<Vec<StoredRecord>, StorageError>;
+
     /// Number of records after `after_seq`.
     async fn count_after(&self, namespace: &str, after_seq: u64) -> Result<u64, StorageError>;
 }

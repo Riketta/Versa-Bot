@@ -379,6 +379,57 @@ impl GuildStorage for ScopedGuildStorage {
             .collect()
     }
 
+    async fn list_last(
+        &self,
+        namespace: &str,
+        limit: u32,
+    ) -> Result<Vec<StoredRecord>, StorageError> {
+        let rows: Vec<(i64, String)> = match &*self.db {
+            Db::Sqlite(pool) => {
+                sqlx::query_as(
+                    "SELECT seq, value FROM guild_records \
+                     WHERE platform = ? AND guild_id = ? AND namespace = ? \
+                     ORDER BY seq DESC LIMIT ?",
+                )
+                .bind(&self.platform)
+                .bind(self.guild_id)
+                .bind(namespace)
+                .bind(i64::from(limit))
+                .fetch_all(pool)
+                .await
+            }
+            Db::Postgres(pool) => {
+                sqlx::query_as(
+                    "SELECT seq, value FROM guild_records \
+                     WHERE platform = $1 AND guild_id = $2 AND namespace = $3 \
+                     ORDER BY seq DESC LIMIT $4",
+                )
+                .bind(&self.platform)
+                .bind(self.guild_id)
+                .bind(namespace)
+                .bind(i64::from(limit))
+                .fetch_all(pool)
+                .await
+            }
+        }
+        .map_err(|err| StorageError::Database(err.to_string()))?;
+
+        // The query returns newest-first; callers expect ascending order.
+        let mut records: Vec<StoredRecord> = rows
+            .into_iter()
+            .map(|(seq, json)| {
+                Ok(StoredRecord {
+                    seq: u64::try_from(seq)
+                        .map_err(|err| StorageError::Database(err.to_string()))?,
+                    payload: serde_json::from_str(&json)
+                        .map_err(|err| StorageError::Serialization(err.to_string()))?,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        records.reverse();
+        Ok(records)
+    }
+
     async fn count_after(&self, namespace: &str, after_seq: u64) -> Result<u64, StorageError> {
         let after =
             i64::try_from(after_seq).map_err(|err| StorageError::Database(err.to_string()))?;
@@ -549,6 +600,41 @@ mod tests {
         let limited = guild.list_after("llm", 0, 2).await.unwrap();
         assert_eq!(limited.len(), 2);
         assert_eq!(limited.first().map(|record| record.payload.clone()), Some(Value::from(1)));
+    }
+
+    #[tokio::test]
+    async fn list_last_returns_the_newest_tail_in_ascending_order() {
+        let storage = sqlite_storage().await;
+        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+
+        for value in 1..=5 {
+            guild.append("llm", Value::from(value)).await.unwrap();
+        }
+
+        let tail = guild.list_last("llm", 3).await.unwrap();
+        let seqs: Vec<u64> = tail.iter().map(|record| record.seq).collect();
+        let values: Vec<i64> = tail.iter().filter_map(|record| record.payload.as_i64()).collect();
+        assert_eq!(values, [3, 4, 5]);
+        assert!(
+            seqs.windows(2).all(|pair| pair
+                .first()
+                .is_some_and(|head| pair.get(1).is_some_and(|next| head < next))),
+            "ascending expected"
+        );
+
+        // More capacity than records: everything comes back, oldest first.
+        let all = guild.list_last("llm", 100).await.unwrap();
+        assert_eq!(
+            all.iter().filter_map(|record| record.payload.as_i64()).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5]
+        );
+
+        // Namespaces and guilds do not mix (same partitioning as list_after).
+        let other = storage.guild_scoped(Platform::Discord, GuildId(2));
+        other.append("llm", Value::from(99)).await.unwrap();
+        assert_eq!(guild.list_last("llm", 100).await.unwrap().len(), 5);
+        assert_eq!(other.list_last("llm", 100).await.unwrap().len(), 1);
+        assert_eq!(guild.list_last("tracker", 100).await.unwrap().len(), 0);
     }
 
     #[tokio::test]

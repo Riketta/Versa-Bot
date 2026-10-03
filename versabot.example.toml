@@ -46,9 +46,9 @@ url = "sqlite://versabot.db"
 # default_compaction_prompt = "Summarize the conversation above, preserving facts, decisions, names and open questions. Be concise."
 # compaction_keep_tail = 10
 # max_message_length = 2000
+# Streaming edit cadence while a channel streams its answer live
+# (`streaming` on); the final edit always carries the exact full text.
 # stream_interval_ms = 2000
-# Edit cadence while a channel streams its answer live (`streaming` on);
-# the final edit always carries the exact full text.
 # Cap for /llm_prompt_file attachment downloads, in bytes.
 # max_prompt_file_bytes = 131072
 # Collapse runs of consecutive newlines in completions down to this many

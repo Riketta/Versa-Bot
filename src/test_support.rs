@@ -111,13 +111,17 @@ impl GuildStorage for ScopedView {
 
     async fn list_keys(&self, namespace: &str) -> Result<Vec<String>, StorageError> {
         let (platform, guild_id) = self.key_prefix.clone();
-        Ok(self
+        let mut keys: Vec<String> = self
             .documents
             .lock()
             .keys()
             .filter(|(p, g, ns, _)| p == &platform && g == &guild_id && ns == namespace)
             .map(|(_, _, _, key)| key.clone())
-            .collect())
+            .collect();
+        // The real adapter orders by key (ORDER BY key) - mirror it so
+        // multi-key assertions stay deterministic.
+        keys.sort();
+        Ok(keys)
     }
 
     async fn append(&self, namespace: &str, payload: Value) -> Result<u64, StorageError> {
@@ -151,6 +155,27 @@ impl GuildStorage for ScopedView {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    async fn list_last(
+        &self,
+        namespace: &str,
+        limit: u32,
+    ) -> Result<Vec<StoredRecord>, StorageError> {
+        let (platform, guild_id) = self.key_prefix.clone();
+        let records = self.records.lock();
+        let mut newest: Vec<StoredRecord> = records
+            .get(&(platform, guild_id, namespace.to_owned()))
+            .map(|rows| {
+                rows.iter()
+                    .rev()
+                    .take(limit as usize)
+                    .map(|(seq, payload)| StoredRecord { seq: *seq, payload: payload.clone() })
+                    .collect()
+            })
+            .unwrap_or_default();
+        newest.reverse();
+        Ok(newest)
     }
 
     async fn count_after(&self, namespace: &str, after_seq: u64) -> Result<u64, StorageError> {
@@ -274,6 +299,14 @@ impl GuildStorage for FailingView {
         &self,
         _namespace: &str,
         _after_seq: u64,
+        _limit: u32,
+    ) -> Result<Vec<StoredRecord>, StorageError> {
+        Err(StorageError::Database("simulated storage failure".to_owned()))
+    }
+
+    async fn list_last(
+        &self,
+        _namespace: &str,
         _limit: u32,
     ) -> Result<Vec<StoredRecord>, StorageError> {
         Err(StorageError::Database("simulated storage failure".to_owned()))

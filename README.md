@@ -67,7 +67,8 @@ a slash command from any other reply path.
   its origin, an optional sample rate feeds performance transactions, and
   warn/info/error ship as Sentry log items while error-grade failures
   (storage, LLM provider) surface as Issues. Audit-grade records at `info`
-  cover command dispatch (who ran what, argument shapes - never contents),
+  cover command dispatch (who ran what; short argument values are logged
+  verbatim, long free text only as a `<N chars>` shape),
   the command registration trail (per-plugin registrations plus the
   completed Discord sync) and every LLM answer (model, trigger, latency,
   token usage, window sizes); `debug` adds pipeline traversal, provider
@@ -378,7 +379,10 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   knows an image was posted. Images are fetched from Discord's CDN only;
   recognition usage never mixes into the channel's token stats.
 
-**Context sizing.** The window fills newest-first up to `depth`
+**Context sizing.** The engine loads at most the newest `depth` +
+compaction-tail records per message (the operational window - a much
+longer log serves its newest part, so per-message cost stays flat even
+with compaction off). The window then fills newest-first up to `depth`
 messages. Once the endpoint has reported real token usage (recorded
 per channel), filling becomes token-budget based: the channel's
 `context_budget` if set, otherwise the model's declared
@@ -453,12 +457,16 @@ of clumping.
 visible response: if the generated answer is impossible (provider
 unreachable or rejecting, reasoning-only response, unreadable history),
 the channel gets a short generic fallback notice instead - never a raw
-error, and never recorded as a bot turn (history stays consistent).
-Random chime-ins are unprompted and stay silent on failure. The operator
+error, and never recorded as a bot turn (history stays consistent). A
+reply into the conversation cannot even be detected when the history is
+unreadable - that failure mode stays silent. If the answer cannot be
+delivered at all (platform outage on every send path), nothing is
+recorded either - the bot never writes down a turn nobody saw. Random
+chime-ins are unprompted and stay silent on failure. The operator
 still sees what happened: a rate-limited embed (at most one per 5 minutes
 per service channel) carries the error classification only - endpoint
-response bodies can name operator accounts or projects, so they stay in
-the logs.
+response bodies and storage errors can name operator infrastructure, so
+they stay in the logs.
 
 **Logging.** Every generated answer leaves an `info` audit record in the
 logs: model, trigger (`triggered` vs `chime`), latency (engine wall clock,

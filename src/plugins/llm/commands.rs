@@ -253,6 +253,9 @@ fn apply_numeric(
                 return Some(Ok(format!("`{key}` cleared (count-only filling).")));
             }
             match value.parse::<u32>() {
+                Ok(0) => Some(Err(format!(
+                    "`{key}` must be at least 1 (0 would keep only the newest turn)."
+                ))),
                 Ok(parsed) => {
                     config.context_budget_tokens = Some(parsed);
                     Some(Ok(format!("`{key}` set to {parsed} tokens.")))
@@ -522,8 +525,7 @@ impl CommandHandler for UnassignLlmHandler {
 /// answer starts fresh. Stored history is kept (records are never deleted);
 /// this is a context reset, not a history wipe. The mutation runs under the
 /// channel's processing lock: an in-flight engine run must not commit an
-/// older state (compaction) over the fresh cutoff, and the record count is
-/// only a stable "newest sequence" while no appends interleave.
+/// older state (compaction) over the fresh cutoff.
 pub(super) struct CutoffLlmHandler {
     locks: Arc<ChannelLocks>,
 }
@@ -554,12 +556,14 @@ impl CommandHandler for CutoffLlmHandler {
 
         let channel_id = event.origin.channel_id.get();
         let records_ns = records_namespace(channel_id);
-        // Per-scope sequence numbers are 1..=count, so the record count IS
-        // the newest sequence - the cutoff moves past everything. Safe only
-        // under the channel lock (no concurrent appends).
-        let total = storage.count_after(&records_ns, 0).await?;
+        // The cutoff moves past the NEWEST SEQUENCE (read from the log
+        // itself, not inferred from the count - sequence numbering stays
+        // correct even if retention/deletion ever exists). Safe only under
+        // the channel lock (no concurrent appends).
+        let newest =
+            storage.list_last(&records_ns, 1).await?.first().map_or(0, |record| record.seq);
         let state =
-            ConversationState { summary: None, cutoff_seq: total, cutoff_at: Some(unix_now()) };
+            ConversationState { summary: None, cutoff_seq: newest, cutoff_at: Some(unix_now()) };
         storage
             .set(NAMESPACE, &channel_state_key(channel_id), serde_json::to_value(&state)?)
             .await?;
@@ -952,9 +956,7 @@ impl CommandHandler for ModelsLlmHandler {
 /// `/llm_set`: tunes one setting of the channel's chat configuration by
 /// `key`/`value`. Values of `clear`/`none`/`default` reset the setting to
 /// its default; malformed values are answered with usage and never saved.
-/// `/llm_set`: tunes one channel setting; `value: clear` restores the
-/// setting's default; malformed values are answered with usage and never
-/// saved. The read-modify-write runs under the channel's processing lock so
+/// The read-modify-write runs under the channel's processing lock so
 /// concurrent admin commands cannot lose an update.
 pub(super) struct SetLlmHandler {
     locks: Arc<ChannelLocks>,
@@ -993,9 +995,10 @@ impl CommandHandler for SetLlmHandler {
             return Ok(());
         };
         // Same registry boundary as `/llm_assign`: only declared models are
-        // legal. Clear-words are not assignments - `apply_set` answers them
-        // with its own "cannot be cleared" usage.
-        if (key == "model" || key == "image_model")
+        // legal - chat, image, AND compaction refs alike. Clear-words are
+        // not assignments - `apply_set` answers them with its own "cannot
+        // be cleared" usage.
+        if matches!(key, "model" | "image_model" | "compaction_model")
             && !matches!(value, "clear" | "none" | "default")
             && let Err(reply) = validate_model_ref(self.engine.settings(), value)
         {
@@ -1089,9 +1092,11 @@ impl PromptFileLlmHandler {
     }
 
     /// Downloads and decodes the attachment with the configured byte cap.
-    /// `Err` carries the user-facing reason; transport details go to logs.
+    /// The body is STREAM-read: the cap aborts the transfer instead of
+    /// buffering a lying or chunked response whole. `Err` carries the
+    /// user-facing reason; transport details go to logs.
     async fn download(&self, url: &str) -> Result<String, String> {
-        let response = self.client.get(url).send().await.map_err(|err| {
+        let mut response = self.client.get(url).send().await.map_err(|err| {
             tracing::warn!(%err, "prompt file download failed");
             "the attachment could not be downloaded".to_owned()
         })?;
@@ -1106,18 +1111,23 @@ impl PromptFileLlmHandler {
                 self.max_prompt_file_bytes
             ));
         }
-        let bytes = response.bytes().await.map_err(|err| {
+        let limit = usize::try_from(self.max_prompt_file_bytes).unwrap_or(usize::MAX);
+        let mut body: Vec<u8> = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|err| {
             tracing::warn!(%err, "prompt file download failed");
             "the attachment could not be downloaded".to_owned()
-        })?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > self.max_prompt_file_bytes {
-            return Err(format!(
-                "the attachment exceeds the limit ({} > {} bytes, `max_prompt_file_bytes`)",
-                bytes.len(),
-                self.max_prompt_file_bytes
-            ));
+        })? {
+            body.extend_from_slice(&chunk);
+            if body.len() > limit {
+                return Err(format!(
+                    "the attachment exceeds the limit ({} bytes or more > {}, \
+                     `max_prompt_file_bytes`)",
+                    body.len(),
+                    self.max_prompt_file_bytes
+                ));
+            }
         }
-        let text = String::from_utf8(bytes.to_vec())
+        let text = String::from_utf8(body)
             .map_err(|_| "the attachment is not valid UTF-8 text".to_owned())?;
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -1162,12 +1172,10 @@ impl CommandHandler for PromptFileLlmHandler {
             return Ok(());
         }
 
-        let channel = self.locks.lock_for(&event.origin);
-        let _channel = channel.lock().await;
-        let Some(mut config) = load_assigned_config(event, services).await? else {
-            return Ok(());
-        };
-
+        // Fetch the attachment BEFORE taking the channel lock: the download
+        // is slow network I/O and must not freeze the channel's chat for up
+        // to the client timeout. Only the config read-modify-write needs the
+        // lock.
         let prompt = match self.download(url).await {
             Ok(prompt) => prompt,
             Err(reason) => {
@@ -1177,6 +1185,12 @@ impl CommandHandler for PromptFileLlmHandler {
                     .await?;
                 return Ok(());
             }
+        };
+
+        let channel = self.locks.lock_for(&event.origin);
+        let _channel = channel.lock().await;
+        let Some(mut config) = load_assigned_config(event, services).await? else {
+            return Ok(());
         };
         let characters = prompt.chars().count();
         config.system_prompt = Some(prompt);
@@ -1308,6 +1322,12 @@ mod tests {
         apply_set(&mut config, "random_cooldown", "not-a-number").unwrap_err();
 
         apply_set(&mut config, "max_tokens", "not-a-number").unwrap_err();
+
+        // A zero budget would keep only the newest turn - rejected like
+        // `depth` 0, not accepted as "no budget".
+        apply_set(&mut config, "context_budget", "0").unwrap_err();
+        apply_set(&mut config, "context_budget", "4096").expect("budget expected");
+        assert_eq!(config.context_budget_tokens, Some(4096));
     }
 
     #[test]

@@ -274,7 +274,15 @@ impl ChatEngine {
             return;
         };
         let usage_stats = self.load_stats(storage, channel_id).await;
-        let mut live = match self.load_live_records(storage, channel_id, state.cutoff_seq).await {
+        // Operational window: everything assembly (depth) plus the compaction
+        // tail can ever need - the hard cap on per-message history loading.
+        let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
+        let keep_tail = usize::try_from(self.settings.compaction_keep_tail).unwrap_or(usize::MAX);
+        let window = depth.saturating_add(keep_tail).max(1);
+        let mut live = match self
+            .load_live_records(storage, channel_id, state.cutoff_seq, window)
+            .await
+        {
             Ok(live) => live,
             Err(err) => {
                 // Same policy as the unreadable state doc above: history
@@ -694,6 +702,7 @@ impl ChatEngine {
         // assistant record needs for reply-chain detection.
         let stream = services.chat_output_factory.stream_output(origin);
         let first_chunk = chunks.first().expect("non-empty chunks checked").clone();
+        let mut delivered = false;
         let first_message_id: Option<u64> = if let Some(id) = live_id {
             // The live message already shows prefixes of the answer; the
             // final edit pins it to the authoritative first chunk (reasoning
@@ -701,6 +710,7 @@ impl ChatEngine {
             if let Err(err) = stream.update(id, first_chunk.clone()).await {
                 tracing::warn!(channel = channel_id, %err, "final stream update failed");
             }
+            delivered = true; // the live begin already put content on screen
             Some(id.get())
         } else {
             let mut begin = OutboundMessage::text(first_chunk.clone());
@@ -708,7 +718,10 @@ impl ChatEngine {
                 begin = begin.replying_to(reply_to);
             }
             match stream.begin(begin).await {
-                Ok(id) => Some(id.get()),
+                Ok(id) => {
+                    delivered = true;
+                    Some(id.get())
+                }
                 Err(err) => {
                     tracing::warn!(
                         channel = channel_id,
@@ -722,10 +735,25 @@ impl ChatEngine {
 
         let delivered_first = usize::from(first_message_id.is_some());
         for chunk in chunks.iter().skip(delivered_first) {
-            if let Err(err) = services.chat_output.send(OutboundMessage::text(chunk.clone())).await
-            {
-                tracing::warn!(channel = channel_id, %err, "failed to deliver reply part");
+            match services.chat_output.send(OutboundMessage::text(chunk.clone())).await {
+                Ok(()) => delivered = true,
+                Err(err) => {
+                    tracing::warn!(channel = channel_id, %err, "failed to deliver reply part");
+                }
             }
+        }
+
+        // Delivered = recorded: a turn the channel never saw must not enter
+        // the history (a later reply to it would trigger an answer nobody
+        // can see). Returning false hands the triggered-message case to the
+        // caller's fallback; a total delivery failure is an infrastructure
+        // outage, not a silent-answer path.
+        if !delivered {
+            tracing::error!(
+                channel = channel_id,
+                "reply delivery failed on every path - not recording a phantom bot turn"
+            );
+            return false;
         }
 
         let assistant = ConversationRecord {
@@ -866,30 +894,45 @@ impl ChatEngine {
 
     /// The channel's live window: `(seq, record)` pairs after the cutoff,
     /// ascending. Malformed records are skipped (with a warning) instead of
-    /// failing the whole window; an unreadable log is an error - the caller
-    /// must skip the message rather than answer from a degraded context.
+    /// failing the whole window. The window is BOUNDED: the newest `window`
+    /// records (depth + compaction tail - everything assembly and compaction
+    /// can ever use), filtered to the post-cutoff range. The bound is the
+    /// brake that keeps per-message cost flat even when compaction is off or
+    /// failing: a log longer than the window serves its newest part, and the
+    /// oldest uncompacted records beyond it stay out of the context
+    /// (debug-logged). Records themselves are never deleted; the cutoff
+    /// still moves only through committed compactions. An unreadable log is
+    /// an error - the caller must skip the message rather than answer from a
+    /// degraded context.
     async fn load_live_records(
         &self,
         storage: &Arc<dyn GuildStorage>,
         channel_id: u64,
         after_seq: u64,
+        window: usize,
     ) -> Result<Vec<(u64, ConversationRecord)>, crate::kernel::models::StorageError> {
         let records_ns = records_namespace(channel_id);
-        let total = storage.count_after(&records_ns, after_seq).await?;
-        if total == 0 {
-            return Ok(Vec::new());
-        }
-        let limit = u32::try_from(total).unwrap_or(u32::MAX);
-        let stored = storage.list_after(&records_ns, after_seq, limit).await?;
-        Ok(stored
+        let limit = u32::try_from(window.max(1)).unwrap_or(u32::MAX);
+        let stored = storage.list_last(&records_ns, limit).await?;
+        let live: Vec<(u64, ConversationRecord)> = stored
             .into_iter()
+            .filter(|record| record.seq > after_seq)
             .filter_map(|record| {
                 serde_json::from_value::<ConversationRecord>(record.payload)
                     .inspect_err(|_| tracing::warn!("skipping malformed conversation record"))
                     .ok()
                     .map(|parsed| (record.seq, parsed))
             })
-            .collect())
+            .collect();
+        if live.len() >= window.max(1) {
+            tracing::debug!(
+                channel = channel_id,
+                window,
+                "live log at the operational window cap - older uncompacted records are \
+                 outside the context"
+            );
+        }
+        Ok(live)
     }
 
     async fn append_record(
@@ -1043,12 +1086,18 @@ impl ChatEngine {
             }
             Err(err) => {
                 tracing::error!(channel = channel_id, %err, "failed to persist compacted state");
+                // Same privacy rule as LLM errors: the guild-visible embed
+                // carries the classification only - driver/SQL error text
+                // can name infrastructure internals; the raw error stays in
+                // the log line above.
                 self.notify_service(
                     services,
                     origin,
                     storage,
                     "LLM compaction failed",
-                    format!("Could not persist the summary: {err}"),
+                    "Could not persist the summary (storage error) - the window keeps growing; \
+                         check the bot logs."
+                        .to_owned(),
                     true,
                 )
                 .await;
@@ -1490,6 +1539,14 @@ mod tests {
             Err(StorageError::Database("records unavailable".to_owned()))
         }
 
+        async fn list_last(
+            &self,
+            _namespace: &str,
+            _limit: u32,
+        ) -> Result<Vec<StoredRecord>, StorageError> {
+            Err(StorageError::Database("records unavailable".to_owned()))
+        }
+
         async fn count_after(
             &self,
             _namespace: &str,
@@ -1545,6 +1602,14 @@ mod tests {
             limit: u32,
         ) -> Result<Vec<StoredRecord>, StorageError> {
             self.guild.list_after(namespace, after_seq, limit).await
+        }
+
+        async fn list_last(
+            &self,
+            namespace: &str,
+            limit: u32,
+        ) -> Result<Vec<StoredRecord>, StorageError> {
+            self.guild.list_last(namespace, limit).await
         }
 
         async fn count_after(&self, namespace: &str, after_seq: u64) -> Result<u64, StorageError> {
@@ -1625,6 +1690,120 @@ mod tests {
             guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
         };
         TestCtx { engine, fake, storage, output, begins, factory, services, describer }
+    }
+
+    /// Total-delivery-outage fixture for the delivered=recorded contract:
+    /// every send fails, and the attempt counter proves the fallback was
+    /// still attempted.
+    #[derive(Default)]
+    struct FailingOutput {
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ChatOutputPort for FailingOutput {
+        async fn send(&self, _message: OutboundMessage) -> Result<(), OutboundError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(OutboundError::Send("platform unreachable".to_owned()))
+        }
+    }
+
+    struct FailingStream;
+
+    #[async_trait]
+    impl ChatStreamPort for FailingStream {
+        async fn begin(&self, _message: OutboundMessage) -> Result<MessageId, OutboundError> {
+            Err(OutboundError::Send("platform unreachable".to_owned()))
+        }
+
+        async fn update(&self, _message: MessageId, _content: String) -> Result<(), OutboundError> {
+            Err(OutboundError::Send("platform unreachable".to_owned()))
+        }
+    }
+
+    struct FailingDeliveryFactory {
+        output: Arc<FailingOutput>,
+    }
+
+    #[async_trait]
+    impl ChatOutputFactoryPort for FailingDeliveryFactory {
+        fn chat_output(&self, _origin: &Origin) -> Arc<dyn ChatOutputPort> {
+            Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
+        }
+
+        fn start_typing(&self, _origin: &Origin) -> ChatTypingGuard {
+            ChatTypingGuard::dead()
+        }
+
+        fn channel_output(
+            &self,
+            _origin: &Origin,
+            _channel_id: ChannelId,
+        ) -> Arc<dyn ChatOutputPort> {
+            Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
+        }
+
+        fn stream_output(&self, _origin: &Origin) -> Arc<dyn ChatStreamPort> {
+            Arc::new(FailingStream)
+        }
+
+        fn message_link(
+            &self,
+            _origin: &Origin,
+            _channel_id: ChannelId,
+            _message_id: MessageId,
+        ) -> Option<String> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn total_delivery_failure_records_no_phantom_bot_turn() {
+        let ctx = ctx(vec![Ok("the answer".to_owned())]);
+        let output = Arc::new(FailingOutput::default());
+        let services = KernelServices {
+            chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
+            chat_output_factory: Arc::new(FailingDeliveryFactory { output: Arc::clone(&output) })
+                as Arc<dyn ChatOutputFactoryPort>,
+            guild_storage: Some(ctx.storage.guild_scoped(Platform::Discord, GuildId(1))),
+        };
+        seed_config(&ctx.storage, &assigned_config());
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &assigned_config(), &services)
+            .await;
+
+        // Nothing was delivered - and exactly two sends were attempted:
+        // the answer, then the guaranteed-answer fallback.
+        assert_eq!(output.attempts.load(Ordering::SeqCst), 2);
+        let records = stored_records(&ctx).await;
+        assert!(records.iter().all(|record| record.role == RecordRole::User));
+    }
+
+    /// The operational-window brake: a log longer than depth + compaction
+    /// tail serves its newest part - old records stay out of the context
+    /// (and out of memory) even with compaction disabled.
+    #[tokio::test]
+    async fn live_window_caps_history_loading() {
+        let ctx = ctx(vec![Ok("ok".to_owned())]);
+        let config =
+            ChannelConfig { history_depth: 2, compaction_enabled: false, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+        for seq in 1..=15 {
+            append_record(&ctx.storage, &user_record(seq, "alice", &format!("m{seq}"))).await;
+        }
+
+        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+
+        let request = ctx.fake.requests().first().expect("one request expected").clone();
+        let rendered: Vec<&str> =
+            request.messages.iter().map(|message| message.content.as_str()).collect();
+        // The newest `depth` records (m14 is already beyond depth) + the
+        // capture - never the old tail.
+        assert!(rendered.iter().any(|text| text.contains("m15")));
+        assert!(rendered.iter().any(|text| text.contains("hello bot")));
+        assert!(rendered.iter().all(|text| !text.contains("m14")));
+        assert!(rendered.iter().all(|text| !text.contains("m13")));
     }
 
     fn assigned_config() -> ChannelConfig {

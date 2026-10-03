@@ -195,19 +195,46 @@ async fn main() -> ExitCode {
     .await
     .expect("failed to create client");
 
-    // Ctrl-C: stop the gateway so `start` returns, then plugins stop in
-    // reverse order below.
+    // Ctrl-C (SIGINT) and SIGTERM (docker stop's default signal) both stop
+    // the gateway so `start` returns, then plugins stop in reverse order
+    // below - without the SIGTERM listener, container teardown would bypass
+    // the whole graceful-shutdown lifecycle.
     let shard_manager = client.shard_manager.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("shutdown signal received");
-            shard_manager.shutdown_all().await;
-        }
+        shutdown_signal().await;
+        shard_manager.shutdown_all().await;
     });
 
     let start_result = client.start().await;
     kernel.shutdown();
     gateway_exit_code(start_result)
+}
+
+/// Resolves once the process is asked to shut down: Ctrl-C (SIGINT) or
+/// SIGTERM - the signal `docker stop` sends by default. On platforms without
+/// Unix signals only Ctrl-C can resolve it.
+async fn shutdown_signal() {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("shutdown signal received (SIGINT)");
+        }
+        () = sigterm() => {
+            tracing::info!("shutdown signal received (SIGTERM)");
+        }
+    }
+}
+
+/// Resolves on SIGTERM. Never resolves on platforms without Unix signals
+/// (the select in [`shutdown_signal`] then waits for Ctrl-C only).
+#[cfg(unix)]
+async fn sigterm() {
+    use tokio::signal::unix::{SignalKind, signal};
+    signal(SignalKind::terminate()).expect("SIGTERM handler expected to install").recv().await;
+}
+
+#[cfg(not(unix))]
+async fn sigterm() {
+    std::future::pending::<()>().await;
 }
 
 /// Maps the infra `[llm]` config onto the plugin-facing settings. Field-by-
