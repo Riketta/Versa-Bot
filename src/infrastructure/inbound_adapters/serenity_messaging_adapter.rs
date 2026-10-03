@@ -14,8 +14,9 @@ use crate::infrastructure::outbound_adapters::GatewayContext;
 use crate::kernel::{
     api_ports::RequestHandlerPort,
     models::{
-        ChannelId, CommandPayload, Embed, EventKind, EventPayload, GuildId, MemberPayload,
-        MessageId, Origin, OutboundError, OutboundMessage, Platform, RequestContext, UserId,
+        AttachmentPayload, ChannelId, CommandPayload, Embed, EventKind, EventPayload, GuildId,
+        MemberPayload, MessageId, Origin, OutboundError, OutboundMessage, Platform, RequestContext,
+        UserId,
     },
     spi_ports::{ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard},
 };
@@ -78,6 +79,20 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
         // gateway cache and is guaranteed present once messages flow.
         let current_user_id = ctx.cache.current_user().id;
         let mentions_bot = message.mentions.iter().any(|user| user.id == current_user_id);
+        // Platform-blind attachment DTOs; the URLs are Discord's own CDN
+        // links (the pinned trusted host for plugin-side downloads).
+        let attachments: Vec<AttachmentPayload> = message
+            .attachments
+            .iter()
+            .map(|attachment| AttachmentPayload {
+                url: attachment.url.clone(),
+                content_type: attachment.content_type.clone(),
+                file_name: Some(attachment.filename.clone()),
+                size_bytes: u64::from(attachment.size),
+                width: attachment.width,
+                height: attachment.height,
+            })
+            .collect();
 
         let origin = Origin {
             platform: Platform::Discord,
@@ -125,6 +140,7 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
         let mut event = RequestContext::message_received(origin, content);
         if let EventPayload::Message(payload) = &mut event.payload {
             payload.author_name = Some(author_name);
+            payload.attachments = attachments;
             payload.author_roles = author_roles;
             payload.author_permissions = author_permissions;
             payload.reply_to = reply_to;

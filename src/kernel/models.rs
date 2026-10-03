@@ -8,7 +8,8 @@ mod request_context;
 mod storage_error;
 
 pub use event::{
-    CommandPayload, Event, EventKind, EventPayload, MemberPayload, MessagePayload, Origin, Platform,
+    AttachmentPayload, CommandPayload, Event, EventKind, EventPayload, MemberPayload,
+    MessagePayload, Origin, Platform,
 };
 pub use ids::{ChannelId, GuildId, MessageId, UserId};
 pub use outbound_error::OutboundError;

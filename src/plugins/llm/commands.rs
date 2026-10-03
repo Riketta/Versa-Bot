@@ -24,6 +24,7 @@ use super::model::{
     records_namespace, unix_now,
 };
 use super::providers::{LlmSettings, ModelSettings};
+use super::vision::DEFAULT_IMAGE_PROMPT;
 
 /// Recognized `/llm_set` keys, in display order. Doubles as the Discord
 /// choices dropdown for the `key` argument.
@@ -46,6 +47,9 @@ pub(super) const SET_KEYS: &[&str] = &[
     "compaction",
     "compaction_model",
     "compaction_prompt",
+    "images",
+    "image_model",
+    "image_prompt",
     "max_length",
     "turn_template",
 ];
@@ -179,6 +183,13 @@ fn apply_flag(
             config.compaction_enabled = enabled;
             Some(Ok(format!("`compaction` turned {}.", if enabled { "on" } else { "off" })))
         }
+        "images" => {
+            config.images = enabled;
+            Some(Ok(format!(
+                "`images` turned {} (recognition needs an operator-configured image model).",
+                if enabled { "on" } else { "off" }
+            )))
+        }
         _ => None,
     }
 }
@@ -297,22 +308,36 @@ fn apply_optional_field(
     cleared: bool,
 ) -> Option<Result<String, String>> {
     match key {
-        // Both compaction fields share the same set/clear shape.
-        "compaction_model" | "compaction_prompt" => {
+        // Text/size fields sharing the set/clear shape.
+        "compaction_model" | "compaction_prompt" | "image_model" | "image_prompt" => {
             if cleared {
-                if key == "compaction_model" {
-                    config.compaction_model = None;
-                } else {
-                    config.compaction_prompt = None;
+                match key {
+                    "compaction_model" => config.compaction_model = None,
+                    "image_model" => config.image_model = None,
+                    "image_prompt" => config.image_prompt = None,
+                    _ => config.compaction_prompt = None,
                 }
                 return Some(Ok(format!("`{key}` cleared (plugin default applies).")));
             }
-            if key == "compaction_model" {
-                config.compaction_model = Some(value.to_owned());
-                Some(Ok(format!("`{key}` set to `{value}`.")))
-            } else {
-                config.compaction_prompt = Some(value.to_owned());
-                Some(Ok(format!("`{key}` updated.")))
+            match key {
+                "compaction_model" => {
+                    config.compaction_model = Some(value.to_owned());
+                    Some(Ok(format!("`{key}` set to `{value}`.")))
+                }
+                "image_model" => {
+                    config.image_model = Some(value.to_owned());
+                    Some(Ok(format!(
+                        "`{key}` set to `{value}` (describes images for this channel)."
+                    )))
+                }
+                "image_prompt" => {
+                    config.image_prompt = Some(value.to_owned());
+                    Some(Ok(format!("`{key}` updated (descriptions follow this instruction).")))
+                }
+                _ => {
+                    config.compaction_prompt = Some(value.to_owned());
+                    Some(Ok(format!("`{key}` updated.")))
+                }
             }
         }
         "max_length" => {
@@ -669,6 +694,36 @@ fn capture_label(mode: CaptureMode) -> &'static str {
     }
 }
 
+/// The effective reasoning display: the three-state contract made visible
+/// (value sent as-is / explicit off / nothing sent).
+fn reasoning_label(effort: Option<&str>) -> String {
+    match effort {
+        Some("off") => "off (explicit disable where the provider supports one)".to_owned(),
+        Some(effort) => effort.to_owned(),
+        None => "provider default (nothing sent)".to_owned(),
+    }
+}
+
+/// The effective image-recognition display: on/off, the resolved model and
+/// the resolved prompt length (override -> plugin default -> built-in), so
+/// an admin can see which mechanism is active without printing prompts.
+fn images_label(config: &ChannelConfig, settings: &LlmSettings) -> String {
+    if !config.images {
+        return "off".to_owned();
+    }
+    let model = config
+        .image_model
+        .clone()
+        .or_else(|| settings.image_model.clone())
+        .map_or_else(|| "no image model configured".to_owned(), |model| format!("`{model}`"));
+    let prompt = config
+        .image_prompt
+        .clone()
+        .or_else(|| settings.image_prompt.clone())
+        .unwrap_or_else(|| DEFAULT_IMAGE_PROMPT.to_owned());
+    format!("on ({model}, {}-char prompt)", prompt.chars().count())
+}
+
 /// `/llm_status` label of the chime-in roll chance and cooldown: the
 /// percent plus the per-channel minimum interval, or `off` at zero chance.
 fn chime_label(chance: f64, cooldown_secs: u64) -> String {
@@ -746,13 +801,8 @@ impl CommandHandler for StatusLlmHandler {
             None => "none".to_owned(),
         };
         let context_start = first_link.unwrap_or_else(|| "no messages after the cutoff".to_owned());
-        let reasoning = match &config.params.reasoning_effort {
-            Some(effort) if effort == "off" => {
-                "off (explicit disable where the provider supports one)".to_owned()
-            }
-            Some(effort) => effort.clone(),
-            None => "provider default (nothing sent)".to_owned(),
-        };
+        let reasoning = reasoning_label(config.params.reasoning_effort.as_deref());
+        let images = images_label(&config, self.engine.settings());
         let mut description = format!(
             "Model: `{}`
 Reasoning: {reasoning}
@@ -760,6 +810,7 @@ Prompt: {prompt_source} ({} chars, {})
 Prompt head: {prompt_head}
 Context: {live}/{} messages ({total} kept)
 Compaction: {}
+Images: {images}
 Capture: {} · Chime-ins: {}
 Summary: {summary}
 Context start: {context_start}",
@@ -944,7 +995,7 @@ impl CommandHandler for SetLlmHandler {
         // Same registry boundary as `/llm_assign`: only declared models are
         // legal. Clear-words are not assignments - `apply_set` answers them
         // with its own "cannot be cleared" usage.
-        if key == "model"
+        if (key == "model" || key == "image_model")
             && !matches!(value, "clear" | "none" | "default")
             && let Err(reply) = validate_model_ref(self.engine.settings(), value)
         {
@@ -1190,7 +1241,29 @@ mod tests {
         assert!(!config.streaming);
         apply_set(&mut config, "compaction", "false").expect("false expected");
         assert!(!config.compaction_enabled);
+        apply_set(&mut config, "images", "on").expect("on expected");
+        assert!(config.images);
+        apply_set(&mut config, "images", "off").expect("off expected");
+        assert!(!config.images);
         assert!(apply_set(&mut config, "streaming", "maybe").is_err());
+    }
+
+    /// Image settings follow the same set/clear grammar as their compaction
+    /// counterparts: the model is a validated ref (handler-side), the prompt
+    /// is free text with `clear` falling back to the plugin default.
+    #[test]
+    fn image_keys_set_and_clear() {
+        let mut config = ChannelConfig::assigned("m".to_owned());
+
+        apply_set(&mut config, "image_model", "local/vision").expect("set expected");
+        assert_eq!(config.image_model.as_deref(), Some("local/vision"));
+        apply_set(&mut config, "image_prompt", "Describe in Russian.").expect("set expected");
+        assert_eq!(config.image_prompt.as_deref(), Some("Describe in Russian."));
+
+        apply_set(&mut config, "image_model", "clear").expect("clear expected");
+        assert_eq!(config.image_model, None);
+        apply_set(&mut config, "image_prompt", "default").expect("clear expected");
+        assert_eq!(config.image_prompt, None);
     }
 
     /// `off` is an explicit choice with its own acknowledgment and its own
@@ -1338,6 +1411,7 @@ mod tests {
             content: content.to_owned(),
             reply_to: None,
             captured_at: 0,
+            images: Vec::new(),
         })
         .expect("record expected to serialize")
     }

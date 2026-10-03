@@ -28,6 +28,22 @@ pub struct LlmConfig {
     pub stream_interval_ms: u64,
     /// Cap for `/llm_prompt_file` attachment downloads, in bytes.
     pub max_prompt_file_bytes: u64,
+    /// Image recognition model fallback (`provider/model`); absent = image
+    /// recognition off globally (channels can only toggle within that).
+    pub image_model: Option<String>,
+    /// Images are rescaled to this max side (aspect kept) before the
+    /// recognition call; smaller images pass through untouched.
+    pub image_max_side: u32,
+    /// JPEG quality of the rescaled recognition payload.
+    pub image_jpeg_quality: u8,
+    /// Download cap per image attachment, in bytes; larger images are
+    /// recorded undescribed.
+    pub image_max_source_bytes: u64,
+    /// Recognition prompt override; `None` = built-in default.
+    pub image_prompt: Option<String>,
+    /// Cap on images described per captured message; images beyond it are
+    /// recorded undescribed.
+    pub max_images_per_message: u32,
     /// Collapses runs of consecutive newlines in completions down to this
     /// many; absent = responses left untouched.
     pub max_consecutive_newlines: Option<usize>,
@@ -55,6 +71,12 @@ impl Default for LlmConfig {
             max_message_length: 2000,
             stream_interval_ms: 2000,
             max_prompt_file_bytes: 131_072,
+            image_model: None,
+            image_max_side: 512,
+            image_jpeg_quality: 85,
+            image_max_source_bytes: 8_388_608,
+            image_prompt: None,
+            max_images_per_message: 2,
             max_consecutive_newlines: None,
             log_raw_traffic: false,
             providers: BTreeMap::new(),
@@ -168,6 +190,12 @@ mod tests {
                 "max_message_length": 1500,
                 "stream_interval_ms": 1500,
                 "max_prompt_file_bytes": 4096,
+                "image_model": "local/gemma-vision",
+                "image_max_side": 768,
+                "image_jpeg_quality": 80,
+                "image_max_source_bytes": 4096,
+                "image_prompt": "Describe this.",
+                "max_images_per_message": 3,
                 "max_consecutive_newlines": 2,
                 "log_raw_traffic": true,
                 "providers": {
@@ -190,6 +218,12 @@ mod tests {
         assert_eq!(config.compaction_model.as_deref(), Some("zai/glm-5.3-flash"));
         assert_eq!(config.compaction_keep_tail, 5);
         assert_eq!(config.max_prompt_file_bytes, 4096);
+        assert_eq!(config.image_model.as_deref(), Some("local/gemma-vision"));
+        assert_eq!(config.image_max_side, 768);
+        assert_eq!(config.image_jpeg_quality, 80);
+        assert_eq!(config.image_max_source_bytes, 4096);
+        assert_eq!(config.image_prompt.as_deref(), Some("Describe this."));
+        assert_eq!(config.max_images_per_message, 3);
         assert_eq!(config.max_consecutive_newlines, Some(2));
         assert!(config.log_raw_traffic);
         let zai = config.providers.get("zai").expect("zai provider expected");

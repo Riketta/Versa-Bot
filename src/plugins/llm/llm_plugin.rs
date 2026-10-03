@@ -247,7 +247,7 @@ impl PluginPort for LlmPlugin {
         self.registry.register(
             self.descriptor(
                 "llm_set",
-                "Change a channel chat setting (model, reasoning, sampling, depth, chime-ins)",
+                "Change a channel chat setting (model, images, reasoning, sampling, chime-ins)",
                 vec![
                     ArgDescriptor {
                         name: "key".to_owned(),
@@ -343,14 +343,27 @@ mod tests {
     };
     use crate::plugins::llm::providers::ModelSettings;
     use crate::plugins::llm::{
-        ChatEngine, CompletionRequest, CompletionResponse, ConversationRecord, LlmCompletionPort,
-        LlmError, LlmSettings, RandRandom, RandomPort, RecordRole, ResponseTiming,
+        ChatEngine, CompletionRequest, CompletionResponse, ConversationRecord, ImageDescriber,
+        ImageJob, ImageSource, LlmCompletionPort, LlmError, LlmSettings, RandRandom, RandomPort,
+        RecordRole, ResponseTiming,
     };
     use crate::test_support::{
         FailingStorage, InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory,
     };
 
     struct StubCompletion;
+
+    /// Capture-path stub: no test here sends image payloads, so describe is
+    /// never called - it exists to satisfy the engine's constructor.
+    #[derive(Default)]
+    struct FakeDescriber;
+
+    #[async_trait]
+    impl ImageDescriber for FakeDescriber {
+        async fn describe(&self, _job: &ImageJob, images: Vec<ImageSource>) -> Vec<Option<String>> {
+            images.iter().map(|_| None).collect()
+        }
+    }
 
     #[async_trait]
     impl LlmCompletionPort for StubCompletion {
@@ -379,6 +392,7 @@ mod tests {
             },
             payload: EventPayload::Message(MessagePayload {
                 content: "hello".to_owned(),
+                attachments: Vec::new(),
                 author_name: Some("alice".to_owned()),
                 author_roles: Vec::new(),
                 author_permissions: 0,
@@ -433,6 +447,7 @@ mod tests {
             Arc::new(settings),
             Arc::new(StubCompletion) as Arc<dyn LlmCompletionPort>,
             Arc::new(RandRandom) as Arc<dyn RandomPort>,
+            Arc::new(FakeDescriber) as Arc<dyn ImageDescriber>,
         ));
         let plugin = LlmPlugin::new(
             Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
@@ -873,6 +888,7 @@ mod tests {
                     content: "old".to_owned(),
                     reply_to: None,
                     captured_at: 0,
+                    images: Vec::new(),
                 })
                 .expect("record expected to serialize"),
             )
@@ -930,6 +946,7 @@ mod tests {
             content: "old".to_owned(),
             reply_to: None,
             captured_at: 0,
+            images: Vec::new(),
         })
         .expect("record expected to serialize");
         fixture

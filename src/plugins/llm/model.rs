@@ -138,6 +138,22 @@ pub struct ChannelConfig {
     /// room for the reply on top - this budgets the prompt side only.
     #[serde(default)]
     pub context_budget_tokens: Option<u32>,
+    /// Image recognition for this channel's captured messages:
+    /// attachments are described by the image model at capture time and
+    /// the descriptions are baked into the records. Requires the operator
+    /// to have configured `[llm] image_model`. Off by default - image-
+    /// flooded channels are the reason this is a per-channel choice.
+    #[serde(default)]
+    pub images: bool,
+    /// Recognition model override; `None` = plugin-wide `image_model`.
+    #[serde(default)]
+    pub image_model: Option<String>,
+    /// Recognition prompt override; `None` = plugin-wide `image_prompt`,
+    /// then the built-in default. Descriptions land in the context as
+    /// markdown alt-text, so a channel can pick the language/style its
+    /// conversations need.
+    #[serde(default)]
+    pub image_prompt: Option<String>,
 }
 
 impl ChannelConfig {
@@ -160,6 +176,9 @@ impl ChannelConfig {
             max_length: None,
             turn_template: None,
             context_budget_tokens: None,
+            images: false,
+            image_model: None,
+            image_prompt: None,
         }
     }
 }
@@ -269,6 +288,8 @@ mod tests {
         assert_eq!(config.random_cooldown_secs, 5);
         assert_eq!(config.capture_mode, CaptureMode::BotRelated);
         assert_eq!(config.context_budget_tokens, None);
+        assert!(!config.images);
+        assert_eq!(config.image_model, None);
     }
 
     #[test]

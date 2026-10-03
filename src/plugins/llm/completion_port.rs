@@ -29,11 +29,33 @@ impl ChatRole {
     }
 }
 
+/// One image attached to a chat message, base64-encoded as a data URL on
+/// the wire. Only the image-recognition call ever carries these - chat and
+/// compaction contexts are text-only by design (descriptions are baked into
+/// the records instead).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImagePart {
+    /// MIME type of the encoded bytes, e.g. `image/jpeg`.
+    pub mime: String,
+    /// Image bytes, base64-encoded.
+    pub data_base64: String,
+}
+
 /// One message of an LLM conversation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// Images for vision-capable calls; empty renders plain-text content.
+    pub images: Vec<ImagePart>,
+}
+
+impl ChatMessage {
+    /// A plain-text message (the common shape - chat and compaction turns).
+    #[must_use]
+    pub fn text(role: ChatRole, content: impl Into<String>) -> Self {
+        Self { role, content: content.into(), images: Vec::new() }
+    }
 }
 
 /// A completion request: fully assembled context in, answer out. Context

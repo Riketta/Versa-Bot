@@ -42,6 +42,22 @@ pub struct LlmSettings {
     pub stream_interval_ms: u64,
     /// Cap for `/llm_prompt_file` attachment downloads, in bytes.
     pub max_prompt_file_bytes: u64,
+    /// Image recognition model fallback (`provider/model`); `None` = image
+    /// recognition off globally (channels can only toggle within that).
+    pub image_model: Option<String>,
+    /// Images are rescaled to this max side (aspect kept) before the
+    /// recognition call; smaller images pass through untouched.
+    pub image_max_side: u32,
+    /// JPEG quality of the rescaled recognition payload.
+    pub image_jpeg_quality: u8,
+    /// Download cap per image attachment, in bytes; larger images are
+    /// recorded undescribed.
+    pub image_max_source_bytes: u64,
+    /// Recognition prompt override; `None` = built-in default.
+    pub image_prompt: Option<String>,
+    /// Cap on images described per captured message; images beyond it are
+    /// recorded undescribed.
+    pub max_images_per_message: u32,
     /// Collapses runs of consecutive newlines in completions down to this
     /// many (applied at the adapter boundary, chat answers and compaction
     /// summaries alike); `None` leaves responses untouched.
@@ -73,6 +89,12 @@ impl Default for LlmSettings {
             max_message_length: 2000,
             stream_interval_ms: 2000,
             max_prompt_file_bytes: 131_072,
+            image_model: None,
+            image_max_side: 512,
+            image_jpeg_quality: 85,
+            image_max_source_bytes: 8_388_608,
+            image_prompt: None,
+            max_images_per_message: 2,
             max_consecutive_newlines: None,
             log_raw_traffic: false,
             providers: BTreeMap::new(),
@@ -512,12 +534,7 @@ fn completion_body(
     body.insert("model".to_owned(), json!(model));
     body.insert(
         "messages".to_owned(),
-        json!(
-            messages
-                .iter()
-                .map(|message| json!({"role": message.role.as_str(), "content": message.content}))
-                .collect::<Vec<_>>()
-        ),
+        json!(messages.iter().map(wire_message).collect::<Vec<_>>()),
     );
     if let Some(value) = temperature {
         body.insert("temperature".to_owned(), json!(value));
@@ -595,6 +612,24 @@ fn template_value(name: &str, effort: Option<&str>) -> Option<Value> {
 /// embedded in longer strings substitute textually (string form; `null`
 /// becomes empty). Unknown variables are left as-is with a warning: an
 /// operator typo must show up in the logs, not vanish silently.
+/// One message on the wire: plain string content normally; the `OpenAI`
+/// multipart array (text part + `image_url` data-URL parts) only when the
+/// message carries images - the image-recognition call's shape.
+fn wire_message(message: &ChatMessage) -> Value {
+    let role = json!(message.role.as_str());
+    if message.images.is_empty() {
+        return json!({"role": role, "content": message.content});
+    }
+    let mut parts = vec![json!({"type": "text", "text": message.content})];
+    parts.extend(message.images.iter().map(|image| {
+        json!({
+            "type": "image_url",
+            "image_url": {"url": format!("data:{};base64,{}", image.mime, image.data_base64)},
+        })
+    }));
+    json!({"role": role, "content": parts})
+}
+
 fn render_extra_body(value: &Value, effort: Option<&str>) -> Value {
     match value {
         Value::String(text) => render_template_string(text, effort),
@@ -919,7 +954,7 @@ fn collapse_newlines(content: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::llm::completion_port::ChatRole;
+    use crate::plugins::llm::completion_port::{ChatRole, ImagePart};
 
     /// Single-shot parse with a placeholder wall clock - timing assertions
     /// live in the dedicated tests below.
@@ -942,9 +977,66 @@ mod tests {
 
     fn sample_messages() -> Vec<ChatMessage> {
         vec![
-            ChatMessage { role: ChatRole::System, content: "be nice".to_owned() },
-            ChatMessage { role: ChatRole::User, content: "alice: hi".to_owned() },
+            ChatMessage::text(ChatRole::System, "be nice"),
+            ChatMessage::text(ChatRole::User, "alice: hi"),
         ]
+    }
+
+    #[test]
+    fn image_messages_render_multipart_content() {
+        let messages = vec![ChatMessage {
+            images: vec![ImagePart {
+                mime: "image/jpeg".to_owned(),
+                data_base64: "QUJD".to_owned(),
+            }],
+            ..ChatMessage::text(ChatRole::User, "describe this")
+        }];
+        let body = completion_body(
+            ReasoningStyle::OpenaiEffort,
+            "vision-model",
+            &messages,
+            &GenParams::default(),
+            false,
+            &BTreeMap::new(),
+        );
+
+        let content = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| messages.first())
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .expect("multipart content array expected");
+        let text = content.first().expect("text part expected");
+        let image = content.get(1).expect("image part expected");
+        assert_eq!(content.len(), 2);
+        assert_eq!(text.get("type").and_then(Value::as_str), Some("text"));
+        assert_eq!(text.get("text").and_then(Value::as_str), Some("describe this"));
+        assert_eq!(image.get("type").and_then(Value::as_str), Some("image_url"));
+        assert_eq!(
+            image.get("image_url").and_then(|image| image.get("url")).and_then(Value::as_str),
+            Some("data:image/jpeg;base64,QUJD")
+        );
+    }
+
+    #[test]
+    fn text_only_messages_render_plain_content() {
+        let body = completion_body(
+            ReasoningStyle::OpenaiEffort,
+            "m",
+            &sample_messages(),
+            &GenParams::default(),
+            false,
+            &BTreeMap::new(),
+        );
+        let content = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| messages.first())
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .expect("plain string content expected");
+        assert_eq!(content, "be nice");
     }
 
     #[test]

@@ -28,11 +28,18 @@ use super::completion_port::{
 };
 use super::conversation::{self, ConversationRecord, RecordRole};
 use super::model::{
-    CaptureMode, ChannelConfig, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY,
-    UsageStats, blend_ratio, channel_state_key, channel_stats_key, records_namespace, unix_now,
+    ChannelConfig, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats,
+    blend_ratio, channel_state_key, channel_stats_key, records_namespace, unix_now,
 };
 use super::providers::LlmSettings;
 use super::rng::{RandomPort, RandomScope};
+use super::vision::{self, DEFAULT_IMAGE_PROMPT, ImageDescriber, ImageJob, ImageSource};
+
+/// One undescribed placeholder entry per image (feature off, cap overflow,
+/// or recognition failure - the record still shows THAT an image existed).
+fn undescribed(count: usize) -> Vec<conversation::RecordImage> {
+    std::iter::repeat_n(conversation::RecordImage { description: None }, count).collect()
+}
 
 /// Identifies one channel for service-notice cooldowns: platform, guild,
 /// channel.
@@ -207,6 +214,9 @@ pub struct ChatEngine {
     settings: Arc<LlmSettings>,
     completion: Arc<dyn LlmCompletionPort>,
     rng: Arc<dyn RandomPort>,
+    /// Image recognition (capture-time descriptions); a no-op fake in
+    /// tests.
+    describer: Arc<dyn ImageDescriber>,
     /// Last error-notice time per channel (see [`NOTICE_COOLDOWN`]).
     notices: Mutex<HashMap<ChannelKey, Instant>>,
     /// Last random chime-in time per channel; the cooldown length is the
@@ -220,11 +230,13 @@ impl ChatEngine {
         settings: Arc<LlmSettings>,
         completion: Arc<dyn LlmCompletionPort>,
         rng: Arc<dyn RandomPort>,
+        describer: Arc<dyn ImageDescriber>,
     ) -> Self {
         Self {
             settings,
             completion,
             rng,
+            describer,
             notices: Mutex::new(HashMap::new()),
             chimes: Mutex::new(HashMap::new()),
         }
@@ -282,16 +294,7 @@ impl ChatEngine {
             live.iter().map(|(_, record)| record.clone()).collect();
         let mut captured = false;
         let mut capture_failed = false;
-        match self
-            .capture_message(
-                storage,
-                origin,
-                payload,
-                reply_to,
-                &config.capture_mode,
-                &live_records,
-            )
-            .await
+        match self.capture_message(storage, origin, payload, reply_to, config, &live_records).await
         {
             Some(Ok((seq, record))) => {
                 live.push((seq, record.clone()));
@@ -355,12 +358,18 @@ impl ChatEngine {
         origin: &Origin,
         payload: &MessagePayload,
         reply_to: Option<u64>,
-        mode: &CaptureMode,
+        config: &ChannelConfig,
         live_records: &[ConversationRecord],
     ) -> Option<Result<(u64, ConversationRecord), crate::kernel::models::StorageError>> {
-        if !conversation::should_capture(*mode, payload.mentions_bot, reply_to, live_records) {
+        if !conversation::should_capture(
+            config.capture_mode,
+            payload.mentions_bot,
+            reply_to,
+            live_records,
+        ) {
             return None;
         }
+        let images = self.describe_images(config, payload).await;
         let record = ConversationRecord {
             message_id: origin.message_id.map(MessageId::get),
             role: RecordRole::User,
@@ -368,12 +377,82 @@ impl ChatEngine {
             content: payload.content.clone(),
             reply_to,
             captured_at: unix_now(),
+            images,
         };
         Some(
             Self::append_record(storage, origin.channel_id.get(), &record)
                 .await
                 .map(|seq| (seq, record)),
         )
+    }
+
+    /// Capture-time image recognition. The description is baked into the
+    /// record before the append, so the rendered prompt stays byte-stable
+    /// forever after. Best-effort by contract: channels without the
+    /// feature, images over the per-message cap, and every failure mode
+    /// record undescribed placeholders - capture never breaks, and the
+    /// model still sees THAT an image was posted. Recognition usage stays
+    /// out of the channel's chat stats (compaction precedent).
+    async fn describe_images(
+        &self,
+        config: &ChannelConfig,
+        payload: &MessagePayload,
+    ) -> Vec<conversation::RecordImage> {
+        let sources: Vec<ImageSource> = payload
+            .attachments
+            .iter()
+            .map(|attachment| ImageSource {
+                url: attachment.url.clone(),
+                content_type: attachment.content_type.clone(),
+            })
+            .filter(vision::is_image_source)
+            .collect();
+        if sources.is_empty() {
+            return Vec::new();
+        }
+        if !config.images {
+            return undescribed(sources.len());
+        }
+        let Some(model) = config.image_model.clone().or_else(|| self.settings.image_model.clone())
+        else {
+            tracing::debug!(
+                "channel image recognition enabled but no image model is configured - storing undescribed"
+            );
+            return undescribed(sources.len());
+        };
+        let cap = usize::try_from(self.settings.max_images_per_message).unwrap_or(usize::MAX);
+        let (described, overflow) = if sources.len() > cap {
+            sources.split_at(cap)
+        } else {
+            (sources.as_slice(), [].as_slice())
+        };
+        let job = ImageJob {
+            model,
+            prompt: config
+                .image_prompt
+                .clone()
+                .or_else(|| self.settings.image_prompt.clone())
+                .unwrap_or_else(|| DEFAULT_IMAGE_PROMPT.to_owned()),
+            max_side: self.settings.image_max_side,
+            jpeg_quality: self.settings.image_jpeg_quality,
+            max_source_bytes: self.settings.image_max_source_bytes,
+        };
+        let started = Instant::now();
+        let results = self.describer.describe(&job, described.to_vec()).await;
+        let described_count = results.iter().filter(|result| result.is_some()).count();
+        tracing::info!(
+            total = sources.len(),
+            described = described_count,
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            model = %job.model,
+            "image recognition completed"
+        );
+        let mut images: Vec<_> = results
+            .into_iter()
+            .map(|description| conversation::RecordImage { description })
+            .collect();
+        images.extend(overflow.iter().map(|_| conversation::RecordImage { description: None }));
+        images
     }
 
     /// Completes and delivers the answer for a triggering message. The
@@ -656,6 +735,7 @@ impl ChatEngine {
             content: content.to_owned(),
             reply_to: origin.message_id.map(MessageId::get),
             captured_at: unix_now(),
+            images: Vec::new(),
         };
         if let Some(storage) = &services.guild_storage
             && let Err(err) = Self::append_record(storage, channel_id, &assistant).await
@@ -1098,7 +1178,8 @@ impl ChatEngine {
 mod tests {
     use super::*;
     use crate::kernel::models::{
-        ChannelId, GuildId, MessageId, OutboundError, Platform, StorageError, UserId,
+        AttachmentPayload, ChannelId, GuildId, MessageId, OutboundError, Platform, StorageError,
+        UserId,
     };
     use crate::kernel::spi_ports::{
         ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard, GuildStorage,
@@ -1248,6 +1329,42 @@ mod tests {
         }
     }
 
+    /// Capture-path fake: records describe jobs (model ref, prompt, image
+    /// count) and hands out canned descriptions in order; exhausted queues
+    /// yield undescribed images.
+    #[derive(Default)]
+    struct FakeDescriber {
+        jobs: Mutex<Vec<(String, String, usize)>>,
+        results: Mutex<VecDeque<Option<String>>>,
+    }
+
+    impl FakeDescriber {
+        fn with_results(results: Vec<Option<&str>>) -> Self {
+            Self {
+                jobs: Mutex::new(Vec::new()),
+                results: Mutex::new(
+                    results.into_iter().map(|line| line.map(str::to_owned)).collect(),
+                ),
+            }
+        }
+
+        fn job_count(&self) -> usize {
+            self.jobs.lock().iter().map(|(_, _, count)| *count).sum()
+        }
+    }
+
+    #[async_trait]
+    impl ImageDescriber for FakeDescriber {
+        async fn describe(&self, job: &ImageJob, images: Vec<ImageSource>) -> Vec<Option<String>> {
+            self.jobs.lock().push((job.model.clone(), job.prompt.clone(), images.len()));
+            let mut out = Vec::with_capacity(images.len());
+            for _ in images {
+                out.push(self.results.lock().pop_front().flatten());
+            }
+            out
+        }
+    }
+
     /// Streaming fake: emits its chunks as real deltas, pausing between them
     /// so the engine's throttled reveal ticks, and resolves to the assembled
     /// text. `fail_at_start` / `fail_after` model endpoints that fail before
@@ -1307,7 +1424,12 @@ mod tests {
     }
 
     fn ctx_delta(settings: LlmSettings, completion: Arc<dyn LlmCompletionPort>) -> DeltaCtx {
-        let engine = ChatEngine::new(Arc::new(settings), completion, Arc::new(FixedRandom(false)));
+        let engine = ChatEngine::new(
+            Arc::new(settings),
+            completion,
+            Arc::new(FixedRandom(false)),
+            Arc::new(FakeDescriber::default()),
+        );
         let storage = Arc::new(InMemoryStorage::new());
         let output = RecordingChatOutput::new();
         let begins = Arc::new(Mutex::new(Vec::new()));
@@ -1444,6 +1566,7 @@ mod tests {
         begins: Arc<Mutex<Vec<OutboundMessage>>>,
         factory: Arc<StreamRecordingFactory>,
         services: KernelServices,
+        describer: Arc<FakeDescriber>,
     }
 
     /// Flat text projection of recorded stream begins, for content assertions.
@@ -1464,6 +1587,15 @@ mod tests {
         rng: Arc<dyn RandomPort>,
         responses: Vec<Result<String, LlmError>>,
     ) -> TestCtx {
+        ctx_describer(settings, rng, responses, Arc::new(FakeDescriber::default()))
+    }
+
+    fn ctx_describer(
+        settings: LlmSettings,
+        rng: Arc<dyn RandomPort>,
+        responses: Vec<Result<String, LlmError>>,
+        describer: Arc<FakeDescriber>,
+    ) -> TestCtx {
         let settings = Arc::new(settings);
         let fake = Arc::new(FakeCompletion {
             responses: Mutex::new(responses),
@@ -1475,6 +1607,7 @@ mod tests {
             Arc::clone(&settings),
             Arc::clone(&fake) as Arc<dyn LlmCompletionPort>,
             rng,
+            Arc::clone(&describer) as Arc<dyn ImageDescriber>,
         );
         let storage = Arc::new(InMemoryStorage::new());
         let output = RecordingChatOutput::new();
@@ -1491,7 +1624,7 @@ mod tests {
             chat_output_factory: Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
             guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
         };
-        TestCtx { engine, fake, storage, output, begins, factory, services }
+        TestCtx { engine, fake, storage, output, begins, factory, services, describer }
     }
 
     fn assigned_config() -> ChannelConfig {
@@ -1530,12 +1663,30 @@ mod tests {
     fn payload(mentions_bot: bool, reply_to: Option<u64>) -> MessagePayload {
         MessagePayload {
             content: "hello bot".to_owned(),
+            attachments: Vec::new(),
             author_name: Some("alice".to_owned()),
             author_roles: Vec::new(),
             author_permissions: 0,
             reply_to: reply_to.map(MessageId),
             mentions_bot,
         }
+    }
+
+    /// A mention payload carrying image attachments (PNG CDN links).
+    fn payload_with_images(urls: &[&str]) -> MessagePayload {
+        let mut payload = payload(true, None);
+        payload.attachments = urls
+            .iter()
+            .map(|url| AttachmentPayload {
+                url: (*url).to_owned(),
+                content_type: Some("image/png".to_owned()),
+                file_name: Some("pic.png".to_owned()),
+                size_bytes: 100,
+                width: Some(10),
+                height: Some(10),
+            })
+            .collect();
+        payload
     }
 
     fn user_record(message_id: u64, author: &str, content: &str) -> ConversationRecord {
@@ -1546,6 +1697,7 @@ mod tests {
             content: content.to_owned(),
             reply_to: None,
             captured_at: 0,
+            images: Vec::new(),
         }
     }
 
@@ -1676,6 +1828,196 @@ mod tests {
         assert!(ctx.begins.lock().is_empty());
     }
 
+    fn images_enabled_config(model: &str) -> ChannelConfig {
+        let mut config = assigned_config();
+        config.images = true;
+        config.image_model = Some(model.to_owned());
+        config
+    }
+
+    #[tokio::test]
+    async fn captured_images_are_described_and_baked_into_the_record() {
+        let ctx = ctx_describer(
+            LlmSettings::default(),
+            Arc::new(RandRandom),
+            vec![Ok("cute".to_owned())],
+            Arc::new(FakeDescriber::with_results(vec![Some("a tabby cat")])),
+        );
+        let config = images_enabled_config("local/vision");
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine
+            .handle_message(
+                &origin(),
+                &payload_with_images(&["https://cdn.example/1.png"]),
+                &config,
+                &ctx.services,
+            )
+            .await;
+
+        // The recognition call went to the channel's image model override
+        // with the built-in default prompt (no override configured).
+        let (model, prompt, count) =
+            ctx.describer.jobs.lock().first().expect("job expected").clone();
+        assert_eq!((model.as_str(), count), ("local/vision", 1));
+        assert!(prompt.contains("Describe this image"));
+        // The stored record carries the description, rendered into the
+        // answer context as a markdown image reference.
+        let records = stored_records(&ctx).await;
+        assert_eq!(
+            records.first().and_then(|r| r.images.first()).map(|image| image.description.clone()),
+            Some(Some("a tabby cat".to_owned()))
+        );
+        let context = ctx.fake.requests().first().expect("chat request expected").clone();
+        let turn = context.messages.iter().find(|m| m.role == ChatRole::User).expect("user turn");
+        assert!(turn.content.contains("![a tabby cat](image.png)"));
+    }
+
+    #[tokio::test]
+    async fn channel_image_prompt_override_reaches_the_recognition_call() {
+        let ctx = ctx_describer(
+            LlmSettings {
+                image_prompt: Some("plugin default".to_owned()),
+                ..LlmSettings::default()
+            },
+            Arc::new(RandRandom),
+            vec![Ok("ok".to_owned())],
+            Arc::new(FakeDescriber::with_results(vec![Some("desc")])),
+        );
+        let mut config = images_enabled_config("local/vision");
+        config.image_prompt = Some("channel prompt".to_owned());
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine
+            .handle_message(
+                &origin(),
+                &payload_with_images(&["https://cdn.example/1.png"]),
+                &config,
+                &ctx.services,
+            )
+            .await;
+
+        // Channel override > plugin `[llm] image_prompt` > built-in default.
+        let (_, prompt, _) = ctx.describer.jobs.lock().first().expect("job expected").clone();
+        assert_eq!(prompt, "channel prompt");
+    }
+
+    #[tokio::test]
+    async fn images_off_records_placeholders_without_describe_calls() {
+        let ctx = ctx(vec![Ok("ok".to_owned())]);
+        let config = assigned_config(); // images: false (the default)
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine
+            .handle_message(
+                &origin(),
+                &payload_with_images(&["https://cdn.example/1.png"]),
+                &config,
+                &ctx.services,
+            )
+            .await;
+
+        assert_eq!(ctx.describer.job_count(), 0);
+        let records = stored_records(&ctx).await;
+        let images = records.first().map(|r| r.images.clone()).unwrap_or_default();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images.first().and_then(|image| image.description.clone()), None);
+    }
+
+    #[tokio::test]
+    async fn describe_failure_still_answers_with_an_undescribed_placeholder() {
+        let ctx = ctx_describer(
+            LlmSettings::default(),
+            Arc::new(RandRandom),
+            vec![Ok("answered anyway".to_owned())],
+            Arc::new(FakeDescriber::with_results(vec![None])), // recognition fails
+        );
+        let config = images_enabled_config("local/vision");
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine
+            .handle_message(
+                &origin(),
+                &payload_with_images(&["https://cdn.example/1.png"]),
+                &config,
+                &ctx.services,
+            )
+            .await;
+
+        // Best-effort contract: the record shows the image, undescribed,
+        // and the guaranteed answer still goes out.
+        let records = stored_records(&ctx).await;
+        assert_eq!(
+            records.first().and_then(|r| r.images.first()).map(|image| image.description.clone()),
+            Some(None)
+        );
+        assert_eq!(begin_texts(&ctx.begins), vec!["answered anyway".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn per_message_cap_limits_describe_calls_but_keeps_every_image() {
+        let settings = LlmSettings { max_images_per_message: 2, ..LlmSettings::default() };
+        let ctx = ctx_describer(
+            settings,
+            Arc::new(RandRandom),
+            vec![Ok("ok".to_owned())],
+            Arc::new(FakeDescriber::with_results(vec![Some("first"), Some("second")])),
+        );
+        let config = images_enabled_config("local/vision");
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine
+            .handle_message(
+                &origin(),
+                &payload_with_images(&["https://cdn.example/1.png", "/2.png", "/3.png"]),
+                &config,
+                &ctx.services,
+            )
+            .await;
+
+        // Two describe calls (the cap), three record entries (fidelity).
+        assert_eq!(ctx.describer.job_count(), 2);
+        let records = stored_records(&ctx).await;
+        let images = records.first().map(|r| r.images.clone()).unwrap_or_default();
+        assert_eq!(images.len(), 3);
+        assert_eq!(
+            images.first().and_then(|image| image.description.clone()),
+            Some("first".to_owned())
+        );
+        assert_eq!(
+            images.get(1).and_then(|image| image.description.clone()),
+            Some("second".to_owned())
+        );
+        assert_eq!(images.get(2).and_then(|image| image.description.clone()), None);
+    }
+
+    #[tokio::test]
+    async fn enabled_images_without_any_model_store_undescribed() {
+        let ctx = ctx_describer(
+            LlmSettings::default(), // no image_model configured
+            Arc::new(RandRandom),
+            vec![Ok("ok".to_owned())],
+            Arc::new(FakeDescriber::default()),
+        );
+        let mut config = assigned_config();
+        config.images = true; // ... but no override either
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine
+            .handle_message(
+                &origin(),
+                &payload_with_images(&["https://cdn.example/1.png"]),
+                &config,
+                &ctx.services,
+            )
+            .await;
+
+        assert_eq!(ctx.describer.job_count(), 0);
+        let records = stored_records(&ctx).await;
+        let images = records.first().map(|r| r.images.clone()).unwrap_or_default();
+        assert_eq!(images.first().and_then(|image| image.description.clone()), None);
+    }
+
     #[tokio::test]
     async fn reply_chain_into_conversation_captures_and_reply_to_bot_triggers() {
         let ctx = ctx(vec![Ok("answering".to_owned())]);
@@ -1690,6 +2032,7 @@ mod tests {
                 content: "hello!".to_owned(),
                 reply_to: None,
                 captured_at: 0,
+                images: Vec::new(),
             },
         )
         .await;
@@ -1837,6 +2180,7 @@ mod tests {
             settings,
             Arc::clone(&fake) as Arc<dyn LlmCompletionPort>,
             Arc::new(RandRandom) as Arc<dyn RandomPort>,
+            Arc::new(FakeDescriber::default()) as Arc<dyn ImageDescriber>,
         );
         let output = RecordingChatOutput::new();
         let services = KernelServices {

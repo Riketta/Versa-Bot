@@ -45,12 +45,12 @@ a slash command from any other reply path.
   events (stdout + Sentry/GlitchTip), with origin fields, no per-guild
   configuration needed.
 - LLM chat bot (`llm` plugin): per-channel chat with conversation history,
-  compaction, streaming, token-budget context filling and random
-  chime-ins. Operators declare OpenAI-compatible providers in `[llm]`
-  (keys via env); guild moderators assign and tune each channel via
-  `/llm_*` commands. The guild message content the bot reads is why
-  `MESSAGE_CONTENT` is requested. Full manual in
-  [Plugins](#llm-chat-bot-llm-plugin).
+  compaction, streaming, token-budget context filling, image recognition
+  (described attachments) and random chime-ins. Operators declare
+  OpenAI-compatible providers in `[llm]` (keys via env); guild moderators
+  assign and tune each channel via `/llm_*` commands. The guild message
+  content the bot reads is why `MESSAGE_CONTENT` is requested. Full manual
+  in [Plugins](#llm-chat-bot-llm-plugin).
 - Status rotator (`status_rotator` plugin): rotates the bot's activity
   through a configured list on a configured interval - both come from the
   optional `[status]` section of the config file (presence is bot-wide,
@@ -254,6 +254,11 @@ history.
 # dumps every LLM request and response body at DEBUG level (stdout only)
 # while debugging a provider - it carries conversation content, so it
 # stays off by default.
+# Image recognition: set image_model to a vision-capable declared model;
+# channels then opt in with /llm_set images on. Optional: image_prompt,
+# image_max_side (512), image_jpeg_quality (85), image_max_source_bytes
+# (8 MiB), max_images_per_message (2).
+# image_model = "local/unsloth/gemma-4-26B-A4B-it-qat-GGUF"
 
 [llm.providers.zai]
 api_url = "https://api.z.ai/api/coding/paas/v4"
@@ -357,6 +362,21 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   so the prompt prefix stays byte-stable and provider prompt caches
   stay warm. Records are never deleted - compaction only moves the
   cutoff forward.
+- **Image recognition** (opt-in per channel, `/llm_set images on`;
+  needs an operator-configured `[llm] image_model`): attached images on
+  captured messages are described by a vision-capable model at capture
+  time, and the description is stored with the message. The context
+  renders it as a markdown image reference - `![description](image.png)`
+  (multi-image messages number the placeholders) - so the chat model
+  reads what an image showed without ever receiving pixels: any declared
+  model works, and costs stay bounded (each image is described once,
+  rescaled to `image_max_side`, at most `max_images_per_message` per
+  message). The recognition prompt is customizable per channel
+  (`image_prompt`) - useful for pinning the description language.
+  Undescribed images (feature off, recognition failure, oversize,
+  over-cap) still render `![image](image.png)`, so the model at least
+  knows an image was posted. Images are fetched from Discord's CDN only;
+  recognition usage never mixes into the channel's token stats.
 
 **Context sizing.** The window fills newest-first up to `depth`
 messages. Once the endpoint has reported real token usage (recorded
@@ -383,7 +403,7 @@ channel; tier denials are ephemeral too.
 | `/llm_prompt_file file:<attachment>` | set the system prompt from an uploaded text/markdown file - for prompts beyond the inline limit; fetched from Discord's CDN only, capped by `[llm] max_prompt_file_bytes` (128 KiB default) |
 | `/llm_set key:<key> value:<value>` | tune one channel setting (table below); value `clear`/`none`/`default` resets it |
 | `/llm_cutoff` | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
-| `/llm_status` | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, capture mode, chime-in chance, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
+| `/llm_status` | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, compaction, image recognition (state, model, prompt length), capture mode, chime-in chance, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
 | `/llm_admin` | make this channel the guild's service channel for error notices (one per guild, last write wins) |
 | `/llm_admin_clear` | stop service notices |
 
@@ -402,6 +422,9 @@ saved):
 | `compaction` | summarize-and-cutoff on/off | on |
 | `compaction_model` | model used for summaries | the channel's chat model |
 | `compaction_prompt` | summarization instruction | plugin default |
+| `images` | image recognition for captured messages (needs operator `[llm] image_model`) | off |
+| `image_model` | recognition model for this channel | plugin `image_model` |
+| `image_prompt` | recognition instruction (e.g. pin the description language) | plugin `image_prompt` |
 | `streaming` | stream the answer live from the provider (SSE, `stream: true`); the message is created with the first tokens and edited at `stream_interval_ms` - needs a streaming-capable endpoint | off |
 | `random_chance` | percent chance to chime in on a captured non-trigger message | 2 |
 | `random_cooldown` | minimum seconds between chime-ins (`0` = none) | 5 |

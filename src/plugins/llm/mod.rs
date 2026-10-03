@@ -12,6 +12,7 @@ mod llm_plugin;
 mod model;
 mod providers;
 mod rng;
+mod vision;
 
 pub use chat_engine::ChatEngine;
 pub use completion_port::{
@@ -29,3 +30,4 @@ pub use providers::{
     SummaryPlacement,
 };
 pub use rng::{DeckRandom, RandRandom, RandomPort, RandomScope};
+pub use vision::{ImageDescriber, ImageJob, ImageSource, VisionService};

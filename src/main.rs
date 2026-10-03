@@ -24,8 +24,9 @@ use versa_bot::plugins::audit::AuditLogPlugin;
 use versa_bot::plugins::auth::AuthPlugin;
 use versa_bot::plugins::command::CommandPlugin;
 use versa_bot::plugins::llm::{
-    ChatEngine, DeckRandom, LlmCompletionPort, LlmPlugin, LlmSettings, ModelSettings,
-    OpenAiCompatibleAdapter, ProviderSettings, RandomPort, ReasoningStyle, SummaryPlacement,
+    ChatEngine, DeckRandom, ImageDescriber, LlmCompletionPort, LlmPlugin, LlmSettings,
+    ModelSettings, OpenAiCompatibleAdapter, ProviderSettings, RandomPort, ReasoningStyle,
+    SummaryPlacement, VisionService,
 };
 use versa_bot::plugins::status::{StatusRotatorPlugin, StatusSettings};
 use versa_bot::plugins::tracker::UserActivityTrackerPlugin;
@@ -100,10 +101,15 @@ async fn main() -> ExitCode {
     let llm_settings = Arc::new(config.llm.as_ref().map(llm_settings_from).unwrap_or_default());
     let llm_adapter = OpenAiCompatibleAdapter::from_settings(Arc::clone(&llm_settings))
         .expect("config [llm] section expected to be valid (api_key_env set, proxies parseable)");
+    // One completion port, two consumers: the chat engine and the image
+    // recognition service (same adapter, per the cardinality rule).
+    let llm_completion = Arc::new(llm_adapter) as Arc<dyn LlmCompletionPort>;
+    let llm_describer = Arc::new(VisionService::new(Arc::clone(&llm_completion)));
     let llm_engine = Arc::new(ChatEngine::new(
         llm_settings,
-        Arc::new(llm_adapter) as Arc<dyn LlmCompletionPort>,
+        Arc::clone(&llm_completion),
         Arc::new(DeckRandom::new()) as Arc<dyn RandomPort>,
+        llm_describer as Arc<dyn ImageDescriber>,
     ));
     let llm =
         Arc::new(LlmPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>, llm_engine));
@@ -216,6 +222,12 @@ fn llm_settings_from(config: &LlmConfig) -> LlmSettings {
         max_message_length: config.max_message_length,
         stream_interval_ms: config.stream_interval_ms,
         max_prompt_file_bytes: config.max_prompt_file_bytes,
+        image_model: config.image_model.clone(),
+        image_max_side: config.image_max_side,
+        image_jpeg_quality: config.image_jpeg_quality,
+        image_max_source_bytes: config.image_max_source_bytes,
+        image_prompt: config.image_prompt.clone(),
+        max_images_per_message: config.max_images_per_message,
         max_consecutive_newlines: config.max_consecutive_newlines,
         log_raw_traffic: config.log_raw_traffic,
         providers: config

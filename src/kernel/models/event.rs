@@ -102,9 +102,27 @@ pub struct CommandPayload {
     pub author_permissions: u64,
 }
 
+/// One file attached to an inbound message, normalized platform-blind. The
+/// URL is the platform's own CDN link, filled by the driving adapter - the
+/// only host guild input may ever name (the adapter guarantees it points at
+/// the platform CDN; plugins fetch it under their own size-cap policy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentPayload {
+    pub url: String,
+    /// MIME type when the platform reported one.
+    pub content_type: Option<String>,
+    pub file_name: Option<String>,
+    pub size_bytes: u64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MessagePayload {
     pub content: String,
+    /// Files attached to the message (images feed the LLM plugin's image
+    /// recognition); empty for platforms/events without attachments.
+    pub attachments: Vec<AttachmentPayload>,
     /// Author display name at capture time (channel nick, else platform
     /// username; best effort). Lets history consumers render `{sender}:
     /// {message}` context lines without a gateway cache.

@@ -6,7 +6,14 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.91"
+base64 = "0.22"
 bon = "3.9.1"
+image = { version = "0.25", default-features = false, features = [
+  "jpeg",
+  "png",
+  "gif",
+  "webp",
+] }
 
 config = {
   version = "0.15.25",

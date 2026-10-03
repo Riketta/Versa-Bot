@@ -21,6 +21,52 @@ pub const NO_EARLIER_CONTEXT: &str = "(no earlier context)";
 /// Default rendering of user turns in the context.
 pub const DEFAULT_TURN_TEMPLATE: &str = "{sender}: {message}";
 
+/// The file name is a fake placeholder: the model only needs the "this was
+/// an image" hint - the description lives in the markdown alt-text slot.
+/// Multi-image messages number the placeholders so the model can refer to
+/// them separately.
+const IMAGE_PLACEHOLDER: &str = "image.png";
+
+/// Renders a record's images as markdown image references, one per line:
+/// `![description](image.png)`, undescribed ones as `![image](image.png)`.
+#[must_use]
+pub fn render_images(images: &[RecordImage]) -> String {
+    let mut rendered = String::new();
+    for (index, image) in images.iter().enumerate() {
+        rendered.push('\n');
+        let name = if index == 0 {
+            IMAGE_PLACEHOLDER.to_owned()
+        } else {
+            format!("image_{}.png", index + 1)
+        };
+        let alt = image.description.as_deref().unwrap_or("image");
+        let _ = write!(rendered, "![{alt}]({name})");
+    }
+    rendered
+}
+
+/// A record's content as it enters the prompt: text plus rendered images.
+/// The single source of turn rendering - context assembly and compaction
+/// transcripts render identically.
+#[must_use]
+pub fn record_content(record: &ConversationRecord) -> String {
+    if record.images.is_empty() {
+        return record.content.clone();
+    }
+    format!("{}{}", record.content, render_images(&record.images))
+}
+
+/// One image attached to a captured user message: the recognition
+/// description when it succeeded, `None` when the image could not be
+/// described (feature off at capture, endpoint failure, over the per-message
+/// cap). Records are immutable once appended, so the rendered prompt stays
+/// byte-stable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordImage {
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
 /// One captured conversation entry - the payload of a `guild_records` row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConversationRecord {
@@ -40,6 +86,10 @@ pub struct ConversationRecord {
     pub reply_to: Option<u64>,
     /// Capture time, unix seconds.
     pub captured_at: u64,
+    /// Images attached to the message, in attachment order (user turns
+    /// only; empty on records from before image recognition existed).
+    #[serde(default)]
+    pub images: Vec<RecordImage>,
 }
 
 /// Who spoke a captured record. The bot's own turns are recorded at send
@@ -175,17 +225,17 @@ pub fn assemble_context(
                 system.push_str("\n\n");
                 system.push_str(&summary_slot);
             }
-            messages.push(ChatMessage { role: ChatRole::System, content: system });
+            messages.push(ChatMessage::text(ChatRole::System, system));
         }
         SummaryPlacement::SystemTurn => {
             used += estimated_tokens(&summary_slot, tokens_per_char);
-            messages.push(ChatMessage { role: ChatRole::System, content: system });
-            messages.push(ChatMessage { role: ChatRole::System, content: summary_slot });
+            messages.push(ChatMessage::text(ChatRole::System, system));
+            messages.push(ChatMessage::text(ChatRole::System, summary_slot));
         }
         SummaryPlacement::AssistantTurn => {
             used += estimated_tokens(&summary_slot, tokens_per_char);
-            messages.push(ChatMessage { role: ChatRole::System, content: system });
-            messages.push(ChatMessage { role: ChatRole::Assistant, content: summary_slot });
+            messages.push(ChatMessage::text(ChatRole::System, system));
+            messages.push(ChatMessage::text(ChatRole::Assistant, summary_slot));
         }
     }
 
@@ -194,7 +244,7 @@ pub fn assemble_context(
         let Some(record) = records.get(records.len() - count - 1) else {
             break;
         };
-        let cost = estimated_tokens(&record.content, tokens_per_char);
+        let cost = estimated_tokens(&record_content(record), tokens_per_char);
         if budget.is_some_and(|budget| used + cost > budget) && count > 0 {
             break;
         }
@@ -206,15 +256,13 @@ pub fn assemble_context(
     let template = config.turn_template.as_deref().unwrap_or(DEFAULT_TURN_TEMPLATE);
     for record in window {
         let message = match record.role {
-            RecordRole::User => ChatMessage {
-                role: ChatRole::User,
-                content: template
+            RecordRole::User => ChatMessage::text(
+                ChatRole::User,
+                template
                     .replace("{sender}", record.author.as_deref().unwrap_or("user"))
-                    .replace("{message}", &record.content),
-            },
-            RecordRole::Assistant => {
-                ChatMessage { role: ChatRole::Assistant, content: record.content.clone() }
-            }
+                    .replace("{message}", &record_content(record)),
+            ),
+            RecordRole::Assistant => ChatMessage::text(ChatRole::Assistant, record.content.clone()),
         };
         messages.push(message);
     }
@@ -242,16 +290,13 @@ pub fn compaction_input(
                 transcript,
                 "{}: {}",
                 record.author.as_deref().unwrap_or("user"),
-                record.content
+                record_content(record)
             ),
             RecordRole::Assistant => writeln!(transcript, "assistant: {}", record.content),
         }
         .expect("writing to a String expected to be infallible");
     }
-    vec![
-        ChatMessage { role: ChatRole::System, content: prompt.to_owned() },
-        ChatMessage { role: ChatRole::User, content: transcript },
-    ]
+    vec![ChatMessage::text(ChatRole::System, prompt), ChatMessage::text(ChatRole::User, transcript)]
 }
 
 /// Splits a reply into platform-sized chunks on line boundaries: a line
@@ -325,6 +370,7 @@ mod tests {
             content: content.to_owned(),
             reply_to: None,
             captured_at: 0,
+            images: Vec::new(),
         }
     }
 
@@ -336,6 +382,7 @@ mod tests {
             content: content.to_owned(),
             reply_to: None,
             captured_at: 0,
+            images: Vec::new(),
         }
     }
 
@@ -381,6 +428,7 @@ mod tests {
                 content: "no name".to_owned(),
                 reply_to: None,
                 captured_at: 0,
+                images: Vec::new(),
             },
         ];
 
@@ -556,6 +604,72 @@ mod tests {
         let messages = assemble_context(&config, &settings, &state, &records, 0.25, None);
 
         assert_eq!(messages.get(2).map(|m| m.content.as_str()), Some("<alice> hello"));
+    }
+
+    #[test]
+    fn images_render_as_markdown_references_in_user_turns() {
+        let config = ChannelConfig::assigned("m".to_owned());
+        let settings = LlmSettings::default();
+        let state = ConversationState::default();
+        let mut record = user_record(10, "alice", "look at this");
+        record.images = vec![
+            RecordImage { description: Some("a tabby cat on a keyboard".to_owned()) },
+            RecordImage { description: None },
+        ];
+
+        let messages = assemble_context(&config, &settings, &state, &[record], 0.25, None);
+
+        assert_eq!(
+            messages.get(2).map(|m| m.content.as_str()),
+            Some(concat!(
+                "alice: look at this\n",
+                "![a tabby cat on a keyboard](image.png)\n",
+                "![image](image_2.png)"
+            ))
+        );
+    }
+
+    #[test]
+    fn image_descriptions_count_toward_the_context_budget() {
+        let config = ChannelConfig::assigned("m".to_owned());
+        let settings = LlmSettings::default();
+        let state = ConversationState::default();
+        let mut padded = user_record(10, "alice", "old");
+        padded.images = vec![RecordImage { description: Some("x".repeat(4000)) }];
+        let records = vec![padded, user_record(11, "bob", "newest")];
+
+        // A tight budget drops the image-padded record first - descriptions
+        // are real prompt bytes and must not ride for free.
+        let messages = assemble_context(&config, &settings, &state, &records, 0.25, Some(300));
+
+        assert_eq!(messages.len(), 3); // system + placeholder + the newest turn
+        assert!(messages.get(2).is_some_and(|m| m.content.ends_with("bob: newest")));
+    }
+
+    #[test]
+    fn compaction_transcript_renders_images_like_the_context() {
+        let mut record = user_record(10, "alice", "look");
+        record.images = vec![RecordImage { description: Some("a dog".to_owned()) }];
+
+        let messages = compaction_input("summarize", None, &[record]);
+
+        assert_eq!(
+            messages.get(1).map(|m| m.content.as_str()),
+            Some("New messages:\nalice: look\n![a dog](image.png)\n")
+        );
+    }
+
+    #[test]
+    fn records_without_images_field_deserialize_from_old_logs() {
+        let record: ConversationRecord = serde_json::from_value(serde_json::json!({
+            "message_id": 10,
+            "role": "user",
+            "author": "alice",
+            "content": "pre-feature message",
+            "captured_at": 0
+        }))
+        .expect("old record shape expected to deserialize");
+        assert!(record.images.is_empty());
     }
 
     /// Serializes the assembled context the way a provider prompt cache sees
@@ -778,6 +892,7 @@ mod tests {
                 content: "who is there".to_owned(),
                 reply_to: None,
                 captured_at: 0,
+                images: Vec::new(),
             },
         ];
 
