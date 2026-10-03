@@ -51,10 +51,12 @@ a slash command from any other reply path.
   `/llm_*` commands. The guild message content the bot reads is why
   `MESSAGE_CONTENT` is requested. Full manual in
   [Plugins](#llm-chat-bot-llm-plugin).
-- Status rotator (`status_rotator` plugin): cycles the bot's activity
+- Status rotator (`status_rotator` plugin): rotates the bot's activity
   through a configured list on a configured interval - both come from the
   optional `[status]` section of the config file (presence is bot-wide,
-  not per-guild); omitted or empty means the rotation is off.
+  not per-guild); omitted or empty means the rotation is off. Statuses
+  draw from a shuffled deck - every status shows once per cycle, in
+  fake-random order - and the first status lands exactly on connect.
 - Guild-partitioned document storage: plugins persist JSON documents scoped
   to `(platform, guild)` - reading another guild's data is impossible by
   construction. An append-only record log (`append`/`list_after`/`count_after`)

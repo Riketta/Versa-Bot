@@ -1,9 +1,9 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use rand::seq::SliceRandom;
 
 use crate::kernel::{
     models::{PluginError, Presence},
@@ -37,7 +37,10 @@ impl StatusSettings {
 /// the rotation, otherwise the job is rescheduled with the new interval and
 /// list. `start` schedules only when no job is active yet, so an `update`
 /// landing between construction and start cannot double-schedule. The job
-/// runs on the kernel scheduler (first run immediate); `stop` cancels it.
+/// runs on the kernel scheduler (first run immediate - a status set before
+/// the gateway is up is queued by the presence adapter and lands exactly on
+/// connect); `stop` cancels it. Statuses draw from a shuffled deck: every
+/// status shows once per cycle, in fake-random order.
 pub struct StatusRotatorPlugin {
     scheduler: Arc<dyn SchedulerPort>,
     presence: Arc<dyn PresencePort>,
@@ -84,11 +87,7 @@ impl StatusRotatorPlugin {
             return;
         }
 
-        let job = Arc::new(StatusJob {
-            presence: Arc::clone(&self.presence),
-            statuses: settings.statuses,
-            index: AtomicUsize::new(0),
-        });
+        let job = Arc::new(StatusJob::new(Arc::clone(&self.presence), settings.statuses));
         let handle = self.scheduler.schedule(self.name(), settings.interval, job);
         *self.job.lock() = Some(handle);
     }
@@ -117,21 +116,37 @@ impl PluginPort for StatusRotatorPlugin {
     }
 }
 
-/// Cycles through the configured statuses, one per tick.
+/// Draws the configured statuses from a shuffled deck, one per tick: the
+/// deck refills and reshuffles (Fisher-Yates over `rand`'s thread generator)
+/// whenever it runs empty, so every status appears exactly once per cycle,
+/// in fake-random order - full coverage without a predictable sequence.
 struct StatusJob {
     presence: Arc<dyn PresencePort>,
     statuses: Vec<String>,
-    index: AtomicUsize,
+    deck: Mutex<Vec<usize>>,
+}
+
+impl StatusJob {
+    fn new(presence: Arc<dyn PresencePort>, statuses: Vec<String>) -> Self {
+        Self { presence, statuses, deck: Mutex::new(Vec::new()) }
+    }
+
+    fn draw(&self) -> Option<usize> {
+        let mut deck = self.deck.lock();
+        if deck.is_empty() {
+            *deck = (0..self.statuses.len()).collect();
+            deck.shuffle(&mut rand::rng());
+        }
+        deck.pop()
+    }
 }
 
 #[async_trait]
 impl Job for StatusJob {
     async fn run(&self) {
-        let count = self.statuses.len();
-        if count == 0 {
+        let Some(index) = self.draw() else {
             return;
-        }
-        let index = self.index.fetch_add(1, Ordering::Relaxed) % count;
+        };
         let Some(status) = self.statuses.get(index) else {
             return;
         };
@@ -147,6 +162,7 @@ mod tests {
     use super::*;
     use crate::kernel::models::OutboundError;
     use parking_lot::Mutex as PLMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // --- fakes ---
 
@@ -251,19 +267,33 @@ mod tests {
         );
     }
 
+    /// Deck semantics: two full cycles over three statuses draw each status
+    /// exactly twice, and the first cycle covers every status once (a
+    /// permutation, not a subsequence) - full coverage, shuffled order.
     #[tokio::test]
-    async fn job_rotates_through_statuses_in_order() {
+    async fn job_draws_all_statuses_once_per_deck_cycle() {
         let scheduler = FakeScheduler::new();
         let presence = FakePresence::new();
-        let plugin = plugin(&scheduler, &presence, vec!["a", "b"]);
+        let plugin = plugin(&scheduler, &presence, vec!["a", "b", "c"]);
         plugin.start().expect("start expected to succeed");
 
         let job = scheduler.job.lock().clone().expect("job expected");
-        job.run().await;
-        job.run().await;
-        job.run().await;
+        for _ in 0..6 {
+            job.run().await;
+        }
 
-        assert_eq!(presence.statuses(), ["a", "b", "a"]);
+        let drawn = presence.statuses();
+        assert_eq!(drawn.len(), 6);
+        for status in ["a", "b", "c"] {
+            assert_eq!(
+                drawn.iter().filter(|drawn| drawn == &status).count(),
+                2,
+                "status {status} must appear exactly once per cycle"
+            );
+        }
+        let first_cycle = drawn.get(..3).expect("two full cycles drawn");
+        let distinct: std::collections::HashSet<_> = first_cycle.iter().collect();
+        assert_eq!(distinct.len(), 3, "a deck cycle is a permutation of the list");
     }
 
     #[tokio::test]

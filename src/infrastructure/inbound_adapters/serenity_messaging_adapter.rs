@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use serenity::all::{
     ChannelId as SerenityChannelId, CommandDataOption, CommandDataOptionValue, CommandDataResolved,
@@ -8,6 +8,7 @@ use serenity::all::{
 use serenity::async_trait;
 use tokio_util::sync::CancellationToken;
 
+use crate::infrastructure::outbound_adapters::GatewayContext;
 use crate::kernel::{
     api_ports::RequestHandlerPort,
     models::{
@@ -22,13 +23,14 @@ use crate::kernel::{
 /// pipeline. Platform specifics (serenity types) never cross this boundary.
 pub struct DiscordGatewayAdapter<H: RequestHandlerPort> {
     handler: H,
-    /// Filled on `ready` so outbound adapters (presence) can drive the
-    /// gateway; this adapter is the only writer.
-    context: Arc<OnceLock<Context>>,
+    /// Attached on `ready` so outbound adapters (presence) can drive the
+    /// gateway; this adapter is the only writer. Presence requests that
+    /// arrived before connect are queued in the handle and flush here.
+    context: Arc<GatewayContext>,
 }
 
 impl<H: RequestHandlerPort> DiscordGatewayAdapter<H> {
-    pub fn new(handler: H, context: Arc<OnceLock<Context>>) -> Self {
+    pub fn new(handler: H, context: Arc<GatewayContext>) -> Self {
         Self { handler, context }
     }
 }
@@ -207,7 +209,9 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
-        let _ = self.context.set(ctx);
+        // Flushes a presence queued before connect - the first rotation
+        // status lands exactly when the bot comes online.
+        self.context.attach(ctx);
         tracing::info!("connected as {}", ready.user.name);
     }
 }
