@@ -368,55 +368,15 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
         }
 
         // SSE reading is byte-buffered: only complete lines are decoded, so
-        // a multi-byte character split across TCP chunks stays intact.
-        let mut bytes = response.bytes_stream();
-        let mut buffer: Vec<u8> = Vec::new();
-        let mut content = String::new();
-        let mut usage: Option<TokenUsage> = None;
-        // Opt-in diagnostic: the raw SSE body, reassembled line by line.
-        // Without the flag the stream is never stored anywhere.
-        let mut raw = if self.settings.log_raw_traffic { Some(String::new()) } else { None };
-        let mut done = false;
-        while !done {
-            let Some(chunk) = bytes.next().await else { break };
-            let chunk =
-                chunk.map_err(|err| LlmError::Request(format!("stream read failed: {err}")))?;
-            buffer.extend_from_slice(&chunk);
-            while let Some(pos) = buffer.iter().position(|&byte| byte == b'\n') {
-                let line_bytes = buffer.drain(..=pos).collect::<Vec<u8>>();
-                let line_len = line_bytes.len().saturating_sub(1); // the newline
-                let decoded =
-                    String::from_utf8_lossy(line_bytes.get(..line_len).unwrap_or(&line_bytes));
-                let line = decoded.trim_end_matches('\r');
-                if let Some(raw) = raw.as_mut() {
-                    raw.push_str(line);
-                    raw.push('\n');
-                }
-                let Some(data) = line.strip_prefix("data:") else { continue };
-                let data = data.trim();
-                if data == "[DONE]" {
-                    done = true;
-                    break;
-                }
-                let Some((delta, event_usage)) = parse_sse_data(data) else { continue };
-                if event_usage.is_some() {
-                    usage = event_usage;
-                }
-                if let Some(delta) = delta.filter(|delta| !delta.is_empty()) {
-                    content.push_str(&delta);
-                    // The engine consumes promptly - it throttles Discord
-                    // edits, not receives. A closed channel means the engine
-                    // task died; finish reading the authoritative response
-                    // anyway.
-                    let _ = deltas.send(delta).await;
-                }
-            }
-        }
+        // a multi-byte character split across TCP chunks stays intact. The
+        // raw body is reassembled only for the operator diagnostic.
+        let (content, usage, done, raw) =
+            read_sse_stream(response, &deltas, self.settings.log_raw_traffic).await?;
         if self.settings.log_raw_traffic {
             tracing::debug!(
                 provider = provider_name,
                 model = model_name,
-                body = %raw.unwrap_or_default(),
+                body = %raw,
                 "LLM raw response (stream)"
             );
         }
@@ -670,7 +630,7 @@ fn parse_usage_value(usage: &Value) -> Option<TokenUsage> {
     })
 }
 
-/// Parses one `data:` payload of the OpenAI SSE stream into an owned
+/// Parses one `data:` payload of the `OpenAI` SSE stream into an owned
 /// content delta and/or usage block. `reasoning_content` deltas are
 /// deliberately NOT represented - they are cut at this boundary and never
 /// surface. Unknown shapes (keep-alives, empty choices) parse to a pair of
@@ -686,6 +646,60 @@ fn parse_sse_data(data: &str) -> Option<(Option<String>, Option<TokenUsage>)> {
         .map(str::to_owned);
     let usage = value.get("usage").filter(|usage| usage.is_object()).and_then(parse_usage_value);
     Some((content, usage))
+}
+
+/// Reads an OpenAI SSE body: forwards non-empty content deltas to `deltas`,
+/// captures the final `usage` block, and reassembles the raw text when
+/// `log_raw` is set (operator diagnostic). Byte-buffered on purpose: only
+/// complete lines are decoded, so a multi-byte character split across TCP
+/// chunks stays intact. Returns the assembled content, the usage when
+/// reported, whether the stream terminated with `[DONE]`, and the raw body
+/// (empty unless `log_raw`).
+async fn read_sse_stream(
+    response: reqwest::Response,
+    deltas: &mpsc::Sender<String>,
+    log_raw: bool,
+) -> Result<(String, Option<TokenUsage>, bool, String), LlmError> {
+    let mut bytes = response.bytes_stream();
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut content = String::new();
+    let mut usage: Option<TokenUsage> = None;
+    let mut raw = String::new();
+    let mut done = false;
+    while !done {
+        let Some(chunk) = bytes.next().await else { break };
+        let chunk = chunk.map_err(|err| LlmError::Request(format!("stream read failed: {err}")))?;
+        buffer.extend_from_slice(&chunk);
+        while let Some(pos) = buffer.iter().position(|&byte| byte == b'\n') {
+            let line_bytes = buffer.drain(..=pos).collect::<Vec<u8>>();
+            let line_len = line_bytes.len().saturating_sub(1); // the newline
+            let decoded =
+                String::from_utf8_lossy(line_bytes.get(..line_len).unwrap_or(&line_bytes));
+            let line = decoded.trim_end_matches('\r');
+            if log_raw {
+                raw.push_str(line);
+                raw.push('\n');
+            }
+            let Some(data) = line.strip_prefix("data:") else { continue };
+            let data = data.trim();
+            if data == "[DONE]" {
+                done = true;
+                break;
+            }
+            let Some((delta, event_usage)) = parse_sse_data(data) else { continue };
+            if event_usage.is_some() {
+                usage = event_usage;
+            }
+            if let Some(delta) = delta.filter(|delta| !delta.is_empty()) {
+                content.push_str(&delta);
+                // The engine consumes promptly - it throttles Discord edits,
+                // not receives. A closed channel means the engine task died;
+                // finish reading the authoritative response anyway.
+                let _ = deltas.send(delta).await;
+            }
+        }
+    }
+    Ok((content, usage, done, raw))
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {

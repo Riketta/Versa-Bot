@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use crate::kernel::{
     models::{ChannelId, Embed, GuildId, MessageId, MessagePayload, Origin, OutboundMessage},
     services::KernelServices,
-    spi_ports::GuildStorage,
+    spi_ports::{ChatStreamPort, GuildStorage},
 };
 
 use super::completion_port::{
@@ -81,6 +81,101 @@ enum LiveOutcome {
     Done(CompletionResponse),
     Partial(String),
     Failed(LlmError),
+}
+
+/// Live reveal state of one streaming answer: the target message plus the
+/// throttle clock. [`Self::push`] begins the message with the first delta
+/// and edits it at the configured cadence afterwards; [`Self::drain`]
+/// applies leftovers that were buffered before the engine polled (a stream
+/// can resolve faster than the engine's first poll). Edits always carry
+/// prefixes of the revealed text - the message is only ever behind, never
+/// wrong. A failed `begin` (platform hiccup) stops revealing; the
+/// completion still finishes and delivers through the plain path.
+struct LiveReveal {
+    stream: Arc<dyn ChatStreamPort>,
+    channel_id: u64,
+    message: Option<MessageId>,
+    revealed: String,
+    revealing: bool,
+    next_edit: Instant,
+    interval: Duration,
+}
+
+impl LiveReveal {
+    fn new(stream: Arc<dyn ChatStreamPort>, channel_id: u64, interval: Duration) -> Self {
+        Self {
+            stream,
+            channel_id,
+            message: None,
+            revealed: String::new(),
+            revealing: true,
+            next_edit: Instant::now() + interval,
+            interval,
+        }
+    }
+
+    async fn push(&mut self, delta: &str) {
+        self.revealed.push_str(delta);
+        if !self.revealing {
+            return;
+        }
+        match self.message {
+            Some(id) => {
+                if Instant::now() >= self.next_edit {
+                    self.next_edit = Instant::now() + self.interval;
+                    if let Err(err) = self.stream.update(id, self.revealed.clone()).await {
+                        tracing::warn!(
+                            channel = self.channel_id,
+                            %err,
+                            "streaming update failed - continuing"
+                        );
+                    }
+                }
+            }
+            None => match self.stream.begin(OutboundMessage::text(self.revealed.clone())).await {
+                Ok(id) => {
+                    self.message = Some(id);
+                    self.next_edit = Instant::now() + self.interval;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        channel = self.channel_id,
+                        %err,
+                        "stream begin failed - delivering without live reveal"
+                    );
+                    self.revealing = false;
+                }
+            },
+        }
+    }
+
+    /// Applies deltas buffered before the adapter resolved.
+    async fn drain(&mut self, rx: &mut mpsc::Receiver<String>) {
+        while let Ok(delta) = rx.try_recv() {
+            self.push(&delta).await;
+        }
+    }
+}
+
+/// Maps the streaming completion result onto the outcome: content already
+/// revealed turns a stream failure into a partial answer (the fallback
+/// notice would contradict visible text).
+fn live_outcome(
+    result: Result<CompletionResponse, LlmError>,
+    reveal: &mut LiveReveal,
+) -> LiveOutcome {
+    match result {
+        Ok(response) => LiveOutcome::Done(response),
+        Err(err) if reveal.message.is_some() => {
+            tracing::warn!(
+                channel = reveal.channel_id,
+                %err,
+                "stream failed after content was revealed"
+            );
+            LiveOutcome::Partial(std::mem::take(&mut reveal.revealed))
+        }
+        Err(err) => LiveOutcome::Failed(err),
+    }
 }
 
 /// Generic public notice when a message that explicitly addresses the bot
@@ -326,51 +421,20 @@ impl ChatEngine {
                 // channel sees a (partial) answer - the generic fallback
                 // would contradict visible text. Finalize the partial,
                 // log, and report through the service channel.
-                tracing::error!(
-                    channel = channel_id,
-                    model = %config.model,
-                    content_chars = partial.chars().count(),
-                    "LLM stream interrupted - partial answer delivered"
-                );
-                if let Some(storage) = &services.guild_storage {
-                    self.notify_service(
-                        services,
-                        origin,
-                        storage,
-                        "LLM stream interrupted",
-                        format!(
-                            "Model `{}`: the connection dropped mid-answer; a partial reply \
-                             was delivered.",
-                            config.model
-                        ),
-                        true,
-                    )
-                    .await;
-                }
+                self.report_stream_interrupted(origin, config, services).await;
                 return self
                     .deliver_reply(origin, config, channel_id, &partial, live_id, services)
                     .await;
             }
             LiveOutcome::Failed(err) => {
-                tracing::error!(channel = channel_id, model = %config.model, %err, "LLM completion failed - no generated reply");
-                if let Some(storage) = &services.guild_storage {
-                    self.notify_service(
-                        services,
-                        origin,
-                        storage,
-                        "LLM completion failed",
-                        format!("Model `{}`: {}.", config.model, err.classify()),
-                        true,
-                    )
-                    .await;
-                }
+                self.report_completion_failure(origin, config, services, &err).await;
                 return false;
             }
         };
         // Per-completion audit: usage, latency and context shape.
-        self.log_answer_audit(
+        Self::log_answer_audit(
             channel_id,
-            AnswerAudit {
+            &AnswerAudit {
                 trigger,
                 started,
                 model: config.model.as_str(),
@@ -408,130 +472,91 @@ impl ChatEngine {
     ) -> (Option<MessageId>, LiveOutcome) {
         let (tx, mut rx) = mpsc::channel::<String>(32);
         let mut completion = Box::pin(self.completion.complete_streaming(request, tx));
-        let stream = services.chat_output_factory.stream_output(origin);
-        let mut live_id: Option<MessageId> = None;
-        let mut revealed = String::new();
-        let interval = Duration::from_millis(self.settings.stream_interval_ms.max(1));
-        let mut next_edit = Instant::now() + interval;
-        // A failed `begin` (platform hiccup) stops live revealing; the
-        // completion still finishes and delivers through the plain path.
-        let mut revealing = true;
+        let mut reveal = LiveReveal::new(
+            services.chat_output_factory.stream_output(origin),
+            origin.channel_id.get(),
+            Duration::from_millis(self.settings.stream_interval_ms.max(1)),
+        );
 
         let outcome = loop {
             tokio::select! {
                 biased;
                 delta = rx.recv() => match delta {
-                    Some(delta) => {
-                        revealed.push_str(&delta);
-                        if !revealing {
-                            continue;
-                        }
-                        match live_id {
-                            Some(id) => {
-                                if Instant::now() >= next_edit {
-                                    next_edit = Instant::now() + interval;
-                                    if let Err(err) = stream.update(id, revealed.clone()).await {
-                                        tracing::warn!(
-                                            channel = origin.channel_id.get(),
-                                            %err,
-                                            "streaming update failed - continuing"
-                                        );
-                                    }
-                                }
-                            }
-                            None => {
-                                match stream.begin(OutboundMessage::text(revealed.clone())).await {
-                                    Ok(id) => {
-                                        live_id = Some(id);
-                                        next_edit = Instant::now() + interval;
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!(
-                                            channel = origin.channel_id.get(),
-                                            %err,
-                                            "stream begin failed - delivering without live reveal"
-                                        );
-                                        revealing = false;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    Some(delta) => reveal.push(&delta).await,
                     // The adapter dropped the sender: the authoritative
                     // result is ready.
-                    None => {
-                        let result = completion.as_mut().await;
-                        break match result {
-                            Ok(response) => LiveOutcome::Done(response),
-                            Err(err) if live_id.is_some() => {
-                                tracing::warn!(
-                                    channel = origin.channel_id.get(),
-                                    %err,
-                                    "stream failed after content was revealed"
-                                );
-                                LiveOutcome::Partial(revealed)
-                            }
-                            Err(err) => LiveOutcome::Failed(err),
-                        };
-                    }
+                    None => break live_outcome(completion.as_mut().await, &mut reveal),
                 },
                 res = &mut completion => {
                     // The adapter's future can resolve before the engine's
                     // first recv poll (tiny streams, single-poll fakes):
-                    // drain whatever was buffered and reveal it - the
-                    // outcome mapping below depends on knowing whether
-                    // content was already on screen.
-                    if revealing {
-                        while let Ok(delta) = rx.try_recv() {
-                            revealed.push_str(&delta);
-                            match live_id {
-                                None => {
-                                    match stream
-                                        .begin(OutboundMessage::text(revealed.clone()))
-                                        .await
-                                    {
-                                        Ok(id) => live_id = Some(id),
-                                        Err(err) => {
-                                            tracing::warn!(
-                                                channel = origin.channel_id.get(),
-                                                %err,
-                                                "stream begin failed - delivering without live reveal"
-                                            );
-                                            revealing = false;
-                                            break;
-                                        }
-                                    }
-                                }
-                                Some(id) => {
-                                    if let Err(err) =
-                                        stream.update(id, revealed.clone()).await
-                                    {
-                                        tracing::warn!(
-                                            channel = origin.channel_id.get(),
-                                            %err,
-                                            "streaming update failed - continuing"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    break match res {
-                        Ok(response) => LiveOutcome::Done(response),
-                        Err(err) if live_id.is_some() => {
-                            tracing::warn!(
-                                channel = origin.channel_id.get(),
-                                %err,
-                                "stream failed after content was revealed"
-                            );
-                            LiveOutcome::Partial(revealed)
-                        }
-                        Err(err) => LiveOutcome::Failed(err),
-                    };
+                    // drain the buffered deltas first - the outcome mapping
+                    // depends on knowing whether content was on screen.
+                    reveal.drain(&mut rx).await;
+                    break live_outcome(res, &mut reveal);
                 }
             }
         };
-        (live_id, outcome)
+        (reveal.message, outcome)
+    }
+
+    /// A completion that failed before anything was shown: error log plus
+    /// service-channel notice. The caller owes the channel the fallback.
+    async fn report_completion_failure(
+        &self,
+        origin: &Origin,
+        config: &ChannelConfig,
+        services: &KernelServices,
+        err: &LlmError,
+    ) {
+        tracing::error!(
+            channel = origin.channel_id.get(),
+            model = %config.model,
+            %err,
+            "LLM completion failed - no generated reply"
+        );
+        if let Some(storage) = &services.guild_storage {
+            self.notify_service(
+                services,
+                origin,
+                storage,
+                "LLM completion failed",
+                format!("Model `{}`: {}.", config.model, err.classify()),
+                true,
+            )
+            .await;
+        }
+    }
+
+    /// A stream that died after content was revealed: error log plus
+    /// service-channel notice. The partial text is delivered as-is - the
+    /// fallback notice would contradict what the channel already sees.
+    async fn report_stream_interrupted(
+        &self,
+        origin: &Origin,
+        config: &ChannelConfig,
+        services: &KernelServices,
+    ) {
+        tracing::error!(
+            channel = origin.channel_id.get(),
+            model = %config.model,
+            "LLM stream interrupted - partial answer delivered"
+        );
+        if let Some(storage) = &services.guild_storage {
+            self.notify_service(
+                services,
+                origin,
+                storage,
+                "LLM stream interrupted",
+                format!(
+                    "Model `{}`: the connection dropped mid-answer; a partial reply was \
+                     delivered.",
+                    config.model
+                ),
+                true,
+            )
+            .await;
+        }
     }
 
     /// Delivery half of [`ChatEngine::answer`]: splits the reply to the
@@ -610,8 +635,8 @@ impl ChatEngine {
 
     /// Per-completion audit record: usage, latency and context shape.
     /// Contents never log - sizes and counters only (info-grade: rides along
-    /// to GlitchTip as a log item).
-    fn log_answer_audit(&self, channel_id: u64, audit: AnswerAudit<'_>) {
+    /// to `GlitchTip` as a log item).
+    fn log_answer_audit(channel_id: u64, audit: &AnswerAudit<'_>) {
         let AnswerAudit {
             trigger,
             started,
@@ -621,7 +646,7 @@ impl ChatEngine {
             window_used,
             context_chars,
             calibrated,
-        } = audit;
+        } = *audit;
         tracing::info!(
             channel = channel_id,
             model,
@@ -1363,7 +1388,6 @@ mod tests {
         storage: Arc<InMemoryStorage>,
         output: Arc<RecordingChatOutput>,
         begins: Arc<Mutex<Vec<String>>>,
-        updates: Arc<Mutex<Vec<String>>>,
         factory: Arc<StreamRecordingFactory>,
         services: KernelServices,
     }
@@ -1408,7 +1432,7 @@ mod tests {
             chat_output_factory: Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
             guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
         };
-        TestCtx { engine, fake, storage, output, begins, updates, factory, services }
+        TestCtx { engine, fake, storage, output, begins, factory, services }
     }
 
     fn assigned_config() -> ChannelConfig {
