@@ -1765,6 +1765,30 @@ mod tests {
         (format!("http://{addr}/v1"), handle)
     }
 
+    /// Multi-part variant: writes each part as its own TCP write with a
+    /// pause between them, so the reader sees separate chunks - the fixture
+    /// for the byte-buffering contract.
+    async fn raw_http_server_parts(parts: Vec<Vec<u8>>) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let _ = socket.read(&mut buf).await;
+            let mut parts = parts.into_iter();
+            if let Some(first) = parts.next() {
+                socket.write_all(&first).await.expect("write");
+            }
+            for part in parts {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                socket.write_all(&part).await.expect("write");
+            }
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
+
     /// A successful SSE response head + the given frames.
     fn sse_response(frames: &str) -> String {
         format!(
@@ -1854,6 +1878,39 @@ mod tests {
         );
         // No `timings` block in the stream: the complete time is measured.
         assert!(!response.timing.endpoint_reported);
+    }
+
+    /// Byte-buffering contract: a multi-byte UTF-8 character split across
+    /// TCP chunks survives intact - decoding happens only on complete
+    /// lines, never on raw chunk boundaries.
+    #[tokio::test]
+    async fn utf8_char_split_across_tcp_chunks_stays_intact() {
+        let script = sse_response(
+            &(sse_frame(r#"{"choices":[{"delta":{"content":"привет"}}]}"#) + "data: [DONE]\n\n"),
+        );
+        // Split inside the first char's two bytes (`п` = 0xD0 0xBF).
+        let split_at = script
+            .as_bytes()
+            .windows(2)
+            .position(|pair| pair == [0xD0, 0xBF])
+            .expect("multi-byte char expected in the script");
+        let (first, second) = script.as_bytes().split_at(split_at + 1);
+        let (api_url, server) = raw_http_server_parts(vec![first.to_vec(), second.to_vec()]).await;
+        let adapter = streaming_adapter(api_url);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let response = adapter
+            .complete_streaming(stream_request(), tx)
+            .await
+            .expect("stream expected to succeed");
+        server.await.expect("server task");
+
+        let mut deltas = Vec::new();
+        while let Ok(delta) = rx.try_recv() {
+            deltas.push(delta);
+        }
+        assert_eq!(deltas, vec!["привет".to_owned()]);
+        assert_eq!(response.content, "привет");
     }
 
     /// An abrupt end of stream (no `[DONE]`) is a failure: the assembled

@@ -589,6 +589,14 @@ cargo test --locked
   tests never imply a clean clippy gate - and a deny-level failure adds an
   `error:` line without changing the warning count, so check the exit
   status, not the warnings.
+- The storage adapter ships two SQL dialects (SQLite and PostgreSQL), but
+  the default suite runs SQLite only. The `postgres_*` tests in
+  `sqlx_storage` opt in via the `VERSABOT_TEST_PG_URL` environment
+  variable - point it at a throwaway database (the bot runs its own
+  migrations) and they exercise the document roundtrip, guild isolation,
+  the reserved namespace guard, and the record log incl. the documented
+  concurrent-append contract against the real dialect. Without the
+  variable they report a skip and pass.
 
 ### CI
 

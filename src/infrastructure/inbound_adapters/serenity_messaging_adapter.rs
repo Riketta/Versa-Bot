@@ -774,41 +774,50 @@ impl ChatOutputPort for InteractionFollowupOutput {
             tracing::warn!("dropping empty interaction followup (no content, no embeds)");
             return Ok(());
         }
-        // `reply_to` is ignored: a transactional reply is already anchored to
-        // its interaction - a channel message reference adds nothing.
         // Normalized mention tags invert back to bare mentions on the way
-        // out, like every other Discord send.
-        let mut body = serde_json::Map::new();
-        if !message.content.is_empty() {
-            body.insert(
-                "content".to_owned(),
-                serde_json::json!(denormalize_mention_tags(&message.content)),
-            );
-        }
-        if !message.embeds.is_empty() {
-            let embeds: Vec<serde_json::Value> = message
-                .embeds
-                .iter()
-                .map(|embed| {
-                    serde_json::json!({
-                        "title": denormalize_mention_tags(&embed.title),
-                        "description": denormalize_mention_tags(&embed.description),
-                    })
-                })
-                .collect();
-            body.insert("embeds".to_owned(), serde_json::json!(embeds));
-        }
-        if message.ephemeral {
-            // EPHEMERAL flag (1 << 6): visible to the invoking user only.
-            body.insert("flags".to_owned(), serde_json::json!(64));
-        }
-
+        // out, like every other Discord send - see `followup_body`.
+        let body = followup_body(&message);
         self.http
-            .create_followup_message(&self.token, &serde_json::Value::Object(body), Vec::new())
+            .create_followup_message(&self.token, &body, Vec::new())
             .await
             .map_err(|err| OutboundError::Send(err.to_string()))?;
         Ok(())
     }
+}
+
+/// Builds the interaction-followup JSON body. Pure so the two halves of the
+/// "command replies stay invoker-only" contract are verifiable side by side:
+/// the deferred loading state carries EPHEMERAL inside its `data` (see
+/// `deferred_ephemeral_response`), and every followup built here carries the
+/// same flag when the message is ephemeral. `reply_to` is ignored: a
+/// transactional reply is already anchored to its interaction. Normalized
+/// mention tags invert back to bare mentions, like every other Discord send.
+fn followup_body(message: &OutboundMessage) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    if !message.content.is_empty() {
+        body.insert(
+            "content".to_owned(),
+            serde_json::json!(denormalize_mention_tags(&message.content)),
+        );
+    }
+    if !message.embeds.is_empty() {
+        let embeds: Vec<serde_json::Value> = message
+            .embeds
+            .iter()
+            .map(|embed| {
+                serde_json::json!({
+                    "title": denormalize_mention_tags(&embed.title),
+                    "description": denormalize_mention_tags(&embed.description),
+                })
+            })
+            .collect();
+        body.insert("embeds".to_owned(), serde_json::json!(embeds));
+    }
+    if message.ephemeral {
+        // EPHEMERAL flag (1 << 6): visible to the invoking user only.
+        body.insert("flags".to_owned(), serde_json::json!(64));
+    }
+    serde_json::Value::Object(body)
 }
 
 fn discord_embed(embed: &Embed) -> serenity::all::CreateEmbed {
@@ -961,6 +970,41 @@ mod tests {
         assert_eq!(data.get("flags").and_then(serde_json::Value::as_u64), Some(64));
         // The flag must not leak to the top level, where Discord drops it.
         assert!(response.get("flags").is_none());
+    }
+
+    /// The followup half of the same contract: an ephemeral message carries
+    /// the EPHEMERAL flag (64); a public one carries none.
+    #[test]
+    fn followup_body_carries_the_ephemeral_flag() {
+        let message = OutboundMessage::text("not authorized".to_owned()).ephemeral();
+        let body = followup_body(&message);
+        assert_eq!(body.get("flags").and_then(serde_json::Value::as_u64), Some(64));
+
+        let public = OutboundMessage::text("hello".to_owned());
+        assert!(followup_body(&public).get("flags").is_none());
+    }
+
+    /// Followup content and embeds denormalize mention tags back to bare
+    /// tags, and a `reply_to` reference is ignored - the interaction itself
+    /// is the reply anchor.
+    #[test]
+    fn followup_body_denormalizes_and_ignores_reply_reference() {
+        let message = OutboundMessage::embed(Embed {
+            title: "Hey [Alice]<@123>".to_owned(),
+            description: "ping [Bob]<@77>".to_owned(),
+        })
+        .replying_to(MessageId(42));
+
+        let body = followup_body(&message);
+        let embeds =
+            body.get("embeds").and_then(serde_json::Value::as_array).expect("embeds expected");
+        let first = embeds.first().expect("one embed expected");
+        assert_eq!(first.get("title").and_then(serde_json::Value::as_str), Some("Hey <@123>"));
+        assert_eq!(
+            first.get("description").and_then(serde_json::Value::as_str),
+            Some("ping <@77>")
+        );
+        assert!(body.get("message_reference").is_none());
     }
 
     #[test]

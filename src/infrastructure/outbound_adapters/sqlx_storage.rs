@@ -697,4 +697,98 @@ mod tests {
         let append = guild.append(GUILD_SETTINGS, Value::String("x".to_owned())).await;
         assert!(matches!(append, Err(StorageError::Forbidden(_))));
     }
+
+    // --- PostgreSQL dialect -------------------------------------------------
+    // The suite above runs SQLite only; the `$n`-placeholder arms of every
+    // query ship untested without these. They opt in via
+    // `VERSABOT_TEST_PG_URL` (a throwaway database - the bot runs its own
+    // migrations); without the variable they report a skip and pass, so CI
+    // stays SQLite-only.
+
+    async fn optional_pg_storage() -> Option<SqlxStorage> {
+        let url = std::env::var("VERSABOT_TEST_PG_URL").ok()?;
+        Some(SqlxStorage::connect(&url).await.expect("pg storage expected to connect"))
+    }
+
+    /// Per-run namespace: repeated runs against one database must not see
+    /// each other's rows.
+    fn unique_pg_namespace(scope: &str) -> String {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after 1970")
+            .as_millis();
+        format!("pgtest_{millis}_{scope}")
+    }
+
+    #[tokio::test]
+    async fn postgres_documents_roundtrip_isolated_and_guarded() {
+        let Some(storage) = optional_pg_storage().await else {
+            eprintln!("VERSABOT_TEST_PG_URL not set - skipping Postgres tests");
+            return;
+        };
+        let ns = unique_pg_namespace("docs");
+        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+
+        assert_eq!(guild.get(&ns, "k").await.unwrap(), None);
+        guild.set(&ns, "k", Value::String("v1".to_owned())).await.unwrap();
+        guild.set(&ns, "k", Value::String("v2".to_owned())).await.unwrap();
+        assert_eq!(guild.get(&ns, "k").await.unwrap(), Some(Value::String("v2".to_owned())));
+        assert_eq!(guild.list_keys(&ns).await.unwrap(), ["k"]);
+
+        // Guild isolation - the core privacy claim, now dialect-checked.
+        let other = storage.guild_scoped(Platform::Discord, GuildId(2));
+        assert_eq!(other.get(&ns, "k").await.unwrap(), None);
+
+        // The reserved namespace is guarded on this dialect too.
+        let forbidden = guild.set(GUILD_SETTINGS, "language", Value::String("en".to_owned())).await;
+        assert!(matches!(forbidden, Err(StorageError::Forbidden(_))));
+    }
+
+    /// The documented append contract (see `GuildStorage::append`): sequence
+    /// assignment is atomic on SQLite; on Postgres two concurrent appends to
+    /// one scope can collide on the primary key and ONE FAILS LOUDLY. The
+    /// contract under any interleaving: every append either succeeds with a
+    /// unique sequence or errors as a database collision - sequences stay
+    /// unique and contiguous, never double-assigned.
+    #[tokio::test]
+    async fn postgres_record_log_and_concurrent_append_contract() {
+        let Some(storage) = optional_pg_storage().await else {
+            eprintln!("VERSABOT_TEST_PG_URL not set - skipping Postgres tests");
+            return;
+        };
+        let ns = unique_pg_namespace("records");
+        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+
+        let first = guild.append(&ns, Value::String("a".to_owned())).await.unwrap();
+        assert_eq!(guild.append(&ns, Value::String("b".to_owned())).await.unwrap(), first + 1);
+        let records = guild.list_last(&ns, 10).await.unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records.first().map(|record| record.seq), Some(first));
+        assert_eq!(guild.count_after(&ns, 0).await.unwrap(), 2);
+
+        let mut handles = Vec::new();
+        for i in 0..8u64 {
+            let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+            let ns = ns.clone();
+            handles.push(tokio::spawn(async move { guild.append(&ns, Value::from(i)).await }));
+        }
+        let mut seqs = Vec::new();
+        let mut collisions = 0;
+        for handle in handles {
+            match handle.await.expect("append task expected to join") {
+                Ok(seq) => seqs.push(seq),
+                Err(StorageError::Database(_)) => collisions += 1,
+                Err(err) => panic!("unexpected append error: {err:?}"),
+            }
+        }
+        assert_eq!(seqs.len() + collisions, 8, "every append either succeeds or collides loudly");
+        seqs.sort_unstable();
+        for (index, seq) in seqs.iter().enumerate() {
+            assert_eq!(
+                *seq,
+                first + 1 + u64::try_from(index).expect("index fits u64"),
+                "sequence numbers must stay unique and contiguous: {seqs:?}"
+            );
+        }
+    }
 }
