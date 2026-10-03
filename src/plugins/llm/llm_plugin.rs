@@ -307,7 +307,7 @@ mod tests {
     use crate::plugins::llm::providers::ModelSettings;
     use crate::plugins::llm::{
         ChatEngine, CompletionRequest, CompletionResponse, ConversationRecord, LlmCompletionPort,
-        LlmError, LlmSettings, RandRandom, RandomPort, RecordRole,
+        LlmError, LlmSettings, RandRandom, RandomPort, RecordRole, ResponseTiming,
     };
     use crate::test_support::{
         FailingStorage, InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory,
@@ -321,7 +321,11 @@ mod tests {
             &self,
             _request: CompletionRequest,
         ) -> Result<CompletionResponse, LlmError> {
-            Ok(CompletionResponse { content: "stub reply".to_owned(), usage: None })
+            Ok(CompletionResponse {
+                content: "stub reply".to_owned(),
+                usage: None,
+                timing: ResponseTiming::measured(0),
+            })
         }
     }
 

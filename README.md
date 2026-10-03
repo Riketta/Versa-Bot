@@ -384,13 +384,16 @@ response bodies can name operator accounts or projects, so they stay in
 the logs.
 
 **Logging.** Every generated answer leaves an `info` audit record in the
-logs: model, trigger (`triggered` vs `chime`), latency, prompt/completion
-token usage (cached and reasoning-token breakdowns when the endpoint
-reports them), live-window and currently-used sizes. Sizes and counters
-only - message text and prompts never log. At `debug`, chime roll
-decisions (cooldown skips and deck draws) and per-request LLM traces
-(provider, model, status, duration) explain why the bot stayed quiet or
-answered slowly.
+logs: model, trigger (`triggered` vs `chime`), latency (engine wall clock,
+plus the complete provider time with its source - endpoint-reported when
+the provider publishes timings like llama.cpp's `timings` block, else
+adapter-measured), prompt/completion token usage (cached and
+reasoning-token breakdowns when the endpoint reports them), live-window
+and currently-used sizes. Sizes and counters only - message text and
+prompts never log. At `debug`, chime roll decisions (cooldown skips and
+deck draws) and per-request LLM traces (provider, model, status, complete
+response time and whether the endpoint or the adapter timed it) explain
+why the bot stayed quiet or answered slowly.
 
 **Raw traffic dump.** For provider debugging, `[llm] log_raw_traffic = true`
 dumps the unmodified request and response bodies of every completion at

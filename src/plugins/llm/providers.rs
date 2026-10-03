@@ -16,7 +16,8 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::completion_port::{
-    ChatMessage, CompletionRequest, CompletionResponse, LlmCompletionPort, LlmError, TokenUsage,
+    ChatMessage, CompletionRequest, CompletionResponse, LlmCompletionPort, LlmError,
+    ResponseTiming, TokenUsage,
 };
 use super::model::GenParams;
 
@@ -292,12 +293,14 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
         if !status.is_success() {
             return Err(LlmError::Request(format!("HTTP {status}: {}", truncate(&text, 300))));
         }
-        let parsed = parse_completion_content(&text)?;
+        let parsed = parse_completion_content(&text, wall_ms(started))?;
         tracing::debug!(
             provider = provider_name,
             model = model_name,
             status = %status,
             elapsed_ms = started.elapsed().as_millis(),
+            response_ms = parsed.timing.total_ms,
+            timed_by = if parsed.timing.endpoint_reported { "endpoint" } else { "adapter" },
             content_chars = parsed.content.chars().count(),
             "LLM response received"
         );
@@ -370,39 +373,44 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
         // SSE reading is byte-buffered: only complete lines are decoded, so
         // a multi-byte character split across TCP chunks stays intact. The
         // raw body is reassembled only for the operator diagnostic.
-        let (content, usage, done, raw) =
-            read_sse_stream(response, &deltas, self.settings.log_raw_traffic).await?;
+        let read = read_sse_stream(response, &deltas, self.settings.log_raw_traffic).await?;
         if self.settings.log_raw_traffic {
             tracing::debug!(
                 provider = provider_name,
                 model = model_name,
-                body = %raw,
+                body = %read.raw,
                 "LLM raw response (stream)"
             );
         }
-        if !done {
+        if !read.done {
             // The endpoint vanished mid-stream: the assembled prefix is
             // incomplete by definition - it must never pass as a full
             // answer. The engine finalizes what was already revealed.
             return Err(LlmError::Request(format!(
                 "stream ended without [DONE] after {} content chars",
-                content.chars().count()
+                read.content.chars().count()
             )));
         }
-        let content = strip_think_blocks(&content);
+        let content = strip_think_blocks(&read.content);
         if content.is_empty() {
             // A reasoning-only stream is no answer, same as non-streaming.
             return Err(LlmError::EmptyResponse);
         }
+        let timing = match read.endpoint_ms {
+            Some(ms) => ResponseTiming::reported(ms),
+            None => ResponseTiming::measured(wall_ms(started)),
+        };
         tracing::debug!(
             provider = provider_name,
             model = model_name,
             status = %status,
             elapsed_ms = started.elapsed().as_millis(),
+            response_ms = timing.total_ms,
+            timed_by = if timing.endpoint_reported { "endpoint" } else { "adapter" },
             content_chars = content.chars().count(),
             "LLM stream completed"
         );
-        Ok(CompletionResponse { content, usage })
+        Ok(CompletionResponse { content, usage: read.usage, timing })
     }
 }
 
@@ -507,16 +515,18 @@ fn completion_body(
     Value::Object(body)
 }
 
-/// Extracts `choices[0].message.content` plus the optional `usage` block
-/// from an OpenAI-compatible response, cutting model reasoning so it can
-/// never reach a channel: separate `reasoning_content`/`reasoning` fields
-/// are simply never read, and inline `<think>...</think>` blocks (the
-/// interleaved-reasoning shape emitted by llama.cpp/LM Studio/vLLM) are
-/// stripped from the content itself. This is also what keeps reasoning out
-/// of the progressive reveal - the reveal only ever shows prefixes of the
-/// returned content. A reasoning-only answer (empty after the strip) is no
-/// answer: [`LlmError::EmptyResponse`].
-fn parse_completion_content(text: &str) -> Result<CompletionResponse, LlmError> {
+/// Extracts `choices[0].message.content` plus the optional `usage` and
+/// `timings` blocks from an OpenAI-compatible response, cutting model
+/// reasoning so it can never reach a channel: separate
+/// `reasoning_content`/`reasoning` fields are simply never read, and inline
+/// `<think>...</think>` blocks (the interleaved-reasoning shape emitted by
+/// llama.cpp/LM Studio/vLLM) are stripped from the content itself. This is
+/// also what keeps reasoning out of the progressive reveal - the reveal only
+/// ever shows prefixes of the returned content. A reasoning-only answer
+/// (empty after the strip) is no answer: [`LlmError::EmptyResponse`].
+/// `measured_ms` is the adapter-measured round trip, used when the endpoint
+/// publishes no timing data of its own.
+fn parse_completion_content(text: &str, measured_ms: u64) -> Result<CompletionResponse, LlmError> {
     let value: Value = serde_json::from_str(text)
         .map_err(|err| LlmError::Request(format!("malformed JSON: {err}")))?;
     let content = value
@@ -532,7 +542,9 @@ fn parse_completion_content(text: &str) -> Result<CompletionResponse, LlmError> 
     if content.is_empty() {
         return Err(LlmError::EmptyResponse);
     }
-    Ok(CompletionResponse { content, usage: parse_usage(&value) })
+    let timing = parse_timings(&value)
+        .map_or_else(|| ResponseTiming::measured(measured_ms), ResponseTiming::reported);
+    Ok(CompletionResponse { content, usage: parse_usage(&value), timing })
 }
 
 /// Cuts model reasoning from a completion so it can never reach a channel.
@@ -630,14 +642,38 @@ fn parse_usage_value(usage: &Value) -> Option<TokenUsage> {
     })
 }
 
-/// Parses one `data:` payload of the `OpenAI` SSE stream into an owned
-/// content delta and/or usage block. `reasoning_content` deltas are
-/// deliberately NOT represented - they are cut at this boundary and never
-/// surface. Unknown shapes (keep-alives, empty choices) parse to a pair of
-/// `None`s and are ignored by the caller.
-fn parse_sse_data(data: &str) -> Option<(Option<String>, Option<TokenUsage>)> {
+/// Complete endpoint-side time from llama.cpp's `timings` extension block:
+/// prompt processing plus generation. Fractional milliseconds; absent or
+/// partial blocks yield `None` and the adapter's own measurement stands in.
+fn parse_timings(response: &Value) -> Option<u64> {
+    let timings = response.get("timings")?;
+    let prompt_ms = timings.get("prompt_ms").and_then(Value::as_f64)?;
+    let predicted_ms = timings.get("predicted_ms").and_then(Value::as_f64)?;
+    // Fractional ms from the endpoint; rounded, clamped at zero (a sane
+    // endpoint never reports a negative sum).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some((prompt_ms + predicted_ms).round().max(0.0) as u64)
+}
+
+/// Adapter-measured round trip in whole milliseconds.
+fn wall_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// One decoded `data:` payload of the `OpenAI` SSE stream: an owned content
+/// delta and/or usage block and/or llama.cpp `timings` block. Reasoning
+/// deltas are deliberately NOT represented - they are cut at this boundary
+/// and never surface. Unknown shapes (keep-alives, empty choices) parse to
+/// `None` and are ignored by the caller.
+struct SseEvent {
+    delta: Option<String>,
+    usage: Option<TokenUsage>,
+    endpoint_ms: Option<u64>,
+}
+
+fn parse_sse_data(data: &str) -> Option<SseEvent> {
     let value: Value = serde_json::from_str(data).ok()?;
-    let content = value
+    let delta = value
         .get("choices")
         .and_then(|choices| choices.get(0))
         .and_then(|choice| choice.get("delta"))
@@ -645,25 +681,36 @@ fn parse_sse_data(data: &str) -> Option<(Option<String>, Option<TokenUsage>)> {
         .and_then(Value::as_str)
         .map(str::to_owned);
     let usage = value.get("usage").filter(|usage| usage.is_object()).and_then(parse_usage_value);
-    Some((content, usage))
+    let endpoint_ms = parse_timings(&value);
+    Some(SseEvent { delta, usage, endpoint_ms })
 }
 
-/// Reads an OpenAI SSE body: forwards non-empty content deltas to `deltas`,
-/// captures the final `usage` block, and reassembles the raw text when
-/// `log_raw` is set (operator diagnostic). Byte-buffered on purpose: only
-/// complete lines are decoded, so a multi-byte character split across TCP
-/// chunks stays intact. Returns the assembled content, the usage when
-/// reported, whether the stream terminated with `[DONE]`, and the raw body
-/// (empty unless `log_raw`).
+/// What one SSE body yielded: the assembled content, the final `usage` and
+/// `timings` blocks when reported, whether the stream terminated with
+/// `[DONE]`, and the raw body (empty unless `log_raw`).
+struct SseRead {
+    content: String,
+    usage: Option<TokenUsage>,
+    endpoint_ms: Option<u64>,
+    done: bool,
+    raw: String,
+}
+
+/// Reads an `OpenAI` SSE body: forwards non-empty content deltas to `deltas`,
+/// captures the final `usage` and `timings` blocks, and reassembles the raw
+/// text when `log_raw` is set (operator diagnostic). Byte-buffered on
+/// purpose: only complete lines are decoded, so a multi-byte character split
+/// across TCP chunks stays intact.
 async fn read_sse_stream(
     response: reqwest::Response,
     deltas: &mpsc::Sender<String>,
     log_raw: bool,
-) -> Result<(String, Option<TokenUsage>, bool, String), LlmError> {
+) -> Result<SseRead, LlmError> {
     let mut bytes = response.bytes_stream();
     let mut buffer: Vec<u8> = Vec::new();
     let mut content = String::new();
     let mut usage: Option<TokenUsage> = None;
+    let mut endpoint_ms: Option<u64> = None;
     let mut raw = String::new();
     let mut done = false;
     while !done {
@@ -686,11 +733,14 @@ async fn read_sse_stream(
                 done = true;
                 break;
             }
-            let Some((delta, event_usage)) = parse_sse_data(data) else { continue };
-            if event_usage.is_some() {
-                usage = event_usage;
+            let Some(event) = parse_sse_data(data) else { continue };
+            if event.usage.is_some() {
+                usage = event.usage;
             }
-            if let Some(delta) = delta.filter(|delta| !delta.is_empty()) {
+            if event.endpoint_ms.is_some() {
+                endpoint_ms = event.endpoint_ms;
+            }
+            if let Some(delta) = event.delta.filter(|delta| !delta.is_empty()) {
                 content.push_str(&delta);
                 // The engine consumes promptly - it throttles Discord edits,
                 // not receives. A closed channel means the engine task died;
@@ -699,7 +749,7 @@ async fn read_sse_stream(
             }
         }
     }
-    Ok((content, usage, done, raw))
+    Ok(SseRead { content, usage, endpoint_ms, done, raw })
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -714,6 +764,12 @@ fn truncate(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::plugins::llm::completion_port::ChatRole;
+
+    /// Single-shot parse with a placeholder wall clock - timing assertions
+    /// live in the dedicated tests below.
+    fn parse_completion(text: &str) -> Result<CompletionResponse, LlmError> {
+        parse_completion_content(text, 0)
+    }
 
     #[test]
     fn model_refs_split_at_first_slash() {
@@ -857,7 +913,7 @@ mod tests {
 
     #[test]
     fn completion_content_is_extracted() {
-        let response = parse_completion_content(
+        let response = parse_completion(
             r#"{"choices":[{"message":{"role":"assistant","content":"hello there"}}]}"#,
         )
         .expect("response expected to parse");
@@ -867,14 +923,11 @@ mod tests {
 
         // Reasoning models may answer with null content - that is no answer.
         assert!(matches!(
-            parse_completion_content(r#"{"choices":[{"message":{"content":null}}]}"#),
+            parse_completion(r#"{"choices":[{"message":{"content":null}}]}"#),
             Err(LlmError::EmptyResponse)
         ));
-        assert!(matches!(
-            parse_completion_content(r#"{"choices":[]}"#),
-            Err(LlmError::EmptyResponse)
-        ));
-        assert!(matches!(parse_completion_content("not json"), Err(LlmError::Request(_))));
+        assert!(matches!(parse_completion(r#"{"choices":[]}"#), Err(LlmError::EmptyResponse)));
+        assert!(matches!(parse_completion("not json"), Err(LlmError::Request(_))));
     }
 
     /// Reasoning output never reaches a channel: separate reasoning fields
@@ -883,7 +936,7 @@ mod tests {
     #[test]
     fn reasoning_is_cut_from_responses() {
         // Separate field (GLM/DeepSeek shape): never read, content stands alone.
-        let response = parse_completion_content(
+        let response = parse_completion(
             r#"{"choices":[{"message":{"content":"The answer is 4.",
                 "reasoning_content":"secret chain of thought"}}]}"#,
         )
@@ -891,14 +944,14 @@ mod tests {
         assert_eq!(response.content, "The answer is 4.");
 
         // Leading block (R1/llama.cpp shape): the trailing newline goes too.
-        let response = parse_completion_content(
+        let response = parse_completion(
             r#"{"choices":[{"message":{"content":"<think>reasoning here</think>\n\nThe answer is 4."}}]}"#,
         )
         .expect("response expected to parse");
         assert_eq!(response.content, "The answer is 4.");
 
         // Interleaved blocks, case-insensitive tags.
-        let response = parse_completion_content(
+        let response = parse_completion(
             r#"{"choices":[{"message":{"content":"One <think>a</think> two <THINK>b</THINK> three."}}]}"#,
         )
         .expect("response expected to parse");
@@ -907,7 +960,7 @@ mod tests {
         // Unclosed opener MID-TEXT is literal: answers may discuss the tag
         // without being truncated from it onward.
         for content in ["Visible<think>hidden forever", "Wrap it in <think> tags to reason."] {
-            let response = parse_completion_content(&format!(
+            let response = parse_completion(&format!(
                 r#"{{"choices":[{{"message":{{"content":"{content}"}}}}]}}"#
             ))
             .expect("response expected to parse");
@@ -915,7 +968,7 @@ mod tests {
         }
 
         // Chained leading blocks are all reasoning.
-        let response = parse_completion_content(
+        let response = parse_completion(
             r#"{"choices":[{"message":{"content":"<think>a</think><think>b</think>The answer."}}]}"#,
         )
         .expect("response expected to parse");
@@ -924,15 +977,13 @@ mod tests {
         // A leading unclosed block means the model never got past thinking:
         // a reasoning-only answer is empty and counts as no answer.
         assert!(matches!(
-            parse_completion_content(
-                r#"{"choices":[{"message":{"content":"<think>only reasoning"}}]}"#
-            ),
+            parse_completion(r#"{"choices":[{"message":{"content":"<think>only reasoning"}}]}"#),
             Err(LlmError::EmptyResponse)
         ));
 
         // Residual false positive, pinned on purpose: prose containing BOTH
         // tags in order loses the span between them.
-        let response = parse_completion_content(
+        let response = parse_completion(
             r#"{"choices":[{"message":{"content":"Compare <think> with </think> syntax."}}]}"#,
         )
         .expect("response expected to parse");
@@ -940,14 +991,14 @@ mod tests {
 
         // No tag: byte-identical passthrough - even odd whitespace.
         let response =
-            parse_completion_content(r#"{"choices":[{"message":{"content":"  keep\nthis  "}}]}"#)
+            parse_completion(r#"{"choices":[{"message":{"content":"  keep\nthis  "}}]}"#)
                 .expect("response expected to parse");
         assert_eq!(response.content, "  keep\nthis  ");
     }
 
     #[test]
     fn usage_is_parsed_when_the_endpoint_reports_it() {
-        let response = parse_completion_content(
+        let response = parse_completion(
             r#"{
                 "choices": [{"message": {"content": "ok"}}],
                 "usage": {
@@ -972,7 +1023,7 @@ mod tests {
         );
 
         // No cached/reasoning breakdown: the core fields still parse.
-        let response = parse_completion_content(
+        let response = parse_completion(
             r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#,
         )
         .expect("response expected to parse");
@@ -988,11 +1039,70 @@ mod tests {
         );
 
         // Partial usage blocks are treated as absent, not guessed at.
-        let response = parse_completion_content(
+        let response = parse_completion(
             r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1}}"#,
         )
         .expect("response expected to parse");
         assert_eq!(response.usage, None);
+    }
+
+    /// llama.cpp reports its own complete time (the `timings` block: prompt
+    /// processing plus generation, fractional ms) - the recorded timing
+    /// prefers it over the adapter's wall clock and marks it
+    /// endpoint-reported.
+    #[test]
+    fn timing_prefers_endpoint_reported_values() {
+        let response = parse_completion(
+            r#"{
+                "choices": [{"message": {"content": "ok"}}],
+                "timings": {
+                    "prompt_n": 218, "prompt_ms": 2468.306,
+                    "predicted_n": 999, "predicted_ms": 47768.303
+                }
+            }"#,
+        )
+        .expect("response expected to parse");
+        assert_eq!(response.timing, ResponseTiming::reported(50_237));
+
+        // Partial timings blocks are treated as absent, not guessed at.
+        let response = parse_completion(
+            r#"{"choices":[{"message":{"content":"ok"}}],"timings":{"prompt_ms":10.0}}"#,
+        )
+        .expect("response expected to parse");
+        assert_eq!(response.timing, ResponseTiming::measured(0));
+    }
+
+    /// Without a `timings` block the complete time is the adapter-measured
+    /// wall clock passed in by the caller.
+    #[test]
+    fn timing_falls_back_to_the_measured_wall_clock() {
+        let response =
+            parse_completion_content(r#"{"choices":[{"message":{"content":"ok"}}]}"#, 1234)
+                .expect("response expected to parse");
+        assert_eq!(response.timing, ResponseTiming::measured(1234));
+    }
+
+    /// llama.cpp also emits `timings` on the final SSE chunk - the stream
+    /// path records the endpoint-reported time the same way.
+    #[tokio::test]
+    async fn streaming_uses_endpoint_timings_when_reported() {
+        let script = String::new()
+            + &sse_frame(r#"{"choices":[{"delta":{"content":"He"}}]}"#)
+            + &sse_frame(
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"timings":{"prompt_ms":1.5,"predicted_ms":2.4}}"#,
+            )
+            + "data: [DONE]\n\n";
+        let (api_url, server) = raw_http_server(sse_response(&script)).await;
+        let adapter = streaming_adapter(api_url);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let response = adapter
+            .complete_streaming(stream_request(), tx)
+            .await
+            .expect("stream expected to succeed");
+        server.await.expect("server task");
+
+        assert_eq!(response.timing, ResponseTiming::reported(4));
     }
 
     #[test]
@@ -1138,6 +1248,8 @@ mod tests {
                 reasoning_tokens: None,
             })
         );
+        // No `timings` block in the stream: the complete time is measured.
+        assert!(!response.timing.endpoint_reported);
     }
 
     /// An abrupt end of stream (no `[DONE]`) is a failure: the assembled

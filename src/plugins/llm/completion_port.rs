@@ -53,6 +53,34 @@ pub struct CompletionResponse {
     /// Provider-reported token usage; `None` when the endpoint does not
     /// provide usage stats (the field is optional in the shape).
     pub usage: Option<TokenUsage>,
+    /// Complete response time: endpoint-reported when the provider
+    /// publishes timing data, otherwise adapter-measured wall clock.
+    pub timing: ResponseTiming,
+}
+
+/// How long one completion took end to end. `endpoint_reported` marks the
+/// provider's own measurement (llama.cpp `timings`: prompt processing +
+/// generation); without it the total is the adapter's wall clock around the
+/// HTTP call - which additionally contains network transfer and JSON
+/// encoding, so the two sources are not expected to agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseTiming {
+    pub total_ms: u64,
+    pub endpoint_reported: bool,
+}
+
+impl ResponseTiming {
+    /// Endpoint-reported complete time (`timings` block present).
+    #[must_use]
+    pub fn reported(total_ms: u64) -> Self {
+        Self { total_ms, endpoint_reported: true }
+    }
+
+    /// Adapter-measured wall clock (endpoint publishes no timing data).
+    #[must_use]
+    pub fn measured(total_ms: u64) -> Self {
+        Self { total_ms, endpoint_reported: false }
+    }
 }
 
 /// Token accounting of one completion, as reported by the endpoint. Field

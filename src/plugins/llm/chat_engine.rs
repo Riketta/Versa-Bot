@@ -24,7 +24,7 @@ use crate::kernel::{
 };
 
 use super::completion_port::{
-    CompletionRequest, CompletionResponse, LlmCompletionPort, LlmError, TokenUsage,
+    CompletionRequest, CompletionResponse, LlmCompletionPort, LlmError, ResponseTiming, TokenUsage,
 };
 use super::conversation::{self, ConversationRecord, RecordRole};
 use super::model::{
@@ -66,6 +66,9 @@ struct AnswerAudit<'a> {
     started: Instant,
     model: &'a str,
     usage: Option<TokenUsage>,
+    /// Complete provider time plus its source (endpoint-reported when the
+    /// provider publishes timings, else adapter-measured wall clock).
+    timing: ResponseTiming,
     window: usize,
     window_used: usize,
     context_chars: u64,
@@ -450,6 +453,7 @@ impl ChatEngine {
                 started,
                 model: config.model.as_str(),
                 usage: response.usage,
+                timing: response.timing,
                 window: live.len(),
                 window_used: window.len(),
                 context_chars,
@@ -661,6 +665,7 @@ impl ChatEngine {
             started,
             model,
             usage,
+            timing,
             window,
             window_used,
             context_chars,
@@ -671,6 +676,8 @@ impl ChatEngine {
             model,
             trigger,
             elapsed_ms = started.elapsed().as_millis(),
+            provider_ms = timing.total_ms,
+            provider_timed = timing.endpoint_reported,
             prompt_tokens = usage.map_or(0, |usage| usage.prompt_tokens),
             completion_tokens = usage.map_or(0, |usage| usage.completion_tokens),
             cached_tokens = ?usage.and_then(|usage| usage.cached_tokens),
@@ -1093,7 +1100,7 @@ mod tests {
         StoragePort, StoredRecord,
     };
     use crate::plugins::llm::completion_port::{
-        ChatRole, CompletionResponse, LlmError, TokenUsage,
+        ChatRole, CompletionResponse, LlmError, ResponseTiming, TokenUsage,
     };
     use crate::plugins::llm::model::{CaptureMode, channel_config_key};
     use crate::plugins::llm::rng::RandRandom;
@@ -1138,8 +1145,20 @@ mod tests {
             let queued = self.usage_queue.lock().pop_front();
             let usage = queued.unwrap_or_else(|| self.usage.lock().to_owned());
             self.responses.lock().pop().map_or_else(
-                || Ok(CompletionResponse { content: "canned".to_owned(), usage }),
-                |response| response.map(|content| CompletionResponse { content, usage }),
+                || {
+                    Ok(CompletionResponse {
+                        content: "canned".to_owned(),
+                        usage,
+                        timing: ResponseTiming::measured(0),
+                    })
+                },
+                |response| {
+                    response.map(|content| CompletionResponse {
+                        content,
+                        usage,
+                        timing: ResponseTiming::measured(0),
+                    })
+                },
             )
         }
     }
@@ -1241,7 +1260,11 @@ mod tests {
             &self,
             _request: CompletionRequest,
         ) -> Result<CompletionResponse, LlmError> {
-            Ok(CompletionResponse { content: self.chunks.join(""), usage: None })
+            Ok(CompletionResponse {
+                content: self.chunks.join(""),
+                usage: None,
+                timing: ResponseTiming::measured(0),
+            })
         }
 
         async fn complete_streaming(
@@ -1259,7 +1282,11 @@ mod tests {
                     return Err(LlmError::Request("stream aborted".to_owned()));
                 }
             }
-            Ok(CompletionResponse { content: self.chunks.join(""), usage: None })
+            Ok(CompletionResponse {
+                content: self.chunks.join(""),
+                usage: None,
+                timing: ResponseTiming::measured(0),
+            })
         }
     }
 

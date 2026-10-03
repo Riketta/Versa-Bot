@@ -16,6 +16,7 @@ mod rng;
 pub use chat_engine::ChatEngine;
 pub use completion_port::{
     ChatMessage, ChatRole, CompletionRequest, CompletionResponse, LlmCompletionPort, LlmError,
+    ResponseTiming,
 };
 pub use conversation::{ConversationRecord, RecordRole};
 pub use llm_plugin::LlmPlugin;
