@@ -62,8 +62,9 @@ pub struct CompletionResponse {
 /// provider's own measurement (llama.cpp `timings`: prompt processing +
 /// generation); without it the total is the adapter's wall clock around the
 /// HTTP call - which additionally contains network transfer and JSON
-/// encoding, so the two sources are not expected to agree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// encoding, so the two sources are not expected to agree. Stored per
+/// channel as part of the usage stats, hence the serde derives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseTiming {
     pub total_ms: u64,
     pub endpoint_reported: bool,

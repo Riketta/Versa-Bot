@@ -541,9 +541,10 @@ fn preview(text: &str, max_chars: usize) -> String {
 }
 
 /// The token-usage lines of `/llm_status`: the calibrated live-window
-/// estimate and the last request's reported usage. Both appear only once
+/// estimate and the last request's reported usage (both appear only once
 /// the endpoint has reported real usage - before that the default ratio is
-/// an uncalibrated guess and showing it would be noise.
+/// an uncalibrated guess and showing it would be noise), plus the last
+/// response's complete time, which is kept for every completed answer.
 async fn usage_lines(
     storage: &Arc<dyn GuildStorage>,
     records_ns: &str,
@@ -551,8 +552,15 @@ async fn usage_lines(
     live: u64,
     stats: &UsageStats,
 ) -> UsageLines {
+    let last_response = stats.last_timing.map(|timing| {
+        format!(
+            "Last response: {} ({})",
+            format_response_ms(timing.total_ms),
+            if timing.endpoint_reported { "endpoint" } else { "measured" },
+        )
+    });
     let Some(last) = stats.last else {
-        return UsageLines { estimate: None, last_request: None };
+        return UsageLines { estimate: None, last_request: None, last_response };
     };
 
     let mut context_chars = 0u64;
@@ -587,13 +595,27 @@ async fn usage_lines(
         "Last request: {} prompt / {} completion{reasoning} / {} total tokens{cached}",
         last.prompt_tokens, last.completion_tokens, last.total_tokens
     ));
-    UsageLines { estimate, last_request }
+    UsageLines { estimate, last_request, last_response }
 }
 
-/// The two optional `/llm_status` lines fed by calibration data.
+/// Renders a response time for `/llm_status`: whole milliseconds below ten
+/// seconds, one-decimal seconds from there.
+fn format_response_ms(total_ms: u64) -> String {
+    if total_ms >= 10_000 {
+        // precision loss is fine for a status line
+        #[allow(clippy::cast_precision_loss)]
+        let seconds = total_ms as f64 / 1000.0;
+        format!("{seconds:.1} s")
+    } else {
+        format!("{total_ms} ms")
+    }
+}
+
+/// The optional `/llm_status` lines fed by calibration data.
 struct UsageLines {
     estimate: Option<String>,
     last_request: Option<String>,
+    last_response: Option<String>,
 }
 
 /// `/llm_status`: inspect the channel's chat configuration and conversation
@@ -715,6 +737,10 @@ Context start: {context_start}",
             description.push_str(&line);
         }
         if let Some(line) = usage.last_request {
+            description.push('\n');
+            description.push_str(&line);
+        }
+        if let Some(line) = usage.last_response {
             description.push('\n');
             description.push_str(&line);
         }
@@ -1079,7 +1105,7 @@ mod tests {
     use crate::kernel::models::{GuildId, Platform};
     use crate::kernel::spi_ports::StoragePort;
     use crate::plugins::llm::RecordRole;
-    use crate::plugins::llm::completion_port::TokenUsage;
+    use crate::plugins::llm::completion_port::{ResponseTiming, TokenUsage};
     use crate::test_support::InMemoryStorage;
 
     /// The attachment argument must name Discord's CDN - https and the exact
@@ -1288,6 +1314,35 @@ mod tests {
 
         assert!(lines.estimate.is_none());
         assert!(lines.last_request.is_none());
+        assert!(lines.last_response.is_none());
+    }
+
+    /// The response-time line shows on its own - without usage stats too
+    /// (endpoints that report neither), and with the source named.
+    #[tokio::test]
+    async fn usage_lines_render_response_time_with_and_without_usage() {
+        let storage = InMemoryStorage::new();
+        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+
+        let timed = UsageStats {
+            last_timing: Some(ResponseTiming::reported(50_237)),
+            ..UsageStats::default()
+        };
+        let lines =
+            usage_lines(&guild, &records_namespace(2), &ConversationState::default(), 0, &timed)
+                .await;
+        assert_eq!(lines.last_response.as_deref(), Some("Last response: 50.2 s (endpoint)"));
+        assert!(lines.estimate.is_none());
+        assert!(lines.last_request.is_none());
+
+        let measured = UsageStats {
+            last_timing: Some(ResponseTiming::measured(950)),
+            ..UsageStats::default()
+        };
+        let lines =
+            usage_lines(&guild, &records_namespace(2), &ConversationState::default(), 0, &measured)
+                .await;
+        assert_eq!(lines.last_response.as_deref(), Some("Last response: 950 ms (measured)"));
     }
 
     /// Calibrated: the estimate line carries the enforced budget, the last
@@ -1312,6 +1367,7 @@ mod tests {
                 cached_tokens: Some(40),
                 reasoning_tokens: Some(6),
             }),
+            last_timing: Some(ResponseTiming::reported(527_000)),
             tokens_per_char: 1.0,
             last_budget: Some(500),
         };
@@ -1328,6 +1384,7 @@ mod tests {
                 "Last request: 100 prompt / 10 completion (6 reasoning) / 110 total tokens (+40 cached)"
             )
         );
+        assert_eq!(lines.last_response.as_deref(), Some("Last response: 527.0 s (endpoint)"));
 
         let plain = UsageStats { last_budget: None, ..stats };
         let mut bare = stats.last.expect("usage expected");

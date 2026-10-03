@@ -59,6 +59,16 @@ struct AnswerRequest<'a> {
     trigger: &'a str,
 }
 
+/// Inputs of the per-channel stats write, grouped so
+/// [`ChatEngine::record_usage`] keeps a flat signature.
+struct UsageRecord {
+    usage: Option<TokenUsage>,
+    timing: ResponseTiming,
+    context_chars: u64,
+    tokens_per_char: f64,
+    budget: Option<u64>,
+}
+
 /// Fields of the per-completion audit record, grouped so the logging helper
 /// keeps a flat signature.
 struct AnswerAudit<'a> {
@@ -463,10 +473,13 @@ impl ChatEngine {
         self.record_usage(
             services,
             channel_id,
-            response.usage,
-            context_chars,
-            usage_stats.tokens_per_char,
-            budget,
+            UsageRecord {
+                usage: response.usage,
+                timing: response.timing,
+                context_chars,
+                tokens_per_char: usage_stats.tokens_per_char,
+                budget,
+            },
         )
         .await;
 
@@ -1039,31 +1052,25 @@ impl ChatEngine {
         self.chimes.lock().insert(key, Instant::now());
     }
 
-    /// Persists the last chat completion's token usage and blends the
-    /// observed tokens-per-character ratio into the channel's estimate.
-    /// Compaction never records (its transcript is not chat traffic).
-    /// Best effort: a failed write only degrades the next estimate back to
-    /// the previous ratio; endpoints without usage stats write nothing.
-    async fn record_usage(
-        &self,
-        services: &KernelServices,
-        channel_id: u64,
-        usage: Option<TokenUsage>,
-        context_chars: u64,
-        tokens_per_char: f64,
-        budget: Option<u64>,
-    ) {
-        let Some(usage) = usage else {
-            return; // endpoint does not report usage: nothing to record
-        };
+    /// Persists the last chat completion's response time and - when the
+    /// endpoint reports usage - token stats, blending the observed
+    /// tokens-per-character ratio into the channel's estimate. Compaction
+    /// never records (its transcript is not chat traffic). Best effort: a
+    /// failed write only degrades the next estimate back to the previous
+    /// ratio.
+    async fn record_usage(&self, services: &KernelServices, channel_id: u64, record: UsageRecord) {
+        let UsageRecord { usage, timing, context_chars, tokens_per_char, budget } = record;
         let Some(storage) = &services.guild_storage else {
             return;
         };
-        let stats = UsageStats {
-            last: Some(usage),
-            tokens_per_char: blend_ratio(tokens_per_char, usage.prompt_tokens, context_chars),
-            last_budget: budget,
+        let (last, tokens_per_char) = match usage {
+            Some(usage) => {
+                (Some(usage), blend_ratio(tokens_per_char, usage.prompt_tokens, context_chars))
+            }
+            None => (None, tokens_per_char),
         };
+        let stats =
+            UsageStats { last, last_timing: Some(timing), tokens_per_char, last_budget: budget };
         if let Err(err) = storage
             .set(
                 NAMESPACE,
@@ -2345,8 +2352,11 @@ mod tests {
         assert!((stats.tokens_per_char - 2.0).abs() < 1e-9);
     }
 
+    /// A usage-less endpoint still leaves the response time (observability
+    /// only); the usage-dependent parts of the stats doc stay empty, so the
+    /// estimate stays uncalibrated.
     #[tokio::test]
-    async fn stats_stay_absent_when_endpoint_reports_nothing() {
+    async fn stats_keep_only_the_response_time_when_usage_is_missing() {
         let ctx = ctx(vec![Ok("ok".to_owned())]); // no usage reported
         seed_config(&ctx.storage, &assigned_config());
 
@@ -2359,7 +2369,14 @@ mod tests {
             .guild_scoped(Platform::Discord, GuildId(1))
             .get(NAMESPACE, &channel_stats_key(2))
             .await
-            .expect("stats readable");
-        assert_eq!(stats_raw, None);
+            .expect("stats readable")
+            .expect("timing-only stats expected to be recorded");
+        let stats: UsageStats =
+            serde_json::from_value(stats_raw).expect("stats expected to deserialize");
+        assert_eq!(stats.last, None);
+        assert_eq!(stats.last_timing, Some(ResponseTiming::measured(0)));
+        // The estimate stays uncalibrated without usage.
+        assert!((stats.tokens_per_char - 0.25).abs() < f64::EPSILON);
+        assert_eq!(stats.last_budget, None);
     }
 }

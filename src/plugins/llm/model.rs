@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::plugins::llm::completion_port::TokenUsage;
+use crate::plugins::llm::completion_port::{ResponseTiming, TokenUsage};
 
 /// Guild storage namespace owned by this plugin (the plugin's slug).
 pub const NAMESPACE: &str = "llm";
@@ -166,6 +166,10 @@ impl ChannelConfig {
 pub struct UsageStats {
     /// Token usage of the last completion, when the endpoint reports it.
     pub last: Option<TokenUsage>,
+    /// Complete response time of the last chat completion and its source.
+    /// Recorded for every completed answer - also from endpoints that do
+    /// not report token usage.
+    pub last_timing: Option<ResponseTiming>,
     /// Rolling estimate of tokens per character of assembled context,
     /// blended from the endpoint's own usage reports (EWMA). The estimate
     /// sizes the token-budget fill; the default is typical English prose
@@ -180,7 +184,7 @@ pub struct UsageStats {
 
 impl Default for UsageStats {
     fn default() -> Self {
-        Self { last: None, tokens_per_char: 0.25, last_budget: None }
+        Self { last: None, last_timing: None, tokens_per_char: 0.25, last_budget: None }
     }
 }
 
@@ -329,6 +333,7 @@ mod tests {
                 cached_tokens: Some(40),
                 reasoning_tokens: None,
             }),
+            last_timing: Some(ResponseTiming::reported(50_237)),
             tokens_per_char: 0.31,
             last_budget: Some(6176),
         };
@@ -336,12 +341,14 @@ mod tests {
         let back: UsageStats = serde_json::from_value(json).expect("stats expected to deserialize");
         assert_eq!(back, stats);
 
-        // Old stats documents (no last_budget) load with the field cleared.
+        // Old stats documents (no last_budget, no last_timing) load with
+        // those fields cleared.
         let legacy: UsageStats = serde_json::from_value(serde_json::json!({
             "last": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
             "tokens_per_char": 0.3
         }))
         .expect("legacy stats expected to deserialize");
         assert_eq!(legacy.last_budget, None);
+        assert_eq!(legacy.last_timing, None);
     }
 }
