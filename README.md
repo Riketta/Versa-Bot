@@ -271,6 +271,14 @@ reasoning = true          # per-channel reasoning_effort is sent only for these
 context_window = 131072   # enables token-budget context filling
 ```
 
+Per-model `summary_placement` controls how the compaction summary enters
+the context: `system_turn` (default - a separate second system message,
+with a stable placeholder keeping the slot present), `system_suffix`
+(merged into the end of the system prompt - the one shape every chat
+template honors; prefer it for models on templates that silently drop
+later system turns, which would erase the summary after every
+compaction) or `assistant_turn` (assistant message before the window).
+
 Undeclared models remain usable but get default capabilities: no
 reasoning parameter is ever sent for them, and context filling stays
 message-count based.
@@ -322,11 +330,13 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   are captured but do not trigger (`random_chance` below is the
   exception).
 - **Context** is assembled as: system prompt -> compaction summary (or a
-  stable placeholder if none) -> live window, oldest first. User turns
-  render through the channel's turn template (`{sender}: {message}` by
-  default); bot turns are plain assistant messages. The window is
-  selected newest-first under the token budget and `depth`, whichever
-  bites first - the newest turn is always included.
+  stable placeholder if none - default `summary_placement`, which merges
+  into the prompt instead when a model declares `system_suffix`) -> live
+  window, oldest first. User turns render through the channel's turn
+  template (`{sender}: {message}` by default); bot turns are plain
+  assistant messages. The window is selected newest-first under the token
+  budget and `depth`, whichever bites first - the newest turn is always
+  included.
 - **Reasoning** is never exposed: thinking output (`reasoning_content`
   fields, inline `<think>` blocks) is cut at the provider adapter before
   it can be recorded or rendered - complete `<think>...</think>` pairs

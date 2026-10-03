@@ -8,11 +8,14 @@ use serde::{Deserialize, Serialize};
 
 use super::completion_port::{ChatMessage, ChatRole};
 use super::model::{CaptureMode, ChannelConfig, ConversationState};
-use super::providers::LlmSettings;
+use super::providers::{LlmSettings, SummaryPlacement};
 
-/// Slot-2 placeholder: the summary position always exists, keeping turn
-/// positions stable (early messages carry more weight with most models) and
-/// the prompt prefix byte-stable for provider prompt caches.
+/// Slot placeholder for the summary placements that keep a dedicated
+/// message (the default `SystemTurn`, and `AssistantTurn`): the position
+/// always exists, keeping turn positions stable (early messages carry more
+/// weight with most models) and the prompt prefix byte-stable for provider
+/// prompt caches. `SystemSuffix` merges the summary instead - no slot, no
+/// placeholder.
 pub const NO_EARLIER_CONTEXT: &str = "(no earlier context)";
 
 /// Default rendering of user turns in the context.
@@ -126,10 +129,10 @@ fn estimated_tokens(text: &str, tokens_per_char: f64) -> u64 {
     cost
 }
 
-/// Assembles the LLM context: fixed schema - the system prompt, then the
-/// always-present summary slot (compacted context or placeholder), then the
-/// live window. User turns render via the channel template; assistant turns
-/// pass through raw (the role already says who spoke).
+/// Assembles the LLM context: the system prompt (with the compacted-context
+/// summary merged into its end by default - see `SummaryPlacement`), then
+/// the live window. User turns render via the channel template; assistant
+/// turns pass through raw (the role already says who spoke).
 ///
 /// The whole prompt side (system + summary + turns) counts against the
 /// resolved budget, and turns fill NEWEST-FIRST under that budget and
@@ -146,17 +149,46 @@ pub fn assemble_context(
     budget: Option<u64>,
 ) -> Vec<ChatMessage> {
     let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
-    let system =
+    // Undeclared models run the safe default (merged into the system
+    // prompt) - same capability contract as reasoning/context_window.
+    let placement = settings
+        .models
+        .get(&config.model)
+        .map_or(SummaryPlacement::default(), |model| model.summary_placement);
+    let mut system =
         config.system_prompt.clone().unwrap_or_else(|| settings.default_system_prompt.clone());
     let summary_slot = match &state.summary {
         Some(summary) => format!("Earlier conversation summary:\n{summary}"),
         None => NO_EARLIER_CONTEXT.to_owned(),
     };
 
-    // The fixed slots are part of the budget: the endpoint bills them as
-    // prompt tokens just like the turns.
-    let mut used = estimated_tokens(&system, tokens_per_char)
-        + estimated_tokens(&summary_slot, tokens_per_char);
+    // The fixed prompt side is part of the budget: the endpoint bills it as
+    // prompt tokens just like the turns. `SystemSuffix` folds the summary
+    // into the system message; the slot modes keep it as its own message
+    // (placeholder included - the slot is always present there).
+    let mut used = estimated_tokens(&system, tokens_per_char);
+    let mut messages = Vec::new();
+    match placement {
+        SummaryPlacement::SystemSuffix => {
+            if state.summary.is_some() {
+                used += estimated_tokens(&summary_slot, tokens_per_char);
+                system.push_str("\n\n");
+                system.push_str(&summary_slot);
+            }
+            messages.push(ChatMessage { role: ChatRole::System, content: system });
+        }
+        SummaryPlacement::SystemTurn => {
+            used += estimated_tokens(&summary_slot, tokens_per_char);
+            messages.push(ChatMessage { role: ChatRole::System, content: system });
+            messages.push(ChatMessage { role: ChatRole::System, content: summary_slot });
+        }
+        SummaryPlacement::AssistantTurn => {
+            used += estimated_tokens(&summary_slot, tokens_per_char);
+            messages.push(ChatMessage { role: ChatRole::System, content: system });
+            messages.push(ChatMessage { role: ChatRole::Assistant, content: summary_slot });
+        }
+    }
+
     let mut count = 0usize;
     while count < records.len() && count < depth {
         let Some(record) = records.get(records.len() - count - 1) else {
@@ -171,9 +203,6 @@ pub fn assemble_context(
     }
     let (_, window) = records.split_at(records.len() - count);
 
-    let mut messages = Vec::new();
-    messages.push(ChatMessage { role: ChatRole::System, content: system });
-    messages.push(ChatMessage { role: ChatRole::System, content: summary_slot });
     let template = config.turn_template.as_deref().unwrap_or(DEFAULT_TURN_TEMPLATE);
     for record in window {
         let message = match record.role {
@@ -270,7 +299,23 @@ pub fn split_reply(content: &str, max_length: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::llm::providers::ModelSettings;
+    use crate::plugins::llm::providers::{ModelSettings, SummaryPlacement};
+
+    /// `LlmSettings` with model `m` declared at the given placement - so the
+    /// assembly resolves it the way a real configuration would.
+    fn settings_with_placement(placement: SummaryPlacement) -> LlmSettings {
+        LlmSettings {
+            models: std::collections::BTreeMap::from([(
+                "m".to_owned(),
+                ModelSettings {
+                    reasoning: false,
+                    context_window: None,
+                    summary_placement: placement,
+                },
+            )]),
+            ..LlmSettings::default()
+        }
+    }
 
     fn user_record(message_id: u64, author: &str, content: &str) -> ConversationRecord {
         ConversationRecord {
@@ -341,6 +386,8 @@ mod tests {
 
         let messages = assemble_context(&config, &settings, &state, &records, 0.25, None);
 
+        // Default placement (SystemTurn): system prompt, always-present
+        // summary slot (placeholder without a summary), then the turns.
         assert_eq!(messages.len(), 5);
         assert_eq!(
             messages.first().map(|m| (m.role, m.content.as_str())),
@@ -386,6 +433,114 @@ mod tests {
             Some("Earlier conversation summary:\nthe gist")
         );
         assert_eq!(messages.len(), 2);
+    }
+
+    /// `SystemSuffix` merges the summary into the end of the system prompt:
+    /// one message, no placeholder, no separate slot.
+    #[test]
+    fn system_suffix_placement_merges_the_summary_into_the_prompt() {
+        let config = ChannelConfig {
+            system_prompt: Some("custom prompt".to_owned()),
+            ..ChannelConfig::assigned("m".to_owned())
+        };
+        let settings = settings_with_placement(SummaryPlacement::SystemSuffix);
+        let state = ConversationState {
+            summary: Some("the gist".to_owned()),
+            cutoff_seq: 4,
+            cutoff_at: Some(1_717_000_000),
+        };
+        let records = vec![user_record(10, "alice", "hello")];
+
+        let messages = assemble_context(&config, &settings, &state, &records, 0.25, None);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages.first().map(|m| m.content.as_str()),
+            Some("custom prompt\n\nEarlier conversation summary:\nthe gist")
+        );
+        assert_eq!(
+            messages.get(1).map(|m| (m.role, m.content.as_str())),
+            Some((ChatRole::User, "alice: hello"))
+        );
+
+        // Without a summary there is no placeholder either - just the prompt.
+        let bare = assemble_context(
+            &config,
+            &settings,
+            &ConversationState::default(),
+            &records,
+            0.25,
+            None,
+        );
+        assert_eq!(bare.len(), 2);
+        assert_eq!(bare.first().map(|m| m.content.as_str()), Some("custom prompt"));
+    }
+
+    /// `SystemTurn` (the default) keeps the separate summary slot: second
+    /// system message, placeholder present even without a summary. Declared
+    /// explicitly here to pin the placement resolution path.
+    #[test]
+    fn system_turn_placement_keeps_the_separate_slot() {
+        let config = ChannelConfig::assigned("m".to_owned());
+        let settings = settings_with_placement(SummaryPlacement::SystemTurn);
+        let state = ConversationState {
+            summary: Some("the gist".to_owned()),
+            cutoff_seq: 4,
+            cutoff_at: Some(1_717_000_000),
+        };
+        let records = vec![user_record(10, "alice", "hello")];
+
+        let with_summary = assemble_context(&config, &settings, &state, &records, 0.25, None);
+        assert_eq!(
+            with_summary.get(1).map(|m| (m.role, m.content.as_str())),
+            Some((ChatRole::System, "Earlier conversation summary:\nthe gist"))
+        );
+
+        let without_summary = assemble_context(
+            &config,
+            &settings,
+            &ConversationState::default(),
+            &records,
+            0.25,
+            None,
+        );
+        assert_eq!(
+            without_summary.get(1).map(|m| (m.role, m.content.as_str())),
+            Some((ChatRole::System, NO_EARLIER_CONTEXT))
+        );
+    }
+
+    /// `AssistantTurn` posts the summary (or the placeholder) as the
+    /// assistant's own message before the live window.
+    #[test]
+    fn assistant_turn_placement_posts_the_summary_as_assistant() {
+        let config = ChannelConfig::assigned("m".to_owned());
+        let settings = settings_with_placement(SummaryPlacement::AssistantTurn);
+        let state = ConversationState {
+            summary: Some("the gist".to_owned()),
+            cutoff_seq: 4,
+            cutoff_at: Some(1_717_000_000),
+        };
+        let records = vec![user_record(10, "alice", "hello")];
+
+        let with_summary = assemble_context(&config, &settings, &state, &records, 0.25, None);
+        assert_eq!(
+            with_summary.get(1).map(|m| (m.role, m.content.as_str())),
+            Some((ChatRole::Assistant, "Earlier conversation summary:\nthe gist"))
+        );
+
+        let without_summary = assemble_context(
+            &config,
+            &settings,
+            &ConversationState::default(),
+            &records,
+            0.25,
+            None,
+        );
+        assert_eq!(
+            without_summary.get(1).map(|m| (m.role, m.content.as_str())),
+            Some((ChatRole::Assistant, NO_EARLIER_CONTEXT))
+        );
     }
 
     #[test]
@@ -458,7 +613,7 @@ mod tests {
         }
 
         // Depth 100 and no budget: all five turns made it in after the two
-        // fixed slots.
+        // fixed slots (system prompt + summary placeholder).
         assert_eq!(previous.lines().count(), 7);
     }
 
@@ -492,6 +647,7 @@ mod tests {
         assert!(matches!(messages.get(1).expect("summary expected").role, ChatRole::System));
 
         let rendered = render(&messages);
+        assert!(rendered.contains("Earlier conversation summary:\nearlier facts"));
         assert!(rendered.contains("user:alice: what time is it\n"));
         assert!(rendered.contains("assistant:noon\n"));
 
@@ -560,7 +716,7 @@ mod tests {
         let mut settings = LlmSettings::default();
         settings.models.insert(
             "local/gemma".to_owned(),
-            ModelSettings { reasoning: false, context_window: Some(2000) },
+            ModelSettings { reasoning: false, context_window: Some(2000), ..Default::default() },
         );
         // No channel override -> budget = window 2000 - reserve 1024 - 10%
         // margin (200) = 776. Ratio 1.0, fixed slots 68 -> 300-char turns
@@ -592,7 +748,7 @@ mod tests {
         let mut settings = LlmSettings::default();
         settings.models.insert(
             "local/gemma".to_owned(),
-            ModelSettings { reasoning: false, context_window: Some(8000) },
+            ModelSettings { reasoning: false, context_window: Some(8000), ..Default::default() },
         );
         let mut config = ChannelConfig::assigned("local/gemma".to_owned());
 

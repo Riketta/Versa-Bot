@@ -138,6 +138,33 @@ pub enum ReasoningStyle {
     GlmThinking,
 }
 
+/// How the compaction summary enters the request context. Per-model because
+/// chat templates disagree about context shapes: the default keeps the
+/// long-standing separate summary slot (stable turn positions); models on
+/// templates that silently drop later system messages should opt into
+/// `system_suffix` - a dropped summary is silent context loss after every
+/// compaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryPlacement {
+    /// Separate second system message; a placeholder keeps the slot present
+    /// when no summary exists yet. The default - the long-standing schema,
+    /// with stable turn positions (early messages carry more weight with
+    /// most models) and a byte-stable prompt prefix for provider caches.
+    #[default]
+    SystemTurn,
+    /// Appended to the end of the system prompt: the one shape every chat
+    /// template honors. The bytes before the summary stay stable, so
+    /// provider prompt caches keep the system-prompt prefix across
+    /// compactions. No placeholder exists in this mode - without a summary
+    /// the context is just the system prompt.
+    SystemSuffix,
+    /// Assistant message before the live window; a placeholder keeps the
+    /// slot present when no summary exists yet. For endpoints that mishandle
+    /// merged prompts - the model reads the summary as its own words.
+    AssistantTurn,
+}
+
 /// Capabilities of one declared model.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -151,6 +178,9 @@ pub struct ModelSettings {
     /// filling needs calibrated usage data; before the first reported
     /// request, message-count filling applies).
     pub context_window: Option<u64>,
+    /// How the compaction summary enters the context (see
+    /// [`SummaryPlacement`]); undeclared models run the default slot schema.
+    pub summary_placement: SummaryPlacement,
 }
 
 struct ProviderClient {

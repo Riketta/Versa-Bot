@@ -6,5 +6,7 @@ mod status;
 mod storage;
 mod watcher;
 
-pub use llm::{LlmConfig, LlmModelConfig, LlmProviderConfig, LlmReasoningStyle};
+pub use llm::{
+    LlmConfig, LlmModelConfig, LlmProviderConfig, LlmReasoningStyle, LlmSummaryPlacement,
+};
 pub use watcher::PollingConfigWatcher;

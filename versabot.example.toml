@@ -106,6 +106,8 @@ url = "sqlite://versabot.db"
 # [llm.models."zai/glm-5.3-flash"]
 # reasoning = true
 # context_window = 131072
+# summary_placement = "system_turn"   # default; "system_suffix" merges the
+#                                     # summary into the system prompt
 #
 # [llm.models."local/unsloth/gemma-4-26B-A4B-it-qat-GGUF"]
 # reasoning = false

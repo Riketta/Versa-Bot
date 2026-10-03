@@ -113,6 +113,24 @@ pub enum LlmReasoningStyle {
     GlmThinking,
 }
 
+/// How the compaction summary enters the request context (see the plugin's
+/// `SummaryPlacement` - the default keeps the long-standing separate slot;
+/// `system_suffix` merges it into the system prompt for templates that
+/// silently drop later system messages).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmSummaryPlacement {
+    /// Separate second system message (placeholder keeps the slot present).
+    /// Default.
+    #[default]
+    SystemTurn,
+    /// Appended to the end of the system prompt.
+    SystemSuffix,
+    /// Assistant message before the live window (placeholder keeps the
+    /// slot present).
+    AssistantTurn,
+}
+
 /// Capabilities of one declared model.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -123,6 +141,8 @@ pub struct LlmModelConfig {
     /// Total context window in tokens; enables token-budget context filling
     /// for channels that do not set their own budget.
     pub context_window: Option<u64>,
+    /// How the compaction summary enters the context.
+    pub summary_placement: LlmSummaryPlacement,
 }
 
 #[cfg(test)]

@@ -1325,7 +1325,8 @@ mod tests {
         let plain = ModelSettings::default();
         assert_eq!(model_catalog_line("p/m", &plain), "`p/m`");
 
-        let full = ModelSettings { reasoning: true, context_window: Some(4096) };
+        let full =
+            ModelSettings { reasoning: true, context_window: Some(4096), ..Default::default() };
         assert_eq!(model_catalog_line("p/m", &full), "`p/m` - reasoning - 4096 token context");
     }
 

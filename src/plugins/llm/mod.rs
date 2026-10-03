@@ -26,5 +26,6 @@ pub use model::{
 };
 pub use providers::{
     LlmSettings, ModelSettings, OpenAiCompatibleAdapter, ProviderSettings, ReasoningStyle,
+    SummaryPlacement,
 };
 pub use rng::{DeckRandom, RandRandom, RandomPort, RandomScope};

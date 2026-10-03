@@ -7,7 +7,7 @@ use config::{Config, Environment, File};
 use serenity::all::{ClientBuilder, GatewayIntents, Http, HttpBuilder};
 
 use versa_bot::infrastructure::{
-    Configuration, LlmConfig, LlmReasoningStyle, PollingConfigWatcher,
+    Configuration, LlmConfig, LlmReasoningStyle, LlmSummaryPlacement, PollingConfigWatcher,
     inbound_adapters::{DiscordGatewayAdapter, SerenityChatOutputFactory},
     observability,
     outbound_adapters::{DiscordCommandRegistrar, SerenityPresence, SqlxStorage},
@@ -25,7 +25,7 @@ use versa_bot::plugins::auth::AuthPlugin;
 use versa_bot::plugins::command::CommandPlugin;
 use versa_bot::plugins::llm::{
     ChatEngine, DeckRandom, LlmCompletionPort, LlmPlugin, LlmSettings, ModelSettings,
-    OpenAiCompatibleAdapter, ProviderSettings, RandomPort, ReasoningStyle,
+    OpenAiCompatibleAdapter, ProviderSettings, RandomPort, ReasoningStyle, SummaryPlacement,
 };
 use versa_bot::plugins::status::{StatusRotatorPlugin, StatusSettings};
 use versa_bot::plugins::tracker::UserActivityTrackerPlugin;
@@ -247,6 +247,11 @@ fn llm_settings_from(config: &LlmConfig) -> LlmSettings {
                     ModelSettings {
                         reasoning: model.reasoning,
                         context_window: model.context_window,
+                        summary_placement: match model.summary_placement {
+                            LlmSummaryPlacement::SystemSuffix => SummaryPlacement::SystemSuffix,
+                            LlmSummaryPlacement::SystemTurn => SummaryPlacement::SystemTurn,
+                            LlmSummaryPlacement::AssistantTurn => SummaryPlacement::AssistantTurn,
+                        },
                     },
                 )
             })
