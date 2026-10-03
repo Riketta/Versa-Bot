@@ -24,9 +24,9 @@ use versa_bot::plugins::audit::AuditLogPlugin;
 use versa_bot::plugins::auth::AuthPlugin;
 use versa_bot::plugins::command::CommandPlugin;
 use versa_bot::plugins::llm::{
-    ChatEngine, DeckRandom, ImageDescriber, LlmCompletionPort, LlmPlugin, LlmSettings,
-    ModelSettings, OpenAiCompatibleAdapter, ProviderSettings, RandomPort, ReasoningStyle,
-    SummaryPlacement, VisionService,
+    ChatEngine, DISCORD_MESSAGE_LIMIT, DeckRandom, ImageDescriber, LlmCompletionPort, LlmPlugin,
+    LlmSettings, ModelSettings, OpenAiCompatibleAdapter, ProviderSettings, RandomPort,
+    ReasoningStyle, SummaryPlacement, VisionService,
 };
 use versa_bot::plugins::status::{StatusRotatorPlugin, StatusSettings};
 use versa_bot::plugins::tracker::UserActivityTrackerPlugin;
@@ -241,16 +241,33 @@ async fn sigterm() {
 /// field on purpose: the composition root is the only place allowed to know
 /// both sides.
 fn llm_settings_from(config: &LlmConfig) -> LlmSettings {
+    // Operator knobs clamped to safe ranges, mirroring the command-layer
+    // guards: a >2000 reply limit would produce chunks Discord rejects
+    // outright, and a zero resize side would collapse every image to
+    // nothing. The clamp is announced - a silent correction hides a typo.
+    let max_message_length = config.max_message_length.min(DISCORD_MESSAGE_LIMIT);
+    if config.max_message_length > DISCORD_MESSAGE_LIMIT {
+        tracing::warn!(
+            configured = config.max_message_length,
+            clamped = DISCORD_MESSAGE_LIMIT,
+            "[llm] max_message_length exceeds Discord's message cap - clamped"
+        );
+    }
+    let image_max_side = config.image_max_side.max(1);
+    if config.image_max_side == 0 {
+        tracing::warn!("[llm] image_max_side is zero - clamped to 1");
+    }
+
     LlmSettings {
         default_system_prompt: config.default_system_prompt.clone(),
         default_compaction_prompt: config.default_compaction_prompt.clone(),
         compaction_model: config.compaction_model.clone(),
         compaction_keep_tail: config.compaction_keep_tail,
-        max_message_length: config.max_message_length,
+        max_message_length,
         stream_interval_ms: config.stream_interval_ms,
         max_prompt_file_bytes: config.max_prompt_file_bytes,
         image_model: config.image_model.clone(),
-        image_max_side: config.image_max_side,
+        image_max_side,
         image_jpeg_quality: config.image_jpeg_quality,
         image_max_source_bytes: config.image_max_source_bytes,
         image_prompt: config.image_prompt.clone(),

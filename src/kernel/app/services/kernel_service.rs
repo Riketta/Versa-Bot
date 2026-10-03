@@ -81,6 +81,9 @@ impl<E: EventBusPort> KernelService<E> {
     /// meaning-blind and cannot know which plugin gates which, so a gating
     /// plugin (e.g. auth) must be registered before the plugins it gates.
     ///
+    /// A failed boot rolls the one-shot guard back - the rollback already
+    /// stopped everything that started, so `boot` may be retried.
+    ///
     /// # Errors
     /// Propagates the first plugin `init`/`start` failure, or
     /// `PluginError::Invalid` on registration conflicts.
@@ -91,6 +94,15 @@ impl<E: EventBusPort> KernelService<E> {
             tracing::warn!("kernel boot called twice - ignoring, plugins are already booted");
             return Ok(());
         }
+        let outcome = self.boot_plugins();
+        if outcome.is_err() {
+            self.boot_started.store(false, Ordering::SeqCst);
+        }
+        outcome
+    }
+
+    /// The boot body - the one-shot guard bookkeeping stays in [`Self::boot`].
+    fn boot_plugins(&self) -> Result<(), PluginError> {
         let plugins = self.validated_plugins()?;
 
         for plugin in &plugins {
@@ -455,6 +467,28 @@ mod tests {
         }
     }
 
+    /// Plugin whose `start` fails only on the first attempt - the fixture
+    /// for the boot-retry test.
+    struct OnceFailingStartPlugin {
+        name: &'static str,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PluginPort for OnceFailingStartPlugin {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn start(&self) -> Result<(), PluginError> {
+            let attempt = self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                Err(PluginError::Start(format!("start failed: {}", self.name)))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     /// Plugin whose `pre` hard-stops the chain with `Abort` - the fixture
     /// for the hard-stop policy test.
     struct AbortingPlugin {
@@ -698,6 +732,36 @@ mod tests {
             entries,
             vec!["stop:healthy".to_owned()],
             "the started plugin must be rolled back, the failed one must not be stopped"
+        );
+    }
+
+    /// A failed boot must not poison the kernel: the one-shot guard rolls
+    /// back, so a retry genuinely boots instead of silently reporting
+    /// success over an unbooted kernel.
+    #[tokio::test]
+    async fn failed_boot_can_be_retried() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flaky =
+            Arc::new(OnceFailingStartPlugin { name: "flaky", attempts: Arc::clone(&attempts) });
+
+        let (kernel, _output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![Arc::clone(&flaky) as Arc<dyn PluginPort>],
+            vec![],
+        );
+
+        kernel.boot().expect_err("first boot must fail");
+        kernel.boot().expect("retry after a failed boot must genuinely boot");
+
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "start must have run on both attempts"
+        );
+        assert_eq!(
+            kernel.started.lock().len(),
+            1,
+            "the retried boot must register the started plugin"
         );
     }
 

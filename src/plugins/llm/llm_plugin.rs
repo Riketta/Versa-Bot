@@ -101,7 +101,9 @@ impl ChannelPermits {
 /// The `pre` hook never runs the engine inline - LLM calls are slow and the
 /// pipeline must not wait on them. Assigned-channel messages spawn a task
 /// that runs the engine under the channel's lock (tokio's mutex is fair, so
-/// execution follows pipeline order, and records keep conversation order).
+/// runs serialize in lock-arrival order). The gateway dispatches each event
+/// on its own task and the hook awaits a storage read before the spawn, so
+/// strict gateway-order processing is a best effort, not a guarantee.
 /// The hook itself only matches the event and reads the channel config.
 pub struct LlmPlugin {
     registry: Arc<dyn CommandRegistryPort>,
@@ -128,6 +130,10 @@ impl LlmPlugin {
     #[must_use]
     pub fn new(registry: Arc<dyn CommandRegistryPort>, engine: Arc<ChatEngine>) -> Self {
         let prompt_fetch = reqwest::Client::builder()
+            // Same trust boundary as vision downloads: the CDN host is
+            // prefix-checked per request - redirects must not carry the
+            // fetch off the pinned host, so none are followed.
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(PROMPT_FETCH_TIMEOUT_SECS))
             .build()
             .expect("static prompt-fetch client config expected to build");

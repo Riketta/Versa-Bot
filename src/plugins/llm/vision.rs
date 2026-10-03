@@ -87,6 +87,9 @@ impl VisionService {
     /// (TLS backend unavailable) - a process-level defect, not config.
     pub fn new(completion: Arc<dyn LlmCompletionPort>) -> Self {
         let fetch = reqwest::Client::builder()
+            // The CDN host is prefix-checked per request; redirects must not
+            // carry the fetch off the pinned host, so none are followed.
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(IMAGE_FETCH_TIMEOUT_SECS))
             .build()
             .expect("static image-fetch client config expected to build");
@@ -147,6 +150,11 @@ impl VisionService {
             .send()
             .await
             .map_err(|err| VisionError::Download(err.to_string()))?;
+        // With redirects unfollowed, a 3xx arrives here as-is - rejected
+        // like any other non-success instead of its body being decoded.
+        if !response.status().is_success() {
+            return Err(VisionError::Download(format!("HTTP {}", response.status())));
+        }
         Self::read_capped(response, max_source_bytes).await
     }
 

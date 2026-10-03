@@ -1056,14 +1056,32 @@ impl ChatEngine {
         services: &KernelServices,
     ) {
         let channel_id = origin.channel_id.get();
-        match storage
-            .set(
-                NAMESPACE,
-                &channel_state_key(channel_id),
-                serde_json::to_value(&new_state).unwrap_or(serde_json::Value::Null),
-            )
-            .await
-        {
+        // A serialization failure must abort the commit: persisting `null`
+        // would silently reset the channel's conversation state on next
+        // load. Same guild-visible treatment as a storage error.
+        let value = match serde_json::to_value(&new_state) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::error!(
+                    channel = channel_id,
+                    %err,
+                    "failed to serialize compacted state - not committed"
+                );
+                self.notify_service(
+                    services,
+                    origin,
+                    storage,
+                    "LLM compaction failed",
+                    "Could not persist the summary (serialization error) - the window keeps \
+                         growing; check the bot logs."
+                        .to_owned(),
+                    true,
+                )
+                .await;
+                return;
+            }
+        };
+        match storage.set(NAMESPACE, &channel_state_key(channel_id), value).await {
             Ok(()) => {
                 tracing::info!(
                     channel = channel_id,
@@ -1198,14 +1216,20 @@ impl ChatEngine {
         };
         let stats =
             UsageStats { last, last_timing: Some(timing), tokens_per_char, last_budget: budget };
-        if let Err(err) = storage
-            .set(
-                NAMESPACE,
-                &channel_stats_key(channel_id),
-                serde_json::to_value(&stats).unwrap_or(serde_json::Value::Null),
-            )
-            .await
-        {
+        // Same rule as the state doc: a serialization failure aborts the
+        // persist instead of storing `null` (which would reset the stats).
+        let value = match serde_json::to_value(&stats) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    channel = channel_id,
+                    %err,
+                    "failed to serialize usage stats - not persisted"
+                );
+                return;
+            }
+        };
+        if let Err(err) = storage.set(NAMESPACE, &channel_stats_key(channel_id), value).await {
             tracing::warn!(channel = channel_id, %err, "failed to persist token usage stats");
         }
     }

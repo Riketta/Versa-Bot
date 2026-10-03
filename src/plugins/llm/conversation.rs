@@ -179,10 +179,10 @@ fn estimated_tokens(text: &str, tokens_per_char: f64) -> u64 {
     cost
 }
 
-/// Assembles the LLM context: the system prompt (with the compacted-context
-/// summary merged into its end by default - see `SummaryPlacement`), then
-/// the live window. User turns render via the channel template; assistant
-/// turns pass through raw (the role already says who spoke).
+/// Assembles the LLM context: the system prompt, the always-present summary
+/// slot (a separate second message by default - see `SummaryPlacement` for
+/// the merge modes), then the live window. User turns render via the channel
+/// template; assistant turns pass through raw (the role already says who spoke).
 ///
 /// The whole prompt side (system + summary + turns) counts against the
 /// resolved budget, and turns fill NEWEST-FIRST under that budget and
@@ -199,8 +199,8 @@ pub fn assemble_context(
     budget: Option<u64>,
 ) -> Vec<ChatMessage> {
     let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
-    // Undeclared models run the safe default (merged into the system
-    // prompt) - same capability contract as reasoning/context_window.
+    // Undeclared models run the default placement (a separate summary slot)
+    // - same capability contract as reasoning/context_window.
     let placement = settings
         .models
         .get(&config.model)

@@ -15,6 +15,7 @@ mod rng;
 mod vision;
 
 pub use chat_engine::ChatEngine;
+pub use commands::DISCORD_MESSAGE_LIMIT;
 pub use completion_port::{
     ChatMessage, ChatRole, CompletionRequest, CompletionResponse, LlmCompletionPort, LlmError,
     ResponseTiming,

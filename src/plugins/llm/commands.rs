@@ -28,7 +28,7 @@ use super::vision::DEFAULT_IMAGE_PROMPT;
 
 /// Discord's hard cap for one text message - the reply splitter must never
 /// produce chunks beyond it (the platform rejects them outright).
-const DISCORD_MESSAGE_LIMIT: usize = 2000;
+pub const DISCORD_MESSAGE_LIMIT: usize = 2000;
 
 /// Recognized `/llm_set` keys, in display order. Doubles as the Discord
 /// choices dropdown for the `key` argument.
@@ -171,13 +171,20 @@ fn apply_set(config: &mut ChannelConfig, key: &str, value: &str) -> Result<Strin
     }
 }
 
-/// On/off settings. `None` = the key is not a flag (caller continues matching).
+/// On/off settings. `None` = the key is not a flag (caller continues
+/// matching). A recognized flag key with an unparseable value claims the key
+/// and answers with usage - falling through would misreport it as unknown.
 fn apply_flag(
     config: &mut ChannelConfig,
     key: &str,
     value: &str,
 ) -> Option<Result<String, String>> {
-    let enabled = parse_bool(value)?;
+    if !matches!(key, "streaming" | "compaction" | "images") {
+        return None;
+    }
+    let Some(enabled) = parse_bool(value) else {
+        return Some(Err(format!("`{key}` expects on or off, got `{value}`.")));
+    };
     match key {
         "streaming" => {
             config.streaming = enabled;
@@ -1445,6 +1452,18 @@ mod tests {
         assert!(apply_set(&mut config, "depth", "clear").is_err());
         apply_set(&mut config, "model", "zai/glm-5.3-flash").expect("model expected");
         assert_eq!(config.model, "zai/glm-5.3-flash");
+    }
+
+    /// A recognized flag key with a bad value answers usage - it must not
+    /// fall through to "Unknown key".
+    #[test]
+    fn flag_with_invalid_value_reports_usage_not_unknown_key() {
+        let mut config = ChannelConfig::assigned("m".to_owned());
+
+        let err = apply_set(&mut config, "streaming", "maybe").unwrap_err();
+        assert!(err.contains("on or off"), "unexpected reply: {err}");
+        assert!(!err.contains("Unknown key"), "unexpected reply: {err}");
+        assert!(!config.streaming, "the failed set must not mutate");
     }
 
     #[test]
