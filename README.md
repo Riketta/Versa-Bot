@@ -281,7 +281,10 @@ extra_body = { chat_template_kwargs = { enable_thinking = false } }
 - **Capture** decides what enters the channel's history. `bot_related`
   (default) tracks only bot-related messages: mentions and replies into
   the captured conversation. `all_messages` tracks everything. The
-  bot's own answers are recorded at send time.
+  bot's own answers are recorded at send time. Chime-ins only roll on
+  captured messages - in `bot_related` mode that is essentially never
+  (captured non-triggering messages are rare), so random answers need
+  `capture_mode = all_messages`.
 - **Trigger** decides when the bot answers: an explicit mention or a
   direct reply to one of the bot's own messages. Replies between users
   are captured but do not trigger (`random_chance` below is the
@@ -332,7 +335,7 @@ confirmations, usage notices and reports never appear in the channel.
 | `/llm_prompt_file file:<attachment>` | set the system prompt from an uploaded text/markdown file - for prompts beyond the inline limit; fetched from Discord's CDN only, capped by `[llm] max_prompt_file_bytes` (128 KiB default) |
 | `/llm_set key:<key> value:<value>` | tune one channel setting (table below); value `clear`/`none`/`default` resets it |
 | `/llm_cutoff` | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
-| `/llm_status` | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
+| `/llm_status` | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, capture mode, chime-in chance, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
 | `/llm_admin` | make this channel the guild's service channel for error notices (one per guild, last write wins) |
 | `/llm_admin_clear` | stop service notices |
 

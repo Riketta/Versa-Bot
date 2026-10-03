@@ -643,6 +643,20 @@ fn prompt_fingerprint(text: &str) -> String {
     format!("#{:016x}", hasher.finish())
 }
 
+/// `/llm_status` label of the channel's capture mode.
+fn capture_label(mode: CaptureMode) -> &'static str {
+    match mode {
+        CaptureMode::BotRelated => "bot_related",
+        CaptureMode::AllMessages => "all_messages",
+    }
+}
+
+/// `/llm_status` label of the chime-in roll chance: the percent, or `off`
+/// when set to zero.
+fn chime_label(chance: f64) -> String {
+    if chance > 0.0 { format!("{chance:.1}%") } else { "off".to_owned() }
+}
+
 #[async_trait]
 impl CommandHandler for StatusLlmHandler {
     async fn invoke(
@@ -724,6 +738,7 @@ Prompt: {prompt_source} ({} chars, {})
 Prompt head: {prompt_head}
 Context: {live}/{} messages ({total} kept)
 Compaction: {}
+Capture: {} · Chime-ins: {}
 Summary: {summary}
 Context start: {context_start}",
             config.model,
@@ -731,6 +746,8 @@ Context start: {context_start}",
             prompt_fingerprint(prompt_text),
             config.history_depth,
             if config.compaction_enabled { "on" } else { "off" },
+            capture_label(config.capture_mode),
+            chime_label(config.random_chance_percent),
         );
         if let Some(line) = usage.estimate {
             description.push('\n');
