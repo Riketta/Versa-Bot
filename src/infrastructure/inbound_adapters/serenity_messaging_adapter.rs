@@ -104,16 +104,21 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
         // Interaction responses owe Discord an answer within ~3 seconds.
         // Acknowledge deferred right here, at ingestion, so plugins can take
         // as long as they need; their replies go out as followups bound to
-        // the interaction token. Type 5 = DeferredChannelMessageWithSource;
-        // flags 64 (EPHEMERAL) shows the "thinking" indicator to the invoker
-        // only, so denied or failed commands no longer flash publicly. Later
-        // followups control their own visibility - public replies still work.
+        // the interaction token. Type 5 = DeferredChannelMessageWithSource.
+        // `flags` must live INSIDE `data`: a top-level `flags` field is
+        // ignored, and a non-ephemeral defer makes the whole exchange public
+        // - the first followup edits the original response and inherits its
+        // ephemeral state (an existing message's ephemeral state cannot be
+        // changed later). All command replies are admin-only, so the defer
+        // carries EPHEMERAL (64) and the loading state already shows to the
+        // invoker alone. (A future public-reply command would follow up a
+        // second time with its own flags.)
         if let Err(err) = ctx
             .http
             .create_interaction_response(
                 command.id,
                 &command.token,
-                &serde_json::json!({ "type": 5, "flags": 64 }),
+                &deferred_ephemeral_response(),
                 Vec::new(),
             )
             .await
@@ -202,6 +207,17 @@ fn member_origin(guild_id: SerenityGuildId, user: &User) -> Origin {
         message_id: None,
         reply_token: None,
     }
+}
+
+/// The acknowledgement sent for every slash-command interaction: a deferred
+/// channel message whose loading state carries the EPHEMERAL flag (64). The
+/// first followup then edits this response and inherits its ephemeral state,
+/// so the whole exchange stays visible to the invoker alone. `flags` sits
+/// inside `data` per the interaction-callback data shape - a top-level
+/// `flags` field is silently ignored by Discord and would make the defer
+/// (and with it every command reply) public.
+fn deferred_ephemeral_response() -> serde_json::Value {
+    serde_json::json!({ "type": 5, "data": { "flags": 64 } })
 }
 
 /// Flattens Discord's option tree into `name -> value` string pairs.
@@ -545,6 +561,20 @@ fn reply_reference(channel_id: SerenityChannelId, reply_to: MessageId) -> Messag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The defer carries EPHEMERAL inside `data` - Discord ignores a
+    /// top-level `flags` field, and a public defer makes every command
+    /// reply public (the first followup inherits the defer's visibility).
+    #[test]
+    fn interaction_defer_is_ephemeral() {
+        let response = deferred_ephemeral_response();
+
+        assert_eq!(response.get("type").and_then(serde_json::Value::as_u64), Some(5));
+        let data = response.get("data").expect("callback data expected");
+        assert_eq!(data.get("flags").and_then(serde_json::Value::as_u64), Some(64));
+        // The flag must not leak to the top level, where Discord drops it.
+        assert!(response.get("flags").is_none());
+    }
 
     #[test]
     fn flattens_subcommands_and_resolved_entities() {
