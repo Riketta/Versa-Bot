@@ -1,3 +1,5 @@
+use super::MessageId;
+
 /// Minimal embed payload. Deliberately platform-blind: two text fields an
 /// adapter can render natively (Discord embeds) or flatten into plain text
 /// where the platform has no embed concept.
@@ -13,11 +15,18 @@ pub struct Embed {
 /// followups) can truly be shown to a single user, so adapters honor it there
 /// (Discord: the `EPHEMERAL` message flag) and ignore it for plain channel
 /// sends, which are always public.
+///
+/// `reply_to` is a native platform reply reference (Discord: a reply-chain
+/// header, no mention) to a message *in the destination channel* - typically
+/// the inbound message the answer answers. Adapters degrade gracefully where
+/// the reference is unusable (platform without the concept, deleted target):
+/// the send goes out as a normal message, never an error.
 #[derive(Debug, Clone, Default)]
 pub struct OutboundMessage {
     pub content: String,
     pub embeds: Vec<Embed>,
     pub ephemeral: bool,
+    pub reply_to: Option<MessageId>,
 }
 
 impl OutboundMessage {
@@ -37,6 +46,14 @@ impl OutboundMessage {
     #[must_use]
     pub fn ephemeral(mut self) -> Self {
         self.ephemeral = true;
+        self
+    }
+
+    /// Marks the message as a native platform reply to `message_id` (a
+    /// message in the destination channel).
+    #[must_use]
+    pub fn replying_to(mut self, message_id: MessageId) -> Self {
+        self.reply_to = Some(message_id);
         self
     }
 

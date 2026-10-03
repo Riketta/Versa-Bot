@@ -89,11 +89,13 @@ enum LiveOutcome {
 /// applies leftovers that were buffered before the engine polled (a stream
 /// can resolve faster than the engine's first poll). Edits always carry
 /// prefixes of the revealed text - the message is only ever behind, never
-/// wrong. A failed `begin` (platform hiccup) stops revealing; the
-/// completion still finishes and delivers through the plain path.
+/// wrong. The begin message natively replies to the triggering message.
+/// A failed `begin` (platform hiccup) stops revealing; the completion still
+/// finishes and delivers through the plain path.
 struct LiveReveal {
     stream: Arc<dyn ChatStreamPort>,
     channel_id: u64,
+    reply_to: Option<MessageId>,
     message: Option<MessageId>,
     revealed: String,
     revealing: bool,
@@ -102,10 +104,16 @@ struct LiveReveal {
 }
 
 impl LiveReveal {
-    fn new(stream: Arc<dyn ChatStreamPort>, channel_id: u64, interval: Duration) -> Self {
+    fn new(
+        stream: Arc<dyn ChatStreamPort>,
+        channel_id: u64,
+        reply_to: Option<MessageId>,
+        interval: Duration,
+    ) -> Self {
         Self {
             stream,
             channel_id,
+            reply_to,
             message: None,
             revealed: String::new(),
             revealing: true,
@@ -119,20 +127,23 @@ impl LiveReveal {
         if !self.revealing {
             return;
         }
-        match self.message {
-            Some(id) => {
-                if Instant::now() >= self.next_edit {
-                    self.next_edit = Instant::now() + self.interval;
-                    if let Err(err) = self.stream.update(id, self.revealed.clone()).await {
-                        tracing::warn!(
-                            channel = self.channel_id,
-                            %err,
-                            "streaming update failed - continuing"
-                        );
-                    }
+        if let Some(id) = self.message {
+            if Instant::now() >= self.next_edit {
+                self.next_edit = Instant::now() + self.interval;
+                if let Err(err) = self.stream.update(id, self.revealed.clone()).await {
+                    tracing::warn!(
+                        channel = self.channel_id,
+                        %err,
+                        "streaming update failed - continuing"
+                    );
                 }
             }
-            None => match self.stream.begin(OutboundMessage::text(self.revealed.clone())).await {
+        } else {
+            let mut begin = OutboundMessage::text(self.revealed.clone());
+            if let Some(reply_to) = self.reply_to {
+                begin = begin.replying_to(reply_to);
+            }
+            match self.stream.begin(begin).await {
                 Ok(id) => {
                     self.message = Some(id);
                     self.next_edit = Instant::now() + self.interval;
@@ -145,7 +156,7 @@ impl LiveReveal {
                     );
                     self.revealing = false;
                 }
-            },
+            }
         }
     }
 
@@ -475,6 +486,7 @@ impl ChatEngine {
         let mut reveal = LiveReveal::new(
             services.chat_output_factory.stream_output(origin),
             origin.channel_id.get(),
+            origin.message_id,
             Duration::from_millis(self.settings.stream_interval_ms.max(1)),
         );
 
@@ -561,10 +573,14 @@ impl ChatEngine {
 
     /// Delivery half of [`ChatEngine::answer`]: splits the reply to the
     /// channel's length cap (on line boundaries), delivers it, and records
-    /// the bot turn. `live_id` carries an already-streaming message from
-    /// [`Self::complete_live`] - its final edit pins the exact first chunk;
-    /// without one, `begin` posts the first chunk directly. Returns whether
-    /// delivery could start - the caller's fallback follows when it did not.
+    /// the bot turn. The first message natively replies to the triggering
+    /// one (`origin.message_id`) - both for mentions and for random
+    /// chime-ins; follow-up split parts go out plain. `live_id` carries an
+    /// already-streaming message from [`Self::complete_live`] - its final
+    /// edit pins the exact first chunk (the reference was set at its
+    /// `begin`); without one, `begin` posts the first chunk directly.
+    /// Returns whether delivery could start - the caller's fallback follows
+    /// when it did not.
     async fn deliver_reply(
         &self,
         origin: &Origin,
@@ -586,17 +602,20 @@ impl ChatEngine {
         // assistant record needs for reply-chain detection.
         let stream = services.chat_output_factory.stream_output(origin);
         let first_chunk = chunks.first().expect("non-empty chunks checked").clone();
-        let first_message_id: Option<u64> = match live_id {
-            Some(id) => {
-                // The live message already shows prefixes of the answer;
-                // the final edit pins it to the authoritative first chunk
-                // (reasoning stripping may have shortened the raw deltas).
-                if let Err(err) = stream.update(id, first_chunk.clone()).await {
-                    tracing::warn!(channel = channel_id, %err, "final stream update failed");
-                }
-                Some(id.get())
+        let first_message_id: Option<u64> = if let Some(id) = live_id {
+            // The live message already shows prefixes of the answer; the
+            // final edit pins it to the authoritative first chunk (reasoning
+            // stripping may have shortened the raw deltas).
+            if let Err(err) = stream.update(id, first_chunk.clone()).await {
+                tracing::warn!(channel = channel_id, %err, "final stream update failed");
             }
-            None => match stream.begin(OutboundMessage::text(first_chunk.clone())).await {
+            Some(id.get())
+        } else {
+            let mut begin = OutboundMessage::text(first_chunk.clone());
+            if let Some(reply_to) = origin.message_id {
+                begin = begin.replying_to(reply_to);
+            }
+            match stream.begin(begin).await {
                 Ok(id) => Some(id.get()),
                 Err(err) => {
                     tracing::warn!(
@@ -606,7 +625,7 @@ impl ChatEngine {
                     );
                     None
                 }
-            },
+            }
         };
 
         let delivered_first = usize::from(first_message_id.is_some());
@@ -622,7 +641,7 @@ impl ChatEngine {
             role: RecordRole::Assistant,
             author: None,
             content: content.to_owned(),
-            reply_to: None,
+            reply_to: origin.message_id.map(MessageId::get),
             captured_at: unix_now(),
         };
         if let Some(storage) = &services.guild_storage
@@ -703,12 +722,15 @@ impl ChatEngine {
     /// the bot (a mention, or a reply to a bot turn) never disappears
     /// silently. When the generated answer is impossible - provider failure,
     /// reasoning-only response, untrustworthy history - the channel gets
-    /// this generic notice instead. It is never recorded as a bot turn and
-    /// never carries error detail.
+    /// this generic notice instead, natively replying to the triggering
+    /// message so it is unambiguous what failed. It is never recorded as a
+    /// bot turn and never carries error detail.
     async fn send_fallback(&self, origin: &Origin, services: &KernelServices) {
-        if let Err(err) =
-            services.chat_output.send(OutboundMessage::text(FALLBACK_MESSAGE.to_owned())).await
-        {
+        let mut notice = OutboundMessage::text(FALLBACK_MESSAGE.to_owned());
+        if let Some(reply_to) = origin.message_id {
+            notice = notice.replying_to(reply_to);
+        }
+        if let Err(err) = services.chat_output.send(notice).await {
             tracing::warn!(
                 channel = origin.channel_id.get(),
                 %err,
@@ -1125,7 +1147,7 @@ mod tests {
     /// Factory whose stream port succeeds - mirrors the Discord adapter's
     /// `begin`-returns-a-handle behavior the engine relies on.
     struct StreamRecordingFactory {
-        begins: Arc<Mutex<Vec<String>>>,
+        begins: Arc<Mutex<Vec<OutboundMessage>>>,
         updates: Arc<Mutex<Vec<String>>>,
         output: Arc<RecordingChatOutput>,
         typing_starts: AtomicUsize,
@@ -1174,7 +1196,7 @@ mod tests {
     }
 
     struct RecordingStream {
-        begins: Arc<Mutex<Vec<String>>>,
+        begins: Arc<Mutex<Vec<OutboundMessage>>>,
         updates: Arc<Mutex<Vec<String>>>,
         counter: AtomicU64,
     }
@@ -1182,7 +1204,7 @@ mod tests {
     #[async_trait]
     impl ChatStreamPort for RecordingStream {
         async fn begin(&self, message: OutboundMessage) -> Result<MessageId, OutboundError> {
-            self.begins.lock().push(message.content);
+            self.begins.lock().push(message);
             Ok(MessageId(self.counter.fetch_add(1, Ordering::Relaxed)))
         }
 
@@ -1247,9 +1269,9 @@ mod tests {
         engine: ChatEngine,
         storage: Arc<InMemoryStorage>,
         output: Arc<RecordingChatOutput>,
-        begins: Arc<Mutex<Vec<String>>>,
+        begins: Arc<Mutex<Vec<OutboundMessage>>>,
         updates: Arc<Mutex<Vec<String>>>,
-        services: KernelServices,
+        services: Arc<KernelServices>,
     }
 
     fn ctx_delta(settings: LlmSettings, completion: Arc<dyn LlmCompletionPort>) -> DeltaCtx {
@@ -1264,11 +1286,11 @@ mod tests {
             output: Arc::clone(&output),
             typing_starts: AtomicUsize::new(0),
         });
-        let services = KernelServices {
+        let services = Arc::new(KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
             guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
-        };
+        });
         DeltaCtx { engine, storage, output, begins, updates, services }
     }
 
@@ -1387,9 +1409,14 @@ mod tests {
         fake: Arc<FakeCompletion>,
         storage: Arc<InMemoryStorage>,
         output: Arc<RecordingChatOutput>,
-        begins: Arc<Mutex<Vec<String>>>,
+        begins: Arc<Mutex<Vec<OutboundMessage>>>,
         factory: Arc<StreamRecordingFactory>,
         services: KernelServices,
+    }
+
+    /// Flat text projection of recorded stream begins, for content assertions.
+    fn begin_texts(begins: &Mutex<Vec<OutboundMessage>>) -> Vec<String> {
+        begins.lock().iter().map(|message| message.content.clone()).collect()
     }
 
     fn ctx(responses: Vec<Result<String, LlmError>>) -> TestCtx {
@@ -1549,9 +1576,11 @@ mod tests {
         );
         assert_eq!(request.messages.get(2).map(|m| m.content.as_str()), Some("alice: hello bot"));
 
-        // Reply delivered via the stream begin; assistant turn recorded with
-        // the returned handle for future reply-chain detection.
-        assert_eq!(ctx.begins.lock().clone(), vec!["hi alice".to_owned()]);
+        // Reply delivered via the stream begin - as a native reply to the
+        // triggering message (origin message id 77); assistant turn recorded
+        // with the returned handle for future reply-chain detection.
+        assert_eq!(begin_texts(&ctx.begins), vec!["hi alice".to_owned()]);
+        assert_eq!(ctx.begins.lock().first().and_then(|m| m.reply_to), Some(MessageId(77)));
         let records = stored_records(&ctx).await;
         assert_eq!(records.len(), 2);
         assert_eq!(
@@ -1562,6 +1591,8 @@ mod tests {
         assert_eq!(assistant.role, RecordRole::Assistant);
         assert!(assistant.message_id.is_some());
         assert_eq!(assistant.content, "hi alice");
+        // The record keeps what the answer replied to - the triggering turn.
+        assert_eq!(assistant.reply_to, Some(77));
     }
 
     /// Every generated answer holds the platform typing indicator across
@@ -1659,6 +1690,7 @@ mod tests {
         // visible generic fallback - and no bot turn is recorded.
         assert!(ctx.begins.lock().is_empty());
         assert_eq!(ctx.output.messages(), vec![FALLBACK_MESSAGE.to_owned()]);
+        assert_eq!(ctx.output.sent().first().and_then(|m| m.reply_to), Some(MessageId(77)));
         let records = stored_records(&ctx).await;
         assert_eq!(records.len(), 1);
         assert_eq!(records.first().map(|r| r.role), Some(RecordRole::User));
@@ -1672,9 +1704,14 @@ mod tests {
 
         ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
 
-        // First chunk via begin, remainder via plain sends.
-        assert_eq!(ctx.begins.lock().clone(), vec!["aaa".to_owned()]);
+        // First chunk via begin (as a native reply to the trigger),
+        // remainder via plain sends.
+        assert_eq!(begin_texts(&ctx.begins), vec!["aaa".to_owned()]);
+        assert_eq!(ctx.begins.lock().first().and_then(|m| m.reply_to), Some(MessageId(77)));
         assert_eq!(ctx.output.messages(), vec!["bbb".to_owned()]);
+        // Follow-up split parts are plain - only the first message is a
+        // reply; the rest are continuation.
+        assert!(ctx.output.sent().first().is_none_or(|m| m.reply_to.is_none()));
         // The assistant record keeps the FULL text.
         let records = stored_records(&ctx).await;
         let assistant = records.get(1).expect("assistant record expected");
@@ -1828,7 +1865,7 @@ mod tests {
 
         // The reply went out and all records (seeded + capture + assistant)
         // are kept.
-        assert_eq!(ctx.begins.lock().clone(), vec!["the answer".to_owned()]);
+        assert_eq!(begin_texts(&ctx.begins), vec!["the answer".to_owned()]);
         assert_eq!(stored_records(&ctx).await.len(), 5);
     }
 
@@ -1895,7 +1932,7 @@ mod tests {
         ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
 
         // The reply went out; the compaction failure left the state intact.
-        assert_eq!(ctx.begins.lock().clone(), vec!["the answer".to_owned()]);
+        assert_eq!(begin_texts(&ctx.begins), vec!["the answer".to_owned()]);
         let state_raw = ctx
             .storage
             .guild_scoped(Platform::Discord, GuildId(1))
@@ -2065,7 +2102,9 @@ mod tests {
         ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
 
         assert_eq!(ctx.fake.requests().len(), 1);
-        assert_eq!(ctx.begins.lock().clone(), vec!["random thought".to_owned()]);
+        assert_eq!(begin_texts(&ctx.begins), vec!["random thought".to_owned()]);
+        // The chime answer natively replies to the message that triggered it.
+        assert_eq!(ctx.begins.lock().first().and_then(|m| m.reply_to), Some(MessageId(77)));
         let records = stored_records(&ctx).await;
         assert_eq!(records.len(), 2);
         assert_eq!(records.get(1).map(|record| record.role), Some(RecordRole::Assistant));
@@ -2175,7 +2214,9 @@ mod tests {
 
         ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
 
-        assert_eq!(ctx.begins.lock().clone(), vec!["Answer".to_owned()]);
+        assert_eq!(begin_texts(&ctx.begins), vec!["Answer".to_owned()]);
+        // The live message opened as a native reply to the trigger.
+        assert_eq!(ctx.begins.lock().first().and_then(|m| m.reply_to), Some(MessageId(77)));
         let updates = ctx.updates.lock().clone();
         assert_eq!(updates.last().map(String::as_str), Some("Answer continues"));
         for update in &updates {
@@ -2236,7 +2277,8 @@ mod tests {
 
         // No fallback: partial text is already on screen.
         assert!(ctx.output.messages().is_empty());
-        assert_eq!(ctx.begins.lock().clone(), vec!["partial answer".to_owned()]);
+        assert_eq!(begin_texts(&ctx.begins), vec!["partial answer".to_owned()]);
+        assert_eq!(ctx.begins.lock().first().and_then(|m| m.reply_to), Some(MessageId(77)));
         let updates = ctx.updates.lock().clone();
         assert_eq!(updates.last().map(String::as_str), Some("partial answer"));
         let records = stored_records_in(&ctx.storage).await;

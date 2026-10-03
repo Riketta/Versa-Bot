@@ -355,9 +355,12 @@ saved):
 | `turn_template` | user-turn rendering; must contain `{sender}` and `{message}` | `{sender}: {message}` |
 
 **Delivery.** While an answer generates and delivers, the bot holds the
-channel's typing indicator - users see it composing, not frozen. Long
-answers split on line boundaries - a line that does
-not fit moves whole to the next message. With `streaming` on, the
+channel's typing indicator - users see it composing, not frozen. The
+answer posts as a native Discord reply to the message that triggered it
+(the mention/reply target, or the message a chime-in fired on); only the
+first message of a split answer carries the reply header, the rest
+continue plainly. Long answers split on line boundaries - a line that
+does not fit moves whole to the next message. With `streaming` on, the
 endpoint is asked for a real SSE stream: the message appears with the
 first tokens and is edited in place (throttled by `stream_interval_ms`)
 while the model writes; the final edit carries the exact full text, and

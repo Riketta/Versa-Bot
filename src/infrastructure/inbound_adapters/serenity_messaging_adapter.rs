@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 use serenity::all::{
     ChannelId as SerenityChannelId, CommandDataOption, CommandDataOptionValue, CommandDataResolved,
     Context, CreateMessage, EditMessage, EventHandler, GuildId as SerenityGuildId, Http,
-    Interaction, Member, Message, Ready, User,
+    Interaction, Member, Message, MessageReference, MessageReferenceKind, Ready, User,
 };
 use serenity::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -399,6 +399,9 @@ impl ChatOutputPort for SerenityChatOutput {
         if !message.embeds.is_empty() {
             create = create.embeds(message.embeds.iter().map(discord_embed).collect());
         }
+        if let Some(reply_to) = message.reply_to {
+            create = create.reference_message(reply_reference(self.channel_id, reply_to));
+        }
 
         self.http
             .send_message(self.channel_id, Vec::new(), &create)
@@ -437,13 +440,13 @@ impl ChatStreamPort for SerenityChatStream {
             tracing::warn!(channel = %self.channel_id, "dropping empty streaming placeholder");
             return Err(OutboundError::Send("empty streaming placeholder".to_owned()));
         }
+        let mut create = CreateMessage::new().content(message.content);
+        if let Some(reply_to) = message.reply_to {
+            create = create.reference_message(reply_reference(self.channel_id, reply_to));
+        }
         let created = self
             .http
-            .send_message(
-                self.channel_id,
-                Vec::new(),
-                &CreateMessage::new().content(message.content),
-            )
+            .send_message(self.channel_id, Vec::new(), &create)
             .await
             .map_err(|err| OutboundError::Send(err.to_string()))?;
         Ok(MessageId(created.id.get()))
@@ -492,6 +495,8 @@ impl ChatOutputPort for InteractionFollowupOutput {
             tracing::warn!("dropping empty interaction followup (no content, no embeds)");
             return Ok(());
         }
+        // `reply_to` is ignored: a transactional reply is already anchored to
+        // its interaction - a channel message reference adds nothing.
         let mut body = serde_json::Map::new();
         if !message.content.is_empty() {
             body.insert("content".to_owned(), serde_json::json!(message.content));
@@ -526,6 +531,15 @@ fn discord_embed(embed: &Embed) -> serenity::all::CreateEmbed {
     serenity::all::CreateEmbed::new()
         .title(embed.title.clone())
         .description(embed.description.clone())
+}
+
+/// Reply reference for a message in the destination channel. `fail_if_not_exists`
+/// stays off: a deleted target must degrade to a normal send, never fail the
+/// delivery (the LLM guaranteed-answer contract rides these sends).
+fn reply_reference(channel_id: SerenityChannelId, reply_to: MessageId) -> MessageReference {
+    MessageReference::new(MessageReferenceKind::Default, channel_id)
+        .message_id(serenity::all::MessageId::new(reply_to.get()))
+        .fail_if_not_exists(false)
 }
 
 #[cfg(test)]
