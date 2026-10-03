@@ -337,6 +337,10 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   assistant messages. The window is selected newest-first under the token
   budget and `depth`, whichever bites first - the newest turn is always
   included.
+- **Mentions** in captured messages are normalized to `[Name]<@id>` - the
+  model sees both who was named and the raw tag to imitate in replies.
+  Replies using the same shape are converted back to bare mentions on
+  send, so a tag the model assembles pings cleanly.
 - **Reasoning** is never exposed: thinking output (`reasoning_content`
   fields, inline `<think>` blocks) is cut at the provider adapter before
   it can be recorded or rendered - complete `<think>...</think>` pairs

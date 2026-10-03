@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serenity::all::{
     ChannelId as SerenityChannelId, CommandDataOption, CommandDataOptionValue, CommandDataResolved,
     Context, CreateMessage, EditMessage, EventHandler, GuildId as SerenityGuildId, Http,
-    Interaction, Member, Message, MessageReference, MessageReferenceKind, Ready, User,
+    Interaction, Member, Message, MessageReference, MessageReferenceKind, Ready,
+    RoleId as SerenityRoleId, User, UserId as SerenityUserId,
 };
 use serenity::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -86,7 +88,41 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
             reply_token: None,
         };
 
-        let mut event = RequestContext::message_received(origin, message.content);
+        // Discord meta-tags are unreadable to consumers (`<@123>`): rewrite
+        // them as `[Name]<@123>` so history readers see who was named AND
+        // the raw tag to imitate in replies. Names resolve from the
+        // payload's mentions first, then the gateway cache; anything
+        // unresolvable stays raw. Outbound sends invert the shape (see
+        // `denormalize_mention_tags`). The cache guard is scoped: it must
+        // be dropped before the pipeline await below.
+        let content = {
+            let guild = message.guild_id.and_then(|guild_id| ctx.cache.guild(guild_id));
+            let mentioned: HashMap<u64, &User> =
+                message.mentions.iter().map(|user| (user.id.get(), user)).collect();
+            let resolve = |kind: MentionKind, id: u64| match kind {
+                MentionKind::User => {
+                    mentioned.get(&id).map(|user| display_name(user)).or_else(|| {
+                        guild
+                            .as_ref()
+                            .and_then(|guild| guild.members.get(&SerenityUserId::new(id)))
+                            .map(|member| {
+                                member.nick.clone().unwrap_or_else(|| member.user.name.clone())
+                            })
+                    })
+                }
+                MentionKind::Role => guild
+                    .as_ref()
+                    .and_then(|guild| guild.roles.get(&SerenityRoleId::new(id)))
+                    .map(|role| role.name.clone()),
+                MentionKind::Channel => guild
+                    .as_ref()
+                    .and_then(|guild| guild.channels.get(&SerenityChannelId::new(id)))
+                    .map(|channel| channel.name.clone()),
+            };
+            normalize_mention_tags(&message.content, &resolve)
+        };
+
+        let mut event = RequestContext::message_received(origin, content);
         if let EventPayload::Message(payload) = &mut event.payload {
             payload.author_name = Some(author_name);
             payload.author_roles = author_roles;
@@ -237,6 +273,130 @@ fn member_origin(guild_id: SerenityGuildId, user: &User) -> Origin {
 /// (and with it every command reply) public.
 fn deferred_ephemeral_response() -> serde_json::Value {
     serde_json::json!({ "type": 5, "data": { "flags": 64 } })
+}
+
+/// Which Discord entity a mention tag points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MentionKind {
+    User,
+    Role,
+    Channel,
+}
+
+/// Display name of a mention payload user: global display name when set,
+/// else the username.
+fn display_name(user: &User) -> String {
+    user.global_name.clone().unwrap_or_else(|| user.name.clone())
+}
+
+/// Parses a Discord mention tag at the start of `text`: user `<@id>` /
+/// `<@!id>`, role `<@&id>`, channel `<#id>`. Returns the kind, the id and
+/// the tag's length in bytes. Custom emoji (`<:name:id>`) and any other
+/// shape are not mention tags.
+fn parse_mention_tag(text: &str) -> Option<(MentionKind, u64, usize)> {
+    let bytes = text.as_bytes();
+    let mut index = 1; // past '<'
+    let kind = match bytes.get(index) {
+        Some(b'@') => {
+            index += 1;
+            if bytes.get(index) == Some(&b'&') {
+                index += 1;
+                MentionKind::Role
+            } else {
+                if bytes.get(index) == Some(&b'!') {
+                    index += 1;
+                }
+                MentionKind::User
+            }
+        }
+        Some(b'#') => {
+            index += 1;
+            MentionKind::Channel
+        }
+        _ => return None,
+    };
+
+    let mut id: u64 = 0;
+    let mut digits = 0;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'0'..=b'9' => {
+                id = id.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+                digits += 1;
+                index += 1;
+            }
+            b'>' if digits > 0 => return Some((kind, id, index + 1)),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Rewrites mention tags in message content to the normalized shape:
+/// `<@123>` -> `[Name]<@123>`. The lookup receives the entity kind and id
+/// and returns the display name; unresolvable ids and non-mention shapes
+/// pass through untouched. `[`/`]` are stripped from resolved names so the
+/// outbound inverse scan stays unambiguous.
+fn normalize_mention_tags(
+    content: &str,
+    resolve: &dyn Fn(MentionKind, u64) -> Option<String>,
+) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(position) = rest.find('<') {
+        out.push_str(rest.get(..position).unwrap_or(""));
+        // `tail` starts at the '<' - `parse_mention_tag` expects it.
+        let tail = rest.get(position..).unwrap_or("");
+        if let Some((kind, id, length)) = parse_mention_tag(tail) {
+            if let Some(name) = resolve(kind, id) {
+                let name = name.replace(['[', ']'], "");
+                if !name.is_empty() {
+                    out.push('[');
+                    out.push_str(&name);
+                    out.push(']');
+                }
+            }
+            out.push_str(tail.get(..length).unwrap_or(""));
+            rest = tail.get(length..).unwrap_or("");
+        } else {
+            out.push('<');
+            rest = tail.get(1..).unwrap_or("");
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The outbound inverse: `[Name]<@id>` -> `<@id>`, so tags the model
+/// assembles from normalized history arrive as clean Discord mentions
+/// (rendered output shows the resolved name anyway). The name segment must
+/// be bracket-adjacent to the tag and free of nested brackets - text that
+/// never used the normalized shape passes through byte-identical.
+fn denormalize_mention_tags(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some((before, tail)) = rest.split_once(']') {
+        if let Some((_, _, length)) = parse_mention_tag(tail) {
+            if let Some((prefix, name)) = before.rsplit_once('[')
+                && !name.is_empty()
+                && !name.contains('[')
+            {
+                out.push_str(prefix);
+                out.push_str(tail.get(..length).unwrap_or(""));
+                rest = tail.get(length..).unwrap_or("");
+                continue;
+            }
+            out.push_str(before);
+            out.push(']');
+            rest = tail;
+        } else {
+            out.push_str(before);
+            out.push(']');
+            rest = tail;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The Discord epoch: snowflakes count milliseconds from 2015-01-01.
@@ -442,10 +602,11 @@ impl ChatOutputPort for SerenityChatOutput {
             return Ok(());
         }
         // Plain channel sends are always public - the ephemeral hint has no
-        // meaning here and is ignored.
+        // meaning here and is ignored. Normalized mention tags
+        // (`[Name]<@id>`) invert back to bare mentions on the way out.
         let mut create = CreateMessage::new();
         if !message.content.is_empty() {
-            create = create.content(message.content);
+            create = create.content(denormalize_mention_tags(&message.content));
         }
         if !message.embeds.is_empty() {
             create = create.embeds(message.embeds.iter().map(discord_embed).collect());
@@ -491,7 +652,7 @@ impl ChatStreamPort for SerenityChatStream {
             tracing::warn!(channel = %self.channel_id, "dropping empty streaming placeholder");
             return Err(OutboundError::Send("empty streaming placeholder".to_owned()));
         }
-        let mut create = CreateMessage::new().content(message.content);
+        let mut create = CreateMessage::new().content(denormalize_mention_tags(&message.content));
         if let Some(reply_to) = message.reply_to {
             create = create.reference_message(reply_reference(self.channel_id, reply_to));
         }
@@ -508,7 +669,7 @@ impl ChatStreamPort for SerenityChatStream {
             .edit_message(
                 self.channel_id,
                 serenity::all::MessageId::new(message.get()),
-                &EditMessage::new().content(content),
+                &EditMessage::new().content(denormalize_mention_tags(&content)),
                 Vec::new(),
             )
             .await
@@ -548,9 +709,14 @@ impl ChatOutputPort for InteractionFollowupOutput {
         }
         // `reply_to` is ignored: a transactional reply is already anchored to
         // its interaction - a channel message reference adds nothing.
+        // Normalized mention tags invert back to bare mentions on the way
+        // out, like every other Discord send.
         let mut body = serde_json::Map::new();
         if !message.content.is_empty() {
-            body.insert("content".to_owned(), serde_json::json!(message.content));
+            body.insert(
+                "content".to_owned(),
+                serde_json::json!(denormalize_mention_tags(&message.content)),
+            );
         }
         if !message.embeds.is_empty() {
             let embeds: Vec<serde_json::Value> = message
@@ -558,8 +724,8 @@ impl ChatOutputPort for InteractionFollowupOutput {
                 .iter()
                 .map(|embed| {
                     serde_json::json!({
-                        "title": embed.title,
-                        "description": embed.description,
+                        "title": denormalize_mention_tags(&embed.title),
+                        "description": denormalize_mention_tags(&embed.description),
                     })
                 })
                 .collect();
@@ -580,8 +746,8 @@ impl ChatOutputPort for InteractionFollowupOutput {
 
 fn discord_embed(embed: &Embed) -> serenity::all::CreateEmbed {
     serenity::all::CreateEmbed::new()
-        .title(embed.title.clone())
-        .description(embed.description.clone())
+        .title(denormalize_mention_tags(&embed.title))
+        .description(denormalize_mention_tags(&embed.description))
 }
 
 /// Reply reference for a message in the destination channel. `fail_if_not_exists`
@@ -596,6 +762,73 @@ fn reply_reference(channel_id: SerenityChannelId, reply_to: MessageId) -> Messag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolver(kind: MentionKind, id: u64) -> Option<String> {
+        match (kind, id) {
+            (MentionKind::User, 123) => Some("Alice".to_owned()),
+            (MentionKind::User, 77) => Some("[weird]name".to_owned()),
+            (MentionKind::Role, 7) => Some("Mods".to_owned()),
+            (MentionKind::Channel, 5) => Some("general".to_owned()),
+            _ => None,
+        }
+    }
+
+    /// User (both wire shapes), role and channel tags get the name prefix;
+    /// custom emoji already carries its name and stays raw.
+    #[test]
+    fn mention_tags_are_normalized_with_names() {
+        let out =
+            normalize_mention_tags("hey <@123> and <@!123>: <@&7> in <#5> (<:face:9>)", &resolver);
+        assert_eq!(
+            out,
+            "hey [Alice]<@123> and [Alice]<@!123>: [Mods]<@&7> in [general]<#5> (<:face:9>)"
+        );
+    }
+
+    #[test]
+    fn unresolvable_and_non_tag_input_stays_raw() {
+        assert_eq!(normalize_mention_tags("hi <@55>", &resolver), "hi <@55>");
+        assert_eq!(
+            normalize_mention_tags("<@abc> <@> <:face:9> <https://x>", &resolver),
+            "<@abc> <@> <:face:9> <https://x>"
+        );
+        assert_eq!(normalize_mention_tags("unclosed <@123", &resolver), "unclosed <@123");
+        assert_eq!(normalize_mention_tags("no tags at all", &resolver), "no tags at all");
+    }
+
+    /// Brackets in resolved names would break the outbound inverse scan -
+    /// they are stripped before the name goes into the prompt.
+    #[test]
+    fn resolved_names_are_sanitized_against_brackets() {
+        assert_eq!(normalize_mention_tags("<@77>", &resolver), "[weirdname]<@77>");
+    }
+
+    #[test]
+    fn mention_tag_parsing_recognizes_the_wire_shapes() {
+        assert_eq!(parse_mention_tag("<@123> x"), Some((MentionKind::User, 123, 6)));
+        assert_eq!(parse_mention_tag("<@!123>"), Some((MentionKind::User, 123, 7)));
+        assert_eq!(parse_mention_tag("<@&7>"), Some((MentionKind::Role, 7, 5)));
+        assert_eq!(parse_mention_tag("<#5>"), Some((MentionKind::Channel, 5, 4)));
+        assert_eq!(parse_mention_tag("<:face:9>"), None);
+        assert_eq!(parse_mention_tag("<@>"), None);
+        assert_eq!(parse_mention_tag("<@1x>"), None);
+    }
+
+    /// The outbound inverse strips the name prefix only when it is
+    /// bracket-adjacent to a mention tag and free of nested brackets;
+    /// everything else passes through byte-identical.
+    #[test]
+    fn denormalize_inverts_the_normalized_shape() {
+        assert_eq!(denormalize_mention_tags("hey [Alice]<@123>!"), "hey <@123>!");
+        assert_eq!(denormalize_mention_tags("[Mods]<@&7> [general]<#5>"), "<@&7> <#5>");
+        // Literal brackets and non-tag shapes pass through.
+        assert_eq!(
+            denormalize_mention_tags("[b] <@123> [unclosed<@123>"),
+            "[b] <@123> [unclosed<@123>"
+        );
+        assert_eq!(denormalize_mention_tags("[a[b]]<@123>"), "[a[b]]<@123>");
+        assert_eq!(denormalize_mention_tags("plain text"), "plain text");
+    }
 
     /// The snowflake's embedded birth time drives the age: a snowflake born
     /// now is moments old; the zero id (born 2015) is over a decade old.
