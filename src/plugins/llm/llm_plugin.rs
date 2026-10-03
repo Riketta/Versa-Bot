@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::kernel::{
     models::{EventKind, EventPayload, GuildId, Origin, PluginError, RequestContext},
@@ -27,6 +28,13 @@ use super::model::{ChannelConfig, NAMESPACE, channel_config_key};
 /// deliberately shorter than provider timeouts: the fetch is interactive
 /// (the invoking admin waits for the answer).
 const PROMPT_FETCH_TIMEOUT_SECS: u64 = 30;
+
+/// Cap on accepted-but-unfinished engine runs per channel - the flood
+/// valve. Generous by design: regular multi-guild traffic never approaches
+/// it; a channel that floods past the cap sheds excess messages (warn +
+/// skip, not captured) instead of accumulating tasks and memory without
+/// bound.
+const MAX_PENDING_RUNS_PER_CHANNEL: usize = 64;
 
 /// Identifies one channel's processing lock: platform, guild, channel.
 type ChannelKey = (String, u64, u64);
@@ -57,6 +65,36 @@ impl ChannelLocks {
     }
 }
 
+/// Per-channel admission permits, keyed like [`ChannelLocks`]: at most
+/// [`MAX_PENDING_RUNS_PER_CHANNEL`] accepted-but-unfinished engine runs per
+/// channel. Handed out non-blockingly (`try_acquire` - the pipeline never
+/// waits) and held until the spawned run finishes, so the shed decision
+/// happens at intake while the slot frees itself on completion.
+#[derive(Default)]
+struct ChannelPermits {
+    permits: Mutex<HashMap<ChannelKey, Arc<Semaphore>>>,
+}
+
+impl ChannelPermits {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn permit_for(&self, origin: &Origin) -> Arc<Semaphore> {
+        let key: ChannelKey = (
+            origin.platform.as_str().to_owned(),
+            origin.guild_id.map_or(0, GuildId::get),
+            origin.channel_id.get(),
+        );
+        Arc::clone(
+            self.permits
+                .lock()
+                .entry(key)
+                .or_insert_with(|| Arc::new(Semaphore::new(MAX_PENDING_RUNS_PER_CHANNEL))),
+        )
+    }
+}
+
 /// LLM chat plugin: lifecycle + admin commands (`PluginPort`) and the
 /// conversation intake (`MiddlewarePluginPort`).
 ///
@@ -69,6 +107,13 @@ pub struct LlmPlugin {
     registry: Arc<dyn CommandRegistryPort>,
     engine: Arc<ChatEngine>,
     channel_locks: Arc<ChannelLocks>,
+    /// Admission permits bounding outstanding engine runs per channel (the
+    /// flood valve - see [`MAX_PENDING_RUNS_PER_CHANNEL`]).
+    channel_permits: Arc<ChannelPermits>,
+    /// Cancelled in `stop`: afterwards no new engine runs are admitted (the
+    /// kernel stops plugins during shutdown). In-flight runs finish
+    /// naturally - they are bounded by the permits.
+    shutdown: CancellationToken,
     /// Keyless client for prompt-file downloads - Discord CDN only (host
     /// pinned in the handler), never a provider endpoint.
     prompt_fetch: reqwest::Client,
@@ -86,7 +131,14 @@ impl LlmPlugin {
             .timeout(Duration::from_secs(PROMPT_FETCH_TIMEOUT_SECS))
             .build()
             .expect("static prompt-fetch client config expected to build");
-        Self { registry, engine, channel_locks: ChannelLocks::new(), prompt_fetch }
+        Self {
+            registry,
+            engine,
+            channel_locks: ChannelLocks::new(),
+            channel_permits: ChannelPermits::new(),
+            shutdown: CancellationToken::new(),
+            prompt_fetch,
+        }
     }
 
     fn channel_lock(&self, origin: &Origin) -> Arc<AsyncMutex<()>> {
@@ -275,6 +327,14 @@ impl PluginPort for LlmPlugin {
         self.register_prompt_commands();
         Ok(())
     }
+
+    fn stop(&self) -> Result<(), PluginError> {
+        // Shutdown gate: the kernel stops plugins while the gateway is
+        // already tearing down - admit no new engine runs from here on.
+        // Runs already admitted finish naturally (bounded by the permits).
+        self.shutdown.cancel();
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -296,6 +356,23 @@ impl MiddlewarePluginPort for LlmPlugin {
             return Next::Continue;
         };
 
+        // Shutdown gate first: a stopped plugin admits nothing.
+        if self.shutdown.is_cancelled() {
+            return Next::Continue;
+        }
+        // Admission control before any I/O: at most
+        // MAX_PENDING_RUNS_PER_CHANNEL accepted-but-unfinished runs per
+        // channel. `try_acquire` never blocks the pipeline - a channel
+        // flooding past the cap sheds its excess messages (not captured,
+        // warned) instead of accumulating unbounded work.
+        let Ok(permit) = self.channel_permits.permit_for(&origin).try_acquire_owned() else {
+            tracing::warn!(
+                channel = origin.channel_id.get(),
+                "engine run backlog full - shedding message"
+            );
+            return Next::Continue;
+        };
+
         let raw = match storage.get(NAMESPACE, &channel_config_key(origin.channel_id.get())).await {
             Ok(Some(raw)) => raw,
             Ok(None) => return Next::Continue, // channel not assigned
@@ -310,11 +387,17 @@ impl MiddlewarePluginPort for LlmPlugin {
         };
 
         // Off the pipeline task; capture/trigger decisions happen inside,
-        // under the channel lock, on fresh records.
+        // under the channel lock, on fresh records. The permit rides along
+        // and frees when the run finishes.
         let lock = self.channel_lock(&origin);
         let engine = Arc::clone(&self.engine);
         let services = services.clone();
+        let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
+            let _permit = permit;
+            if shutdown.is_cancelled() {
+                return;
+            }
             let _guard = lock.lock().await;
             engine.handle_message(&origin, &payload, &config, &services).await;
         });
@@ -868,6 +951,91 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(fixture.output.messages().is_empty());
+    }
+
+    /// The flood valve: a channel at its cap sheds further messages (no
+    /// capture, no engine run); other channels keep their own budget.
+    #[test]
+    fn channel_permits_bound_outstanding_runs_per_channel() {
+        let permits = ChannelPermits::new();
+        let origin = Origin {
+            platform: Platform::Discord,
+            guild_id: Some(GuildId(1)),
+            channel_id: ChannelIdModel(2),
+            user_id: UserId(3),
+            message_id: None,
+            reply_token: None,
+        };
+        let gate = permits.permit_for(&origin);
+        // Hold the permits - a dropped permit releases its slot instantly.
+        let held: Vec<_> =
+            (0..MAX_PENDING_RUNS_PER_CHANNEL).filter_map(|_| gate.try_acquire().ok()).collect();
+        assert_eq!(held.len(), MAX_PENDING_RUNS_PER_CHANNEL);
+        assert!(gate.try_acquire().is_err(), "cap expected");
+
+        let other = Origin { channel_id: ChannelIdModel(9), ..origin };
+        assert!(permits.permit_for(&other).try_acquire().is_ok());
+    }
+
+    /// A full backlog sheds the message at intake: not captured, no engine
+    /// run, pipeline unaffected.
+    #[tokio::test]
+    async fn full_backlog_sheds_the_message() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&fixture.storage);
+        let origin = Origin {
+            platform: Platform::Discord,
+            guild_id: Some(GuildId(1)),
+            channel_id: ChannelIdModel(2),
+            user_id: UserId(3),
+            message_id: Some(MessageId(4)),
+            reply_token: None,
+        };
+        let gate = plugin.channel_permits.permit_for(&origin);
+        // Hold the permits so the backlog is genuinely full when `pre` runs.
+        let held: Vec<_> =
+            (0..MAX_PENDING_RUNS_PER_CHANNEL).filter_map(|_| gate.try_acquire().ok()).collect();
+        assert_eq!(held.len(), MAX_PENDING_RUNS_PER_CHANNEL);
+
+        let mut event = message_event(2, true);
+        let next = plugin.pre(&mut event, &fixture.services).await;
+
+        assert!(matches!(next, Next::Continue));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(stored_records(&fixture).await.is_empty(), "shed messages must not be captured");
+    }
+
+    /// `stop` cancels admission: a stopped plugin spawns no engine runs -
+    /// the shutdown gate.
+    #[tokio::test]
+    async fn stopped_plugin_admits_no_engine_runs() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&fixture.storage);
+        plugin.stop().expect("stop expected to succeed");
+
+        let mut event = message_event(2, true);
+        let next = plugin.pre(&mut event, &fixture.services).await;
+
+        assert!(matches!(next, Next::Continue));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            stored_records(&fixture).await.is_empty(),
+            "a stopped plugin must not run the engine"
+        );
+    }
+
+    async fn stored_records(fixture: &Fixture) -> Vec<ConversationRecord> {
+        fixture
+            .storage
+            .guild_scoped(Platform::Discord, GuildId(1))
+            .list_after(&records_namespace(2), 0, 100)
+            .await
+            .expect("records readable")
+            .into_iter()
+            .filter_map(|stored| serde_json::from_value(stored.payload).ok())
+            .collect()
     }
 
     #[tokio::test]

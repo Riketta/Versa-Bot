@@ -26,6 +26,10 @@ use super::model::{
 use super::providers::{LlmSettings, ModelSettings};
 use super::vision::DEFAULT_IMAGE_PROMPT;
 
+/// Discord's hard cap for one text message - the reply splitter must never
+/// produce chunks beyond it (the platform rejects them outright).
+const DISCORD_MESSAGE_LIMIT: usize = 2000;
+
 /// Recognized `/llm_set` keys, in display order. Doubles as the Discord
 /// choices dropdown for the `key` argument.
 pub(super) const SET_KEYS: &[&str] = &[
@@ -350,6 +354,12 @@ fn apply_optional_field(
             }
             match value.parse::<usize>() {
                 Ok(0) => Some(Err(format!("`{key}` must be at least 1."))),
+                // Discord rejects longer text messages outright - a bigger
+                // limit would only turn split replies into undelivered
+                // chunks.
+                Ok(n) if n > DISCORD_MESSAGE_LIMIT => Some(Err(format!(
+                    "`{key}` cannot exceed {DISCORD_MESSAGE_LIMIT} (Discord's message limit)."
+                ))),
                 Ok(characters) => {
                     config.max_length = Some(characters);
                     Some(Ok(format!("`{key}` set to {characters} characters.")))
@@ -1328,6 +1338,18 @@ mod tests {
         apply_set(&mut config, "context_budget", "0").unwrap_err();
         apply_set(&mut config, "context_budget", "4096").expect("budget expected");
         assert_eq!(config.context_budget_tokens, Some(4096));
+    }
+
+    #[test]
+    fn max_length_cannot_exceed_the_platform_limit() {
+        let mut config = ChannelConfig::assigned("m".to_owned());
+
+        apply_set(&mut config, "max_length", "2000").expect("limit value expected");
+        assert_eq!(config.max_length, Some(2000));
+        // Beyond Discord's cap the platform rejects the chunks outright -
+        // rejected here so replies never turn into undelivered garbage.
+        apply_set(&mut config, "max_length", "2001").unwrap_err();
+        assert_eq!(config.max_length, Some(2000));
     }
 
     #[test]

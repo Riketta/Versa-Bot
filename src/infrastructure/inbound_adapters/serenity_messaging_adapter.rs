@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serenity::all::{
     ChannelId as SerenityChannelId, CommandDataOption, CommandDataOptionValue, CommandDataResolved,
     Context, CreateMessage, EditMessage, EventHandler, GuildId as SerenityGuildId, Http,
-    Interaction, Member, Message, MessageReference, MessageReferenceKind, Ready,
+    Interaction, Member, Message, MessageReference, MessageReferenceKind, Permissions, Ready,
     RoleId as SerenityRoleId, User, UserId as SerenityUserId,
 };
 use serenity::async_trait;
@@ -57,11 +57,10 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
             .as_ref()
             .map(|member| member.roles.iter().map(|role| role.get().to_string()).collect())
             .unwrap_or_default();
-        let author_permissions = message
-            .member
-            .as_ref()
-            .and_then(|member| member.permissions)
-            .map_or(0, |permissions| permissions.bits());
+        // Message-path permission resolution: payload bits when the platform
+        // included them, else the gateway cache - so the auth plugin's
+        // Discord-admin clamp holds everywhere.
+        let author_permissions = resolve_author_permissions(&ctx, &message);
         // Same best-effort display naming: channel nick when present, else
         // the platform username, frozen at capture time for history renders.
         let author_name = message
@@ -381,6 +380,60 @@ fn normalize_mention_tags(
     }
     out.push_str(rest);
     out
+}
+
+/// Message-path permission resolution: the payload's permission bits when
+/// the platform included them (interaction-shaped payloads do), otherwise
+/// the gateway cache - owner => everything, else @everyone + member roles
+/// union. 0 = unknown (no bits, no cached guild): authorization treats
+/// unknown as "no admin clamp", never as a hard failure.
+fn resolve_author_permissions(ctx: &Context, message: &Message) -> u64 {
+    if let Some(permissions) = message.member.as_ref().and_then(|member| member.permissions) {
+        return permissions.bits();
+    }
+    let Some(guild_id) = message.guild_id else { return 0 };
+    let Some(guild) = ctx.cache.guild(guild_id) else { return 0 };
+    let everyone =
+        guild.roles.get(&SerenityRoleId::new(guild.id.get())).map(|role| role.permissions.bits());
+    let member_roles: Vec<u64> = guild
+        .members
+        .get(&message.author.id)
+        .map(|member| {
+            member
+                .roles
+                .iter()
+                .filter_map(|role_id| guild.roles.get(role_id))
+                .map(|role| role.permissions.bits())
+                .collect()
+        })
+        .unwrap_or_default();
+    unioned_member_permissions(
+        guild.owner_id.get(),
+        message.author.id.get(),
+        everyone,
+        &member_roles,
+    )
+}
+
+/// Effective Discord permissions of a guild member from the gateway cache:
+/// the owner gets everything, anyone else the union of the @everyone role
+/// and their member roles (Discord's own algorithm minus channel
+/// overwrites - sufficient for the admin-bit check the auth plugin makes).
+/// Pure so the owner/union rules stay testable without a live cache.
+fn unioned_member_permissions(
+    owner_id: u64,
+    user_id: u64,
+    everyone: Option<u64>,
+    member_role_bits: &[u64],
+) -> u64 {
+    if owner_id == user_id {
+        return Permissions::all().bits();
+    }
+    let mut permissions = Permissions::from_bits_truncate(everyone.unwrap_or(0));
+    for bits in member_role_bits {
+        permissions |= Permissions::from_bits_truncate(*bits);
+    }
+    permissions.bits()
 }
 
 /// The outbound inverse: `[Name]<@id>` -> `<@id>`, so tags the model
@@ -848,6 +901,31 @@ mod tests {
         assert_eq!(denormalize_mention_tags("[text](url)<@123>"), "[text](url)<@123>");
         assert_eq!(denormalize_mention_tags("[Name (x)]<@123>"), "<@123>");
         assert_eq!(denormalize_mention_tags("[l](u) [Name]<@1>"), "[l](u) <@1>");
+    }
+
+    /// Owner => everything; anyone else => @everyone + member roles union.
+    /// This is what makes the auth plugin's Discord-admin clamp hold on the
+    /// message path, where payloads usually carry no permission bits.
+    #[test]
+    fn unioned_permissions_owner_gets_everything() {
+        let all = unioned_member_permissions(1, 1, None, &[]);
+        assert_eq!(all, Permissions::all().bits());
+    }
+
+    #[test]
+    fn unioned_permissions_union_of_everyone_and_member_roles() {
+        let bits = unioned_member_permissions(1, 2, Some(0x400), &[0x800, 0x10]);
+        assert_eq!(bits, 0x400 | 0x800 | 0x10);
+
+        // Bits outside Discord's valid mask are truncated, not propagated.
+        let bits = unioned_member_permissions(1, 2, Some(u64::MAX), &[]);
+        assert_eq!(bits, Permissions::all().bits());
+    }
+
+    #[test]
+    fn unioned_permissions_unknown_member_is_zero() {
+        assert_eq!(unioned_member_permissions(1, 2, None, &[]), 0);
+        assert_eq!(unioned_member_permissions(1, 2, Some(0x400), &[]), 0x400);
     }
 
     /// The snowflake's embedded birth time drives the age: a snowflake born
