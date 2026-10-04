@@ -23,13 +23,17 @@ Everything below was verified live (October 2026, game version 16.19).
 
 Gotchas, all live-verified:
 
-- **`platform_id` is digitless** (`KR`, `EUW`, `EUN`, `NA`, `JP`, `BR`,
-  `TR`, `TW`, `VN`, `SEA`). Riot's digitless platform codes, not
-  routing codes - `KR1` does **not** 422, it **500s**. An unknown value
-  fails inside the handler with `{"msg":"Internal Server Error"}`, which
-  looks like an outage but is a bad key. Same trap for `lane`: valid
-  values are `All`, `Top`, `Jungle`, `Middle`, `Bot`, `Supporter`
-  (case-insensitive); `MID`, `BOTTOM`, `UTILITY`, `SUP` all 500.
+- **`platform_id` is Riot's platform id**, digit-suffixed for every
+  region except Korea: `KR`, `EUW1`, `EUN1`, `NA1`, `JP1`, `BR1`,
+  `TR1`, `TW2`, `VN2`, `SG2` (the `*2` codes are the post-Garena
+  servers; `SEA` maps to `SG2`). Digitless guesses like `EUW`, `NA` or
+  `KR1` do **not** 422 - they fail inside the handler with
+  `{"msg":"Internal Server Error"}`, which looks like an outage but is
+  a bad key. Each of these codes was probed live (October 2026):
+  exactly the set above answers 200, every digitless / `KR1` variant
+  answers 500. Same trap for `lane`: valid values are `All`, `Top`,
+  `Jungle`, `Middle`, `Bot`, `Supporter` (case-insensitive); `MID`,
+  `BOTTOM`, `UTILITY`, `SUP` all 500.
 - **`lane=All` is all you need**: every entry already carries the
   player's `most_role` and `most_champion` list, so role distribution
   and champion tables come from one sweep - never query per lane.
@@ -64,10 +68,13 @@ as leaderboard data and degrade unknown ids to `Champion #id`.
 ## Quick curl check
 
 ```bash
-curl -s "https://b2c-api-cdn.deeplol.gg/summoner/summoner_rank?platform_id=KR&lane=All&page=1" | head -c 400
+curl -s "https://b2c-api-cdn.deeplol.gg/summoner/summoner_rank?platform_id=EUW1&lane=All&page=1" | head -c 400
 ```
 
-If this 500s, re-check the query values against the lists above before
-assuming an outage - the 500-on-bad-enum quirk makes typos look like
-server fires. `/common/deeplol-status` tells a real outage from a bad
-request in one call.
+Check a digit-suffixed code here, not just `KR` - `KR` is the one
+region whose platform id is digitless, so a "works for KR" probe can
+hide a wrong digitless convention for everything else. If this 500s,
+re-check the query values against the lists above before assuming an
+outage - the 500-on-bad-enum quirk makes typos look like server fires.
+`/common/deeplol-status` tells a real outage from a bad request in one
+call.

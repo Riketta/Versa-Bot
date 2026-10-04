@@ -459,8 +459,8 @@ Parsed 3000/3000 players from 3 regions · data age 2h 5m old
 ````
 
 Maintainer notes - how to explore and re-verify the data source (the
-digitless-region-code trap, the lane enum, pagination, the champion
-info endpoint) - live in
+platform-id gotcha, the lane enum, pagination, the champion info
+endpoint) - live in
 [`src/plugins/lol_leaderboard/README.md`](src/plugins/lol_leaderboard/README.md).
 
 ### LLM chat bot (`llm` plugin)

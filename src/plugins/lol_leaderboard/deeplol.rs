@@ -88,21 +88,24 @@ fn body_excerpt(body: &str) -> String {
     format!("{excerpt}\u{2026} (+{} bytes not logged)", body.len() - excerpt.len())
 }
 
-/// Neutral region key -> provider platform code. The provider uses Riot's
-/// digitless codes (`KR`, not `KR1`) - the single most important gotcha of
-/// this API.
+/// Neutral region key -> provider platform code. The provider expects
+/// Riot's platform ids: digit-suffixed (`EUW1`, `NA1`, ... `TW2`, `VN2`,
+/// `SG2` - the post-Garena servers too), with `KR` the lone digitless id
+/// in Riot's own scheme (`KR1` is an unknown key). A digitless guess such
+/// as `EUW` is not rejected with 422 - it fails inside the handler with a
+/// misleading `HTTP 500`, so a wrong mapping looks like an outage.
 pub fn provider_region(region: &str) -> Option<&'static str> {
     match region {
         "kr" => Some("KR"),
-        "euw" => Some("EUW"),
-        "eun" => Some("EUN"),
-        "na" => Some("NA"),
-        "jp" => Some("JP"),
-        "br" => Some("BR"),
-        "tr" => Some("TR"),
-        "tw" => Some("TW"),
-        "vn" => Some("VN"),
-        "sea" => Some("SEA"),
+        "euw" => Some("EUW1"),
+        "eun" => Some("EUN1"),
+        "na" => Some("NA1"),
+        "jp" => Some("JP1"),
+        "br" => Some("BR1"),
+        "tr" => Some("TR1"),
+        "tw" => Some("TW2"),
+        "vn" => Some("VN2"),
+        "sea" => Some("SG2"),
         _ => None,
     }
 }
@@ -299,10 +302,12 @@ mod tests {
     }
 
     #[test]
-    fn region_parse_maps_known_keys_to_digitless_codes() {
+    fn region_parse_maps_known_keys_to_riot_platform_ids() {
         assert_eq!(provider_region("kr"), Some("KR"));
-        assert_eq!(provider_region("euw"), Some("EUW"));
-        assert_eq!(provider_region("sea"), Some("SEA"));
+        assert_eq!(provider_region("euw"), Some("EUW1"));
+        assert_eq!(provider_region("na"), Some("NA1"));
+        assert_eq!(provider_region("tw"), Some("TW2"));
+        assert_eq!(provider_region("sea"), Some("SG2"));
         assert_eq!(provider_region("kr1"), None);
         assert_eq!(provider_region("mars"), None);
     }
