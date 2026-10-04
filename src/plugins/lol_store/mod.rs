@@ -1020,6 +1020,53 @@ mod tests {
         assert!(reply.contains("New sales"), "reply: {reply}");
     }
 
+    /// Once an update has been announced, the dump replays that
+    /// announcement - the current-store fallback must not shadow it.
+    #[tokio::test]
+    async fn dump_prefers_the_last_announcement_over_the_current_store() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let f = command_fixture_with(true, Arc::clone(&storage)).await;
+        let lcu = Arc::new(OnlineLcu::new());
+        *lcu.sales.lock() = vec![OnlineLcu::skin_sale(1031)];
+        let engine = Arc::new(StoreEngine::new(
+            Arc::clone(&lcu) as Arc<dyn crate::plugins::lol_store::lcu::LcuPort>,
+            Arc::clone(&storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
+            RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
+            RecordingBus::default(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: DEFAULT_USER_CAP,
+                watch_guild_cap: DEFAULT_GUILD_CAP,
+            },
+        ));
+        engine.tick().await; // silent baseline
+
+        // A second, distinct sale (the helper hardcodes id 1) produces a
+        // real delta and a stored announcement.
+        lcu.sales.lock().push(lcu::Sale {
+            id: 2,
+            item: lcu::ItemRef {
+                inventory_type: Some("CHAMPION_SKIN".to_owned()),
+                item_id: Some(1032),
+            },
+            sale: lcu::SaleInfo {
+                start_date: None,
+                end_date: None,
+                prices: vec![lcu::Price { cost: Some(607), currency: Some("RP".to_owned()) }],
+            },
+        });
+        engine.tick().await;
+
+        DumpHandler { engine }
+            .invoke(&f.event, &Default::default(), &f.services)
+            .await
+            .expect("invoke");
+        let reply = f.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("LoL Store - latest update"), "reply: {reply}");
+        assert!(!reply.contains("LoL Store - current state"), "reply: {reply}");
+    }
+
     #[tokio::test]
     async fn client_status_renders_the_engine_snapshot() {
         let f = command_fixture(true).await;
