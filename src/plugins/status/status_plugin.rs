@@ -95,8 +95,14 @@ impl StatusRotatorPlugin {
         }
         // Settings-then-job lock order - the same order `start` uses, so a
         // config change racing plugin start can neither double-schedule nor
-        // deadlock. The check-and-install runs under one held lock.
+        // deadlock. The check-and-install runs under one held lock, and the
+        // stopped flag is RE-CHECKED under it: a `stop` landing between the
+        // cheap check above and this lock must win - otherwise update would
+        // resurrect a rotation the stop just cancelled.
         let mut job = self.job.lock();
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
         if let Some(handle) = job.take() {
             handle.cancel();
         }

@@ -206,7 +206,7 @@ mod tests {
         stale.unsubscribe();
 
         let live_counter = Arc::new(AtomicUsize::new(0));
-        let live = bus.subscribe(Arc::new(CountingHandler(Arc::clone(&live_counter))));
+        let _live = bus.subscribe(Arc::new(CountingHandler(Arc::clone(&live_counter))));
 
         // The stale handle's position points at the live subscription's
         // slot; the second call must be a no-op, not a cancellation.
@@ -220,7 +220,6 @@ mod tests {
             1,
             "the stale handle must not cancel the newer subscription"
         );
-        let _ = live; // keeps the handle alive to the end of the test
     }
 
     #[test]

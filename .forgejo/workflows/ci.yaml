@@ -109,11 +109,17 @@ jobs:
             # and package jobs). Resolve the ref through the commits API and
             # refuse to publish a mislabeled image; if the API cannot
             # resolve it at all, say so loudly and proceed as before.
+            # grep -o reports matches in order of appearance, and the
+            # top-level "sha" field precedes the nested tree/parents sha
+            # fields in the commit JSON - the first match is the commit the
+            # ref points at. A greedy sed would instead catch the LAST sha
+            # (a parent commit) and refuse every fallback build.
             resolved=$(curl --fail-with-body --silent --show-error \
               --header "Authorization: token $GITHUB_TOKEN" \
               "$API_REPO/commits?sha=$FORGEJO_REF_NAME&limit=1" \
-              | sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' \
-              | head -1)
+              | grep -o -E '"sha"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]{40}"' \
+              | head -1 \
+              | cut -d'"' -f4)
             if [ -n "$resolved" ] && [ "$resolved" != "$GITHUB_SHA" ]; then
               echo "ref $FORGEJO_REF_NAME is at $resolved, but the image would be tagged \
   sha-$(echo "$GITHUB_SHA" | cut -c1-8) - refusing to publish a mislabeled image" >&2
