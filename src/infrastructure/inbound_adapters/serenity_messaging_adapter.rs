@@ -439,8 +439,10 @@ fn unioned_member_permissions(
 /// The outbound inverse: `[Name]<@id>` -> `<@id>`, so tags the model
 /// assembles from normalized history arrive as clean Discord mentions
 /// (rendered output shows the resolved name anyway). The name segment must
-/// be bracket-adjacent to the tag and free of nested brackets - text that
-/// never used the normalized shape passes through byte-identical.
+/// be bracket-adjacent to the tag and free of nested brackets; literal user
+/// text matching that same shape (e.g. `[at this]<@123>`) is inherently
+/// ambiguous and is rewritten too - only non-adjacent or nested brackets
+/// pass through byte-identical.
 fn denormalize_mention_tags(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
     let mut rest = content;
@@ -540,7 +542,16 @@ fn flatten_options(
                         );
                     }
                 }
-                _ => {}
+                other => {
+                    // The enum is non_exhaustive upstream: an unknown option
+                    // shape would silently vanish from `args` - make the
+                    // drift visible instead.
+                    tracing::warn!(
+                        argument = %option.name,
+                        value = ?other,
+                        "unknown option value shape - argument dropped"
+                    );
+                }
             }
         }
     }

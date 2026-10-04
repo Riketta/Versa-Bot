@@ -75,21 +75,27 @@ impl StatusRotatorPlugin {
             interval_secs = settings.interval.as_secs(),
             "applying new status rotation settings"
         );
-        if let Some(handle) = self.job.lock().take() {
+        // Settings-then-job lock order - the same order `start` uses, so a
+        // config change racing plugin start can neither double-schedule nor
+        // deadlock. The check-and-install runs under one held lock.
+        let mut job = self.job.lock();
+        if let Some(handle) = job.take() {
             handle.cancel();
         }
-        self.schedule_rotation(settings);
+        *job = self.build_rotation(&settings);
     }
 
-    fn schedule_rotation(&self, settings: StatusSettings) {
+    /// Schedules the rotation job for the given settings; `None` = disabled
+    /// (no statuses configured). Caller installs the handle under the job
+    /// lock.
+    fn build_rotation(&self, settings: &StatusSettings) -> Option<JobHandle> {
         if settings.statuses.is_empty() {
             tracing::info!("status rotator has no statuses - disabled");
-            return;
+            return None;
         }
 
-        let job = Arc::new(StatusJob::new(Arc::clone(&self.presence), settings.statuses));
-        let handle = self.scheduler.schedule(self.name(), settings.interval, job);
-        *self.job.lock() = Some(handle);
+        let job = Arc::new(StatusJob::new(Arc::clone(&self.presence), settings.statuses.clone()));
+        Some(self.scheduler.schedule(self.name(), settings.interval, job))
     }
 }
 
@@ -101,9 +107,12 @@ impl PluginPort for StatusRotatorPlugin {
     fn start(&self) -> Result<(), PluginError> {
         // An `update` landing between construction and start has already
         // scheduled the rotation - starting must not schedule a second job.
-        if self.job.lock().is_none() {
-            let settings = self.settings.lock().clone();
-            self.schedule_rotation(settings);
+        // Settings-then-job lock order (same as `update`) makes the
+        // check-and-install atomic against config changes.
+        let settings = self.settings.lock().clone();
+        let mut job = self.job.lock();
+        if job.is_none() {
+            *job = self.build_rotation(&settings);
         }
         Ok(())
     }

@@ -87,10 +87,20 @@ impl EventBusPort for InMemoryEventBus {
         // The handle owns the shared bookkeeping and clears exactly its own
         // slot; a second unsubscribe overwrites `None` with `None`.
         EventBusSubscription::new(Arc::new(move || {
-            if let Some(slots) = inner.subscribers.write().get_mut(&type_id) {
+            let mut subscribers = inner.subscribers.write();
+            let mut remove_type = false;
+            if let Some(slots) = subscribers.get_mut(&type_id) {
                 if let Some(slot) = slots.get_mut(index) {
                     *slot = None;
                 }
+                // Compact when the last subscriber for this event type is
+                // gone - slot vectors would otherwise grow without bound
+                // under subscribe/unsubscribe cycling. Removal is safe: it
+                // happens only when no live index for the type remains.
+                remove_type = slots.iter().all(Option::is_none);
+            }
+            if remove_type {
+                subscribers.remove(&type_id);
             }
         }))
     }

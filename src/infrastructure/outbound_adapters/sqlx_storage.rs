@@ -59,7 +59,12 @@ pub struct SqlxStorage {
 
 impl SqlxStorage {
     /// Connects by URL scheme (`sqlite://...` or `postgres://...`), creates
-    /// the SQLite file if missing, and runs pending migrations.
+    /// the SQLite file if missing, and runs pending migrations. Any other
+    /// scheme is rejected up front (the URL is never echoed - it may carry
+    /// credentials) instead of surfacing as a confusing Postgres error.
+    ///
+    /// # Errors
+    /// On connect, migration, or an unrecognized URL scheme.
     pub async fn connect(url: &str) -> Result<Self, StorageError> {
         if url.starts_with("sqlite") {
             let in_memory = url.contains(":memory:");
@@ -80,7 +85,7 @@ impl SqlxStorage {
                 .await
                 .map_err(|err| StorageError::Database(err.to_string()))?;
             Ok(Self { db: Arc::new(Db::Sqlite(pool)) })
-        } else {
+        } else if url.starts_with("postgres") {
             let pool = PgPool::connect(url)
                 .await
                 .map_err(|err| StorageError::Database(err.to_string()))?;
@@ -89,6 +94,11 @@ impl SqlxStorage {
                 .await
                 .map_err(|err| StorageError::Database(err.to_string()))?;
             Ok(Self { db: Arc::new(Db::Postgres(pool)) })
+        } else {
+            Err(StorageError::Database(
+                "unsupported storage URL scheme - expected `sqlite://...` or `postgres://...`"
+                    .to_owned(),
+            ))
         }
     }
 }

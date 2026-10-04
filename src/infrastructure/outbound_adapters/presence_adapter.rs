@@ -24,8 +24,15 @@ impl GatewayContext {
     /// before `ready` (if any). Re-attaching (a new gateway session) keeps
     /// the original context.
     pub fn attach(&self, context: Context) {
-        if self.context.set(context).is_ok()
-            && let Some(presence) = self.pending.lock().take()
+        if self.context.set(context).is_err() {
+            // A re-`ready` hands a second context. serenity 0.12 keeps the
+            // same Arc'd shard/cache handles across sessions, so the
+            // original stays correct - log so a future serenity change (a
+            // materially distinct Context) becomes visible.
+            tracing::debug!("gateway re-attached - keeping the existing gateway context");
+            return;
+        }
+        if let Some(presence) = self.pending.lock().take()
             && let Some(context) = self.context.get()
         {
             Self::apply(context, &presence);
