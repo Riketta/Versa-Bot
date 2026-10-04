@@ -523,7 +523,8 @@ message without replying: one single-shot call carrying a dedicated
 reaction-only instruction (the model must choose a reaction, not write
 a reply), whose prose is discarded, only the marker's emojis apply,
 nothing is recorded - the two rolls
-each keep their own cooldown and never suppress one another.
+each keep their own cooldown and their own deck, and never suppress one
+another.
 
 **Failures.** A message that tags the bot or replies to it is guaranteed a
 visible response: if the generated answer is impossible (provider

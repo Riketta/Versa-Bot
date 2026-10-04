@@ -15,13 +15,18 @@ use parking_lot::Mutex;
 use rand::Rng;
 use rand::seq::SliceRandom;
 
-/// Identifies one random sequence - one per channel. The platform joins
-/// the key so id spaces of different platforms can never collide.
+/// Identifies one random sequence - one per channel and purpose. The
+/// platform joins the key so id spaces of different platforms can never
+/// collide; the purpose separates a channel's parallel rolls (reply vs
+/// silent react) so each draws from its own bag - they would interleave
+/// and rebuild one another's decks otherwise, since their percents differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RandomScope {
     pub platform: &'static str,
     pub guild_id: u64,
     pub channel_id: u64,
+    /// Roll purpose inside the channel (e.g. `"reply"`, `"react"`).
+    pub purpose: &'static str,
 }
 
 /// Driven port for plugin-internal randomness.
@@ -113,7 +118,7 @@ mod tests {
     use super::*;
 
     fn scope(platform: &'static str, channel_id: u64) -> RandomScope {
-        RandomScope { platform, guild_id: 1, channel_id }
+        RandomScope { platform, guild_id: 1, channel_id, purpose: "reply" }
     }
 
     #[test]
@@ -195,6 +200,31 @@ mod tests {
             }
         }
         assert_eq!(telegram_hits, 5);
+    }
+
+    /// Reply and silent-react rolls share a channel but never a bag: each
+    /// purpose's cycle holds exactly its own promised hits. A shared bag
+    /// would be rebuilt on every alternating draw (the percents differ),
+    /// collapsing the deck into plain-RNG behavior.
+    #[test]
+    fn deck_state_is_per_purpose() {
+        let deck = DeckRandom::new();
+
+        let mut reply_hits = 0;
+        for _ in 0..100 {
+            if deck.chance_percent(RandomScope { purpose: "reply", ..scope("discord", 1) }, 5.0) {
+                reply_hits += 1;
+            }
+        }
+        assert_eq!(reply_hits, 5);
+
+        let mut react_hits = 0;
+        for _ in 0..100 {
+            if deck.chance_percent(RandomScope { purpose: "react", ..scope("discord", 1) }, 10.0) {
+                react_hits += 1;
+            }
+        }
+        assert_eq!(react_hits, 10);
     }
 
     #[test]

@@ -894,11 +894,13 @@ impl ChatEngine {
 
     /// Random chime decisions for one captured, non-triggering message: two
     /// INDEPENDENT rolls (reply and silent react), each with its own
-    /// cooldown tracker behind the channel's `random_cooldown_secs`. They
-    /// coexist in parallel - a react neither consumes nor suppresses a
-    /// reply - and when both fire, one LLM call serves both (the reply
-    /// carries the reaction markers). Silent on every negative decision -
-    /// only the roll traces at debug explain why the bot stayed quiet.
+    /// cooldown tracker behind the channel's `random_cooldown_secs` and its
+    /// own RNG deck (purpose-separated scopes - shared decks would rebuild
+    /// on every alternating draw and defeat the balancing). They coexist in
+    /// parallel - a react neither consumes nor suppresses a reply - and when
+    /// both fire, one LLM call serves both (the reply carries the reaction
+    /// markers). Silent on every negative decision - only the roll traces
+    /// at debug explain why the bot stayed quiet.
     async fn maybe_chime(
         &self,
         origin: &Origin,
@@ -906,11 +908,13 @@ impl ChatEngine {
         services: &KernelServices,
     ) {
         let config = request.config;
-        let scope = RandomScope {
+        let reply_scope = RandomScope {
             platform: origin.platform.as_str(),
             guild_id: origin.guild_id.map_or(0, GuildId::get),
             channel_id: origin.channel_id.get(),
+            purpose: "reply",
         };
+        let react_scope = RandomScope { purpose: "react", ..reply_scope };
         let reply_allowed = config.random_chance_percent > 0.0
             && self.chime_allowed(origin, config.random_cooldown_secs);
         let react_allowed = config.react
@@ -919,7 +923,7 @@ impl ChatEngine {
 
         let mut reply_fire = false;
         if reply_allowed {
-            reply_fire = self.rng.chance_percent(scope, config.random_chance_percent);
+            reply_fire = self.rng.chance_percent(reply_scope, config.random_chance_percent);
             tracing::debug!(
                 channel = origin.channel_id.get(),
                 chance = config.random_chance_percent,
@@ -929,7 +933,7 @@ impl ChatEngine {
         }
         let mut react_fire = false;
         if react_allowed {
-            react_fire = self.rng.chance_percent(scope, config.random_react_chance_percent);
+            react_fire = self.rng.chance_percent(react_scope, config.random_react_chance_percent);
             tracing::debug!(
                 channel = origin.channel_id.get(),
                 chance = config.random_react_chance_percent,
