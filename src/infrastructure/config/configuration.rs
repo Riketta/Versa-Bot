@@ -2,8 +2,8 @@ use serde::Deserialize;
 
 use super::discord::DiscordConfig;
 use super::llm::LlmConfig;
-use super::lol::LolConfig;
 use super::lol_leaderboard::LolLeaderboardConfig;
+use super::lol_store::LolStoreConfig;
 use super::sentry::SentryConfig;
 use super::status::StatusConfig;
 use super::storage::StorageConfig;
@@ -25,10 +25,11 @@ pub struct Configuration {
     /// Optional bot status rotation (`[status]` section). Global concern:
     /// interval and status list are bot-wide, not per-guild.
     pub status: Option<StatusConfig>,
-    /// Optional League-client store watcher (`[lol]` section). Startup-only:
-    /// absent section - or an empty `lockfile_path` - keeps the watcher off.
+    /// Optional League-client store watcher (`[lol_store]` section).
+    /// Startup-only: absent section - or an empty `lockfile_path` - keeps
+    /// the watcher off.
     #[serde(default)]
-    pub lol: Option<LolConfig>,
+    pub lol_store: Option<LolStoreConfig>,
     /// Optional leaderboard command (`[lol_leaderboard]` section).
     /// Startup-only: an absent section - or an empty `regions` list - keeps
     /// the command in "not configured" mode.

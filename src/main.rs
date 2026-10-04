@@ -7,8 +7,8 @@ use config::{Config, Environment, File};
 use serenity::all::{ClientBuilder, GatewayIntents, Http, HttpBuilder};
 
 use versa_bot::infrastructure::{
-    Configuration, LlmConfig, LlmReasoningStyle, LlmSummaryPlacement, LolConfig,
-    LolLeaderboardConfig, PollingConfigWatcher,
+    Configuration, LlmConfig, LlmReasoningStyle, LlmSummaryPlacement, LolLeaderboardConfig,
+    LolStoreConfig, PollingConfigWatcher,
     inbound_adapters::{DiscordGatewayAdapter, SerenityChatOutputFactory},
     observability,
     outbound_adapters::{DiscordCommandRegistrar, SerenityPresence, SqlxStorage},
@@ -144,14 +144,14 @@ async fn main() -> ExitCode {
     ));
 
     // LoL store watcher: always registered (its commands explain themselves
-    // when the watcher is off). `[lol]` is startup-only - the LCU client and
-    // the poll engine are built once here; changes require a restart. An
-    // absent section, an empty lockfile path or a zero poll keep the
-    // watcher disabled.
-    let lol_settings = lol_engine_settings(config.lol.as_ref());
+    // when the watcher is off). `[lol_store]` is startup-only - the LCU
+    // client and the poll engine are built once here; changes require a
+    // restart. An absent section, an empty lockfile path or a zero poll
+    // keep the watcher disabled.
+    let lol_settings = lol_store_engine_settings(config.lol_store.as_ref());
     let lcu_client = LcuClient::new(
-        config.lol.as_ref().map(|lol| lol.lockfile_path.clone()).unwrap_or_default(),
-        config.lol.as_ref().map(|lol| lol.address.clone()).unwrap_or_default(),
+        config.lol_store.as_ref().map(|store| store.lockfile_path.clone()).unwrap_or_default(),
+        config.lol_store.as_ref().map(|store| store.address.clone()).unwrap_or_default(),
     )
     .expect("LCU http client expected to build");
     let lol_engine = Arc::new(StoreEngine::new(
@@ -453,36 +453,36 @@ fn status_settings(config: &Configuration) -> StatusSettings {
     }
 }
 
-/// Extracts the store watcher's settings; absent `[lol]`, an empty lockfile
-/// path or a zero poll all map to the disabled state (zero poll = the
-/// scheduler contract's dead handle).
-fn lol_engine_settings(lol: Option<&LolConfig>) -> EngineSettings {
+/// Extracts the store watcher's settings; absent `[lol_store]`, an empty
+/// lockfile path or a zero poll all map to the disabled state (zero poll =
+/// the scheduler contract's dead handle).
+fn lol_store_engine_settings(lol_store: Option<&LolStoreConfig>) -> EngineSettings {
     let disabled = EngineSettings { poll: Duration::ZERO, flags: AnnounceFlags::all_on() };
-    let Some(lol) = lol else { return disabled };
-    if lol.lockfile_path.is_empty() {
-        tracing::info!("config section [lol] has no lockfile_path - store watcher disabled");
+    let Some(lol_store) = lol_store else { return disabled };
+    if lol_store.lockfile_path.is_empty() {
+        tracing::info!("config section [lol_store] has no lockfile_path - store watcher disabled");
         return disabled;
     }
-    if lol.poll_secs == 0 {
-        tracing::warn!("config section [lol] ignored: poll_secs must be > 0");
+    if lol_store.poll_secs == 0 {
+        tracing::warn!("config section [lol_store] ignored: poll_secs must be > 0");
         return disabled;
     }
     EngineSettings {
-        poll: Duration::from_secs(lol.poll_secs),
+        poll: Duration::from_secs(lol_store.poll_secs),
         flags: AnnounceFlags {
-            sales: lol.announce_sales,
-            new_skins: lol.announce_new_skins,
-            mythic_rotation: lol.announce_mythic_rotation,
-            yourshop: lol.announce_yourshop,
+            sales: lol_store.announce_sales,
+            new_skins: lol_store.announce_new_skins,
+            mythic_rotation: lol_store.announce_mythic_rotation,
+            yourshop: lol_store.announce_yourshop,
         },
     }
 }
 
 /// Maps `[lol_leaderboard]` onto the engine settings. A zero interval,
-/// depth or TTL would misbehave rather than degrade, so - like `[lol]`'s
-/// zero poll - it disables the plugin with a warning instead of a silent
-/// rescue. `None` maps to nothing usable: the command stays in
-/// "not configured" mode.
+/// depth or TTL would misbehave rather than degrade, so - like
+/// `[lol_store]`'s zero poll - it disables the plugin with a warning
+/// instead of a silent rescue. `None` maps to nothing usable: the command
+/// stays in "not configured" mode.
 fn leaderboard_settings(
     config: Option<&LolLeaderboardConfig>,
     source: &dyn LeaderboardSourcePort,

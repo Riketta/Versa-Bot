@@ -43,7 +43,7 @@ url = "sqlite://versabot.db"
 # /lol_store_assign). Startup-only: an absent section, an empty
 # lockfile_path, or poll_secs = 0 keeps the watcher off. Your logged-in
 # account is only the API key - no account data is ever read or announced.
-# [lol]
+# [lol_store]
 # lockfile_path = "C:/Riot Games/League of Legends/lockfile"
 # Host the client API listens on; the port always comes from the lockfile.
 # address = "127.0.0.1"

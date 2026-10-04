@@ -282,7 +282,7 @@ read or announced. Because there is no purchase-history endpoint, every
 event is detected by diffing store snapshots - two changes inside one
 poll window merge into a single line.
 
-Setup: point `[lol]` at the client's `lockfile` (the bot reads the
+Setup: point `[lol_store]` at the client's `lockfile` (the bot reads the
 per-start port and token from it, so client restarts self-heal), enable
 per guild with `/lol_store_enable`, and assign the announcement channel
 with `/lol_store_assign`. Announcements batch into one embed per poll
@@ -307,7 +307,7 @@ The tag rides the message content (embeds never notify on Discord); the
 role must be marked "allow anyone to mention", or the bot needs the
 mention-everyone permission.
 
-Operator configuration lives in the optional `[lol]` section
+Operator configuration lives in the optional `[lol_store]` section
 (**startup-only** - an absent section, an empty `lockfile_path`, or a
 zero `poll_secs` keep the watcher off):
 
