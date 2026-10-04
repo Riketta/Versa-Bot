@@ -62,6 +62,9 @@ pub struct LlmSettings {
     /// many (applied at the adapter boundary, chat answers and compaction
     /// summaries alike); `None` leaves responses untouched.
     pub max_consecutive_newlines: Option<usize>,
+    /// Cap on emoji reactions applied per answer (the react tool's tokens
+    /// are deduplicated first, then capped). Discord's own hard cap is 20.
+    pub react_max_per_message: usize,
     /// Diagnostic dump: log the raw request and response bodies of every
     /// completion at DEBUG level (stdout only, never shipped to Sentry).
     /// Off by default - the bodies carry full conversation content.
@@ -96,6 +99,7 @@ impl Default for LlmSettings {
             image_prompt: None,
             max_images_per_message: 2,
             max_consecutive_newlines: None,
+            react_max_per_message: 3,
             log_raw_traffic: false,
             providers: BTreeMap::new(),
             models: BTreeMap::new(),
@@ -982,10 +986,12 @@ async fn read_sse_stream(
     let mut endpoint_ms: Option<u64> = None;
     let mut raw = String::new();
     let mut done = false;
-    // The reveal never sees reasoning: deltas are filtered through the
-    // incremental suppressor while `content` stays raw for the
-    // authoritative strip below.
+    // The reveal never sees reasoning or tool markers: deltas are filtered
+    // through the incremental suppressors while `content` stays raw for the
+    // authoritative strips below (think blocks in this adapter, marker
+    // extraction in the engine).
     let mut stripper = DeltaThinkStripper::default();
+    let mut marker_hold = super::tools::MarkerHold::default();
     while !done {
         let Some(chunk) = bytes.next().await else { break };
         let chunk = chunk.map_err(|err| LlmError::Request(format!("stream read failed: {err}")))?;
@@ -1018,14 +1024,18 @@ async fn read_sse_stream(
                 // The engine consumes promptly - it throttles Discord edits,
                 // not receives. A closed channel means the engine task died;
                 // finish reading the authoritative response anyway.
-                let visible = stripper.push(&delta);
+                let visible = marker_hold.push(&stripper.push(&delta));
                 if !visible.is_empty() {
                     let _ = deltas.send(visible).await;
                 }
             }
         }
     }
-    let visible = stripper.finish();
+    let think_tail = stripper.finish();
+    let mut visible = marker_hold.push(&think_tail);
+    // An unclosed candidate at end of stream is literal text (R6) - the
+    // reveal flushes it so it matches the authoritative final edit.
+    visible.push_str(&marker_hold.finish());
     if !visible.is_empty() {
         let _ = deltas.send(visible).await;
     }

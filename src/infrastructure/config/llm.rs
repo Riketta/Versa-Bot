@@ -47,6 +47,8 @@ pub struct LlmConfig {
     /// Collapses runs of consecutive newlines in completions down to this
     /// many; absent = responses left untouched.
     pub max_consecutive_newlines: Option<usize>,
+    /// Cap on emoji reactions applied per answer (the LLM react tool).
+    pub react_max_per_message: usize,
     /// Diagnostic dump of raw LLM request/response bodies at DEBUG level
     /// (stdout only, never Sentry). Off by default: the bodies carry full
     /// conversation content.
@@ -78,6 +80,7 @@ impl Default for LlmConfig {
             image_prompt: None,
             max_images_per_message: 2,
             max_consecutive_newlines: None,
+            react_max_per_message: 3,
             log_raw_traffic: false,
             providers: BTreeMap::new(),
             models: BTreeMap::new(),

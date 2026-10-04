@@ -156,6 +156,17 @@ pub struct ChannelConfig {
     /// conversations need.
     #[serde(default)]
     pub image_prompt: Option<String>,
+    /// Emoji-reaction tool for this channel: the model may decorate the
+    /// message it replies to by emitting a `[[react: ...]]` marker, which is
+    /// stripped before delivery (see `tools`). Off by default - the marker
+    /// instruction joins the system prompt only where the feature is on.
+    #[serde(default)]
+    pub react: bool,
+    /// Chance the bot silently reacts (no reply) to an unrelated captured
+    /// message, percent (`0` = off). Independent of `random_chance_percent`
+    /// and its own cooldown - the two rolls coexist in parallel.
+    #[serde(default = "default_random_react_chance")]
+    pub random_react_chance_percent: f64,
 }
 
 impl ChannelConfig {
@@ -181,6 +192,8 @@ impl ChannelConfig {
             images: false,
             image_model: None,
             image_prompt: None,
+            react: false,
+            random_react_chance_percent: default_random_react_chance(),
         }
     }
 }
@@ -243,6 +256,12 @@ fn default_random_chance() -> f64 {
     2.0
 }
 
+/// Plugin default of the per-channel silent-react chime chance - higher than
+/// the reply chime: an emoji is a much lighter interruption than a message.
+fn default_random_react_chance() -> f64 {
+    10.0
+}
+
 /// Plugin default of the per-channel chime cooldown (`/llm_set
 /// random_cooldown clear` resets to this).
 pub(crate) fn default_random_cooldown() -> u64 {
@@ -292,6 +311,8 @@ mod tests {
         assert_eq!(config.context_budget_tokens, None);
         assert!(!config.images);
         assert_eq!(config.image_model, None);
+        assert!(!config.react);
+        assert!((config.random_react_chance_percent - 10.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -308,6 +329,9 @@ mod tests {
         assert!((config.random_chance_percent - 2.0).abs() < f64::EPSILON);
         assert_eq!(config.random_cooldown_secs, 5);
         assert_eq!(config.max_length, None);
+        // Stored before the feature existed: serde defaults keep it loadable.
+        assert!(!config.react);
+        assert!((config.random_react_chance_percent - 10.0).abs() < f64::EPSILON);
     }
 
     #[test]

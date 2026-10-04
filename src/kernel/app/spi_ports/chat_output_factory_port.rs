@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use super::{ChatOutputPort, ChatStreamPort};
+use super::{ChatOutputPort, ChatStreamPort, ReactionPort, UndeliverableReactionPort};
 use crate::kernel::models::{ChannelId, MessageId, Origin};
 
 /// Driven port the kernel calls per event to obtain outbound ports bound to
@@ -46,6 +46,16 @@ pub trait ChatOutputFactoryPort: Send + Sync + 'static {
     /// (member lifecycle) yield an already-dead guard. Fire-and-forget:
     /// indicator failures are the adapter's log concern, never the caller's.
     fn start_typing(&self, origin: &Origin) -> ChatTypingGuard;
+
+    /// Reaction port bound to the event's origin channel - for plugins that
+    /// decorate a delivered message with emoji reactions (the LLM plugin's
+    /// tool protocol). Origins that cannot react (DMs, channel-less events)
+    /// and platforms without the concept yield the undeliverable default;
+    /// callers treat per-token failures as cosmetic (log, continue).
+    fn react(&self, origin: &Origin) -> Arc<dyn ReactionPort> {
+        let _ = origin;
+        Arc::new(UndeliverableReactionPort)
+    }
 }
 
 /// RAII token for a platform typing indicator: dropping it stops the

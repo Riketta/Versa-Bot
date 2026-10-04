@@ -235,6 +235,13 @@ pub fn assemble_context(
         .map_or(SummaryPlacement::default(), |model| model.summary_placement);
     let mut system =
         config.system_prompt.clone().unwrap_or_else(|| settings.default_system_prompt.clone());
+    // The reactions tool block joins the operator's prompt (constant bytes;
+    // appended AFTER the operator text so the prefix before it stays stable,
+    // and BEFORE any summary merge so `system_suffix` still appends last).
+    if config.react {
+        system.push_str("\n\n");
+        system.push_str(super::tools::REACT_TOOL_PROMPT);
+    }
     let summary_slot = match &state.summary {
         Some(summary) => format!("Earlier conversation summary:\n{summary}"),
         None => NO_EARLIER_CONTEXT.to_owned(),
@@ -450,6 +457,41 @@ mod tests {
         assert!(!should_trigger(false, None, &live));
         // An unknown reply target cannot be the bot.
         assert!(!should_trigger(false, Some(99), &live));
+    }
+
+    /// The reactions tool block joins the system prompt only where the
+    /// channel opted in - appended after the operator text, before any
+    /// summary handling, at constant bytes (cache stability).
+    #[test]
+    fn react_enabled_appends_the_tool_block_to_the_system_prompt() {
+        let mut config = flat_turn_config();
+        config.react = true;
+        let messages = assemble_context(
+            &config,
+            &LlmSettings::default(),
+            &ConversationState::default(),
+            &[],
+            0.25,
+            None,
+        );
+        let system = messages.first().map(|m| m.content.as_str()).unwrap_or_default();
+        assert!(system.starts_with("You are a helpful chat assistant."));
+        assert!(system.contains(super::super::tools::REACT_TOOL_PROMPT));
+
+        // Opted-out channels keep the prompt untouched.
+        let plain = flat_turn_config();
+        let messages = assemble_context(
+            &plain,
+            &LlmSettings::default(),
+            &ConversationState::default(),
+            &[],
+            0.25,
+            None,
+        );
+        assert_eq!(
+            messages.first().map(|m| m.content.as_str()),
+            Some("You are a helpful chat assistant.")
+        );
     }
 
     #[test]

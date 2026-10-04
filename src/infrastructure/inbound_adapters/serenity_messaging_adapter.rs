@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use serenity::all::{
     ChannelId as SerenityChannelId, CommandDataOption, CommandDataOptionValue, CommandDataResolved,
-    Context, CreateMessage, EditMessage, EventHandler, GuildId as SerenityGuildId, Http,
-    Interaction, Member, Message, MessageReference, MessageReferenceKind, Permissions, Ready,
-    RoleId as SerenityRoleId, User, UserId as SerenityUserId,
+    Context, CreateMessage, EditMessage, EmojiId, EventHandler, GuildId as SerenityGuildId, Http,
+    Interaction, Member, Message, MessageId as SerenityMessageId, MessageReference,
+    MessageReferenceKind, Permissions, ReactionType, Ready, RoleId as SerenityRoleId, User,
+    UserId as SerenityUserId,
 };
 use serenity::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -18,7 +19,10 @@ use crate::kernel::{
         MemberPayload, MessageId, Origin, OutboundError, OutboundMessage, Platform, RequestContext,
         UserId,
     },
-    spi_ports::{ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard},
+    spi_ports::{
+        ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard, ReactionPort,
+        UndeliverableReactionPort,
+    },
 };
 
 /// Kernel driving adapter: normalizes Discord gateway events onto the
@@ -672,6 +676,23 @@ impl ChatOutputFactoryPort for SerenityChatOutputFactory {
         });
         ChatTypingGuard::new(token)
     }
+
+    /// Reactions are guild-scoped (custom emoji resolution needs the
+    /// guild's emoji list), so DM and channel-less origins yield the
+    /// undeliverable port.
+    fn react(&self, origin: &Origin) -> Arc<dyn ReactionPort> {
+        let Some(guild_id) = origin.guild_id else {
+            return Arc::new(UndeliverableReactionPort);
+        };
+        if origin.channel_id.get() == 0 {
+            return Arc::new(UndeliverableReactionPort);
+        }
+        Arc::new(SerenityReaction {
+            http: Arc::clone(&self.http),
+            channel_id: SerenityChannelId::new(origin.channel_id.get()),
+            guild_id: SerenityGuildId::new(guild_id.get()),
+        })
+    }
 }
 
 struct SerenityChatOutput {
@@ -721,6 +742,132 @@ impl ChatOutputPort for UndeliverableChatOutput {
         tracing::warn!("dropping outbound message: origin has no deliverable Discord channel");
         Err(OutboundError::Send("no deliverable Discord channel for this origin".to_owned()))
     }
+}
+
+/// Reaction port bound to one origin: applies emoji reactions to messages
+/// in the origin channel. Custom `:name:` tokens resolve against the
+/// guild's current emoji list (one REST fetch per bare-name token -
+/// reactions are rare and capped, and the factory holds no gateway cache).
+struct SerenityReaction {
+    http: Arc<Http>,
+    channel_id: SerenityChannelId,
+    guild_id: SerenityGuildId,
+}
+
+#[async_trait]
+impl ReactionPort for SerenityReaction {
+    async fn add_reaction(&self, message_id: MessageId, emoji: &str) -> Result<(), OutboundError> {
+        let reaction = self.resolve(emoji).await?;
+        self.http
+            .create_reaction(self.channel_id, SerenityMessageId::new(message_id.get()), &reaction)
+            .await
+            .map_err(|err| OutboundError::Reaction(err.to_string()))
+    }
+}
+
+impl SerenityReaction {
+    /// Maps a raw protocol token onto a Discord reaction type. Fully
+    /// qualified forms (`<:name:id>`, `<a:name:id>`, `:name:id`) build the
+    /// custom reaction directly; bare `:name:` needs the guild emoji list;
+    /// anything else is a Unicode emoji (tokens the plugin already
+    /// validated - an unparseable token here fails per-token, by design).
+    async fn resolve(&self, emoji: &str) -> Result<ReactionType, OutboundError> {
+        let parsed = parse_reaction_token(emoji);
+        match parsed {
+            ParsedReaction::Custom { animated, name, id } => {
+                Ok(custom_reaction(animated, &name, &id))
+            }
+            ParsedReaction::Name(name) => {
+                let emojis = self
+                    .http
+                    .get_emojis(self.guild_id)
+                    .await
+                    .map_err(|err| OutboundError::Reaction(err.to_string()))?;
+                emojis
+                    .into_iter()
+                    .find(|known| known.name.as_str() == name.as_str())
+                    .map(|known| ReactionType::Custom {
+                        animated: known.animated,
+                        id: known.id,
+                        name: Some(known.name),
+                    })
+                    .ok_or_else(|| {
+                        OutboundError::Reaction(format!(
+                            "custom emoji `:{name}:` not found in this server"
+                        ))
+                    })
+            }
+            ParsedReaction::Unicode => Ok(ReactionType::Unicode(emoji.to_owned())),
+            ParsedReaction::Invalid => {
+                Err(OutboundError::Reaction(format!("unrecognized emoji token `{emoji}`")))
+            }
+        }
+    }
+}
+
+/// The adapter-side parse of one reaction token.
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedReaction {
+    /// Fully qualified custom form - usable without resolution.
+    Custom { animated: bool, name: String, id: String },
+    /// Bare `:name:` - resolve against the guild's emojis.
+    Name(String),
+    /// Unicode emoji (any token with a non-ASCII character).
+    Unicode,
+    /// Not an emoji token at all.
+    Invalid,
+}
+
+fn parse_reaction_token(token: &str) -> ParsedReaction {
+    fn valid_name(name: &str) -> bool {
+        !name.is_empty() && name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    }
+    fn numeric(id: &str) -> bool {
+        !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit())
+    }
+
+    if let Some(body) = token.strip_prefix('<').and_then(|rest| rest.strip_suffix('>')) {
+        let (animated, rest) = match body.strip_prefix("a:") {
+            Some(rest) => (true, rest),
+            None => match body.strip_prefix(':') {
+                Some(rest) => (false, rest),
+                None => return ParsedReaction::Invalid,
+            },
+        };
+        return match rest.split_once(':') {
+            Some((name, id)) if valid_name(name) && numeric(id) => {
+                ParsedReaction::Custom { animated, name: name.to_owned(), id: id.to_owned() }
+            }
+            _ => ParsedReaction::Invalid,
+        };
+    }
+    if let Some(body) = token.strip_prefix(':') {
+        if let Some(name) = body.strip_suffix(':') {
+            return if valid_name(name) {
+                ParsedReaction::Name(name.to_owned())
+            } else {
+                ParsedReaction::Invalid
+            };
+        }
+        // `:name:id` - the id makes it fully qualified.
+        return match body.rsplit_once(':') {
+            Some((name, id)) if valid_name(name) && numeric(id) => {
+                ParsedReaction::Custom { animated: false, name: name.to_owned(), id: id.to_owned() }
+            }
+            _ => ParsedReaction::Invalid,
+        };
+    }
+    if token.chars().any(|ch| !ch.is_ascii()) {
+        ParsedReaction::Unicode
+    } else {
+        ParsedReaction::Invalid
+    }
+}
+
+fn custom_reaction(animated: bool, name: &str, id: &str) -> ReactionType {
+    // Digit-validated by the parsers; a failed parse cannot be reached.
+    let id = id.parse::<u64>().map(EmojiId::new).unwrap_or_else(|_| EmojiId::new(0));
+    ReactionType::Custom { animated, id, name: Some(name.to_owned()) }
 }
 
 /// Progressive-rendering output: creates the message on `begin`, then edits
@@ -896,6 +1043,58 @@ mod tests {
     #[test]
     fn resolved_names_are_sanitized_against_brackets() {
         assert_eq!(normalize_mention_tags("<@77>", &resolver), "[weirdname]<@77>");
+    }
+
+    // ---- Reaction token parsing (the react tool's adapter half) ----
+
+    #[test]
+    fn reaction_tokens_parse_into_their_reaction_kinds() {
+        // Fully qualified custom forms build directly, animated flag kept.
+        assert_eq!(
+            parse_reaction_token("<:face:9>"),
+            ParsedReaction::Custom { animated: false, name: "face".to_owned(), id: "9".to_owned() }
+        );
+        assert_eq!(
+            parse_reaction_token("<a:spin:456>"),
+            ParsedReaction::Custom {
+                animated: true,
+                name: "spin".to_owned(),
+                id: "456".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_reaction_token(":name_id:789"),
+            ParsedReaction::Custom {
+                animated: false,
+                name: "name_id".to_owned(),
+                id: "789".to_owned()
+            }
+        );
+        // Bare name needs guild resolution.
+        assert_eq!(parse_reaction_token(":dorkiS:"), ParsedReaction::Name("dorkiS".to_owned()));
+        assert_eq!(parse_reaction_token(":x:"), ParsedReaction::Name("x".to_owned()));
+        // Anything with a non-ASCII character is a Unicode emoji.
+        assert_eq!(parse_reaction_token("🤓"), ParsedReaction::Unicode);
+        assert_eq!(parse_reaction_token("👍🏽"), ParsedReaction::Unicode);
+        // Malformed tokens fail per-token (the plugin's per-item rule); a
+        // name-shaped token like `:x:` stays resolvable - the API has the
+        // final say on whether the emoji exists.
+        for bad in ["word", "::", ":bad name:", "<nope>", "<:bad>", "42", ":id:abc"] {
+            assert_eq!(parse_reaction_token(bad), ParsedReaction::Invalid, "token `{bad}`");
+        }
+    }
+
+    #[test]
+    fn custom_reaction_builds_the_serenity_type() {
+        let reaction = custom_reaction(true, "spin", "456");
+        match reaction {
+            ReactionType::Custom { animated, id, name } => {
+                assert!(animated);
+                assert_eq!(id, EmojiId::new(456));
+                assert_eq!(name.as_deref(), Some("spin"));
+            }
+            other => panic!("expected a custom reaction, got {other:?}"),
+        }
     }
 
     #[test]

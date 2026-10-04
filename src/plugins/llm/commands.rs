@@ -54,6 +54,14 @@ pub(super) const SET_KEYS: &[&str] = &[
     "images",
     "image_model",
     "image_prompt",
+    "react",
+    "random_chance",
+    "random_cooldown",
+    "random_react_chance",
+    "capture_mode",
+    "compaction",
+    "compaction_model",
+    "compaction_prompt",
     "max_length",
     "turn_template",
 ];
@@ -179,7 +187,7 @@ fn apply_flag(
     key: &str,
     value: &str,
 ) -> Option<Result<String, String>> {
-    if !matches!(key, "streaming" | "compaction" | "images") {
+    if !matches!(key, "streaming" | "compaction" | "images" | "react") {
         return None;
     }
     let Some(enabled) = parse_bool(value) else {
@@ -198,6 +206,13 @@ fn apply_flag(
             config.images = enabled;
             Some(Ok(format!(
                 "`images` turned {} (recognition needs an operator-configured image model).",
+                if enabled { "on" } else { "off" }
+            )))
+        }
+        "react" => {
+            config.react = enabled;
+            Some(Ok(format!(
+                "`react` turned {} (the model may add emoji reactions to the message it replies to).",
                 if enabled { "on" } else { "off" }
             )))
         }
@@ -286,10 +301,28 @@ fn apply_numeric(
                 Ok(parsed) if parsed.is_finite() => {
                     let clamped = parsed.clamp(0.0, 100.0);
                     config.random_chance_percent = clamped;
-                    Some(Ok(format!("`random_chance` set to {clamped}%.")))
+                    Some(Ok(format!("`random_chance` set to {clamped}.")))
                 }
                 _ => Some(Err(format!(
                     "`random_chance` expects a finite number (percent), got `{value}`."
+                ))),
+            }
+        }
+        "random_react_chance" => {
+            if cleared {
+                config.random_react_chance_percent = 0.0;
+                return Some(
+                    Ok("`random_react_chance` cleared (silent reactions off).".to_owned()),
+                );
+            }
+            match value.parse::<f64>() {
+                Ok(parsed) if parsed.is_finite() => {
+                    let clamped = parsed.clamp(0.0, 100.0);
+                    config.random_react_chance_percent = clamped;
+                    Some(Ok(format!("`random_react_chance` set to {clamped}.")))
+                }
+                _ => Some(Err(format!(
+                    "`random_react_chance` expects a finite number (percent), got `{value}`."
                 ))),
             }
         }
@@ -745,6 +778,18 @@ fn images_label(config: &ChannelConfig, settings: &LlmSettings) -> String {
     format!("on ({model}, {}-char prompt)", prompt.chars().count())
 }
 
+/// `/llm_status` label of the reaction tool state: off, or on with the
+/// silent-react chime chance when it is enabled.
+fn react_label(config: &ChannelConfig) -> String {
+    if !config.react {
+        "off".to_owned()
+    } else if config.random_react_chance_percent > 0.0 {
+        format!("on · {:.1}% silent-react", config.random_react_chance_percent)
+    } else {
+        "on".to_owned()
+    }
+}
+
 /// `/llm_status` label of the chime-in roll chance and cooldown: the
 /// percent plus the per-channel minimum interval, or `off` at zero chance.
 fn chime_label(chance: f64, cooldown_secs: u64) -> String {
@@ -824,6 +869,7 @@ impl CommandHandler for StatusLlmHandler {
         let context_start = first_link.unwrap_or_else(|| "no messages after the cutoff".to_owned());
         let reasoning = reasoning_label(config.params.reasoning_effort.as_deref());
         let images = images_label(&config, self.engine.settings());
+        let reactions = react_label(&config);
         let mut description = format!(
             "Model: `{}`
 Reasoning: {reasoning}
@@ -832,6 +878,7 @@ Prompt head: {prompt_head}
 Context: {live}/{} messages ({total} kept)
 Compaction: {}
 Images: {images}
+Reactions: {reactions}
 Capture: {} · Chime-ins: {}
 Summary: {summary}
 Context start: {context_start}",
@@ -1344,6 +1391,10 @@ mod tests {
         assert!(config.images);
         apply_set(&mut config, "images", "off").expect("off expected");
         assert!(!config.images);
+        apply_set(&mut config, "react", "on").expect("on expected");
+        assert!(config.react);
+        apply_set(&mut config, "react", "off").expect("off expected");
+        assert!(!config.react);
         assert!(apply_set(&mut config, "streaming", "maybe").is_err());
     }
 
@@ -1399,6 +1450,11 @@ mod tests {
         assert!((config.random_chance_percent - 100.0).abs() < f64::EPSILON);
         apply_set(&mut config, "random_chance", "clear").expect("clear expected");
         assert!((config.random_chance_percent).abs() < f64::EPSILON);
+
+        apply_set(&mut config, "random_react_chance", "250").expect("clamp expected");
+        assert!((config.random_react_chance_percent - 100.0).abs() < f64::EPSILON);
+        apply_set(&mut config, "random_react_chance", "clear").expect("clear expected");
+        assert!((config.random_react_chance_percent).abs() < f64::EPSILON);
 
         apply_set(&mut config, "random_cooldown", "30").expect("cooldown expected");
         assert_eq!(config.random_cooldown_secs, 30);

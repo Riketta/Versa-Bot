@@ -12,6 +12,7 @@ mod llm_plugin;
 mod model;
 mod providers;
 mod rng;
+mod tools;
 mod vision;
 
 pub use chat_engine::ChatEngine;

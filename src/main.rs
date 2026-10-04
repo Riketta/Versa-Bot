@@ -273,6 +273,7 @@ fn llm_settings_from(config: &LlmConfig) -> LlmSettings {
         image_prompt: config.image_prompt.clone(),
         max_images_per_message: config.max_images_per_message,
         max_consecutive_newlines: config.max_consecutive_newlines,
+        react_max_per_message: config.react_max_per_message,
         log_raw_traffic: config.log_raw_traffic,
         providers: config
             .providers

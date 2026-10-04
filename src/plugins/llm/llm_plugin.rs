@@ -307,7 +307,7 @@ impl PluginPort for LlmPlugin {
         self.registry.register(
             self.descriptor(
                 "llm_set",
-                "Change a channel chat setting (model, images, reasoning, sampling, chime-ins)",
+                "Change a channel chat setting (model, images, reasoning, sampling, reactions)",
                 vec![
                     ArgDescriptor {
                         name: "key".to_owned(),

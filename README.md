@@ -46,7 +46,9 @@ a slash command from any other reply path.
   configuration needed.
 - LLM chat bot (`llm` plugin): per-channel chat with conversation history,
   compaction, streaming, token-budget context filling, image recognition
-  (described attachments) and random chime-ins. Operators declare
+  (described attachments), an emoji-reaction tool (`[[react: ...]]`
+  markers, stripped before delivery) and random chime-ins (reply and
+  silent-react rolls). Operators declare
   OpenAI-compatible providers in `[llm]` (keys via env); guild moderators
   assign and tune each channel via `/llm_*` commands. The guild message
   content the bot reads is why `MESSAGE_CONTENT` is requested. Full manual
@@ -258,7 +260,8 @@ history.
 # Image recognition: set image_model to a vision-capable declared model;
 # channels then opt in with /llm_set images on. Optional: image_prompt,
 # image_max_side (512), image_jpeg_quality (85), image_max_source_bytes
-# (8 MiB), max_images_per_message (2).
+# (8 MiB), max_images_per_message (2), react_max_per_message (3 - the
+# emoji-reaction tool's per-answer cap).
 # image_model = "local/unsloth/gemma-4-26B-A4B-it-qat-GGUF"
 
 [llm.providers.zai]
@@ -382,6 +385,18 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   over-cap) still render `![image](image.png)`, so the model at least
   knows an image was posted. Images are fetched from Discord's CDN only;
   recognition usage never mixes into the channel's token stats.
+- **Emoji reactions** (the react tool, opt-in per channel,
+  `/llm_set react on`): the model may decorate the message it replies to
+  by emitting a `[[react: emoji ...]]` marker anywhere in its answer.
+  The marker is stripped before the answer is shown or recorded, and the
+  tokens fire as reactions on the reply target: Unicode (`🤓`), custom
+  (`:dorkiS:` - resolved against the guild's own emojis, foreign ones
+  skip silently) and fully qualified (`<:name:id>`) forms all work.
+  Degradation is per-token: an invalid token drops, valid siblings fire,
+  and a failed reaction never touches the answer. An answer that is only
+  a marker is answered with just the reaction - no fallback, no phantom
+  bot turn. A hallucinated marker in a react-off channel is stripped
+  too, but fires nothing.
 
 **Context sizing.** The engine loads at most the newest `depth` +
 compaction-tail records per message (the operational window - a much
@@ -411,7 +426,7 @@ channel; tier denials are ephemeral too.
 | `/llm_prompt_file file:<attachment>` | set the system prompt from an uploaded text/markdown file - for prompts beyond the inline limit; fetched from Discord's CDN only, capped by `[llm] max_prompt_file_bytes` (128 KiB default) |
 | `/llm_set key:<key> value:<value>` | tune one channel setting (table below); value `clear`/`none`/`default` resets it |
 | `/llm_cutoff` | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
-| `/llm_status` | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, compaction, image recognition (state, model, prompt length), capture mode, chime-in chance, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
+| `/llm_status` | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, compaction, image recognition (state, model, prompt length), reactions (state, silent-react chance), capture mode, chime-in chance, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
 | `/llm_admin` | make this channel the guild's service channel for error notices (one per guild, last write wins) |
 | `/llm_admin_clear` | stop service notices |
 
@@ -433,9 +448,11 @@ saved):
 | `images` | image recognition for captured messages (needs operator `[llm] image_model`) | off |
 | `image_model` | recognition model for this channel | plugin `image_model` |
 | `image_prompt` | recognition instruction (e.g. pin the description language) | plugin `image_prompt` |
+| `react` | emoji-reaction tool: the model may react to the message it replies to via a `[[react: ...]]` marker (stripped from the answer) | off |
 | `streaming` | stream the answer live from the provider (SSE, `stream: true`); the message is created with the first tokens and edited at `stream_interval_ms` - needs a streaming-capable endpoint | off |
 | `random_chance` | percent chance to chime in on a captured non-trigger message | 2 |
 | `random_cooldown` | minimum seconds between chime-ins (`0` = none) | 5 |
+| `random_react_chance` | percent chance for a silent react (emoji only, no reply) on a captured non-trigger message; independent of `random_chance` and its own cooldown; needs `react` on | 10 |
 | `max_length` | per-channel reply-splitting limit | 2000 (`max_message_length`) |
 | `turn_template` | user-turn rendering; must contain `{sender}` and `{message}`; params: `{sender}`, `{user_id}`, `{guild_name}`, `{time}` (unix), `{message}` | `[{{sender}}](<@{user_id}>): {message}` |
 
@@ -455,7 +472,11 @@ non-streaming channel always does). Chime-ins are cooldown-guarded
 (default 5 seconds between them, per-channel `random_cooldown`) and
 only fire on messages the bot actually captured; the chance draws from a
 per-channel deck, so hits balance out over each 100-draw cycle instead
-of clumping.
+of clumping. With `react` on, a second independent roll
+(`random_react_chance`, default 10%) can silently react to a captured
+message without replying: one single-shot call whose prose is discarded,
+only the marker's emojis apply, nothing is recorded - the two rolls
+each keep their own cooldown and never suppress one another.
 
 **Failures.** A message that tags the bot or replies to it is guaranteed a
 visible response: if the generated answer is impossible (provider

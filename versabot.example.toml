@@ -56,6 +56,10 @@ url = "sqlite://versabot.db"
 # left untouched. Applied to the authoritative final text - a streaming
 # message may briefly show more blank lines than the final edit keeps.
 # max_consecutive_newlines = 2
+# Cap on emoji reactions applied per answer. The model asks via a
+# [[react: ...]] marker, which is stripped before the answer is shown;
+# channels opt in via /llm_set react on.
+# react_max_per_message = 3
 # Diagnostic: dump every LLM request and response body at DEBUG level
 # (stdout only, never Sentry). The bodies carry full conversation
 # content - enable only while debugging a provider.

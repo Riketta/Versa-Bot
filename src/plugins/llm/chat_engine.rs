@@ -33,6 +33,7 @@ use super::model::{
 };
 use super::providers::LlmSettings;
 use super::rng::{RandomPort, RandomScope};
+use super::tools;
 use super::vision::{self, DEFAULT_IMAGE_PROMPT, ImageDescriber, ImageJob, ImageSource};
 
 /// One undescribed placeholder entry per image (feature off, cap overflow,
@@ -222,6 +223,10 @@ pub struct ChatEngine {
     /// Last random chime-in time per channel; the cooldown length is the
     /// channel's `random_cooldown_secs` setting.
     chimes: Mutex<HashMap<ChannelKey, Instant>>,
+    /// Last silent-react chime time per channel - independent of the reply
+    /// chime tracker, so the two rolls coexist in parallel (the cooldown
+    /// duration is the same `random_cooldown_secs`).
+    react_chimes: Mutex<HashMap<ChannelKey, Instant>>,
 }
 
 impl ChatEngine {
@@ -239,6 +244,7 @@ impl ChatEngine {
             describer,
             notices: Mutex::new(HashMap::new()),
             chimes: Mutex::new(HashMap::new()),
+            react_chimes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -340,14 +346,18 @@ impl ChatEngine {
                 // still gets a visible response.
                 self.send_fallback(origin, services).await;
             }
-        } else if captured && config.random_chance_percent > 0.0 {
+        } else if captured
+            && (config.random_chance_percent > 0.0
+                || (config.react && config.random_react_chance_percent > 0.0))
+        {
             // Random chime-in: same delivery path as a mention reply - the
             // answer is assembled from the context the message just joined
             // and recorded as an assistant turn. Only CAPTURED messages are
             // eligible: chiming in on a message the bot never tracked would
             // look like answering nothing. Unprompted, so a failed chime-in
             // stays silent - the guaranteed-answer contract covers only
-            // messages addressed to the bot.
+            // messages addressed to the bot. The react roll lives inside
+            // `maybe_chime` and shares only the capture eligibility.
             self.maybe_chime(origin, request, services).await;
         }
 
@@ -465,30 +475,23 @@ impl ChatEngine {
         images
     }
 
-    /// Completes and delivers the answer for a triggering message. The
-    /// triggering message is already part of `live`, so the context ends
-    /// with what the user just said. Returns whether a generated answer was
-    /// actually delivered - `false` lets the caller honor the
-    /// guaranteed-answer contract with the fallback notice.
-    async fn answer(
+    /// Assembles one answer attempt's completion request from the channel's
+    /// live records: the newest `history_depth` records as the window, the
+    /// resolved token budget, the character count the endpoint's usage
+    /// report is measured against, and the window size for the audit row.
+    /// Shared by the triggered/chime answer and the silent-react chime.
+    fn assemble_prompt(
         &self,
-        origin: &Origin,
-        request: AnswerRequest<'_>,
-        services: &KernelServices,
-    ) -> bool {
-        let AnswerRequest { config, state, live, usage_stats, trigger } = request;
-        // The answer may take tens of seconds: hold the platform typing
-        // indicator across generation and delivery. The guard drops on every
-        // return path - failure included, the caller's fallback follows
-        // right after.
-        let _typing = services.chat_output_factory.start_typing(origin);
-        let channel_id = origin.channel_id.get();
+        config: &ChannelConfig,
+        state: &ConversationState,
+        live: &[ConversationRecord],
+        usage_stats: &UsageStats,
+    ) -> (CompletionRequest, u64, Option<u64>, usize) {
         let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
         let skip = live.len().saturating_sub(depth);
         let window: &[ConversationRecord] = live.get(skip..).unwrap_or(live);
         let budget =
             conversation::resolve_budget(config, &self.settings, usage_stats.last.is_some());
-
         let messages = conversation::assemble_context(
             config,
             &self.settings,
@@ -507,6 +510,29 @@ impl ChatEngine {
             messages,
             params: config.params.clone(),
         };
+        (request, context_chars, budget, window.len())
+    }
+
+    /// Completes and delivers the answer for a triggering message. The
+    /// triggering message is already part of `live`, so the context ends
+    /// with what the user just said. Returns whether a generated answer was
+    /// actually delivered - `false` lets the caller honor the
+    /// guaranteed-answer contract with the fallback notice.
+    async fn answer(
+        &self,
+        origin: &Origin,
+        request: AnswerRequest<'_>,
+        services: &KernelServices,
+    ) -> bool {
+        let AnswerRequest { config, state, live, usage_stats, trigger } = request;
+        // The answer may take tens of seconds: hold the platform typing
+        // indicator across generation and delivery. The guard drops on every
+        // return path - failure included, the caller's fallback follows
+        // right after.
+        let _typing = services.chat_output_factory.start_typing(origin);
+        let channel_id = origin.channel_id.get();
+        let (request, context_chars, budget, window_used) =
+            self.assemble_prompt(config, state, live, usage_stats);
         let started = Instant::now();
 
         // Streaming channels pull the answer live off the endpoint (SSE
@@ -542,7 +568,7 @@ impl ChatEngine {
                     elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     content_chars = partial.chars().count(),
                     window = live.len(),
-                    window_used = window.len(),
+                    window_used,
                     partial = true,
                     "LLM answer generated (partial - stream interrupted)"
                 );
@@ -565,7 +591,7 @@ impl ChatEngine {
                 usage: response.usage,
                 timing: response.timing,
                 window: live.len(),
-                window_used: window.len(),
+                window_used,
                 context_chars,
                 calibrated: usage_stats.last.is_some(),
             },
@@ -583,7 +609,44 @@ impl ChatEngine {
         )
         .await;
 
-        self.deliver_reply(origin, config, channel_id, &response.content, live_id, services).await
+        // Tool protocol (R3/R4): markers never reach the channel or the
+        // history - the cleaned text is what is delivered and recorded.
+        let (visible, calls) = tools::extract_tool_calls(&response.content);
+        // Reactions fire only where the channel opted in (the prompt taught
+        // the tool); marker text is stripped regardless - a hallucinated
+        // marker must not reach the channel either way.
+        let reactions = if config.react {
+            tools::react_tokens_from(&calls, self.settings.react_max_per_message)
+        } else {
+            Vec::new()
+        };
+
+        if visible.is_empty() {
+            // Marker-only answer: the reactions ARE the response. A triggered
+            // message still got its visible response (the emoji), so this
+            // counts as answered - no fallback, and no bot turn recorded
+            // (nothing textual was shown). Without reactions this is the
+            // no-answer path and the caller's fallback applies.
+            if reactions.is_empty() {
+                return false;
+            }
+            tracing::debug!(
+                channel = channel_id,
+                count = reactions.len(),
+                "marker-only answer - reacting without a reply"
+            );
+            self.apply_reactions(origin, &reactions, services).await;
+            return true;
+        }
+
+        let delivered =
+            self.deliver_reply(origin, config, channel_id, &visible, live_id, services).await;
+        // Reactions decorate an already-delivered answer (R5): cosmetic,
+        // never fatal, skipped entirely when nothing was delivered.
+        if delivered && !reactions.is_empty() {
+            self.apply_reactions(origin, &reactions, services).await;
+        }
+        delivered
     }
 
     /// Streaming completion half: pulls content deltas off the endpoint and
@@ -826,39 +889,158 @@ impl ChatEngine {
         );
     }
 
-    /// Random chime-in decision for one captured, non-triggering message:
-    /// cooldown gate (the channel's `random_cooldown_secs`), deck-based
-    /// roll, then the same delivery path as a triggered answer. Silent on
-    /// every negative decision - only the roll trace at debug explains why
-    /// the bot stayed quiet.
+    /// Random chime decisions for one captured, non-triggering message: two
+    /// INDEPENDENT rolls (reply and silent react), each with its own
+    /// cooldown tracker behind the channel's `random_cooldown_secs`. They
+    /// coexist in parallel - a react neither consumes nor suppresses a
+    /// reply - and when both fire, one LLM call serves both (the reply
+    /// carries the reaction markers). Silent on every negative decision -
+    /// only the roll traces at debug explain why the bot stayed quiet.
     async fn maybe_chime(
         &self,
         origin: &Origin,
         mut request: AnswerRequest<'_>,
         services: &KernelServices,
     ) {
-        if !self.chime_allowed(origin, request.config.random_cooldown_secs) {
-            tracing::debug!(channel = origin.channel_id.get(), "chime skipped - cooldown active");
-            return;
+        let config = request.config;
+        let scope = RandomScope {
+            platform: origin.platform.as_str(),
+            guild_id: origin.guild_id.map_or(0, GuildId::get),
+            channel_id: origin.channel_id.get(),
+        };
+        let reply_allowed = config.random_chance_percent > 0.0
+            && self.chime_allowed(origin, config.random_cooldown_secs);
+        let react_allowed = config.react
+            && config.random_react_chance_percent > 0.0
+            && self.react_chime_allowed(origin, config.random_cooldown_secs);
+
+        let mut reply_fire = false;
+        if reply_allowed {
+            reply_fire = self.rng.chance_percent(scope, config.random_chance_percent);
+            tracing::debug!(
+                channel = origin.channel_id.get(),
+                chance = config.random_chance_percent,
+                rolled = reply_fire,
+                "chime roll"
+            );
         }
-        let rolled = self.rng.chance_percent(
-            RandomScope {
-                platform: origin.platform.as_str(),
-                guild_id: origin.guild_id.map_or(0, GuildId::get),
-                channel_id: origin.channel_id.get(),
-            },
-            request.config.random_chance_percent,
-        );
-        tracing::debug!(
-            channel = origin.channel_id.get(),
-            chance = request.config.random_chance_percent,
-            rolled,
-            "chime roll"
-        );
-        if rolled {
+        let mut react_fire = false;
+        if react_allowed {
+            react_fire = self.rng.chance_percent(scope, config.random_react_chance_percent);
+            tracing::debug!(
+                channel = origin.channel_id.get(),
+                chance = config.random_react_chance_percent,
+                rolled = react_fire,
+                "react chime roll"
+            );
+        }
+
+        if reply_fire {
             self.note_chime(origin);
+            // Both rolls fired: the answer's own markers react - no separate
+            // silent call. Both cooldowns are noted (both rolls happened).
+            if react_fire {
+                self.note_react_chime(origin);
+            }
             request.trigger = "chime";
             self.answer(origin, request, services).await;
+        } else if react_fire {
+            self.note_react_chime(origin);
+            self.react_chime(origin, request, services).await;
+        }
+    }
+
+    /// The silent-react chime: one single-shot completion whose prose is
+    /// DISCARDED - only reaction markers act. Never streamed (there is
+    /// nothing to reveal), never delivered, never recorded as a bot turn
+    /// ("delivered = recorded" forbids recording what nobody saw); usage
+    /// still records, the call was real. Unprompted, so every failure stays
+    /// silent: no marker, no reaction, no trace in the channel.
+    async fn react_chime(
+        &self,
+        origin: &Origin,
+        request: AnswerRequest<'_>,
+        services: &KernelServices,
+    ) {
+        let AnswerRequest { config, state, live, usage_stats, .. } = request;
+        let channel_id = origin.channel_id.get();
+        let (request, context_chars, budget, _) =
+            self.assemble_prompt(config, state, live, usage_stats);
+        let response = match self.completion.complete(request).await {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::debug!(channel = channel_id, %err, "react chime completion failed");
+                return;
+            }
+        };
+        self.record_usage(
+            services,
+            channel_id,
+            UsageRecord {
+                usage: response.usage,
+                timing: response.timing,
+                context_chars,
+                tokens_per_char: usage_stats.tokens_per_char,
+                budget,
+            },
+        )
+        .await;
+
+        let (visible, calls) = tools::extract_tool_calls(&response.content);
+        let reactions = tools::react_tokens_from(&calls, self.settings.react_max_per_message);
+        if reactions.is_empty() {
+            tracing::debug!(
+                channel = channel_id,
+                trigger = "react_chime",
+                "react chime produced no marker - staying silent"
+            );
+            return;
+        }
+        if !visible.is_empty() {
+            tracing::debug!(
+                channel = channel_id,
+                chars = visible.chars().count(),
+                "react chime prose discarded - silent reaction only"
+            );
+        }
+        tracing::debug!(
+            channel = channel_id,
+            trigger = "react_chime",
+            count = reactions.len(),
+            "react chime applied"
+        );
+        self.apply_reactions(origin, &reactions, services).await;
+    }
+
+    /// Fires the reaction tokens against the message this event's reply
+    /// anchors to (the triggering message for mentions and chime-ins
+    /// alike). Cosmetic per the port contract: failures are per-token,
+    /// debug-logged, and never affect the answer that was already
+    /// delivered.
+    async fn apply_reactions(
+        &self,
+        origin: &Origin,
+        reactions: &[String],
+        services: &KernelServices,
+    ) {
+        let Some(target) = origin.message_id else {
+            return;
+        };
+        let port = services.chat_output_factory.react(origin);
+        for emoji in reactions {
+            match port.add_reaction(target, emoji).await {
+                Ok(()) => {
+                    tracing::debug!(channel = origin.channel_id.get(), emoji = %emoji, "reaction applied");
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        channel = origin.channel_id.get(),
+                        emoji = %emoji,
+                        %err,
+                        "reaction skipped"
+                    );
+                }
+            }
         }
     }
 
@@ -1216,6 +1398,27 @@ impl ChatEngine {
         self.chimes.lock().insert(key, Instant::now());
     }
 
+    /// Silent-react chime cooldown - the same `random_cooldown_secs`
+    /// duration as the reply chime, but an independent tracker.
+    fn react_chime_allowed(&self, origin: &Origin, cooldown_secs: u64) -> bool {
+        let key: ChannelKey = (
+            origin.platform.as_str().to_owned(),
+            origin.guild_id.map_or(0, GuildId::get),
+            origin.channel_id.get(),
+        );
+        let cooldown = Duration::from_secs(cooldown_secs);
+        !matches!(self.react_chimes.lock().get(&key), Some(last) if last.elapsed() < cooldown)
+    }
+
+    fn note_react_chime(&self, origin: &Origin) {
+        let key: ChannelKey = (
+            origin.platform.as_str().to_owned(),
+            origin.guild_id.map_or(0, GuildId::get),
+            origin.channel_id.get(),
+        );
+        self.react_chimes.lock().insert(key, Instant::now());
+    }
+
     /// Persists the last chat completion's response time and - when the
     /// endpoint reports usage - token stats, blending the observed
     /// tokens-per-character ratio into the channel's estimate. Compaction
@@ -1275,7 +1478,7 @@ mod tests {
     };
     use crate::kernel::spi_ports::{
         ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard, GuildStorage,
-        StoragePort, StoredRecord,
+        ReactionPort, StoragePort, StoredRecord,
     };
     use crate::plugins::llm::completion_port::{
         ChatRole, CompletionResponse, LlmError, ResponseTiming, TokenUsage,
@@ -1348,6 +1551,7 @@ mod tests {
         updates: Arc<Mutex<Vec<String>>>,
         output: Arc<RecordingChatOutput>,
         typing_starts: AtomicUsize,
+        reactions: Arc<Mutex<Vec<(u64, String)>>>,
     }
 
     impl StreamRecordingFactory {
@@ -1389,6 +1593,87 @@ mod tests {
             message_id: MessageId,
         ) -> Option<String> {
             Some(format!("link://{}/{}", channel_id.get(), message_id.get()))
+        }
+
+        fn react(&self, _origin: &Origin) -> Arc<dyn ReactionPort> {
+            Arc::new(RecordingReactionPort { reactions: Arc::clone(&self.reactions) })
+        }
+    }
+
+    /// Records `(message_id, emoji)` pairs the engine fired.
+    struct RecordingReactionPort {
+        reactions: Arc<Mutex<Vec<(u64, String)>>>,
+    }
+
+    #[async_trait]
+    impl ReactionPort for RecordingReactionPort {
+        async fn add_reaction(
+            &self,
+            message_id: MessageId,
+            emoji: &str,
+        ) -> Result<(), OutboundError> {
+            self.reactions.lock().push((message_id.get(), emoji.to_owned()));
+            Ok(())
+        }
+    }
+
+    /// Every reaction fails - the answer must not notice (R5).
+    struct FailingReactionPort;
+
+    #[async_trait]
+    impl ReactionPort for FailingReactionPort {
+        async fn add_reaction(
+            &self,
+            _message_id: MessageId,
+            _emoji: &str,
+        ) -> Result<(), OutboundError> {
+            Err(OutboundError::Reaction("custom emoji not found in this server".to_owned()))
+        }
+    }
+
+    /// Delivering output + failing reactions: the fixture for the R5 rule
+    /// that reaction failures never touch the answer.
+    struct FailingReactionFactory {
+        output: Arc<RecordingChatOutput>,
+    }
+
+    #[async_trait]
+    impl ChatOutputFactoryPort for FailingReactionFactory {
+        fn chat_output(&self, _origin: &Origin) -> Arc<dyn ChatOutputPort> {
+            Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
+        }
+
+        fn start_typing(&self, _origin: &Origin) -> ChatTypingGuard {
+            ChatTypingGuard::dead()
+        }
+
+        fn channel_output(
+            &self,
+            _origin: &Origin,
+            _channel_id: ChannelId,
+        ) -> Arc<dyn ChatOutputPort> {
+            Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
+        }
+
+        fn stream_output(&self, _origin: &Origin) -> Arc<dyn ChatStreamPort> {
+            Arc::new(RecordingStream {
+                begins: Arc::new(Mutex::new(Vec::new())),
+                updates: Arc::new(Mutex::new(Vec::new())),
+                counter: AtomicU64::new(100),
+            })
+        }
+
+        fn react(&self, _origin: &Origin) -> Arc<dyn ReactionPort> {
+            Arc::new(FailingReactionPort)
+        }
+
+        fn message_link(
+            &self,
+            _origin: &Origin,
+            _channel_id: ChannelId,
+            _message_id: MessageId,
+        ) -> Option<String> {
+            None
         }
     }
 
@@ -1512,6 +1797,7 @@ mod tests {
         output: Arc<RecordingChatOutput>,
         begins: Arc<Mutex<Vec<OutboundMessage>>>,
         updates: Arc<Mutex<Vec<String>>>,
+        reactions: ReactionLog,
         services: Arc<KernelServices>,
     }
 
@@ -1531,13 +1817,22 @@ mod tests {
             updates: Arc::clone(&updates),
             output: Arc::clone(&output),
             typing_starts: AtomicUsize::new(0),
+            reactions: Arc::new(Mutex::new(Vec::new())),
         });
         let services = Arc::new(KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
             guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
         });
-        DeltaCtx { engine, storage, output, begins, updates, services }
+        DeltaCtx {
+            engine,
+            storage,
+            output,
+            begins,
+            updates,
+            reactions: Arc::clone(&factory.reactions),
+            services,
+        }
     }
 
     /// Storage whose document half delegates to an in-memory storage but
@@ -1677,6 +1972,13 @@ mod tests {
         describer: Arc<FakeDescriber>,
     }
 
+    /// `(message_id, emoji)` pairs the engine fired through the factory.
+    type ReactionLog = Arc<Mutex<Vec<(u64, String)>>>;
+
+    fn reactions_log(factory: &StreamRecordingFactory) -> Vec<(u64, String)> {
+        factory.reactions.lock().clone()
+    }
+
     /// Flat text projection of recorded stream begins, for content assertions.
     fn begin_texts(begins: &Mutex<Vec<OutboundMessage>>) -> Vec<String> {
         begins.lock().iter().map(|message| message.content.clone()).collect()
@@ -1726,6 +2028,7 @@ mod tests {
             updates: Arc::clone(&updates),
             output: Arc::clone(&output),
             typing_starts: AtomicUsize::new(0),
+            reactions: Arc::new(Mutex::new(Vec::new())),
         });
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
@@ -1788,6 +2091,10 @@ mod tests {
 
         fn stream_output(&self, _origin: &Origin) -> Arc<dyn ChatStreamPort> {
             Arc::new(FailingStream)
+        }
+
+        fn react(&self, _origin: &Origin) -> Arc<dyn ReactionPort> {
+            Arc::new(FailingReactionPort)
         }
 
         fn message_link(
@@ -2983,6 +3290,182 @@ mod tests {
         let last = records.last().expect("bot turn recorded");
         assert_eq!(last.role, RecordRole::Assistant);
         assert_eq!(last.content, "partial answer");
+    }
+
+    // ---- Reaction tool (see `tools` for the protocol rules R1-R6) ----
+
+    fn react_config() -> ChannelConfig {
+        ChannelConfig { react: true, ..assigned_config() }
+    }
+
+    /// Markers are stripped from the delivered text and the recorded bot
+    /// turn; the tokens fire against the triggering message (target of the
+    /// reply), in order, deduplicated, invalid ones dropped individually.
+    #[tokio::test]
+    async fn react_markers_are_stripped_and_reactions_fire() {
+        let ctx = ctx(vec![Ok("nice! [[react: 🤓 :dorkiS: word 🤓]]".to_owned())]);
+        let config = react_config();
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+
+        // The channel sees only the cleaned answer.
+        assert_eq!(begin_texts(&ctx.begins), vec!["nice!".to_owned()]);
+        // Valid tokens fired against the reply target; the prose word and
+        // the duplicate were dropped.
+        assert_eq!(
+            reactions_log(&ctx.factory),
+            vec![(77, "🤓".to_owned()), (77, ":dorkiS:".to_owned())]
+        );
+        // The recorded bot turn carries the cleaned text (R4).
+        let records = stored_records(&ctx).await;
+        let last = records.last().expect("bot turn recorded");
+        assert_eq!(last.content, "nice!");
+    }
+
+    /// A triggered answer that is ONLY a marker still honors the
+    /// guaranteed-answer contract: the reactions are the visible response -
+    /// no fallback, and no phantom bot turn in the history.
+    #[tokio::test]
+    async fn marker_only_answer_reacts_without_fallback_or_record() {
+        let ctx = ctx(vec![Ok("[[react: 🤓]]".to_owned())]);
+        let config = react_config();
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+
+        assert!(ctx.begins.lock().is_empty());
+        assert!(ctx.output.messages().is_empty(), "no fallback: the emoji was the answer");
+        assert_eq!(reactions_log(&ctx.factory), vec![(77, "🤓".to_owned())]);
+        let records = stored_records(&ctx).await;
+        assert!(records.iter().all(|record| record.role == RecordRole::User));
+    }
+
+    /// R5: reaction failures are cosmetic - the delivered answer and its
+    /// record are unaffected (a foreign-guild custom emoji skips, the reply
+    /// stays).
+    #[tokio::test]
+    async fn reaction_failure_never_touches_the_answer() {
+        let ctx = ctx(vec![Ok("still delivered [[react: :foreignGuild:]]".to_owned())]);
+        let config = react_config();
+        seed_config(&ctx.storage, &config);
+        let output = RecordingChatOutput::new();
+        let services = KernelServices {
+            chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
+            chat_output_factory: Arc::new(FailingReactionFactory { output: Arc::clone(&output) })
+                as Arc<dyn ChatOutputFactoryPort>,
+            guild_storage: Some(ctx.storage.guild_scoped(Platform::Discord, GuildId(1))),
+        };
+
+        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &services).await;
+
+        // Delivered = recorded: the assistant turn with the cleaned text
+        // proves the answer went out despite the reaction failure.
+        let records = stored_records(&ctx).await;
+        let last = records.last().expect("bot turn recorded");
+        assert_eq!(last.role, RecordRole::Assistant);
+        assert_eq!(last.content, "still delivered");
+    }
+
+    /// A react-off channel strips hallucinated markers (never shows them)
+    /// but fires nothing.
+    #[tokio::test]
+    async fn react_disabled_strips_markers_but_never_fires() {
+        let ctx = ctx(vec![Ok("text [[react: 🤓]]".to_owned())]);
+        let config = assigned_config();
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+
+        assert_eq!(begin_texts(&ctx.begins), vec!["text".to_owned()]);
+        assert!(reactions_log(&ctx.factory).is_empty());
+    }
+
+    /// A stream that died mid-answer skips reactions entirely (Q4): the
+    /// partial text is delivered, no reaction fires even though the full
+    /// content carried a marker.
+    #[tokio::test]
+    async fn partial_stream_never_fires_reactions() {
+        let ctx = ctx_delta(
+            LlmSettings::default(),
+            Arc::new(DeltaCompletion {
+                chunks: vec!["partial".to_owned(), " [[react: 🤓]]".to_owned()],
+                delay_ms: 1,
+                fail_at_start: false,
+                fail_after: Some(1),
+            }),
+        );
+        let config = ChannelConfig { streaming: true, ..react_config() };
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+
+        assert!(ctx.output.messages().is_empty());
+        assert_eq!(ctx.updates.lock().last().map(String::as_str), Some("partial"));
+        assert!(ctx.reactions.lock().is_empty());
+    }
+
+    /// The silent-react chime: one single-shot call, prose discarded, no bot
+    /// turn recorded ("delivered = recorded"), reactions still fire.
+    #[tokio::test]
+    async fn react_chime_reacts_silently_without_a_bot_turn() {
+        let ctx = ctx_random(
+            LlmSettings::default(),
+            Arc::new(FixedRandom(true)),
+            vec![Ok("prose nobody sees [[react: 🐻]]".to_owned())],
+        );
+        let config = ChannelConfig {
+            capture_mode: CaptureMode::AllMessages,
+            react: true,
+            random_chance_percent: 0.0, // reply roll off - react-only chime
+            random_react_chance_percent: 100.0,
+            ..assigned_config()
+        };
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
+
+        assert_eq!(ctx.fake.requests().len(), 1);
+        assert!(ctx.begins.lock().is_empty(), "no reply is delivered");
+        assert!(ctx.output.messages().is_empty());
+        assert_eq!(reactions_log(&ctx.factory), vec![(77, "🐻".to_owned())]);
+        // Only the capture - no phantom assistant turn.
+        assert_eq!(stored_records(&ctx).await.len(), 1);
+        // The call was real: usage stats recorded despite the silence.
+        let stats = ctx
+            .storage
+            .guild_scoped(Platform::Discord, GuildId(1))
+            .get(NAMESPACE, &channel_stats_key(2))
+            .await
+            .expect("stats readable");
+        assert!(stats.is_some(), "react chime usage must be recorded");
+    }
+
+    /// Without a marker the silent-react chime stays invisible: no reply, no
+    /// reaction, no record - the roll trace at debug is the only trace.
+    #[tokio::test]
+    async fn react_chime_without_marker_stays_silent() {
+        let ctx = ctx_random(
+            LlmSettings::default(),
+            Arc::new(FixedRandom(true)),
+            vec![Ok("just prose, no marker".to_owned())],
+        );
+        let config = ChannelConfig {
+            capture_mode: CaptureMode::AllMessages,
+            react: true,
+            random_chance_percent: 0.0,
+            random_react_chance_percent: 100.0,
+            ..assigned_config()
+        };
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
+
+        assert_eq!(ctx.fake.requests().len(), 1);
+        assert!(ctx.begins.lock().is_empty());
+        assert!(ctx.output.messages().is_empty());
+        assert!(reactions_log(&ctx.factory).is_empty());
+        assert_eq!(stored_records(&ctx).await.len(), 1);
     }
 
     #[tokio::test]
