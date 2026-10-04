@@ -23,8 +23,8 @@ use crate::kernel::{
 use super::chat_engine::ChatEngine;
 use super::commands::{
     AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler, CutoffLlmHandler,
-    DumpLlmHandler, GetLlmHandler, ModelsLlmHandler, PromptFileLlmHandler, PromptLlmHandler,
-    SET_KEYS, SetLlmHandler, StatusLlmHandler, UnassignLlmHandler, model_choices,
+    DumpLlmHandler, GetLlmHandler, ModelsLlmHandler, SET_KEYS, SetLlmHandler, SetPromptLlmHandler,
+    StatusLlmHandler, UnassignLlmHandler, model_choices,
 };
 use super::conversation::{ConversationRecord, RecordRole};
 use super::model::{
@@ -251,43 +251,54 @@ impl LlmPlugin {
         }
     }
 
-    /// The two system-prompt commands: inline text (Discord option limit)
-    /// and attachment upload (long prompts, formatting-preserving).
-    fn register_prompt_commands(&self) {
+    /// The one prompt command: every channel prompt (system persona,
+    /// compaction instruction, image instruction) is set inline, from an
+    /// uploaded file, or read back here - `/llm_set` stays a pure key/value
+    /// tuner and keeps its dropdown far under Discord's choice cap.
+    fn register_prompt_command(&self) {
         self.registry.register(
             self.descriptor(
-                "llm_prompt",
-                "Set the chat bot's persona for this channel (clear = plugin default)",
-                vec![ArgDescriptor {
-                    name: "prompt".to_owned(),
-                    description: "Prompt text; `clear` restores the default (long prompts: \
-                         `/llm_prompt_file`)"
-                        .to_owned(),
-                    required: true,
-                    kind: ArgKind::String,
-                    choices: None,
-                }],
+                "llm_set_prompt",
+                "Set or show a channel prompt: system (persona), compaction or image",
+                vec![
+                    ArgDescriptor {
+                        name: "kind".to_owned(),
+                        description: "Prompt to change - system = bot persona, compaction = \
+                             history summary, image = descriptions"
+                            .to_owned(),
+                        required: true,
+                        kind: ArgKind::String,
+                        choices: Some(
+                            ["system", "compaction", "image"]
+                                .iter()
+                                .map(|kind| (*kind).to_owned())
+                                .collect(),
+                        ),
+                    },
+                    ArgDescriptor {
+                        name: "prompt".to_owned(),
+                        description: "Prompt text; `clear` restores the plugin default; omit \
+                             with `file` to view"
+                            .to_owned(),
+                        required: false,
+                        kind: ArgKind::String,
+                        choices: None,
+                    },
+                    ArgDescriptor {
+                        name: "file".to_owned(),
+                        description: "Text (.txt/.md) file with the prompt for long texts; \
+                             overrides `prompt`"
+                            .to_owned(),
+                        required: false,
+                        kind: ArgKind::Attachment,
+                        choices: None,
+                    },
+                ],
                 AccessTier::Moderator,
             ),
-            Arc::new(PromptLlmHandler::new(Arc::clone(&self.channel_locks))),
-        );
-        self.registry.register(
-            self.descriptor(
-                "llm_prompt_file",
-                "Set this channel's persona from an uploaded text file (formatting is kept)",
-                vec![ArgDescriptor {
-                    name: "file".to_owned(),
-                    description: "Text (.txt/.md) file holding the prompt; size-capped by the \
-                         operator"
-                        .to_owned(),
-                    required: true,
-                    kind: ArgKind::Attachment,
-                    choices: None,
-                }],
-                AccessTier::Moderator,
-            ),
-            Arc::new(PromptFileLlmHandler::new(
+            Arc::new(SetPromptLlmHandler::new(
                 Arc::clone(&self.channel_locks),
+                Arc::clone(&self.engine),
                 self.prompt_fetch.clone(),
                 self.engine.settings().max_prompt_file_bytes,
             )),
@@ -434,7 +445,7 @@ impl PluginPort for LlmPlugin {
             ),
             Arc::new(DumpLlmHandler::new(Arc::clone(&self.engine))),
         );
-        self.register_prompt_commands();
+        self.register_prompt_command();
         Ok(())
     }
 
@@ -761,9 +772,8 @@ mod tests {
                 "llm_dump",
                 "llm_get",
                 "llm_models",
-                "llm_prompt",
-                "llm_prompt_file",
                 "llm_set",
+                "llm_set_prompt",
                 "llm_status",
                 "llm_unassign"
             ]
@@ -849,12 +859,12 @@ mod tests {
             .await
             .expect("assign expected to succeed");
         let long_prompt = "ário ".repeat(400); // 2400 chars, multibyte-safe
-        SetLlmHandler::new(ChannelLocks::new(), Arc::clone(&fixture.engine))
+        prompt_handler(&fixture)
             .invoke(
                 &command_event(Some(1)),
                 &CommandArgs(vec![
-                    ("key".to_owned(), "compaction_prompt".to_owned()),
-                    ("value".to_owned(), long_prompt.clone()),
+                    ("kind".to_owned(), "compaction".to_owned()),
+                    ("prompt".to_owned(), long_prompt.clone()),
                 ]),
                 &fixture.services,
             )
@@ -1639,6 +1649,15 @@ mod tests {
         assert!(messages.iter().any(|m| m.contains("You are a helpful chat assistant.")));
     }
 
+    fn prompt_handler(fixture: &Fixture) -> SetPromptLlmHandler {
+        SetPromptLlmHandler::new(
+            ChannelLocks::new(),
+            Arc::clone(&fixture.engine),
+            reqwest::Client::new(),
+            10_000,
+        )
+    }
+
     /// An override is reported as such - and its head preview + fingerprint
     /// let an admin verify the active version without printing the whole
     /// prompt.
@@ -1648,10 +1667,13 @@ mod tests {
         plugin.init().expect("init expected to succeed");
         seed_config_in(&fixture.storage);
 
-        PromptLlmHandler::new(ChannelLocks::new())
+        prompt_handler(&fixture)
             .invoke(
                 &command_event(Some(1)),
-                &CommandArgs(vec![("prompt".to_owned(), "You are a pirate.".to_owned())]),
+                &CommandArgs(vec![
+                    ("kind".to_owned(), "system".to_owned()),
+                    ("prompt".to_owned(), "You are a pirate.".to_owned()),
+                ]),
                 &fixture.services,
             )
             .await
@@ -1770,15 +1792,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_sets_and_clears_system_prompt() {
+    async fn prompt_sets_clears_and_reads_back_system_prompt() {
         let (plugin, fixture) = fixture();
         plugin.init().expect("init expected to succeed");
         seed_config_in(&fixture.storage);
 
-        PromptLlmHandler::new(ChannelLocks::new())
+        prompt_handler(&fixture)
             .invoke(
                 &command_event(Some(1)),
-                &CommandArgs(vec![("prompt".to_owned(), "You are a pirate.".to_owned())]),
+                &CommandArgs(vec![
+                    ("kind".to_owned(), "system".to_owned()),
+                    ("prompt".to_owned(), "You are a pirate.".to_owned()),
+                ]),
                 &fixture.services,
             )
             .await
@@ -1796,10 +1821,32 @@ mod tests {
             serde_json::from_value(raw).expect("config expected to deserialize");
         assert_eq!(config.system_prompt.as_deref(), Some("You are a pirate."));
 
-        PromptLlmHandler::new(ChannelLocks::new())
+        // No text arguments: the command reads the current value back.
+        prompt_handler(&fixture)
             .invoke(
                 &command_event(Some(1)),
-                &CommandArgs(vec![("prompt".to_owned(), "clear".to_owned())]),
+                &CommandArgs(vec![("kind".to_owned(), "system".to_owned())]),
+                &fixture.services,
+            )
+            .await
+            .expect("read-back expected to succeed");
+        assert!(
+            fixture
+                .output
+                .messages()
+                .iter()
+                .any(|m| m.contains("`system_prompt`: `You are a pirate.`")),
+            "read-back expected, got: {:?}",
+            fixture.output.messages()
+        );
+
+        prompt_handler(&fixture)
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![
+                    ("kind".to_owned(), "system".to_owned()),
+                    ("prompt".to_owned(), "clear".to_owned()),
+                ]),
                 &fixture.services,
             )
             .await

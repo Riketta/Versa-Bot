@@ -662,11 +662,10 @@ plugin](#authorization-auth-plugin)).
 | `/llm_assign model:<provider/model>` | moderator | assign the bot to this channel - `model` must be one of the operator-declared models (offered as a dropdown, listed by `/llm_models`); re-assigning retunes in place |
 | `/llm_models` | user | list the declared models - the legal assignment set, with declared capabilities (reasoning, context window) |
 | `/llm_unassign` | moderator | remove the bot from this channel (history is kept) |
-| `/llm_prompt prompt:<text>` | moderator | set the channel system prompt; `clear` falls back to the plugin default (inline limit: Discord's ~6000-character option cap) |
-| `/llm_prompt_file file:<attachment>` | moderator | set the system prompt from an uploaded text/markdown file - for prompts beyond the inline limit; fetched from Discord's CDN only, capped by `[llm] max_prompt_file_bytes` (128 KiB default) |
+| `/llm_set_prompt kind:<kind> prompt:<text>` | moderator | set a channel prompt - `kind` is `system` (persona), `compaction` (summary instruction) or `image` (recognition instruction); `clear` falls back to the plugin default; attach `file` instead of `prompt` for long prompts (Discord CDN only, capped by `[llm] max_prompt_file_bytes`, 128 KiB default); omitting both arguments shows the current value |
 | `/llm_set key:<key> value:<value>` | moderator | tune one channel setting (table below) |
 | `/llm_get key:<key>` | moderator | show a setting's current value (defaults render as the effective value, long text truncated); omit `key` to list every setting |
-| `/llm_dump` | moderator | dump every setting at once in one copy-pasteable code fence (`key = value`, effective values); prompts are not dumped at all - only set-or-not and size, the text is one `/llm_get key` away |
+| `/llm_dump` | moderator | dump every setting at once in one copy-pasteable code fence (`key = value`, effective values); prompts are not dumped at all - only set-or-not and size, the text is one argument-free `/llm_set_prompt kind` away |
 | `/llm_cutoff` | moderator | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
 | `/llm_status` | user | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, compaction, image recognition (state, model, prompt length), reactions (state, silent-react chance), capture mode, chime-in chance, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
 | `/llm_admin` | moderator | make this channel the guild's service channel for error notices (one per guild, last write wins) |
@@ -677,9 +676,11 @@ plugin](#authorization-auth-plugin)).
 without a default (`model`, `depth`) refuse and point at
 `/llm_unassign`. On/off keys accept `on`/`off` (also
 `true`/`yes`/`1` and `false`/`no`/`0`). Invalid values are answered
-with usage and never saved. `/llm_get` reads the same keys back (the
-channel system prompt itself is `/llm_prompt`'s, visible via
-`/llm_status`).
+with usage and never saved. `/llm_get` reads the same keys back. The
+three channel prompts (system persona, compaction and image
+instructions) are deliberately not keys here - they have their own
+command, `/llm_set_prompt`, which also reads them back and accepts
+uploaded files for long texts.
 
 | Key | Values | Default | Meaning |
 |---|---|---|---|
@@ -692,10 +693,8 @@ channel system prompt itself is `/llm_prompt`'s, visible via
 | `capture_mode` | `bot_related` or `all_messages` | `bot_related` | what enters the channel's history: only messages mentioning or replying the bot, or everything (random chime-ins need `all_messages` to have material) |
 | `compaction` | on / off | on | summarize-and-cutoff when the window outgrows `depth` |
 | `compaction_model` | declared model ref | plugin `[llm] compaction_model`, else the channel's chat model | which model writes the summaries |
-| `compaction_prompt` | text | plugin default | summarization instruction |
 | `images` | on / off | off | describe attached images on captured messages via the recognition model; needs an operator `[llm] image_model` |
 | `image_model` | declared model ref | plugin `[llm] image_model` | recognition model override for this channel |
-| `image_prompt` | text | plugin `[llm] image_prompt` | recognition instruction, e.g. pin the description language |
 | `react` | on / off | off | emoji-reaction tool: the model may decorate the message it replies to by emitting a `[[react: ...]]` marker, stripped before the answer is shown |
 | `streaming` | on / off | off | stream the answer live from the provider (SSE): the message appears with the first tokens and is edited at `stream_interval_ms` |
 | `random_chance` | 0-100 (clamped) | 2 | percent chance to chime in on a captured non-trigger message; 0 = off |

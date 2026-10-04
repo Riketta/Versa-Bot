@@ -26,7 +26,7 @@ pub struct LlmConfig {
     pub max_message_length: usize,
     /// Streaming edit cadence in milliseconds.
     pub stream_interval_ms: u64,
-    /// Cap for `/llm_prompt_file` attachment downloads, in bytes.
+    /// Cap for `/llm_set_prompt` file attachments, in bytes.
     pub max_prompt_file_bytes: u64,
     /// Image recognition model fallback (`provider/model`); absent = image
     /// recognition off globally (channels can only toggle within that).

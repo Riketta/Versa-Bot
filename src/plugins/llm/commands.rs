@@ -31,7 +31,9 @@ use super::vision::DEFAULT_IMAGE_PROMPT;
 pub const DISCORD_MESSAGE_LIMIT: usize = 2000;
 
 /// Recognized `/llm_set` keys, in display order. Doubles as the Discord
-/// choices dropdown for the `key` argument.
+/// choices dropdown for the `key` argument. Channel prompts are NOT keys -
+/// they have their own command (`/llm_set_prompt`), which also keeps this
+/// list well under Discord's 25-choice cap.
 pub(super) const SET_KEYS: &[&str] = &[
     "model",
     "temperature",
@@ -47,10 +49,8 @@ pub(super) const SET_KEYS: &[&str] = &[
     "capture_mode",
     "compaction",
     "compaction_model",
-    "compaction_prompt",
     "images",
     "image_model",
-    "image_prompt",
     "react",
     "streaming",
     "random_chance",
@@ -349,14 +349,13 @@ fn apply_optional_field(
     cleared: bool,
 ) -> Option<Result<String, String>> {
     match key {
-        // Text/size fields sharing the set/clear shape.
-        "compaction_model" | "compaction_prompt" | "image_model" | "image_prompt" => {
+        // Model refs sharing the set/clear shape. The text prompts left the
+        // key set for `/llm_set_prompt` - only model refs remain here.
+        "compaction_model" | "image_model" => {
             if cleared {
                 match key {
                     "compaction_model" => config.compaction_model = None,
-                    "image_model" => config.image_model = None,
-                    "image_prompt" => config.image_prompt = None,
-                    _ => config.compaction_prompt = None,
+                    _ => config.image_model = None,
                 }
                 return Some(Ok(format!("`{key}` cleared (plugin default applies).")));
             }
@@ -365,19 +364,11 @@ fn apply_optional_field(
                     config.compaction_model = Some(value.to_owned());
                     Some(Ok(format!("`{key}` set to `{value}`.")))
                 }
-                "image_model" => {
+                _ => {
                     config.image_model = Some(value.to_owned());
                     Some(Ok(format!(
                         "`{key}` set to `{value}` (describes images for this channel)."
                     )))
-                }
-                "image_prompt" => {
-                    config.image_prompt = Some(value.to_owned());
-                    Some(Ok(format!("`{key}` updated (descriptions follow this instruction).")))
-                }
-                _ => {
-                    config.compaction_prompt = Some(value.to_owned());
-                    Some(Ok(format!("`{key}` updated.")))
                 }
             }
         }
@@ -1156,9 +1147,10 @@ impl CommandHandler for GetLlmHandler {
 /// one copy-pasteable code fence. Read-only sibling of `/llm_get` - same
 /// tier, same value renderer, one document read, no channel lock. Prompts
 /// are never dumped - not even as a preview; the dump only says whether
-/// one is set and how big it is, the text is one `/llm_get key` away. The
-/// fence is FOUR backticks deep: rendered values are channel-managed text
-/// (templates) that may themselves contain code fences.
+/// one is set and how big it is, the text is one argument-free
+/// `/llm_set_prompt kind` away. The fence is FOUR backticks deep: rendered
+/// values are channel-managed text (templates) that may themselves contain
+/// code fences.
 pub(super) struct DumpLlmHandler {
     engine: Arc<ChatEngine>,
 }
@@ -1170,8 +1162,9 @@ impl DumpLlmHandler {
 }
 
 /// A rendered value past this many characters degrades to a head preview
-/// in the dump (long custom templates) - 25 keys must stay inside one
-/// Discord message, and the full text is one `/llm_get key` away.
+/// in the dump (long custom templates) - every key plus the prompt shapes
+/// must stay inside one Discord message, and the full text is one focused
+/// read command away.
 const DUMP_VALUE_PREVIEW: usize = 120;
 
 /// Dump shape of one prompt: set-or-not and size only - never the text.
@@ -1193,33 +1186,36 @@ impl CommandHandler for DumpLlmHandler {
         let Some(config) = load_assigned_config(event, services).await? else {
             return Ok(());
         };
-        let lines: Vec<String> = SET_KEYS
+        let mut lines: Vec<String> = SET_KEYS
             .iter()
             .map(|key| {
-                let value = match *key {
-                    "compaction_prompt" => prompt_shape(config.compaction_prompt.as_ref()),
-                    "image_prompt" => prompt_shape(config.image_prompt.as_ref()),
-                    _ => {
-                        let value = current_value(&config, key, self.engine.settings())
-                            .unwrap_or_else(|| "?".to_owned());
-                        if value.chars().count() > DUMP_VALUE_PREVIEW {
-                            format!(
-                                "{}… ({} chars total)",
-                                preview(&value, DUMP_VALUE_PREVIEW),
-                                value.chars().count()
-                            )
-                        } else {
-                            value
-                        }
-                    }
+                let value = current_value(&config, key, self.engine.settings())
+                    .unwrap_or_else(|| "?".to_owned());
+                let value = if value.chars().count() > DUMP_VALUE_PREVIEW {
+                    format!(
+                        "{}… ({} chars total)",
+                        preview(&value, DUMP_VALUE_PREVIEW),
+                        value.chars().count()
+                    )
+                } else {
+                    value
                 };
                 format!("{key} = {value}")
             })
             .collect();
+        // The three prompts are never dumped - set-or-not and size only;
+        // the text is one `/llm_set_prompt kind` away.
+        for kind in [PromptKind::System, PromptKind::Compaction, PromptKind::Image] {
+            lines.push(format!(
+                "{} = {}",
+                kind.field_name(),
+                prompt_shape(kind.field(&config).as_ref())
+            ));
+        }
         services
             .chat_output
             .send(command_reply(format!(
-                "Channel settings ({} keys):\n````\n{}\n````",
+                "Channel settings ({} keys + 3 prompts):\n````\n{}\n````",
                 SET_KEYS.len(),
                 lines.join("\n")
             )))
@@ -1236,9 +1232,6 @@ impl CommandHandler for DumpLlmHandler {
 fn current_value(config: &ChannelConfig, key: &str, settings: &LlmSettings) -> Option<String> {
     let not_sent = || "not sent (provider default)".to_owned();
     let on_off = |enabled: bool| if enabled { "on" } else { "off" }.to_owned();
-    let text_or = |value: &Option<String>, fallback: String| {
-        value.clone().map_or(fallback, |text| shape_or_preview(&text))
-    };
     match key {
         "model" => Some(config.model.clone()),
         "temperature" | "top_p" | "top_k" | "min_p" | "frequency_penalty" | "presence_penalty" => {
@@ -1276,13 +1269,6 @@ fn current_value(config: &ChannelConfig, key: &str, settings: &LlmSettings) -> O
                 .clone()
                 .unwrap_or_else(|| format!("the channel's chat model (`{}`)", config.model)),
         ),
-        "compaction_prompt" => Some(text_or(
-            &config.compaction_prompt,
-            format!(
-                "<plugin default, {} chars>",
-                settings.default_compaction_prompt.chars().count()
-            ),
-        )),
         "images" => Some(on_off(config.images)),
         "image_model" => Some(config.image_model.clone().unwrap_or_else(|| {
             settings.image_model.clone().map_or_else(
@@ -1290,13 +1276,6 @@ fn current_value(config: &ChannelConfig, key: &str, settings: &LlmSettings) -> O
                 |model| format!("plugin `image_model` (`{model}`)"),
             )
         })),
-        "image_prompt" => Some(text_or(
-            &config.image_prompt,
-            settings.image_prompt.clone().map_or_else(
-                || "<built-in default>".to_owned(),
-                |prompt| format!("<plugin default, {} chars>", prompt.chars().count()),
-            ),
-        )),
         "random_chance" => Some(format!("{:.1}%", config.random_chance_percent)),
         "random_cooldown" => Some(format!("{} seconds", config.random_cooldown_secs)),
         "random_react_chance" => Some(format!("{:.1}%", config.random_react_chance_percent)),
@@ -1337,122 +1316,286 @@ fn shape_or_preview(text: &str) -> String {
     format!("`{}` ... ({} chars total)", preview(text, FULL_UP_TO), text.chars().count())
 }
 
-/// `/llm_prompt`: sets the channel's system prompt (long free text); the
-/// value `clear` falls back to the plugin-wide default. Like `/llm_set`, the
-/// read-modify-write runs under the channel's processing lock.
-pub(super) struct PromptLlmHandler {
-    locks: Arc<ChannelLocks>,
+/// The channel prompts `/llm_set_prompt` manages, selected by `kind`.
+#[derive(Clone, Copy)]
+pub(super) enum PromptKind {
+    /// The bot's persona - the conversation's system prompt.
+    System,
+    /// The summarizer instruction used by compaction.
+    Compaction,
+    /// The image-recognition instruction.
+    Image,
 }
 
-impl PromptLlmHandler {
-    pub(super) fn new(locks: Arc<ChannelLocks>) -> Self {
-        Self { locks }
+impl PromptKind {
+    /// The `kind` argument grammar - also the Discord choices dropdown.
+    pub(super) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "system" => Some(Self::System),
+            "compaction" => Some(Self::Compaction),
+            "image" => Some(Self::Image),
+            _ => None,
+        }
+    }
+
+    /// The config field this kind addresses (read).
+    fn field(self, config: &ChannelConfig) -> &Option<String> {
+        match self {
+            Self::System => &config.system_prompt,
+            Self::Compaction => &config.compaction_prompt,
+            Self::Image => &config.image_prompt,
+        }
+    }
+
+    /// The config field this kind addresses (write).
+    fn field_mut(self, config: &mut ChannelConfig) -> &mut Option<String> {
+        match self {
+            Self::System => &mut config.system_prompt,
+            Self::Compaction => &mut config.compaction_prompt,
+            Self::Image => &mut config.image_prompt,
+        }
+    }
+
+    /// Key-style name used in replies (`system_prompt` etc.), mirroring the
+    /// `/llm_set` acknowledgment shape.
+    fn field_name(self) -> &'static str {
+        match self {
+            Self::System => "system_prompt",
+            Self::Compaction => "compaction_prompt",
+            Self::Image => "image_prompt",
+        }
+    }
+
+    /// The effective prompt for read-back: the custom text (shape/preview)
+    /// or what the plugin default contributes.
+    fn current(self, config: &ChannelConfig, settings: &LlmSettings) -> String {
+        if let Some(text) = self.field(config) {
+            return shape_or_preview(text);
+        }
+        match self {
+            Self::System => format!(
+                "<plugin default, {} chars>",
+                settings.default_system_prompt.chars().count()
+            ),
+            Self::Compaction => format!(
+                "<plugin default, {} chars>",
+                settings.default_compaction_prompt.chars().count()
+            ),
+            Self::Image => settings.image_prompt.clone().map_or_else(
+                || "<built-in default>".to_owned(),
+                |prompt| format!("<plugin default, {} chars>", prompt.chars().count()),
+            ),
+        }
+    }
+}
+
+/// Applies one `/llm_set_prompt` mutation. Pure so the grammar stays unit-
+/// testable: `Ok(message)` describes the change, `Err(usage)` is the reply
+/// for a malformed value. `None` clears to the plugin default.
+fn apply_prompt(
+    config: &mut ChannelConfig,
+    kind: PromptKind,
+    value: Option<&str>,
+) -> Result<String, String> {
+    match value {
+        None => {
+            *kind.field_mut(config) = None;
+            Ok(format!("`{}` cleared (the plugin default applies).", kind.field_name()))
+        }
+        Some(text) => {
+            if text.trim().is_empty() {
+                return Err(
+                    "`prompt` cannot be empty - give text, `clear`, or attach a file.".to_owned()
+                );
+            }
+            *kind.field_mut(config) = Some(text.to_owned());
+            Ok(format!("`{}` updated.", kind.field_name()))
+        }
+    }
+}
+
+/// `/llm_set_prompt`: one command for every channel prompt - system persona,
+/// compaction and image instructions. `prompt` sets inline (`clear`/`none`/
+/// `default` restores the plugin default), `file` sets from an uploaded
+/// attachment (long prompts, formatting preserved), and giving neither reads
+/// the current value back. Mutations run under the channel's processing
+/// lock; the file download happens before it (slow network I/O must not
+/// freeze the channel's chat), and the read-back takes no lock at all (a
+/// single document read, like `/llm_get`).
+pub(super) struct SetPromptLlmHandler {
+    locks: Arc<ChannelLocks>,
+    engine: Arc<ChatEngine>,
+    client: reqwest::Client,
+    max_prompt_file_bytes: u64,
+}
+
+impl SetPromptLlmHandler {
+    pub(super) fn new(
+        locks: Arc<ChannelLocks>,
+        engine: Arc<ChatEngine>,
+        client: reqwest::Client,
+        max_prompt_file_bytes: u64,
+    ) -> Self {
+        Self { locks, engine, client, max_prompt_file_bytes }
     }
 }
 
 #[async_trait]
-impl CommandHandler for PromptLlmHandler {
+impl CommandHandler for SetPromptLlmHandler {
     async fn invoke(
         &self,
         event: &RequestContext,
         args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
-        let channel = self.locks.lock_for(&event.origin);
-        let _channel = channel.lock().await;
-        let Some(mut config) = load_assigned_config(event, services).await? else {
+        const USAGE: &str = "Usage: `/llm_set_prompt kind prompt` - kind is `system` (persona), \
+             `compaction` or `image`; give `prompt` text (`clear` restores the default), attach \
+             `file` for long prompts, or give neither to show the current value.";
+        let Some(kind_text) = args.get("kind") else {
+            services.chat_output.send(command_reply(USAGE)).await?;
             return Ok(());
         };
-        let Some(prompt) = args.get("prompt") else {
+        let Some(kind) = PromptKind::parse(kind_text) else {
             services
                 .chat_output
-                .send(command_reply(
-                    "Usage: `/llm_prompt text` - or `/llm_prompt clear` to fall back to the default.",
-                ))
+                .send(command_reply(format!(
+                    "Unknown kind `{kind_text}`. Kinds: system, compaction, image."
+                )))
                 .await?;
             return Ok(());
         };
+        let value = args.get("prompt");
+        let file = args.get("file");
 
-        let message = if prompt == "clear" {
-            config.system_prompt = None;
-            "System prompt cleared: the default applies again."
-        } else {
-            config.system_prompt = Some(prompt.to_owned());
-            "System prompt updated."
-        };
-        save_config(event, services, config).await?;
-        services.chat_output.send(command_reply(message)).await?;
+        // File path: download BEFORE the channel lock (see the struct doc).
+        if let Some(url) = file {
+            if value.is_some() {
+                services
+                    .chat_output
+                    .send(command_reply("Give either `prompt` or `file`, not both."))
+                    .await?;
+                return Ok(());
+            }
+            if let Err(usage) = validate_prompt_file_url(url) {
+                services.chat_output.send(command_reply(usage)).await?;
+                return Ok(());
+            }
+            let prompt =
+                match download_prompt_file(&self.client, self.max_prompt_file_bytes, url).await {
+                    Ok(prompt) => prompt,
+                    Err(reason) => {
+                        services
+                            .chat_output
+                            .send(command_reply(format!("Could not load the attachment: {reason}")))
+                            .await?;
+                        return Ok(());
+                    }
+                };
+            let characters = prompt.chars().count();
+            let channel = self.locks.lock_for(&event.origin);
+            let _channel = channel.lock().await;
+            let Some(mut config) = load_assigned_config(event, services).await? else {
+                return Ok(());
+            };
+            *kind.field_mut(&mut config) = Some(prompt);
+            save_config(event, services, config).await?;
+            services
+                .chat_output
+                .send(command_reply(format!(
+                    "`{}` set from file ({} characters).",
+                    kind.field_name(),
+                    characters
+                )))
+                .await?;
+            return Ok(());
+        }
+
+        match value {
+            // Mutation: read-modify-write under the channel lock.
+            Some(text) => {
+                let cleared = matches!(text, "clear" | "none" | "default");
+                let channel = self.locks.lock_for(&event.origin);
+                let _channel = channel.lock().await;
+                let Some(mut config) = load_assigned_config(event, services).await? else {
+                    return Ok(());
+                };
+                match apply_prompt(&mut config, kind, (!cleared).then_some(text)) {
+                    Ok(message) => {
+                        save_config(event, services, config).await?;
+                        services.chat_output.send(command_reply(message)).await?;
+                    }
+                    Err(usage) => {
+                        services.chat_output.send(command_reply(usage)).await?;
+                    }
+                }
+            }
+            // Read-back: no channel lock (single document read, like
+            // `/llm_get`).
+            None => {
+                let Some(config) = load_assigned_config(event, services).await? else {
+                    return Ok(());
+                };
+                services
+                    .chat_output
+                    .send(command_reply(format!(
+                        "`{}`: {}",
+                        kind.field_name(),
+                        kind.current(&config, self.engine.settings())
+                    )))
+                    .await?;
+            }
+        }
         Ok(())
     }
 }
 
-/// `/llm_prompt_file`: sets the channel's system prompt from an uploaded
-/// attachment - for prompts longer than Discord's inline option limit.
-/// The adapter normalizes the attachment to its Discord CDN URL; this
-/// handler re-validates the pinned host (the CDN is the only network peer
-/// guild input may ever point the bot at - no arbitrary URL fetches),
-/// downloads with the configured byte cap, and stores the decoded text.
-/// Like every state-mutating LLM command, it runs under the channel's
-/// processing lock.
-pub(super) struct PromptFileLlmHandler {
-    locks: Arc<ChannelLocks>,
-    client: reqwest::Client,
+/// Downloads and decodes a `/llm_set_prompt` attachment with the configured
+/// byte cap. The body is STREAM-read: the cap aborts the transfer instead
+/// of buffering a lying or chunked response whole. `Err` carries the
+/// user-facing reason; transport details go to logs.
+async fn download_prompt_file(
+    client: &reqwest::Client,
     max_prompt_file_bytes: u64,
-}
-
-impl PromptFileLlmHandler {
-    pub(super) fn new(
-        locks: Arc<ChannelLocks>,
-        client: reqwest::Client,
-        max_prompt_file_bytes: u64,
-    ) -> Self {
-        Self { locks, client, max_prompt_file_bytes }
+    url: &str,
+) -> Result<String, String> {
+    let mut response = client.get(url).send().await.map_err(|err| {
+        tracing::warn!(%err, "prompt file download failed");
+        "the attachment could not be downloaded".to_owned()
+    })?;
+    if !response.status().is_success() {
+        return Err(format!("the attachment host returned HTTP {}", response.status()));
     }
-
-    /// Downloads and decodes the attachment with the configured byte cap.
-    /// The body is STREAM-read: the cap aborts the transfer instead of
-    /// buffering a lying or chunked response whole. `Err` carries the
-    /// user-facing reason; transport details go to logs.
-    async fn download(&self, url: &str) -> Result<String, String> {
-        let mut response = self.client.get(url).send().await.map_err(|err| {
-            tracing::warn!(%err, "prompt file download failed");
-            "the attachment could not be downloaded".to_owned()
-        })?;
-        if !response.status().is_success() {
-            return Err(format!("the attachment host returned HTTP {}", response.status()));
-        }
-        if let Some(len) = response.content_length()
-            && len > self.max_prompt_file_bytes
-        {
+    if let Some(len) = response.content_length()
+        && len > max_prompt_file_bytes
+    {
+        return Err(format!(
+            "the attachment exceeds the limit ({len} > {max_prompt_file_bytes} bytes, \
+             `max_prompt_file_bytes`)"
+        ));
+    }
+    let limit = usize::try_from(max_prompt_file_bytes).unwrap_or(usize::MAX);
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|err| {
+        tracing::warn!(%err, "prompt file download failed");
+        "the attachment could not be downloaded".to_owned()
+    })? {
+        body.extend_from_slice(&chunk);
+        if body.len() > limit {
             return Err(format!(
-                "the attachment exceeds the limit ({len} > {} bytes, `max_prompt_file_bytes`)",
-                self.max_prompt_file_bytes
+                "the attachment exceeds the limit ({} bytes or more > {}, \
+                 `max_prompt_file_bytes`)",
+                body.len(),
+                max_prompt_file_bytes
             ));
         }
-        let limit = usize::try_from(self.max_prompt_file_bytes).unwrap_or(usize::MAX);
-        let mut body: Vec<u8> = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|err| {
-            tracing::warn!(%err, "prompt file download failed");
-            "the attachment could not be downloaded".to_owned()
-        })? {
-            body.extend_from_slice(&chunk);
-            if body.len() > limit {
-                return Err(format!(
-                    "the attachment exceeds the limit ({} bytes or more > {}, \
-                     `max_prompt_file_bytes`)",
-                    body.len(),
-                    self.max_prompt_file_bytes
-                ));
-            }
-        }
-        let text = String::from_utf8(body)
-            .map_err(|_| "the attachment is not valid UTF-8 text".to_owned())?;
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return Err("the attachment is empty".to_owned());
-        }
-        Ok(trimmed.to_owned())
     }
+    let text =
+        String::from_utf8(body).map_err(|_| "the attachment is not valid UTF-8 text".to_owned())?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("the attachment is empty".to_owned());
+    }
+    Ok(trimmed.to_owned())
 }
 
 /// The attachment argument must name Discord's CDN - the only network peer
@@ -1465,59 +1608,6 @@ fn validate_prompt_file_url(url: &str) -> Result<(), String> {
         Err("the `file` argument must be this command's own attachment - pick the \
              uploaded file in the slash command UI."
             .to_owned())
-    }
-}
-
-#[async_trait]
-impl CommandHandler for PromptFileLlmHandler {
-    async fn invoke(
-        &self,
-        event: &RequestContext,
-        args: &CommandArgs,
-        services: &KernelServices,
-    ) -> anyhow::Result<()> {
-        let Some(url) = args.get("file") else {
-            services
-                .chat_output
-                .send(command_reply(
-                    "Usage: `/llm_prompt_file file` - attach a .txt/.md file with the prompt text.",
-                ))
-                .await?;
-            return Ok(());
-        };
-        if let Err(usage) = validate_prompt_file_url(url) {
-            services.chat_output.send(command_reply(usage)).await?;
-            return Ok(());
-        }
-
-        // Fetch the attachment BEFORE taking the channel lock: the download
-        // is slow network I/O and must not freeze the channel's chat for up
-        // to the client timeout. Only the config read-modify-write needs the
-        // lock.
-        let prompt = match self.download(url).await {
-            Ok(prompt) => prompt,
-            Err(reason) => {
-                services
-                    .chat_output
-                    .send(command_reply(format!("Could not load the attachment: {reason}")))
-                    .await?;
-                return Ok(());
-            }
-        };
-
-        let channel = self.locks.lock_for(&event.origin);
-        let _channel = channel.lock().await;
-        let Some(mut config) = load_assigned_config(event, services).await? else {
-            return Ok(());
-        };
-        let characters = prompt.chars().count();
-        config.system_prompt = Some(prompt);
-        save_config(event, services, config).await?;
-        services
-            .chat_output
-            .send(command_reply(format!("System prompt set from file ({characters} characters).")))
-            .await?;
-        Ok(())
     }
 }
 
@@ -1546,6 +1636,10 @@ mod tests {
         assert!(validate_prompt_file_url("https://example.com/prompt.txt").is_err());
     }
 
+    async fn download(cap: u64, url: &str) -> Result<String, String> {
+        download_prompt_file(&reqwest::Client::new(), cap, url).await
+    }
+
     /// Minimal one-shot TCP server (the same pattern as the provider
     /// tests): swallows the request head, writes the scripted bytes, closes
     /// the connection. Deliberately no HTTP framework.
@@ -1563,25 +1657,19 @@ mod tests {
         (format!("http://{addr}/attachment.md"), handle)
     }
 
-    fn prompt_file_handler(cap: u64) -> PromptFileLlmHandler {
-        PromptFileLlmHandler::new(ChannelLocks::new(), reqwest::Client::new(), cap)
-    }
-
     /// The download happy path and the HTTP-status branch: 200 decodes the
     /// body (trimmed), a non-2xx surfaces the status in the reply.
     #[tokio::test]
     async fn prompt_file_download_success_and_status_error() {
-        let handler = prompt_file_handler(10_000);
-
         let (url, server) =
             raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n  prompt".to_vec()).await;
-        let prompt = handler.download(&url).await.expect("download expected to succeed");
+        let prompt = download(10_000, &url).await.expect("download expected to succeed");
         let _ = server.await;
         assert_eq!(prompt, "prompt");
 
         let (url, server) =
             raw_http_server(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec()).await;
-        let err = handler.download(&url).await.expect_err("404 expected to fail");
+        let err = download(10_000, &url).await.expect_err("404 expected to fail");
         let _ = server.await;
         assert!(err.contains("404"), "{err}");
     }
@@ -1591,11 +1679,10 @@ mod tests {
     /// body (the streaming cap is the point of this test).
     #[tokio::test]
     async fn prompt_file_download_cap_aborts_oversized_body() {
-        let handler = prompt_file_handler(64);
         let script = format!("HTTP/1.0 200 OK\r\nConnection: close\r\n\r\n{}", "x".repeat(500));
         let (url, server) = raw_http_server(script.into_bytes()).await;
 
-        let err = handler.download(&url).await.expect_err("oversized body expected to fail");
+        let err = download(64, &url).await.expect_err("oversized body expected to fail");
         let _ = server.await;
 
         assert!(err.contains("exceeds the limit"), "{err}");
@@ -1603,15 +1690,42 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_file_download_rejects_non_utf8() {
-        let handler = prompt_file_handler(10_000);
         let mut script = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n".to_vec();
         script.extend_from_slice(&[0xFF, 0xFE]);
         let (url, server) = raw_http_server(script).await;
 
-        let err = handler.download(&url).await.expect_err("invalid UTF-8 expected to fail");
+        let err = download(10_000, &url).await.expect_err("invalid UTF-8 expected to fail");
         let _ = server.await;
 
         assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    /// All three prompt kinds share the set/clear grammar: text stores,
+    /// clearing resets to the plugin default, empty text is refused, and
+    /// read-back renders custom text vs what the default contributes.
+    #[test]
+    fn prompt_kinds_set_clear_and_render() {
+        let settings = LlmSettings::default();
+        let mut config = ChannelConfig::assigned("m".to_owned());
+
+        for kind in [PromptKind::System, PromptKind::Compaction, PromptKind::Image] {
+            let set = apply_prompt(&mut config, kind, Some("You are a pirate.")).expect("set");
+            assert!(set.contains("updated"), "{set}");
+            assert_eq!(kind.field(&config).as_deref(), Some("You are a pirate."));
+
+            let cleared = apply_prompt(&mut config, kind, None).expect("clear");
+            assert!(cleared.contains("cleared"), "{cleared}");
+            assert_eq!(kind.field(&config).as_deref(), None);
+        }
+
+        // Default states render what the plugin contributes.
+        assert!(PromptKind::System.current(&config, &settings).contains("plugin default"));
+        assert!(PromptKind::Compaction.current(&config, &settings).contains("plugin default"));
+        assert!(PromptKind::Image.current(&config, &settings).contains("built-in default"));
+
+        // Unknown kinds and empty text are rejected.
+        assert!(PromptKind::parse("vibes").is_none());
+        assert!(apply_prompt(&mut config, PromptKind::System, Some("   ")).is_err());
     }
 
     #[test]
@@ -1653,21 +1767,21 @@ mod tests {
     }
 
     /// Image settings follow the same set/clear grammar as their compaction
-    /// counterparts: the model is a validated ref (handler-side), the prompt
-    /// is free text with `clear` falling back to the plugin default.
+    /// counterpart: the model is a validated ref (handler-side). The image
+    /// and compaction PROMPTS left the key set for `/llm_set_prompt` - the
+    /// tuner must refuse them, not silently set.
     #[test]
     fn image_keys_set_and_clear() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
         apply_set(&mut config, "image_model", "local/vision").expect("set expected");
         assert_eq!(config.image_model.as_deref(), Some("local/vision"));
-        apply_set(&mut config, "image_prompt", "Describe in Russian.").expect("set expected");
-        assert_eq!(config.image_prompt.as_deref(), Some("Describe in Russian."));
 
         apply_set(&mut config, "image_model", "clear").expect("clear expected");
         assert_eq!(config.image_model, None);
-        apply_set(&mut config, "image_prompt", "default").expect("clear expected");
-        assert_eq!(config.image_prompt, None);
+
+        assert!(apply_set(&mut config, "image_prompt", "Describe in Russian.").is_err());
+        assert!(apply_set(&mut config, "compaction_prompt", "Summarize.").is_err());
     }
 
     /// `off` is an explicit choice with its own acknowledgment and its own

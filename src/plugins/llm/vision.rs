@@ -139,7 +139,7 @@ impl VisionService {
         image: &ImageSource,
         max_source_bytes: u64,
     ) -> Result<Vec<u8>, VisionError> {
-        // Trust boundary, enforced (mirrors `/llm_prompt_file`): only the
+        // Trust boundary, enforced (mirrors `/llm_set_prompt`): only the
         // platform CDN is ever fetched, whatever the payload claims.
         if !image.url.starts_with(DISCORD_CDN_PREFIX) {
             return Err(VisionError::UntrustedHost);
