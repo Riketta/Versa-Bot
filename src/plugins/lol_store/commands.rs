@@ -148,6 +148,55 @@ impl CommandHandler for UnassignHandler {
     }
 }
 
+/// `/lol_store_role`: binds the role tagged on store announcements - the
+/// per-guild "subscription": members join the role to opt into pings
+/// (moderator). Run with the role argument to set, without it to clear.
+pub struct RoleHandler;
+
+#[async_trait]
+impl CommandHandler for RoleHandler {
+    async fn invoke(
+        &self,
+        _event: &RequestContext,
+        args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
+        if services.guild_storage.is_none() {
+            return reply_guild_only(services).await;
+        }
+        let role = args.get("role").map(str::to_owned);
+        match role {
+            Some(role) => {
+                if role.parse::<u64>().is_err() {
+                    services
+                        .chat_output
+                        .send(command_reply(
+                            "The role argument must be a role - pick one from the list.",
+                        ))
+                        .await?;
+                    return Ok(());
+                }
+                update_config(services, |config| config.role_id = Some(role)).await?;
+                services
+                    .chat_output
+                    .send(command_reply(
+                        "Store announcements will now tag that role (members opt in by \
+                         joining it). Make sure the role is mentionable.",
+                    ))
+                    .await?;
+            }
+            None => {
+                update_config(services, |config| config.role_id = None).await?;
+                services
+                    .chat_output
+                    .send(command_reply("Store announcements will no longer tag a role."))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// `/lol_client_status`: watcher health, counts and settings (moderator,
 /// ephemeral).
 pub struct ClientStatusHandler<B: crate::kernel::plugin_ports::EventBusPort> {

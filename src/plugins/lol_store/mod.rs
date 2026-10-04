@@ -27,13 +27,14 @@ use parking_lot::Mutex;
 use crate::kernel::{
     models::PluginError,
     plugin_ports::{
-        AccessTier, CommandDescriptor, CommandRegistryPort, EventBusPort, JobHandle, PluginPort,
-        SchedulerPort,
+        AccessTier, ArgDescriptor, ArgKind, CommandDescriptor, CommandRegistryPort, EventBusPort,
+        JobHandle, PluginPort, SchedulerPort,
     },
 };
 
 pub use commands::{
-    AssignHandler, ClientStatusHandler, DisableHandler, DumpHandler, EnableHandler, UnassignHandler,
+    AssignHandler, ClientStatusHandler, DisableHandler, DumpHandler, EnableHandler, RoleHandler,
+    UnassignHandler,
 };
 pub use diff::LastSeen;
 pub use engine::{
@@ -138,6 +139,24 @@ impl<B: EventBusPort> PluginPort for LolStorePlugin<B> {
         register(
             CommandDescriptor {
                 plugin_id: self.name().to_owned(),
+                name: "lol_store_role".to_owned(),
+                description: "Tag this role on store announcements (omit to clear)".to_owned(),
+                arguments: vec![ArgDescriptor {
+                    name: "role".to_owned(),
+                    description: "Role to tag on announcements; omit to clear".to_owned(),
+                    required: false,
+                    kind: ArgKind::Role,
+                    choices: None,
+                }],
+                required_permission: None,
+                required_tier: Some(AccessTier::Moderator),
+                guild_only: true,
+            },
+            Arc::new(RoleHandler),
+        );
+        register(
+            CommandDescriptor {
+                plugin_id: self.name().to_owned(),
                 name: "lol_store_dump".to_owned(),
                 description: "Post the latest LoL store update summary in this channel".to_owned(),
                 arguments: Vec::new(),
@@ -190,7 +209,7 @@ mod tests {
     use crate::kernel::models::{
         CommandPayload, EventKind, EventPayload, GuildId, Origin, Platform, UserId,
     };
-    use crate::kernel::plugin_ports::CommandHandler;
+    use crate::kernel::plugin_ports::{CommandArgs, CommandHandler};
     use crate::kernel::services::KernelServices;
     use crate::kernel::spi_ports::{ChatOutputPort, StoragePort};
     use crate::test_support::{
@@ -251,6 +270,7 @@ mod tests {
                 "lol_store_disable",
                 "lol_store_assign",
                 "lol_store_unassign",
+                "lol_store_role",
                 "lol_store_dump",
             ]
         );
@@ -379,6 +399,45 @@ mod tests {
         UnassignHandler.invoke(&f.event, &Default::default(), &f.services).await.expect("invoke");
         let config = stored_config(&f).await.expect("config expected");
         assert_eq!(config.channel_id, None);
+    }
+
+    #[tokio::test]
+    async fn role_command_sets_and_clears_the_mention_role() {
+        let f = command_fixture(true).await;
+        // With the role: stored, and orthogonal to enable/channel.
+        let args = CommandArgs(vec![("role".to_owned(), "999".to_owned())]);
+        RoleHandler.invoke(&f.event, &args, &f.services).await.expect("invoke");
+        let config = stored_config(&f).await.expect("config expected");
+        assert_eq!(config.role_id.as_deref(), Some("999"));
+        assert!(!config.enabled);
+        assert_eq!(config.channel_id, None);
+
+        // Without the role: cleared, everything else untouched.
+        f.storage
+            .guild_scoped(Platform::Discord, GuildId(42))
+            .set(
+                NAMESPACE,
+                CONFIG_KEY,
+                serde_json::json!({ "enabled": true, "channel_id": "555", "role_id": "999" }),
+            )
+            .await
+            .expect("config write expected");
+        RoleHandler.invoke(&f.event, &Default::default(), &f.services).await.expect("invoke");
+        let config = stored_config(&f).await.expect("config expected");
+        assert_eq!(config.role_id, None);
+        assert!(config.enabled, "clearing the role must not touch the switch");
+        assert_eq!(config.channel_id.as_deref(), Some("555"));
+    }
+
+    #[tokio::test]
+    async fn role_command_rejects_non_role_values() {
+        let f = command_fixture(true).await;
+        let args = CommandArgs(vec![("role".to_owned(), "not-a-role".to_owned())]);
+        RoleHandler.invoke(&f.event, &args, &f.services).await.expect("invoke");
+        let messages = f.output.messages();
+        let first = messages.first().expect("reply expected");
+        assert!(first.contains("must be a role"));
+        assert!(stored_config(&f).await.is_none(), "nothing stored on rejection");
     }
 
     #[tokio::test]

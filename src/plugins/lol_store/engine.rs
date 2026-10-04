@@ -59,6 +59,11 @@ pub struct GuildConfig {
     /// Announcement channel (string - snowflakes exceed JSON numbers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<String>,
+    /// Optional role tagged on announcements (the "subscription" role:
+    /// members join it to opt into pings). The tag rides the message
+    /// content - embeds never notify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_id: Option<String>,
 }
 
 /// What `/lol_client_status` and `/lol_store_dump` render.
@@ -250,14 +255,12 @@ impl<B: EventBusPort> StoreEngine<B> {
             kinds.push(StoreEventKind::YourShop);
         }
 
-        let message = OutboundMessage::embed(Embed {
-            title: "LoL Store updates".to_owned(),
-            description: text.clone(),
-        });
+        let announcement_embed =
+            Embed { title: "LoL Store updates".to_owned(), description: text.clone() };
         let at_unix =
             SystemTime::now().duration_since(UNIX_EPOCH).map(|since| since.as_secs()).unwrap_or(0);
 
-        for &(platform, guild_id, channel_id) in &targets {
+        for &(platform, guild_id, channel_id, ref role_id) in &targets {
             let origin = Origin {
                 platform,
                 guild_id: Some(guild_id),
@@ -266,9 +269,20 @@ impl<B: EventBusPort> StoreEngine<B> {
                 message_id: None,
                 reply_token: None,
             };
+            // The role tag rides the CONTENT: Discord fires notifications
+            // from message content only, never from embeds.
+            let content = role_id
+                .as_deref()
+                .and_then(|id| id.parse::<u64>().ok())
+                .map_or(String::new(), |id| format!("<@&{id}>"));
+            let message = OutboundMessage {
+                content,
+                embeds: vec![announcement_embed.clone()],
+                ..OutboundMessage::default()
+            };
             let storage = self.storage.guild_scoped(platform, guild_id);
             let output = self.factory.channel_output(&origin, channel_id);
-            if let Err(err) = output.send(message.clone()).await {
+            if let Err(err) = output.send(message).await {
                 tracing::warn!(%err, guild = guild_id.get(), "failed to deliver store announcement");
                 continue;
             }
@@ -324,7 +338,7 @@ impl<B: EventBusPort> StoreEngine<B> {
     }
 
     /// Guilds with the tracker enabled and a channel assigned.
-    async fn enabled_guilds(&self) -> Vec<(Platform, GuildId, ChannelId)> {
+    async fn enabled_guilds(&self) -> Vec<(Platform, GuildId, ChannelId, Option<String>)> {
         let mut targets = Vec::new();
         let Ok(guilds) = self.storage.list_guilds().await else {
             return targets;
@@ -346,7 +360,7 @@ impl<B: EventBusPort> StoreEngine<B> {
                 tracing::warn!(guild = guild_id.get(), "store tracker enabled but channel missing");
                 continue;
             };
-            targets.push((platform, guild_id, ChannelId(channel)));
+            targets.push((platform, guild_id, ChannelId(channel), config.role_id));
         }
         targets
     }
@@ -706,6 +720,33 @@ mod tests {
         let records = scoped.list_last(NAMESPACE, 10).await.expect("records read expected");
         assert_eq!(records.len(), 1, "the announcement must be recorded");
         assert_eq!(f.bus.log(), vec![("lol_store.announced", GUILD, "sales")]);
+    }
+
+    #[tokio::test]
+    async fn configured_role_is_tagged_in_content_not_embed() {
+        let f = fixture(FakeLcu::online()).await;
+        // Enabled + channel + subscription role.
+        f.storage
+            .guild_scoped(Platform::Discord, GuildId(GUILD))
+            .set(
+                NAMESPACE,
+                CONFIG_KEY,
+                serde_json::json!({ "enabled": true, "channel_id": "55", "role_id": "999" }),
+            )
+            .await
+            .expect("config write expected");
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        f.engine.tick().await; // baseline
+
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        f.engine.tick().await;
+
+        let sent = f.output.sent();
+        assert_eq!(sent.len(), 1);
+        let message = sent.first().expect("announcement expected");
+        assert_eq!(message.content, "<@&999>", "the role tag rides the content");
+        let embed = message.embeds.first().expect("embed expected");
+        assert!(!embed.description.contains("<@&"), "embeds never notify");
     }
 
     #[tokio::test]

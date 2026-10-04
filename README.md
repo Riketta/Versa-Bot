@@ -293,7 +293,15 @@ state, a silent baseline.
 | `/lol_store_disable` | admin | disable store tracking for this guild (the channel binding is kept) |
 | `/lol_store_assign` | moderator | post store events in this channel (run it in the target channel) |
 | `/lol_store_unassign` | moderator | stop posting store events in this guild |
-| `/lol_store_dump` | moderator | force-post the latest store update summary in the current channel (public) |
+| `/lol_store_role` | moderator | tag this role on store announcements - the subscription role (run without the argument to clear) |
+| `/lol_store_dump` | moderator | force-post the latest store update summary in the current channel (public, no role tag) |
+
+The `/lol_store_role` subscription pattern: create a mentionable role
+(e.g. `Store Pings`), let members join it, and bind it once - every
+announcement then tags the role, so only opted-in members are pinged.
+The tag rides the message content (embeds never notify on Discord); the
+role must be marked "allow anyone to mention", or the bot needs the
+mention-everyone permission.
 
 Operator configuration lives in the optional `[lol]` section
 (**startup-only** - an absent section, an empty `lockfile_path`, or a
