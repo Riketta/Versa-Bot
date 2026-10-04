@@ -217,7 +217,7 @@ impl<B: EventBusPort> PluginPort for LolStorePlugin<B> {
                     .to_owned(),
                 arguments: vec![ArgDescriptor {
                     name: "what".to_owned(),
-                    description: "Watch id from /lol_store_watchlist, or `all`".to_owned(),
+                    description: "Watch id from `/lol_store_watchlist`, or `all`".to_owned(),
                     required: true,
                     kind: ArgKind::String,
                     choices: None,

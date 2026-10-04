@@ -261,7 +261,7 @@ impl LlmPlugin {
                 vec![ArgDescriptor {
                     name: "prompt".to_owned(),
                     description: "Prompt text; `clear` restores the default (long prompts: \
-                         /llm_prompt_file)"
+                         `/llm_prompt_file`)"
                         .to_owned(),
                     required: true,
                     kind: ArgKind::String,

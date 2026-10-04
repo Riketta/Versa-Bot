@@ -81,7 +81,7 @@ impl CommandHandler for EnableHandler {
                 }
                 None => {
                     "LoL store tracking enabled. Assign an announcement channel with \
-                     /lol_store_assign."
+                     `/lol_store_assign`."
                 }
             }))
             .await?;
@@ -135,7 +135,7 @@ impl CommandHandler for AssignHandler {
             .chat_output
             .send(command_reply(
                 "LoL store events will be posted in this channel (tracking must also be \
-                 enabled with /lol_store_enable).",
+                 enabled with `/lol_store_enable`).",
             ))
             .await?;
         Ok(())
@@ -376,7 +376,7 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for WatchHandl
                 .chat_output
                 .send(command_reply(
                     "No store data yet - the League client has not been reachable since \
-                     startup (see /lol_client_status).",
+                     startup (see `/lol_client_status`).",
                 ))
                 .await?;
             return Ok(());
@@ -401,7 +401,7 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for WatchHandl
                 services
                     .chat_output
                     .send(command_reply(format!(
-                        "Several matches - run /lol_store_watch again with the exact name:\n{}",
+                        "Several matches - run `/lol_store_watch` again with the exact name:\n{}",
                         lines.join("\n")
                     )))
                     .await?;
@@ -421,7 +421,7 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for WatchHandl
                 .chat_output
                 .send(command_reply(format!(
                     "Watch limit reached ({user_watches}/{} per user). Remove one with \
-                     /lol_store_unwatch first.",
+                     `/lol_store_unwatch` first.",
                     settings.watch_user_cap
                 )))
                 .await?;
@@ -473,7 +473,7 @@ impl CommandHandler for UnwatchHandler {
             services
                 .chat_output
                 .send(command_reply(
-                    "Give a watch id from /lol_store_watchlist, or `all` to clear yours.",
+                    "Give a watch id from `/lol_store_watchlist`, or `all` to clear yours.",
                 ))
                 .await?;
             return Ok(());
@@ -492,9 +492,9 @@ impl CommandHandler for UnwatchHandler {
         } else {
             match what.parse::<u64>() {
                 Ok(id) if doc.remove(&user_id, id) => (true, format!("Watch #{id} removed.")),
-                Ok(id) => (false, format!("No watch #{id} of yours - see /lol_store_watchlist.")),
+                Ok(id) => (false, format!("No watch #{id} of yours - see `/lol_store_watchlist`.")),
                 Err(_) => {
-                    (false, "Give a watch id from /lol_store_watchlist, or `all`.".to_owned())
+                    (false, "Give a watch id from `/lol_store_watchlist`, or `all`.".to_owned())
                 }
             }
         };
@@ -531,7 +531,7 @@ impl CommandHandler for WatchlistHandler {
             .collect();
         mine.sort_by_key(|watch| watch.id);
         let reply_text = if mine.is_empty() {
-            "No watches yet - add one with /lol_store_watch.".to_owned()
+            "No watches yet - add one with `/lol_store_watch`.".to_owned()
         } else {
             let lines: Vec<String> = mine
                 .iter()
