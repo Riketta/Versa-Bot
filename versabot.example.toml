@@ -53,6 +53,31 @@ url = "sqlite://versabot.db"
 # announce_mythic_rotation = true
 # announce_yourshop = true
 
+# Optional: LoL leaderboard - the on-demand /lol_leaderboard statistics
+# dump (role distributions, most picked champions per role) from a public
+# leaderboard source. Startup-only: an absent section, no regions, or a
+# zero request_interval_secs / parse_depth / cache_ttl_secs keeps the
+# command in "not configured" mode. No per-guild setup - the command
+# answers wherever it is invoked. All display windows (buckets, champ
+# pool) are clamped to parse_depth.
+# [lol_leaderboard]
+# Regions (servers) to aggregate - empty = plugin off.
+# regions = ["kr", "euw", "na"]
+# Minimum delay in seconds between source requests (sequential).
+# request_interval_secs = 1
+# Top players parsed per region.
+# parse_depth = 1000
+# Player-count rows for the role-distribution tables.
+# display_buckets = [300, 1000]
+# Player pool (per region, best first) behind the champion tables.
+# champ_pool_depth = 1000
+# Champions listed per role.
+# champs_per_role = 5
+# How long cached data stays fresh (default 18h).
+# cache_ttl_secs = 64800
+# Optional proxy for source requests (socks5:// or http://).
+# proxy = "socks5://192.168.1.35:8081"
+
 # Optional: LLM chat runtime. This section is the bot operator's domain -
 # guild moderators only pick among the declared models via /llm_assign
 # and /llm_set, never configure endpoints. Startup-only: changes require

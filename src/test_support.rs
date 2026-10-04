@@ -12,7 +12,9 @@ use async_trait::async_trait;
 
 use crate::kernel::{
     models::{GuildId, OutboundError, OutboundMessage, Platform, StorageError},
-    plugin_ports::{Job, JobHandle, SchedulerPort},
+    plugin_ports::{
+        CommandDescriptor, CommandHandler, CommandRegistryPort, Job, JobHandle, SchedulerPort,
+    },
     spi_ports::{
         ChatOutputFactoryPort, ChatOutputPort, ChatTypingGuard, GUILD_SETTINGS, GuildStorage,
         StoragePort, StoredRecord,
@@ -461,6 +463,46 @@ impl SchedulerPort for NoopScheduler {
         _job: Arc<dyn Job>,
     ) -> JobHandle {
         JobHandle::new(Arc::new(|| {}))
+    }
+}
+
+/// [`CommandRegistryPort`] double that captures what a plugin's `init()`
+/// declared, so registration tests can assert descriptors and fetch
+/// handlers without a full kernel.
+#[derive(Default)]
+pub struct CapturingCommandRegistry {
+    entries: Mutex<HashMap<String, (CommandDescriptor, Arc<dyn CommandHandler>)>>,
+}
+
+impl CapturingCommandRegistry {
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.entries.lock().keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    #[must_use]
+    pub fn handler(&self, name: &str) -> Option<Arc<dyn CommandHandler>> {
+        self.entries.lock().get(name).map(|(_, handler)| Arc::clone(handler))
+    }
+}
+
+impl CommandRegistryPort for CapturingCommandRegistry {
+    fn register(&self, descriptor: CommandDescriptor, handler: Arc<dyn CommandHandler>) {
+        self.entries.lock().insert(descriptor.name.clone(), (descriptor, handler));
+    }
+
+    fn lookup(&self, name: &str) -> Option<Arc<dyn CommandHandler>> {
+        self.handler(name)
+    }
+
+    fn descriptor(&self, name: &str) -> Option<CommandDescriptor> {
+        self.entries.lock().get(name).map(|(descriptor, _)| descriptor.clone())
+    }
+
+    fn descriptors(&self) -> Vec<CommandDescriptor> {
+        self.names().iter().filter_map(|name| self.descriptor(name)).collect()
     }
 }
 

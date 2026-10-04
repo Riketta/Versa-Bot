@@ -40,6 +40,10 @@ commands, permission tiers - lives in [Plugins](#plugins).
 - LoL store tracker: watches the locally running League client's store
   (sales, new skins, Mythic Shop rotations, Your Shop start) and announces
   changes to a per-guild assigned channel.
+- LoL leaderboard: on-demand `/lol_leaderboard` dump of aggregated ranked
+  leaderboard statistics (role distributions, most picked champions per
+  role) parsed from a pluggable data source, with cache and coverage
+  reporting.
 - Audit trail: records the bus membership events as structured `audit`
   tracing events.
 - LLM chat bot: per-channel conversations with history, compaction,
@@ -331,6 +335,77 @@ loopback, so the watcher requires the bot to run **on the same Windows
 instance as the client** (natively, or in a container with host-level
 networking plus a read-only mount of the lockfile's *directory* - the
 file itself is rewritten on every client start).
+
+### LoL leaderboard (`lol_leaderboard` plugin)
+
+Dumps aggregated ranked-leaderboard statistics on demand: role
+distribution per region and pooled across regions (TOP 300 / TOP 1000
+rows), and the most picked champions per role - the kind of summary
+analytics sites publish, delivered where the question is asked. The
+data comes from a pluggable source behind the plugin's port (the built
+in adapter reads DeepLoL's public API - no auth, no League client
+needed); the data source is startup-only config, and there is **no
+per-guild setup**: the command answers wherever it is invoked.
+
+The bot parses at most `parse_depth` players per configured region,
+sequentially and rate-limited; the champion tables pool each region's
+highest-ranked `champ_pool_depth` players. Results are cached
+process-lifetime for `cache_ttl` - a fresh cache answers instantly, a
+stale one triggers a re-parse first (the typing indicator shows during
+the parse; a cold multi-region parse takes tens of seconds). The output
+leads with a coverage line (`Parsed 2941/3000 players from 3 regions ·
+data age 2h`), renders a bucket row only when the parses actually cover
+it, degrades holes (a player without role/champion data leaves that
+table but never breaks the answer), and splits across messages on line
+boundaries. A failing region is named in the dump and served from cache
+when possible; only a total failure replies with an error.
+
+| Command | Tier | Effect |
+|---|---|---|
+| `/lol_leaderboard` | user | post the leaderboard statistics in the current channel (public) |
+
+Operator configuration lives in the optional `[lol_leaderboard]`
+section (**startup-only**; an absent section - or no regions served by
+the source - keeps the command in "not configured" mode):
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `regions` | string array | *(empty)* | regions to aggregate: `kr`, `euw`, `eun`, `na`, `jp`, `br`, `tr`, `tw`, `vn`, `sea`; empty = plugin off |
+| `request_interval_secs` | integer | `1` | minimum delay between source requests (sequential, rate-limit politeness); `0` disables the plugin |
+| `parse_depth` | integer | `1000` | top players parsed per region (clamped to what the source's board has); `0` disables |
+| `display_buckets` | integer array | `[300, 1000]` | player-count rows for the role tables; values are clamped to `parse_depth`, sorted, deduplicated; empty = a single full-depth row |
+| `champ_pool_depth` | integer | `1000` | per-region player pool (highest ranked first) behind the champion tables; clamped to `parse_depth` |
+| `champs_per_role` | integer | `5` | champions listed per role |
+| `cache_ttl_secs` | integer | `64800` (18h) | how long cached data stays fresh; `0` disables |
+| `proxy` | string | *(none)* | optional proxy for source requests (`socks5://` or `http://`); the Discord proxy does not apply |
+
+Example output shape (abridged):
+
+````markdown
+# LoL Leaderboard Statistics
+
+Parsed 3000/3000 players from 3 regions · data age 2h 5m old
+
+## Role distribution in average
+
+**TOP 300:** Top: 18.67% | Jungle: 26.33% | Middle: 19.67% | Bot: 24.67% | Supporter: 10.67%
+
+## Role distribution in KR
+
+**TOP 300:** Top: 18.67% | Jungle: 26.33% | Middle: 19.67% | Bot: 24.67% | Supporter: 10.67%
+
+## Most picked champions per role
+
+**Top** - 540 players
+
+1. Ambessa - 14.8%
+2. Rumble - 14.4%
+````
+
+Maintainer notes - how to explore and re-verify the data source (the
+digitless-region-code trap, the lane enum, pagination, the champion
+info endpoint) - live in
+[`src/plugins/lol_leaderboard/README.md`](src/plugins/lol_leaderboard/README.md).
 
 ### LLM chat bot (`llm` plugin)
 

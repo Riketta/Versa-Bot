@@ -8,7 +8,7 @@ use serenity::all::{ClientBuilder, GatewayIntents, Http, HttpBuilder};
 
 use versa_bot::infrastructure::{
     Configuration, LlmConfig, LlmReasoningStyle, LlmSummaryPlacement, LolConfig,
-    PollingConfigWatcher,
+    LolLeaderboardConfig, PollingConfigWatcher,
     inbound_adapters::{DiscordGatewayAdapter, SerenityChatOutputFactory},
     observability,
     outbound_adapters::{DiscordCommandRegistrar, SerenityPresence, SqlxStorage},
@@ -28,6 +28,10 @@ use versa_bot::plugins::llm::{
     ChatEngine, DISCORD_MESSAGE_LIMIT, DeckRandom, ImageDescriber, LlmCompletionPort, LlmPlugin,
     LlmSettings, ModelSettings, OpenAiCompatibleAdapter, ProviderSettings, RandomPort,
     ReasoningStyle, SummaryPlacement, VisionService,
+};
+use versa_bot::plugins::lol_leaderboard::{
+    DeepLolSource, EngineSettings as LeaderboardEngineSettings, LeaderboardEngine,
+    LeaderboardPlugin, LeaderboardSourcePort, ResolvedView as LeaderboardView,
 };
 use versa_bot::plugins::lol_store::{
     AnnounceFlags, EngineSettings, LcuClient, LolStorePlugin, StoreEngine,
@@ -163,6 +167,39 @@ async fn main() -> ExitCode {
         Arc::clone(&lol_engine),
     ));
 
+    // LoL leaderboard: always registered (its command explains itself when
+    // the source is unconfigured). `[lol_leaderboard]` is startup-only -
+    // the HTTP client and engine are built once here; changes require a
+    // restart. The data is world data: no guild storage, no scheduler - the
+    // refresh runs inside the command under the typing indicator.
+    let leaderboard_interval = Duration::from_secs(
+        config.lol_leaderboard.as_ref().map_or(1, |config| config.request_interval_secs).max(1),
+    );
+    let leaderboard_proxy = config.lol_leaderboard.as_ref().and_then(|c| c.proxy.clone());
+    let leaderboard_source = DeepLolSource::new(leaderboard_proxy.as_deref(), leaderboard_interval)
+        .expect("config [lol_leaderboard] section expected to be valid (proxy parseable)");
+    let leaderboard_engine_settings =
+        leaderboard_settings(config.lol_leaderboard.as_ref(), &leaderboard_source).unwrap_or_else(
+            || {
+                LeaderboardEngineSettings::new(
+                    &leaderboard_source,
+                    &[],
+                    1000,
+                    Duration::from_secs(18 * 60 * 60),
+                    Duration::from_secs(1),
+                    LeaderboardView::resolve(1000, &[300, 1000], 1000, 5),
+                )
+            },
+        );
+    let leaderboard_engine = Arc::new(LeaderboardEngine::new(
+        Arc::new(leaderboard_source) as Arc<dyn LeaderboardSourcePort>,
+        leaderboard_engine_settings,
+    ));
+    let lol_leaderboard = Arc::new(LeaderboardPlugin::new(
+        Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
+        Arc::clone(&leaderboard_engine),
+    ));
+
     // Config hot reload: a polling watcher re-reads file+env configuration
     // and applies hot-reloadable sections without a restart. The handle is
     // kept and cancelled after the kernel shuts down - a post-shutdown tick
@@ -184,6 +221,7 @@ async fn main() -> ExitCode {
         Arc::clone(&audit) as Arc<dyn PluginPort>,
         Arc::clone(&status_plugin) as Arc<dyn PluginPort>,
         Arc::clone(&lol_store) as Arc<dyn PluginPort>,
+        Arc::clone(&lol_leaderboard) as Arc<dyn PluginPort>,
     ];
 
     let kernel = Arc::new(
@@ -438,6 +476,51 @@ fn lol_engine_settings(lol: Option<&LolConfig>) -> EngineSettings {
             yourshop: lol.announce_yourshop,
         },
     }
+}
+
+/// Maps `[lol_leaderboard]` onto the engine settings. A zero interval,
+/// depth or TTL would misbehave rather than degrade, so - like `[lol]`'s
+/// zero poll - it disables the plugin with a warning instead of a silent
+/// rescue. `None` maps to nothing usable: the command stays in
+/// "not configured" mode.
+fn leaderboard_settings(
+    config: Option<&LolLeaderboardConfig>,
+    source: &dyn LeaderboardSourcePort,
+) -> Option<LeaderboardEngineSettings> {
+    let Some(config) = config else { return None };
+    if config.request_interval_secs == 0 {
+        tracing::warn!(
+            "config section [lol_leaderboard] ignored: request_interval_secs must be > 0"
+        );
+        return None;
+    }
+    if config.parse_depth == 0 {
+        tracing::warn!("config section [lol_leaderboard] ignored: parse_depth must be > 0");
+        return None;
+    }
+    if config.cache_ttl_secs == 0 {
+        tracing::warn!("config section [lol_leaderboard] ignored: cache_ttl_secs must be > 0");
+        return None;
+    }
+    let settings = LeaderboardEngineSettings::new(
+        source,
+        &config.regions,
+        config.parse_depth,
+        Duration::from_secs(config.cache_ttl_secs),
+        Duration::from_secs(config.request_interval_secs),
+        LeaderboardView::resolve(
+            config.parse_depth,
+            &config.display_buckets,
+            config.champ_pool_depth,
+            config.champs_per_role,
+        ),
+    );
+    if settings.regions.is_empty() {
+        tracing::info!(
+            "config section [lol_leaderboard] has no regions served by the source - command in not-configured mode"
+        );
+    }
+    Some(settings)
 }
 
 /// Applies `[status]` changes to the rotator; the plugin itself ignores

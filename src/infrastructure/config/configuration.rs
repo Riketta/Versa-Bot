@@ -3,6 +3,7 @@ use serde::Deserialize;
 use super::discord::DiscordConfig;
 use super::llm::LlmConfig;
 use super::lol::LolConfig;
+use super::lol_leaderboard::LolLeaderboardConfig;
 use super::sentry::SentryConfig;
 use super::status::StatusConfig;
 use super::storage::StorageConfig;
@@ -28,5 +29,10 @@ pub struct Configuration {
     /// absent section - or an empty `lockfile_path` - keeps the watcher off.
     #[serde(default)]
     pub lol: Option<LolConfig>,
+    /// Optional leaderboard command (`[lol_leaderboard]` section).
+    /// Startup-only: an absent section - or an empty `regions` list - keeps
+    /// the command in "not configured" mode.
+    #[serde(default)]
+    pub lol_leaderboard: Option<LolLeaderboardConfig>,
     pub storage: StorageConfig,
 }
