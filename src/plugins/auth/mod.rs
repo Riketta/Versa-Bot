@@ -376,6 +376,7 @@ mod tests {
                 content: "!ping".to_owned(),
                 attachments: Vec::new(),
                 author_name: None,
+                guild_name: None,
                 author_roles: roles.iter().map(|role| (*role).to_owned()).collect(),
                 author_permissions: 0,
                 reply_to: None,

@@ -127,6 +127,10 @@ pub struct MessagePayload {
     /// username; best effort). Lets history consumers render `{sender}:
     /// {message}` context lines without a gateway cache.
     pub author_name: Option<String>,
+    /// Guild display name at capture time (best effort from the platform;
+    /// `None` in DMs and channel-less events). Lets history consumers
+    /// render a `{guild_name}` template parameter without a gateway cache.
+    pub guild_name: Option<String>,
     /// Opaque platform role identifiers of the author, filled by driving
     /// adapters when the platform provides them (empty otherwise). Lets
     /// guild plugins do role checks without platform-specific types.

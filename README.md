@@ -339,10 +339,14 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   stable placeholder if none - default `summary_placement`, which merges
   into the prompt instead when a model declares `system_suffix`) -> live
   window, oldest first. User turns render through the channel's turn
-  template (`{sender}: {message}` by default); bot turns are plain
-  assistant messages. The window is selected newest-first under the token
-  budget and `depth`, whichever bites first - the newest turn is always
-  included.
+  template (`[{sender}](<@{user_id}>): {message}` by default - the
+  `[Name]<@id>` tag shape normalized inbound messages carry, so the model
+  can assemble clean mentions; also available: `{guild_name}`, `{time}`
+  (unix seconds)); bot turns are plain assistant messages. Template fields
+  are baked into the stored record at capture, so a rendered turn never
+  changes retroactively. The window is selected newest-first under the
+  token budget and `depth`, whichever bites first - the newest turn is
+  always included.
 - **Mentions** in captured messages are normalized to `[Name]<@id>` - the
   model sees both who was named and the raw tag to imitate in replies.
   Replies using the same shape are converted back to bare mentions on
@@ -433,7 +437,7 @@ saved):
 | `random_chance` | percent chance to chime in on a captured non-trigger message | 2 |
 | `random_cooldown` | minimum seconds between chime-ins (`0` = none) | 5 |
 | `max_length` | per-channel reply-splitting limit | 2000 (`max_message_length`) |
-| `turn_template` | user-turn rendering; must contain `{sender}` and `{message}` | `{sender}: {message}` |
+| `turn_template` | user-turn rendering; must contain `{sender}` and `{message}`; params: `{sender}`, `{user_id}`, `{guild_name}`, `{time}` (unix), `{message}` | `[{{sender}}](<@{user_id}>): {message}` |
 
 **Delivery.** While an answer generates and delivers, the bot holds the
 channel's typing indicator - users see it composing, not frozen. The

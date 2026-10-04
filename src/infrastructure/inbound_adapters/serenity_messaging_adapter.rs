@@ -137,8 +137,16 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
         };
 
         let mut event = RequestContext::message_received(origin, content);
+        // Guild display name for the `{guild_name}` turn-template parameter:
+        // best effort from the gateway cache, frozen at capture time like
+        // the author name. `None` in DMs.
+        let guild_name = message
+            .guild_id
+            .and_then(|guild_id| ctx.cache.guild(guild_id))
+            .map(|guild| guild.name.clone());
         if let EventPayload::Message(payload) = &mut event.payload {
             payload.author_name = Some(author_name);
+            payload.guild_name = guild_name;
             payload.attachments = attachments;
             payload.author_roles = author_roles;
             payload.author_permissions = author_permissions;

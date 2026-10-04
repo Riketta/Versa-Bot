@@ -22,6 +22,7 @@ impl RequestContext {
                 content: content.into(),
                 attachments: Vec::new(),
                 author_name: None,
+                guild_name: None,
                 author_roles: Vec::new(),
                 // 0 = unknown; the driving adapter overwrites this with the
                 // platform's permission bits when it has them.

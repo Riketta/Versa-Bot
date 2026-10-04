@@ -376,7 +376,7 @@ fn apply_optional_field(
         }
         "turn_template" => Some(if cleared {
             config.turn_template = None;
-            Ok(format!("`{key}` cleared (`{{sender}}: {{message}}` applies)."))
+            Ok(format!("`{key}` cleared (`[{{sender}}](<@{{user_id}}>): {{message}}` applies)."))
         } else if !value.contains("{sender}") || !value.contains("{message}") {
             Err(format!("`{key}` must contain `{{sender}}` and `{{message}}`, got `{value}`."))
         } else {
@@ -1537,6 +1537,8 @@ mod tests {
             message_id: Some(1),
             role: RecordRole::User,
             author: Some("alice".to_owned()),
+            sender_id: None,
+            guild_name: None,
             content: content.to_owned(),
             reply_to: None,
             captured_at: 0,

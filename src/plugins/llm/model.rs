@@ -128,7 +128,9 @@ pub struct ChannelConfig {
     #[serde(default)]
     pub max_length: Option<usize>,
     /// Template for rendering user turns into the context; `{sender}` and
-    /// `{message}` are substituted. `None` = `{sender}: {message}`.
+    /// User-turn rendering in the context; `{sender}`, `{user_id}`,
+    /// `{guild_name}`, `{time}` (unix seconds) and `{message}` are
+    /// substituted. `None` = `[{sender}](<@{user_id}>): {message}`.
     #[serde(default)]
     pub turn_template: Option<String>,
     /// Estimated token budget for the assembled context. When set, turns

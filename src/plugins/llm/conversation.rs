@@ -18,8 +18,12 @@ use super::providers::{LlmSettings, SummaryPlacement};
 /// placeholder.
 pub const NO_EARLIER_CONTEXT: &str = "(no earlier context)";
 
-/// Default rendering of user turns in the context.
-pub const DEFAULT_TURN_TEMPLATE: &str = "{sender}: {message}";
+/// Default rendering of user turns in the context: the `[Name]<@id>`-style
+/// tag shape normalized inbound messages carry, so the model can both read
+/// who spoke and assemble clean Discord mentions. Parameters: `{sender}`
+/// (display name), `{user_id}`, `{guild_name}`, `{time}` (capture time,
+/// unix seconds), `{message}`.
+pub const DEFAULT_TURN_TEMPLATE: &str = "[{sender}](<@{user_id}>): {message}";
 
 /// The file name is a fake placeholder: the model only needs the "this was
 /// an image" hint - the description lives in the markdown alt-text slot.
@@ -56,6 +60,21 @@ pub fn record_content(record: &ConversationRecord) -> String {
     format!("{}{}", record.content, render_images(&record.images))
 }
 
+/// Renders one user record through the turn template. Every parameter is
+/// capture-baked, so a rendered turn never changes after the fact; legacy
+/// records from before a field existed render it as an empty string
+/// (`{sender}` falls back to `user`).
+#[must_use]
+pub fn render_user_turn(template: &str, record: &ConversationRecord) -> String {
+    let content = record_content(record);
+    template
+        .replace("{sender}", record.author.as_deref().unwrap_or("user"))
+        .replace("{user_id}", &record.sender_id.map(|id| id.to_string()).unwrap_or_default())
+        .replace("{guild_name}", record.guild_name.as_deref().unwrap_or_default())
+        .replace("{time}", &record.captured_at.to_string())
+        .replace("{message}", &content)
+}
+
 /// One image attached to a captured user message: the recognition
 /// description when it succeeded, `None` when the image could not be
 /// described (feature off at capture, endpoint failure, over the per-message
@@ -79,6 +98,15 @@ pub struct ConversationRecord {
     /// Author display name at capture time (user turns only).
     #[serde(default)]
     pub author: Option<String>,
+    /// Author platform id at capture time (user turns only) - renders via
+    /// the `{user_id}` template parameter. `None` on legacy records and bot
+    /// turns.
+    #[serde(default)]
+    pub sender_id: Option<u64>,
+    /// Guild display name at capture time (user turns only; `None` in DMs)
+    /// - renders via the `{guild_name}` template parameter.
+    #[serde(default)]
+    pub guild_name: Option<String>,
     pub content: String,
     /// Message this one replies to, when the platform reported the
     /// reference.
@@ -256,12 +284,9 @@ pub fn assemble_context(
     let template = config.turn_template.as_deref().unwrap_or(DEFAULT_TURN_TEMPLATE);
     for record in window {
         let message = match record.role {
-            RecordRole::User => ChatMessage::text(
-                ChatRole::User,
-                template
-                    .replace("{sender}", record.author.as_deref().unwrap_or("user"))
-                    .replace("{message}", &record_content(record)),
-            ),
+            RecordRole::User => {
+                ChatMessage::text(ChatRole::User, render_user_turn(template, record))
+            }
             RecordRole::Assistant => ChatMessage::text(ChatRole::Assistant, record.content.clone()),
         };
         messages.push(message);
@@ -362,11 +387,23 @@ mod tests {
         }
     }
 
+    /// Mechanics tests render turns through the flat `{sender}: {message}`
+    /// template, so their exact-string assertions stay about the mechanic
+    /// under test - not about the (tag-styled) default template.
+    fn flat_turn_config() -> ChannelConfig {
+        ChannelConfig {
+            turn_template: Some("{sender}: {message}".to_owned()),
+            ..ChannelConfig::assigned("m".to_owned())
+        }
+    }
+
     fn user_record(message_id: u64, author: &str, content: &str) -> ConversationRecord {
         ConversationRecord {
             message_id: Some(message_id),
             role: RecordRole::User,
             author: Some(author.to_owned()),
+            sender_id: None,
+            guild_name: None,
             content: content.to_owned(),
             reply_to: None,
             captured_at: 0,
@@ -379,6 +416,8 @@ mod tests {
             message_id: Some(message_id),
             role: RecordRole::Assistant,
             author: None,
+            sender_id: None,
+            guild_name: None,
             content: content.to_owned(),
             reply_to: None,
             captured_at: 0,
@@ -415,7 +454,7 @@ mod tests {
 
     #[test]
     fn context_has_fixed_schema_and_templated_turns() {
-        let config = ChannelConfig::assigned("m".to_owned());
+        let config = flat_turn_config();
         let settings = LlmSettings::default();
         let state = ConversationState::default();
         let records = vec![
@@ -425,6 +464,8 @@ mod tests {
                 message_id: Some(12),
                 role: RecordRole::User,
                 author: None,
+                sender_id: None,
+                guild_name: None,
                 content: "no name".to_owned(),
                 reply_to: None,
                 captured_at: 0,
@@ -487,10 +528,8 @@ mod tests {
     /// one message, no placeholder, no separate slot.
     #[test]
     fn system_suffix_placement_merges_the_summary_into_the_prompt() {
-        let config = ChannelConfig {
-            system_prompt: Some("custom prompt".to_owned()),
-            ..ChannelConfig::assigned("m".to_owned())
-        };
+        let config =
+            ChannelConfig { system_prompt: Some("custom prompt".to_owned()), ..flat_turn_config() };
         let settings = settings_with_placement(SummaryPlacement::SystemSuffix);
         let state = ConversationState {
             summary: Some("the gist".to_owned()),
@@ -608,7 +647,7 @@ mod tests {
 
     #[test]
     fn images_render_as_markdown_references_in_user_turns() {
-        let config = ChannelConfig::assigned("m".to_owned());
+        let config = flat_turn_config();
         let settings = LlmSettings::default();
         let state = ConversationState::default();
         let mut record = user_record(10, "alice", "look at this");
@@ -631,7 +670,7 @@ mod tests {
 
     #[test]
     fn image_descriptions_count_toward_the_context_budget() {
-        let config = ChannelConfig::assigned("m".to_owned());
+        let config = flat_turn_config();
         let settings = LlmSettings::default();
         let state = ConversationState::default();
         let mut padded = user_record(10, "alice", "old");
@@ -731,15 +770,19 @@ mod tests {
         assert_eq!(previous.lines().count(), 7);
     }
 
-    /// Record metadata (message ids, reply targets, capture timestamps) and
-    /// state metadata (summary bookkeeping, cutoff timestamp) are storage
-    /// bookkeeping - none of it may leak into the rendered prompt, or every
-    /// new capture would rewrite prefix bytes and kill the cache. User turns
-    /// render to exactly the template over author+content; assistant turns
-    /// pass through verbatim.
+    /// Record metadata (message ids, reply targets) and state metadata
+    /// (summary bookkeeping, cutoff timestamp) are storage bookkeeping -
+    /// they never leak into the rendered prompt. Capture-time fields render
+    /// ONLY through explicit template parameters: with a parameter-free
+    /// template the prompt carries nothing dynamic, so new captures never
+    /// rewrite prefix bytes and the cache survives. Assistant turns pass
+    /// through verbatim.
     #[test]
     fn rendered_context_carries_no_dynamic_record_fields() {
-        let config = no_compaction_config();
+        let config = ChannelConfig {
+            turn_template: Some("{sender}: {message}".to_owned()),
+            ..no_compaction_config()
+        };
         let settings = LlmSettings::default();
 
         let mut user = user_record(987_654_321, "alice", "what time is it");
@@ -773,6 +816,54 @@ mod tests {
         }
     }
 
+    /// The default turn template renders the capture-baked tag style:
+    /// `[Name]<@id>` mirrors normalized inbound mentions, so the model can
+    /// read who spoke and assemble clean Discord pings.
+    #[test]
+    fn default_turn_template_renders_the_tag_style() {
+        let config = ChannelConfig::assigned("m".to_owned());
+        let settings = LlmSettings::default();
+        let state = ConversationState::default();
+
+        let mut user = user_record(10, "alice", "hi there");
+        user.sender_id = Some(42);
+        user.captured_at = 1_735_689_600;
+        let records = vec![user];
+
+        let messages = assemble_context(&config, &settings, &state, &records, 0.0, None);
+        let rendered = render(&messages);
+        assert!(rendered.contains("user:[alice](<@42>): hi there\n"), "{rendered}");
+        // Metadata beyond the template's parameters stays bookkeeping.
+        assert!(!rendered.contains("1735689600"), "{rendered}");
+    }
+
+    /// Custom templates reach every capture-baked field; legacy records
+    /// (captured before a field existed) render it as an empty string.
+    #[test]
+    fn turn_template_params_render_capture_baked_fields() {
+        let config = ChannelConfig {
+            turn_template: Some(
+                "{guild_name} / {time}: {sender} ({user_id}): {message}".to_owned(),
+            ),
+            ..ChannelConfig::assigned("m".to_owned())
+        };
+        let settings = LlmSettings::default();
+        let state = ConversationState::default();
+
+        let mut user = user_record(10, "alice", "hi");
+        user.sender_id = Some(42);
+        user.guild_name = Some("Crafters".to_owned());
+        user.captured_at = 1_735_689_600;
+        let mut legacy = user_record(11, "bob", "hello");
+        legacy.captured_at = 1_735_689_601;
+        let records = vec![user, legacy];
+
+        let messages = assemble_context(&config, &settings, &state, &records, 0.0, None);
+        let rendered = render(&messages);
+        assert!(rendered.contains("Crafters / 1735689600: alice (42): hi\n"), "{rendered}");
+        assert!(rendered.contains(" / 1735689601: bob (): hello\n"), "{rendered}");
+    }
+
     #[test]
     fn token_budget_fills_newest_first() {
         let settings = LlmSettings::default();
@@ -788,7 +879,7 @@ mod tests {
         let config = ChannelConfig {
             history_depth: 10,
             context_budget_tokens: Some(93),
-            ..ChannelConfig::assigned("m".to_owned())
+            ..flat_turn_config()
         };
 
         let budget = resolve_budget(&config, &settings, true);
@@ -805,10 +896,7 @@ mod tests {
         let settings = LlmSettings::default();
         let state = ConversationState::default();
         let records = vec![user_record(1, "a1", "a very long message indeed")];
-        let config = ChannelConfig {
-            context_budget_tokens: Some(1),
-            ..ChannelConfig::assigned("m".to_owned())
-        };
+        let config = ChannelConfig { context_budget_tokens: Some(1), ..flat_turn_config() };
 
         let budget = resolve_budget(&config, &settings, true);
         let messages = assemble_context(&config, &settings, &state, &records, 1.0, budget);
@@ -889,6 +977,8 @@ mod tests {
                 message_id: Some(12),
                 role: RecordRole::User,
                 author: None,
+                sender_id: None,
+                guild_name: None,
                 content: "who is there".to_owned(),
                 reply_to: None,
                 captured_at: 0,

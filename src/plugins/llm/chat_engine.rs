@@ -382,6 +382,8 @@ impl ChatEngine {
             message_id: origin.message_id.map(MessageId::get),
             role: RecordRole::User,
             author: payload.author_name.clone(),
+            sender_id: Some(origin.user_id.get()),
+            guild_name: payload.guild_name.clone(),
             content: payload.content.clone(),
             reply_to,
             captured_at: unix_now(),
@@ -775,6 +777,8 @@ impl ChatEngine {
             message_id: first_message_id,
             role: RecordRole::Assistant,
             author: None,
+            sender_id: None,
+            guild_name: None,
             content: content.to_owned(),
             reply_to: origin.message_id.map(MessageId::get),
             captured_at: unix_now(),
@@ -1883,6 +1887,7 @@ mod tests {
             content: "hello bot".to_owned(),
             attachments: Vec::new(),
             author_name: Some("alice".to_owned()),
+            guild_name: None,
             author_roles: Vec::new(),
             author_permissions: 0,
             reply_to: reply_to.map(MessageId),
@@ -1912,6 +1917,8 @@ mod tests {
             message_id: Some(message_id),
             role: RecordRole::User,
             author: Some(author.to_owned()),
+            sender_id: None,
+            guild_name: None,
             content: content.to_owned(),
             reply_to: None,
             captured_at: 0,
@@ -1976,7 +1983,12 @@ mod tests {
             request.messages.get(1).map(|m| m.content.as_str()),
             Some(conversation::NO_EARLIER_CONTEXT)
         );
-        assert_eq!(request.messages.get(2).map(|m| m.content.as_str()), Some("alice: hello bot"));
+        // New default turn template: the capture-baked tag style (user id 3
+        // from the origin).
+        assert_eq!(
+            request.messages.get(2).map(|m| m.content.as_str()),
+            Some("[alice](<@3>): hello bot")
+        );
 
         // Reply delivered via the stream begin - as a native reply to the
         // triggering message (origin message id 77); assistant turn recorded
@@ -1995,6 +2007,27 @@ mod tests {
         assert_eq!(assistant.content, "hi alice");
         // The record keeps what the answer replied to - the triggering turn.
         assert_eq!(assistant.reply_to, Some(77));
+    }
+
+    /// Turn-template fields are baked into the record at capture (same
+    /// immutability principle as image descriptions): sender id from the
+    /// origin, guild name from the payload, capture time present - the
+    /// rendered prompt can never change retroactively.
+    #[tokio::test]
+    async fn capture_bakes_the_template_fields() {
+        let ctx = ctx(vec![Ok("hi".to_owned())]);
+        seed_config(&ctx.storage, &assigned_config());
+        let mut payload = payload(true, None);
+        payload.guild_name = Some("Crafters".to_owned());
+
+        ctx.engine.handle_message(&origin(), &payload, &assigned_config(), &ctx.services).await;
+
+        let records = stored_records(&ctx).await;
+        let user = records.first().expect("user record expected");
+        assert_eq!(user.role, RecordRole::User);
+        assert_eq!(user.sender_id, Some(3));
+        assert_eq!(user.guild_name.as_deref(), Some("Crafters"));
+        assert!(user.captured_at > 0, "capture time expected");
     }
 
     /// Every generated answer holds the platform typing indicator across
@@ -2247,6 +2280,8 @@ mod tests {
                 message_id: Some(11),
                 role: RecordRole::Assistant,
                 author: None,
+                sender_id: None,
+                guild_name: None,
                 content: "hello!".to_owned(),
                 reply_to: None,
                 captured_at: 0,
@@ -2360,7 +2395,7 @@ mod tests {
         let request = ctx.fake.requests().first().expect("request expected").clone();
         let turns: Vec<&str> =
             request.messages.iter().map(|message| message.content.as_str()).collect();
-        assert!(turns.iter().any(|turn| turn.contains("new1: m3")));
+        assert!(turns.iter().any(|turn| turn.contains("[new1](<@>): m3")));
         assert!(!turns.iter().any(|turn| turn.contains("m1") || turn.contains("m2")));
         // The cutoff moved nothing: all records are still stored
         // (4 seeded + the captured trigger + the assistant turn).
@@ -2381,8 +2416,11 @@ mod tests {
         let request = ctx.fake.requests().first().expect("one request expected").clone();
         // Fixed slots (system + summary) plus the newest 2 turns only.
         assert_eq!(request.messages.len(), 4);
-        assert_eq!(request.messages.get(2).map(|m| m.content.as_str()), Some("a3: m3"));
-        assert_eq!(request.messages.get(3).map(|m| m.content.as_str()), Some("alice: hello bot"));
+        assert_eq!(request.messages.get(2).map(|m| m.content.as_str()), Some("[a3](<@>): m3"));
+        assert_eq!(
+            request.messages.get(3).map(|m| m.content.as_str()),
+            Some("[alice](<@3>): hello bot")
+        );
     }
 
     #[tokio::test]
