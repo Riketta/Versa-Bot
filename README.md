@@ -50,6 +50,8 @@ commands, permission tiers - lives in [Plugins](#plugins).
   streaming, token-budget context filling, image recognition, an
   emoji-reaction tool and random chime-ins.
 - Status rotator: cycles the bot's activity through a configured list.
+- Guild-local bot nickname via `/set_guild_name` (reset by omitting the
+  name).
 - Guild-partitioned storage: JSON documents plus an append-only record
   log, scoped to `(platform, guild)` - reading another guild's data is
   impossible by construction. SQLite (default) and PostgreSQL.
@@ -283,6 +285,18 @@ Operator configuration lives in the optional `[status]` config section
 means the rotation is off. The section hot-reloads: editing it
 re-applies the rotation live, removing it stops the rotation. No
 commands.
+
+### Bot nickname (`nickname` plugin)
+
+Sets the bot's guild-local display name - how members of THIS server
+see it (Discord's member nickname; the global bot username is never
+touched). Nothing is stored: the platform owns the value, the command
+only applies it. The bot needs the **Manage Nicknames** permission in
+the guild, otherwise the change is rejected with an ephemeral notice.
+
+| Command | Tier | Effect |
+|---|---|---|
+| `/set_guild_name name:<text>` | moderator | rename the bot in this server (max 32 characters); omitting `name` resets to the bot's real name |
 
 ### LoL store tracker (`lol_store` plugin)
 

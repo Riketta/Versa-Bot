@@ -27,7 +27,8 @@ Core capabilities:
   slash commands) - no prefix parsing in core.
 
 Default plugins: auth (five-tier access ladder, see below), command/ping,
-tracker (member lifecycle audit), audit log, status rotator, LoL store
+tracker (member lifecycle audit), audit log, status rotator, nickname
+(per-guild bot name via `/set_guild_name`), LoL store
 tracker (poll-driven: watches the local League client's store, plus
 per-user skin/champion watch subscriptions; the one case of a plugin
 with NO inbound events - it discovers subscribers via

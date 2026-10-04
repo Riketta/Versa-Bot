@@ -15,7 +15,9 @@ use crate::kernel::{
 /// as soon as the bot is online, not on the next scheduler tick.
 #[derive(Default)]
 pub struct GatewayContext {
-    context: OnceLock<Context>,
+    /// Crate-visible: the nickname adapter reads the same handle to make
+    /// REST calls (rename), as presence makes gateway calls.
+    pub(crate) context: OnceLock<Context>,
     pending: Mutex<Option<Presence>>,
 }
 

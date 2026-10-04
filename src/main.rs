@@ -11,14 +11,15 @@ use versa_bot::infrastructure::{
     LolStoreConfig, PollingConfigWatcher,
     inbound_adapters::{DiscordGatewayAdapter, SerenityChatOutputFactory},
     observability,
-    outbound_adapters::{DiscordCommandRegistrar, SerenityPresence, SqlxStorage},
+    outbound_adapters::{DiscordCommandRegistrar, SerenityNickname, SerenityPresence, SqlxStorage},
     plugin_adapters::{InMemoryCommandRegistry, InMemoryEventBus, TokioScheduler},
 };
 use versa_bot::kernel::{
     plugin_ports::{CommandRegistryPort, Job, MiddlewarePluginPort, PluginPort, SchedulerPort},
     services::KernelService,
     spi_ports::{
-        ChatOutputFactoryPort, ConfigChangeHandler, ConfigPort, PresencePort, StoragePort,
+        ChatOutputFactoryPort, ConfigChangeHandler, ConfigPort, NicknamePort, PresencePort,
+        StoragePort,
     },
 };
 use versa_bot::plugins::audit::AuditLogPlugin;
@@ -37,6 +38,7 @@ use versa_bot::plugins::lol_store::{
     AnnounceFlags, DEFAULT_GUILD_CAP, DEFAULT_USER_CAP, EngineSettings, LcuClient, LolStorePlugin,
     StoreEngine,
 };
+use versa_bot::plugins::nickname::NicknamePlugin;
 use versa_bot::plugins::status::{StatusRotatorPlugin, StatusSettings};
 use versa_bot::plugins::tracker::UserActivityTrackerPlugin;
 
@@ -136,6 +138,15 @@ async fn main() -> ExitCode {
     let (presence, gateway_context) = SerenityPresence::new();
     let presence = Arc::new(presence);
 
+    // Guild-local bot name: same gateway context handle as presence, but a
+    // REST call - it fails (no queueing) when the gateway is not up yet,
+    // because the invoking member is waiting for the command's answer.
+    let nickname = Arc::new(SerenityNickname::new(Arc::clone(&gateway_context)));
+    let nickname_plugin = Arc::new(NicknamePlugin::new(
+        Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
+        Arc::clone(&nickname) as Arc<dyn NicknamePort>,
+    ));
+
     // Status rotator: always registered - `[status]` changes are applied at
     // runtime; an absent/invalid section just means it starts disabled.
     let status_plugin = Arc::new(StatusRotatorPlugin::new(
@@ -221,6 +232,7 @@ async fn main() -> ExitCode {
         Arc::clone(&llm) as Arc<dyn PluginPort>,
         Arc::clone(&audit) as Arc<dyn PluginPort>,
         Arc::clone(&status_plugin) as Arc<dyn PluginPort>,
+        Arc::clone(&nickname_plugin) as Arc<dyn PluginPort>,
         Arc::clone(&lol_store) as Arc<dyn PluginPort>,
         Arc::clone(&lol_leaderboard) as Arc<dyn PluginPort>,
     ];
