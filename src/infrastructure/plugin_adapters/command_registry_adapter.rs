@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -10,7 +10,9 @@ use crate::kernel::plugin_ports::{CommandDescriptor, CommandHandler, CommandRegi
 /// needs comes back out through the same trait.
 #[derive(Default)]
 pub struct InMemoryCommandRegistry {
-    commands: RwLock<HashMap<String, (CommandDescriptor, Arc<dyn CommandHandler>)>>,
+    /// Name-keyed, sorted: `descriptors()` order is deterministic, so the
+    /// Discord bulk sync payload is reproducible across boots.
+    commands: RwLock<BTreeMap<String, (CommandDescriptor, Arc<dyn CommandHandler>)>>,
 }
 
 impl InMemoryCommandRegistry {

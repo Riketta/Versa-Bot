@@ -24,7 +24,11 @@ use super::commands::{
     GetLlmHandler, ModelsLlmHandler, PromptFileLlmHandler, PromptLlmHandler, SET_KEYS,
     SetLlmHandler, StatusLlmHandler, UnassignLlmHandler, model_choices,
 };
-use super::model::{ChannelConfig, NAMESPACE, channel_config_key};
+use super::conversation::{ConversationRecord, RecordRole};
+use super::model::{
+    ChannelConfig, ConversationState, NAMESPACE, channel_config_key, channel_state_key,
+    records_namespace,
+};
 
 /// Whole-request timeout for prompt-file downloads from the Discord CDN -
 /// deliberately shorter than provider timeouts: the fetch is interactive
@@ -146,6 +150,49 @@ impl LlmPlugin {
             channel_permits: ChannelPermits::new(),
             shutdown: CancellationToken::new(),
             prompt_fetch,
+        }
+    }
+
+    /// Whether `reply_to` names one of the bot's recorded turns in this
+    /// channel - the panic-path trigger check, after the engine's in-flight
+    /// window died with the unwound frame. Reads the same bounded
+    /// post-cutoff window the engine would have used. A storage error keeps
+    /// the reply trigger silent (logged): history integrity is the only
+    /// source of truth, and guessing would fire fallback notices into
+    /// conversations between users.
+    async fn reply_targets_bot(
+        storage: &Arc<dyn crate::kernel::spi_ports::GuildStorage>,
+        channel_id: u64,
+        reply_to: u64,
+        depth: u32,
+        keep_tail: u32,
+    ) -> bool {
+        let window = usize::try_from(depth)
+            .unwrap_or(usize::MAX)
+            .saturating_add(usize::try_from(keep_tail).unwrap_or(usize::MAX))
+            .max(1);
+        let limit = u32::try_from(window).unwrap_or(u32::MAX);
+        let cutoff = storage
+            .get(NAMESPACE, &channel_state_key(channel_id))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_value::<ConversationState>(raw).ok())
+            .map_or(0, |state| state.cutoff_seq);
+        match storage.list_last(&records_namespace(channel_id), limit).await {
+            Ok(stored) => stored
+                .into_iter()
+                .filter(|record| record.seq > cutoff)
+                .filter_map(|record| {
+                    serde_json::from_value::<ConversationRecord>(record.payload).ok()
+                })
+                .any(|record| {
+                    record.role == RecordRole::Assistant && record.message_id == Some(reply_to)
+                }),
+            Err(err) => {
+                tracing::warn!(channel = channel_id, %err, "reply-trigger check failed after engine panic");
+                false
+            }
         }
     }
 
@@ -364,12 +411,19 @@ impl PluginPort for LlmPlugin {
 #[async_trait]
 impl MiddlewarePluginPort for LlmPlugin {
     async fn pre(&self, event: &mut RequestContext, services: &KernelServices) -> Next {
-        let (origin, payload) = match (&event.kind, &event.payload) {
-            (EventKind::MessageReceived, EventPayload::Message(payload)) => {
-                (event.origin.clone(), payload.clone())
-            }
-            _ => return Next::Continue,
+        // Cheap rejects first - nothing before the spawn needs owned data,
+        // so DMs and channels that turn out unassigned never pay for a
+        // payload clone.
+        if !matches!(
+            (&event.kind, &event.payload),
+            (EventKind::MessageReceived, EventPayload::Message(_))
+        ) {
+            return Next::Continue;
+        }
+        let EventPayload::Message(payload) = &event.payload else {
+            return Next::Continue; // unreachable: the match above paired them
         };
+        let origin = &event.origin;
 
         // LLM chat is guild-only by design: per-channel config cannot exist
         // outside a guild.
@@ -389,7 +443,7 @@ impl MiddlewarePluginPort for LlmPlugin {
         // channel. `try_acquire` never blocks the pipeline - a channel
         // flooding past the cap sheds its excess messages (not captured,
         // warned) instead of accumulating unbounded work.
-        let Ok(permit) = self.channel_permits.permit_for(&origin).try_acquire_owned() else {
+        let Ok(permit) = self.channel_permits.permit_for(origin).try_acquire_owned() else {
             tracing::warn!(
                 channel = origin.channel_id.get(),
                 "engine run backlog full - shedding message"
@@ -411,10 +465,15 @@ impl MiddlewarePluginPort for LlmPlugin {
                 return Next::Continue;
             }
         };
-        let Ok(config) = serde_json::from_value::<ChannelConfig>(raw) else {
+        let Ok(config) = ChannelConfig::from_stored(raw) else {
             tracing::warn!(namespace = NAMESPACE, "llm channel config is malformed - skipping");
             return Next::Continue;
         };
+
+        // Clone for the spawned run only now that the channel is known
+        // assigned - the copies are actually used.
+        let origin = event.origin.clone();
+        let payload = payload.clone();
 
         // Off the pipeline task; capture/trigger decisions happen inside,
         // under the channel lock, on fresh records. The permit rides along
@@ -450,8 +509,28 @@ impl MiddlewarePluginPort for LlmPlugin {
                 // (the engine's state is intact - only the call frame
                 // unwound). The rare panic after content was already
                 // revealed may place the notice after a partial answer -
-                // acceptable noise for an internal bug.
-                if payload.mentions_bot {
+                // acceptable noise for an internal bug. A mention is
+                // decidable from the payload; a reply trigger is re-checked
+                // against the record log, since the in-flight window is
+                // gone.
+                let triggered = payload.mentions_bot
+                    || match payload.reply_to {
+                        Some(reply_to) => match &services.guild_storage {
+                            Some(storage) => {
+                                Self::reply_targets_bot(
+                                    storage,
+                                    origin.channel_id.get(),
+                                    reply_to.get(),
+                                    config.history_depth,
+                                    engine.settings().compaction_keep_tail,
+                                )
+                                .await
+                            }
+                            None => false,
+                        },
+                        None => false,
+                    };
+                if triggered {
                     engine.send_fallback(&origin, &services).await;
                 }
             }
@@ -1052,6 +1131,70 @@ mod tests {
             messages.first().is_some_and(|m| m.contains("couldn't process")),
             "unexpected messages: {messages:?}"
         );
+    }
+
+    /// The guaranteed-answer contract covers reply triggers too: a reply
+    /// into the bot's conversation gets the panic fallback even though the
+    /// payload alone cannot prove it - the record log re-check names the
+    /// bot's recorded turn.
+    #[tokio::test]
+    async fn engine_panic_covers_reply_triggers_via_the_record_log() {
+        let registry = Arc::new(InMemoryCommandRegistry::new());
+        let storage = Arc::new(InMemoryStorage::new());
+        let output = RecordingChatOutput::new();
+        let services = KernelServices {
+            chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
+            chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
+            guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
+        };
+        let engine = Arc::new(ChatEngine::new(
+            Arc::new(LlmSettings::default()),
+            Arc::new(PanickingCompletion) as Arc<dyn LlmCompletionPort>,
+            Arc::new(RandRandom) as Arc<dyn RandomPort>,
+            Arc::new(FakeDescriber) as Arc<dyn ImageDescriber>,
+        ));
+        let plugin = LlmPlugin::new(
+            Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
+            Arc::clone(&engine),
+        );
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&storage);
+
+        // The bot's own earlier turn, recorded at send time.
+        let bot_turn = ConversationRecord {
+            message_id: Some(999),
+            role: RecordRole::Assistant,
+            author: None,
+            sender_id: None,
+            guild_name: None,
+            content: "earlier bot answer".to_owned(),
+            reply_to: None,
+            captured_at: 1,
+            images: Vec::new(),
+        };
+        storage
+            .guild_scoped(Platform::Discord, GuildId(1))
+            .append(
+                &records_namespace(2),
+                serde_json::to_value(&bot_turn).expect("record serializes"),
+            )
+            .await
+            .expect("append expected to succeed");
+
+        let mut event = message_event(2, false);
+        if let EventPayload::Message(payload) = &mut event.payload {
+            payload.reply_to = Some(MessageId(999));
+        }
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+
+        for _ in 0..1000 {
+            if !output.messages().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let messages = output.messages();
+        assert_eq!(messages.len(), 1, "the reply trigger must get the fallback: {messages:?}");
     }
 
     #[tokio::test]

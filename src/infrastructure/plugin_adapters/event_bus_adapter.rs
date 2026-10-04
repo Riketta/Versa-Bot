@@ -1,4 +1,9 @@
-use std::{any::TypeId, collections::HashMap, sync::Arc};
+use std::{
+    any::TypeId,
+    collections::HashMap,
+    sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use parking_lot::RwLock;
 
@@ -10,12 +15,25 @@ use crate::kernel::{
 
 type ErasedHandler = Arc<dyn Fn(&dyn Event) + Send + Sync>;
 
+/// One subscription slot: the handler plus the unique id its cancellation
+/// handle owns. Clearing matches on the id, not the position - after an
+/// entry's removal (all slots gone) a stale handle's index would otherwise
+/// point into a newer subscription's vector.
+struct Slot {
+    id: u64,
+    handler: ErasedHandler,
+}
+
+/// Ids are process-lifetime unique, so a stale handle can never collide
+/// with a live slot, whatever the subscribe/unsubscribe interleaving.
+static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Subscription bookkeeping, shared by every bus clone so a cancellation
 /// handle can clear exactly its own slot: per event type, `None` marks an
 /// unsubscribed handler.
 #[derive(Default)]
 struct Inner {
-    subscribers: RwLock<HashMap<TypeId, Vec<Option<ErasedHandler>>>>,
+    subscribers: RwLock<HashMap<TypeId, Vec<Option<Slot>>>>,
 }
 
 /// The single active `EventBusPort` adapter: in-memory, topic-keyed by event
@@ -45,7 +63,7 @@ impl EventBusPort for InMemoryEventBus {
             let subscribers = self.inner.subscribers.read();
             subscribers
                 .get(&event.as_any().type_id())
-                .map(|slots| slots.iter().flatten().cloned().collect())
+                .map(|slots| slots.iter().flatten().map(|slot| Arc::clone(&slot.handler)).collect())
                 .unwrap_or_default()
         };
 
@@ -76,27 +94,32 @@ impl EventBusPort for InMemoryEventBus {
         });
 
         let type_id = TypeId::of::<E>();
-        let index = {
+        let id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        {
             let mut subscribers = self.inner.subscribers.write();
             let slots = subscribers.entry(type_id).or_default();
-            slots.push(Some(erased));
-            slots.len() - 1
-        };
+            slots.push(Some(Slot { id, handler: erased }));
+        }
         let inner = Arc::clone(&self.inner);
 
         // The handle owns the shared bookkeeping and clears exactly its own
-        // slot; a second unsubscribe overwrites `None` with `None`.
+        // slot, matched by subscription id - not by position: after the
+        // entry's removal below, a stale handle's index would point into a
+        // newer subscription's vector. A second unsubscribe finds nothing
+        // with its id and is a true no-op.
         EventBusSubscription::new(Arc::new(move || {
             let mut subscribers = inner.subscribers.write();
             let mut remove_type = false;
             if let Some(slots) = subscribers.get_mut(&type_id) {
-                if let Some(slot) = slots.get_mut(index) {
+                if let Some(slot) =
+                    slots.iter_mut().find(|slot| slot.as_ref().is_some_and(|live| live.id == id))
+                {
                     *slot = None;
                 }
                 // Compact when the last subscriber for this event type is
                 // gone - slot vectors would otherwise grow without bound
                 // under subscribe/unsubscribe cycling. Removal is safe: it
-                // happens only when no live index for the type remains.
+                // happens only when no live id for the type remains.
                 remove_type = slots.iter().all(Option::is_none);
             }
             if remove_type {
@@ -170,6 +193,34 @@ mod tests {
             2,
             "healthy subscriber must be unaffected by the panicking one"
         );
+    }
+
+    /// Contract: unsubscribe is idempotent per the port doc - and a stale
+    /// handle whose subscription was already removed must never cancel a
+    /// newer subscriber that reused the same slot position.
+    #[test]
+    fn stale_handle_cannot_cancel_a_newer_subscription() {
+        let bus = InMemoryEventBus::new();
+        let stale_counter = Arc::new(AtomicUsize::new(0));
+        let stale = bus.subscribe(Arc::new(CountingHandler(Arc::clone(&stale_counter))));
+        stale.unsubscribe();
+
+        let live_counter = Arc::new(AtomicUsize::new(0));
+        let live = bus.subscribe(Arc::new(CountingHandler(Arc::clone(&live_counter))));
+
+        // The stale handle's position points at the live subscription's
+        // slot; the second call must be a no-op, not a cancellation.
+        stale.unsubscribe();
+
+        bus.publish(Arc::new(PingPublished));
+
+        assert_eq!(stale_counter.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            live_counter.load(Ordering::SeqCst),
+            1,
+            "the stale handle must not cancel the newer subscription"
+        );
+        let _ = live; // keeps the handle alive to the end of the test
     }
 
     #[test]

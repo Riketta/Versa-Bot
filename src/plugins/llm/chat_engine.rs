@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::kernel::{
@@ -285,9 +286,7 @@ impl ChatEngine {
         let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
         let keep_tail = usize::try_from(self.settings.compaction_keep_tail).unwrap_or(usize::MAX);
         let window = depth.saturating_add(keep_tail).max(1);
-        let mut live = match self
-            .load_live_records(storage, channel_id, state.cutoff_seq, window)
-            .await
+        let live = match self.load_live_records(storage, channel_id, state.cutoff_seq, window).await
         {
             Ok(live) => live,
             Err(err) => {
@@ -304,15 +303,18 @@ impl ChatEngine {
         };
 
         let reply_to = payload.reply_to.map(MessageId::get);
-        let mut live_records: Vec<ConversationRecord> =
-            live.iter().map(|(_, record)| record.clone()).collect();
+        // Split once, by move: the seqs ride parallel to the records, so the
+        // window is never duplicated per message (compaction needs the seqs,
+        // assembly the records).
+        let (mut seqs, mut live_records): (Vec<u64>, Vec<ConversationRecord>) =
+            live.into_iter().unzip();
         let mut captured = false;
         let mut capture_failed = false;
         match self.capture_message(storage, origin, payload, reply_to, config, &live_records).await
         {
             Some(Ok((seq, record))) => {
-                live.push((seq, record.clone()));
                 // The triggering message must be part of the context.
+                seqs.push(seq);
                 live_records.push(record);
                 captured = true;
             }
@@ -364,7 +366,7 @@ impl ChatEngine {
         // Compaction runs after the reply (the triggering turn used the
         // pre-compaction context) and after every capture, so all-messages
         // channels compact too - not just chatty ones.
-        self.maybe_compact(origin, config, &state, &live, services).await;
+        self.maybe_compact(origin, config, &state, &seqs, &live_records, services).await;
     }
 
     /// Capture half of the intake: `None` when the channel's mode does not
@@ -1068,23 +1070,29 @@ impl ChatEngine {
     /// `None` = the state document is unreadable (storage error): the
     /// caller skips the message instead of answering from an unknown
     /// history. A malformed document resets to a fresh window - better
-    /// than bricking the channel until an admin intervenes.
+    /// than bricking the channel until an admin intervenes - but salvages
+    /// the cutoff when it parses: a corrupt summary must not resurrect
+    /// compacted history, only the summary text is lost.
     async fn load_state(
         &self,
         storage: &Arc<dyn GuildStorage>,
         channel_id: u64,
     ) -> Option<ConversationState> {
         match storage.get(NAMESPACE, &channel_state_key(channel_id)).await {
-            Ok(Some(raw)) => Some(
-                serde_json::from_value::<ConversationState>(raw)
-                    .inspect_err(|_| {
-                        tracing::warn!(
-                            channel = channel_id,
-                            "llm conversation state is malformed - starting fresh"
-                        );
-                    })
-                    .unwrap_or_default(),
-            ),
+            Ok(Some(raw)) => {
+                if let Ok(state) = serde_json::from_value::<ConversationState>(raw.clone()) {
+                    return Some(state);
+                }
+                tracing::warn!(
+                    channel = channel_id,
+                    "llm conversation state is malformed - starting fresh"
+                );
+                Some(ConversationState {
+                    summary: None,
+                    cutoff_seq: raw.get("cutoff_seq").and_then(Value::as_u64).unwrap_or(0),
+                    cutoff_at: None,
+                })
+            }
             Ok(None) => Some(ConversationState::default()),
             Err(err) => {
                 tracing::error!(channel = channel_id, %err, "llm conversation state unreadable - skipping message");
@@ -1159,7 +1167,8 @@ impl ChatEngine {
         origin: &Origin,
         config: &ChannelConfig,
         state: &ConversationState,
-        live: &[(u64, ConversationRecord)],
+        seqs: &[u64],
+        records: &[ConversationRecord],
         services: &KernelServices,
     ) {
         if !config.compaction_enabled {
@@ -1167,24 +1176,23 @@ impl ChatEngine {
         }
         let channel_id = origin.channel_id.get();
         let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
-        if live.len() <= depth {
+        if records.len() <= depth {
             return;
         }
         let keep_tail = usize::try_from(self.settings.compaction_keep_tail).unwrap_or(usize::MAX);
-        if keep_tail == 0 || keep_tail >= live.len() {
+        if keep_tail == 0 || keep_tail >= records.len() {
             tracing::warn!(
                 channel = channel_id,
                 keep_tail = self.settings.compaction_keep_tail,
-                live = live.len(),
+                live = records.len(),
                 "compaction would make no progress - skipping"
             );
             return;
         }
 
-        let (chunk, _tail) = live.split_at(live.len() - keep_tail);
-        let chunk_end_seq = chunk.last().map_or(0, |(seq, _)| *seq);
-        let chunk_records: Vec<ConversationRecord> =
-            chunk.iter().map(|(_, record)| record.clone()).collect();
+        let split = records.len() - keep_tail;
+        let chunk = records.get(..split).unwrap_or(records);
+        let chunk_end_seq = seqs.get(split.saturating_sub(1)).copied().unwrap_or(0);
         let prompt = config
             .compaction_prompt
             .clone()
@@ -1195,8 +1203,7 @@ impl ChatEngine {
             .or_else(|| self.settings.compaction_model.clone())
             .unwrap_or_else(|| config.model.clone());
 
-        let messages =
-            conversation::compaction_input(&prompt, state.summary.as_deref(), &chunk_records);
+        let messages = conversation::compaction_input(&prompt, state.summary.as_deref(), chunk);
         // The summarizer call is deliberately NOT recorded into the channel's
         // chat stats: the EWMA ratio and the "last request" report must
         // reflect chat completions only, not compaction traffic.
@@ -1233,15 +1240,8 @@ impl ChatEngine {
             cutoff_at: Some(unix_now()),
         };
         if let Some(storage) = &services.guild_storage {
-            self.commit_compaction(
-                origin,
-                storage,
-                new_state,
-                chunk_records.len(),
-                keep_tail,
-                services,
-            )
-            .await;
+            self.commit_compaction(origin, storage, new_state, chunk.len(), keep_tail, services)
+                .await;
         }
     }
 
@@ -1424,7 +1424,9 @@ impl ChatEngine {
     /// tokens-per-character ratio into the channel's estimate. Compaction
     /// never records (its transcript is not chat traffic). Best effort: a
     /// failed write only degrades the next estimate back to the previous
-    /// ratio.
+    /// ratio. A usage-less response keeps the previously reported usage:
+    /// dropping it would silently disable token-budget context filling (the
+    /// budget gate keys on a stored usage) after one omitted report.
     async fn record_usage(&self, services: &KernelServices, channel_id: u64, record: UsageRecord) {
         let UsageRecord { usage, timing, context_chars, tokens_per_char, budget } = record;
         let Some(storage) = &services.guild_storage else {
@@ -1434,7 +1436,7 @@ impl ChatEngine {
             Some(usage) => {
                 (Some(usage), blend_ratio(tokens_per_char, usage.prompt_tokens, context_chars))
             }
-            None => (None, tokens_per_char),
+            None => (self.load_stats(storage, channel_id).await.last, tokens_per_char),
         };
         let stats =
             UsageStats { last, last_timing: Some(timing), tokens_per_char, last_budget: budget };
@@ -3500,8 +3502,8 @@ mod tests {
     }
 
     /// A usage-less endpoint still leaves the response time (observability
-    /// only); the usage-dependent parts of the stats doc stay empty, so the
-    /// estimate stays uncalibrated.
+    /// only). On a fresh channel (no prior usage) the usage-dependent parts
+    /// of the stats doc stay empty, so the estimate stays uncalibrated.
     #[tokio::test]
     async fn stats_keep_only_the_response_time_when_usage_is_missing() {
         let ctx = ctx(vec![Ok("ok".to_owned())]); // no usage reported
@@ -3525,5 +3527,107 @@ mod tests {
         // The estimate stays uncalibrated without usage.
         assert!((stats.tokens_per_char - 0.25).abs() < f64::EPSILON);
         assert_eq!(stats.last_budget, None);
+    }
+
+    /// A usage-less completion must not wipe the channel's calibration: the
+    /// previously reported usage stays stored - token-budget context filling
+    /// keeps working - until a newer report replaces it.
+    #[tokio::test]
+    async fn usage_less_completion_preserves_the_previous_usage() {
+        let ctx = ctx(vec![Ok("first".to_owned()), Ok("second".to_owned())]);
+        ctx.fake.set_usage_per_call(vec![
+            Some(TokenUsage {
+                prompt_tokens: 1000,
+                completion_tokens: 10,
+                total_tokens: 1010,
+                cached_tokens: None,
+                reasoning_tokens: None,
+            }),
+            None,
+        ]);
+        seed_config(&ctx.storage, &assigned_config());
+
+        for _ in 0..2 {
+            ctx.engine
+                .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+                .await;
+        }
+
+        let stats_raw = ctx
+            .storage
+            .guild_scoped(Platform::Discord, GuildId(1))
+            .get(NAMESPACE, &channel_stats_key(2))
+            .await
+            .expect("stats readable")
+            .expect("stats expected after two completions");
+        let stats: UsageStats =
+            serde_json::from_value(stats_raw).expect("stats expected to deserialize");
+        assert_eq!(
+            stats.last.map(|usage| usage.prompt_tokens),
+            Some(1000),
+            "the usage-less second completion must keep the first report"
+        );
+        assert!(stats.last_timing.is_some());
+    }
+
+    /// A malformed state document resets the channel to a fresh window (the
+    /// summary text is lost) but salvages the cutoff, so compacted history
+    /// does not resurrect into the context - and the message is still
+    /// answered.
+    #[tokio::test]
+    async fn malformed_state_salvages_the_cutoff_and_still_answers() {
+        let ctx = ctx(vec![Ok("recovered".to_owned())]);
+        seed_config(&ctx.storage, &assigned_config());
+
+        // A compacted past: one old user record folded away by a cutoff at
+        // seq 1 - and a state doc whose summary field is the wrong type.
+        let scoped = ctx.storage.guild_scoped(Platform::Discord, GuildId(1));
+        let old_record = ConversationRecord {
+            message_id: None,
+            role: RecordRole::User,
+            author: Some("bob".to_owned()),
+            sender_id: Some(9),
+            guild_name: None,
+            content: "compacted away".to_owned(),
+            reply_to: None,
+            captured_at: 1,
+            images: Vec::new(),
+        };
+        scoped
+            .append(
+                &records_namespace(2),
+                serde_json::to_value(&old_record).expect("record serializes"),
+            )
+            .await
+            .expect("append expected to succeed");
+        ctx.storage.seed(
+            Platform::Discord,
+            GuildId(1),
+            NAMESPACE,
+            &channel_state_key(2),
+            serde_json::json!({ "summary": 42, "cutoff_seq": 1 }),
+        );
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .await;
+
+        // The answer went out (the channel is not bricked) - answers deliver
+        // through the factory's stream begin, not the plain output port.
+        let delivered = begin_texts(&ctx.begins);
+        assert!(
+            delivered.iter().any(|m| m.contains("recovered")),
+            "answer expected, got: {delivered:?}"
+        );
+        // ... and the salvaged cutoff kept the compacted record out of the
+        // prompt: with a wiped cutoff it would have re-entered the window.
+        let requests = ctx.fake.requests();
+        let request = requests.last().expect("a completion was requested");
+        let prompt: String =
+            request.messages.iter().map(|message| message.content.as_str()).collect();
+        assert!(
+            !prompt.contains("compacted away"),
+            "salvaged cutoff must keep compacted history out of the context: {prompt}"
+        );
     }
 }

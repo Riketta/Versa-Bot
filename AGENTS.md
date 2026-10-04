@@ -72,7 +72,7 @@ So `EventBusPort` is injected into the kernel; `MiddlewarePluginPort` implemente
 - Plugin to Kernel: via kernel-owned service ports injected at registration, so plugins can have access to kernel and infrastructure over kernel.
 - Plugin to Plugin: never directly - always via `EventBusPort`.
 - Kernel owns the bus - it routes events but never defines their meaning.
-- Plugins own their events - `UserJoinedGuild` is defined in `UserActivityTrackerPlugin`, not in the kernel.
+- Plugins own their events - `UserJoinedGuild` is defined in `UserActivityTrackerPlugin`, not in the kernel. A subscriber therefore imports the event's *type* from the owning plugin's module: that type-level import IS the bus contract itself - no calls, no shared behavior - and is not a violation of plugin independence (the typed `audit_log` -> `tracker` import is the precedent).
 
 **Kernel lifecycle:**
 

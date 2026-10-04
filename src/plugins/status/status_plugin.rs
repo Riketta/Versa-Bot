@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -46,6 +47,10 @@ pub struct StatusRotatorPlugin {
     presence: Arc<dyn PresencePort>,
     settings: Mutex<StatusSettings>,
     job: Mutex<Option<JobHandle>>,
+    /// Set by `stop`, cleared by `start`: a stopped plugin owns no scheduled
+    /// work. Without this, a config-watcher tick after shutdown would
+    /// re-schedule a live rotation on a stopped plugin.
+    stopped: AtomicBool,
 }
 
 impl StatusRotatorPlugin {
@@ -55,7 +60,13 @@ impl StatusRotatorPlugin {
         presence: Arc<dyn PresencePort>,
         settings: StatusSettings,
     ) -> Self {
-        Self { scheduler, presence, settings: Mutex::new(settings), job: Mutex::new(None) }
+        Self {
+            scheduler,
+            presence,
+            settings: Mutex::new(settings),
+            job: Mutex::new(None),
+            stopped: AtomicBool::new(false),
+        }
     }
 
     /// Applies new settings: identical ones are a no-op (unrelated config
@@ -75,6 +86,13 @@ impl StatusRotatorPlugin {
             interval_secs = settings.interval.as_secs(),
             "applying new status rotation settings"
         );
+        // A stopped plugin stores the settings but schedules nothing - the
+        // next `start` picks them up. Runtime config ticks have no business
+        // resurrecting a cancelled rotation.
+        if self.stopped.load(Ordering::Acquire) {
+            tracing::debug!("status rotator is stopped - settings stored without scheduling");
+            return;
+        }
         // Settings-then-job lock order - the same order `start` uses, so a
         // config change racing plugin start can neither double-schedule nor
         // deadlock. The check-and-install runs under one held lock.
@@ -105,6 +123,7 @@ impl PluginPort for StatusRotatorPlugin {
     }
 
     fn start(&self) -> Result<(), PluginError> {
+        self.stopped.store(false, Ordering::Release);
         // An `update` landing between construction and start has already
         // scheduled the rotation - starting must not schedule a second job.
         // Settings-then-job lock order (same as `update`) makes the
@@ -118,6 +137,7 @@ impl PluginPort for StatusRotatorPlugin {
     }
 
     fn stop(&self) -> Result<(), PluginError> {
+        self.stopped.store(true, Ordering::Release);
         if let Some(handle) = self.job.lock().take() {
             handle.cancel();
         }
@@ -421,5 +441,35 @@ mod tests {
             scheduler.scheduled(),
             vec![("status_rotator".to_owned(), Duration::from_secs(45))]
         );
+    }
+
+    /// A stopped plugin owns no scheduled work: a post-shutdown config tick
+    /// stores the new settings but must not resurrect the rotation.
+    #[tokio::test]
+    async fn update_after_stop_does_not_reschedule() {
+        let scheduler = FakeScheduler::new();
+        let presence = FakePresence::new();
+        let plugin = plugin(&scheduler, &presence, vec!["a"]);
+        plugin.start().expect("start expected to succeed");
+        plugin.stop().expect("stop expected to succeed");
+        let scheduled_at_stop = scheduler.scheduled().len();
+
+        plugin.update(settings(60, &["x"]));
+
+        assert_eq!(
+            scheduler.scheduled().len(),
+            scheduled_at_stop,
+            "a stopped plugin must not schedule new work"
+        );
+        assert_eq!(
+            scheduler.cancel_count.load(Ordering::SeqCst),
+            1,
+            "nothing new was scheduled, so nothing new was cancelled"
+        );
+
+        // A fresh lifecycle (kernel reboot in tests) resumes from the
+        // stored settings.
+        plugin.start().expect("restart expected to succeed");
+        assert_eq!(scheduler.scheduled().len(), scheduled_at_stop + 1);
     }
 }

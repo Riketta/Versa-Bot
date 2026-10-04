@@ -131,12 +131,13 @@ async fn main() -> ExitCode {
     ));
 
     // Config hot reload: a polling watcher re-reads file+env configuration
-    // and applies hot-reloadable sections without a restart. The task dies
-    // with the process on shutdown - no explicit cancellation needed.
+    // and applies hot-reloadable sections without a restart. The handle is
+    // kept and cancelled after the kernel shuts down - a post-shutdown tick
+    // must not hand a fresh snapshot to an already-stopped plugin.
     let watcher = Arc::new(PollingConfigWatcher::new(load_config));
     watcher.seed(config.clone());
     watcher.subscribe(Arc::new(StatusSettingsReloader { plugin: Arc::clone(&status_plugin) }));
-    scheduler.schedule(
+    let config_watch_job = scheduler.schedule(
         "config_watcher",
         Duration::from_secs(5),
         Arc::new(ConfigWatchJob { watcher: Arc::clone(&watcher) }),
@@ -207,6 +208,7 @@ async fn main() -> ExitCode {
 
     let start_result = client.start().await;
     kernel.shutdown();
+    config_watch_job.cancel();
     gateway_exit_code(start_result)
 }
 
@@ -242,11 +244,11 @@ async fn sigterm() {
 /// both sides.
 fn llm_settings_from(config: &LlmConfig) -> LlmSettings {
     // Operator knobs clamped to safe ranges, mirroring the command-layer
-    // guards: a >2000 reply limit would produce chunks Discord rejects
-    // outright, and a zero resize side would collapse every image to
-    // nothing. The clamp is announced - a silent correction hides a typo.
-    let max_message_length = config.max_message_length.min(DISCORD_MESSAGE_LIMIT);
-    if config.max_message_length > DISCORD_MESSAGE_LIMIT {
+    // guards. The clamp is announced - a silent correction hides a typo.
+    let max_message_length = config.max_message_length.clamp(1, DISCORD_MESSAGE_LIMIT);
+    if config.max_message_length == 0 {
+        tracing::warn!("[llm] max_message_length is zero - clamped to 1");
+    } else if config.max_message_length > DISCORD_MESSAGE_LIMIT {
         tracing::warn!(
             configured = config.max_message_length,
             clamped = DISCORD_MESSAGE_LIMIT,
@@ -257,14 +259,31 @@ fn llm_settings_from(config: &LlmConfig) -> LlmSettings {
     if config.image_max_side == 0 {
         tracing::warn!("[llm] image_max_side is zero - clamped to 1");
     }
+    // A zero tail makes compaction unreachable (it would fold everything
+    // and keep nothing) - the window degrades to a sliding depth cap.
+    let compaction_keep_tail = config.compaction_keep_tail.max(1);
+    if config.compaction_keep_tail == 0 {
+        tracing::warn!("[llm] compaction_keep_tail is zero - clamped to 1");
+    }
+    // A sub-second cadence means one Discord edit per SSE delta - a fast
+    // path to rate limiting. The floor keeps the live reveal usable.
+    const MIN_STREAM_INTERVAL_MS: u64 = 250;
+    let stream_interval_ms = config.stream_interval_ms.max(MIN_STREAM_INTERVAL_MS);
+    if config.stream_interval_ms < MIN_STREAM_INTERVAL_MS {
+        tracing::warn!(
+            configured = config.stream_interval_ms,
+            clamped = MIN_STREAM_INTERVAL_MS,
+            "[llm] stream_interval_ms below the Discord-friendly floor - clamped"
+        );
+    }
 
     LlmSettings {
         default_system_prompt: config.default_system_prompt.clone(),
         default_compaction_prompt: config.default_compaction_prompt.clone(),
         compaction_model: config.compaction_model.clone(),
-        compaction_keep_tail: config.compaction_keep_tail,
+        compaction_keep_tail,
         max_message_length,
-        stream_interval_ms: config.stream_interval_ms,
+        stream_interval_ms,
         max_prompt_file_bytes: config.max_prompt_file_bytes,
         image_model: config.image_model.clone(),
         image_max_side,
@@ -279,13 +298,19 @@ fn llm_settings_from(config: &LlmConfig) -> LlmSettings {
             .providers
             .iter()
             .map(|(name, provider)| {
+                // A zero timeout would fail (or hang, depending on the HTTP
+                // stack's reading of it) every request - clamp to 1s.
+                let timeout_secs = provider.timeout_secs.max(1);
+                if provider.timeout_secs == 0 {
+                    tracing::warn!(provider = %name, "[llm] timeout_secs is zero - clamped to 1");
+                }
                 (
                     name.clone(),
                     ProviderSettings {
                         api_url: provider.api_url.clone(),
                         api_key_env: provider.api_key_env.clone(),
                         proxy: provider.proxy.clone(),
-                        timeout_secs: provider.timeout_secs,
+                        timeout_secs,
                         reasoning_style: match provider.reasoning_style {
                             LlmReasoningStyle::OpenaiEffort => ReasoningStyle::OpenaiEffort,
                             LlmReasoningStyle::GlmThinking => ReasoningStyle::GlmThinking,

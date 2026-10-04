@@ -82,7 +82,7 @@ async fn load_assigned_config(
             .await?;
         return Ok(None);
     };
-    Ok(Some(serde_json::from_value(raw)?))
+    Ok(Some(ChannelConfig::from_stored(raw)?))
 }
 
 async fn save_config(
@@ -640,7 +640,7 @@ async fn usage_lines(
     storage: &Arc<dyn GuildStorage>,
     records_ns: &str,
     state: &ConversationState,
-    live: u64,
+    window: usize,
     stats: &UsageStats,
 ) -> UsageLines {
     let last_response = stats.last_timing.map(|timing| {
@@ -654,21 +654,28 @@ async fn usage_lines(
         return UsageLines { estimate: None, last_request: None, last_response };
     };
 
+    // The estimate covers the engine's operational window (depth + compaction
+    // tail, post-cutoff) - the same shape the engine assembles and calibrates
+    // against, not the whole uncompacted log, which is unbounded when
+    // compaction is off or failing.
+    let limit = u32::try_from(window.max(1)).unwrap_or(u32::MAX);
     let mut context_chars = 0u64;
-    let limit = u32::try_from(live).unwrap_or(u32::MAX);
-    for stored in storage.list_after(records_ns, state.cutoff_seq, limit).await.unwrap_or_default()
-    {
+    let mut counted = 0u64;
+    for stored in storage.list_last(records_ns, limit).await.unwrap_or_default() {
+        if stored.seq <= state.cutoff_seq {
+            continue;
+        }
         if let Ok(record) = serde_json::from_value::<ConversationRecord>(stored.payload) {
-            let counted = record.content.chars().count();
             // estimator: precision loss is fine
             #[allow(clippy::cast_precision_loss)]
-            let counted = counted as u64;
-            context_chars += counted;
+            let chars = record.content.chars().count() as u64;
+            context_chars += chars;
+            counted += 1;
         }
     }
     // estimator: precision loss is fine
     #[allow(clippy::cast_precision_loss)]
-    let estimated = stats.tokens_per_char * context_chars as f64 + 8.0 * live as f64;
+    let estimated = stats.tokens_per_char * context_chars as f64 + 8.0 * counted as f64;
     // The budget the engine actually enforced last time (channel override
     // or model-window derived); absent while filling is count-only.
     let estimate = Some(match stats.last_budget {
@@ -818,7 +825,7 @@ impl CommandHandler for StatusLlmHandler {
                 .await?;
             return Ok(());
         };
-        let config: ChannelConfig = serde_json::from_value(raw)?;
+        let config = ChannelConfig::from_stored(raw)?;
         let state: ConversationState = storage
             .get(NAMESPACE, &channel_state_key(channel_id))
             .await?
@@ -846,7 +853,13 @@ impl CommandHandler for StatusLlmHandler {
             .await?
             .and_then(|raw| serde_json::from_value(raw).ok())
             .unwrap_or_default();
-        let usage = usage_lines(storage, &records_ns, &state, live, &usage_stats).await;
+        // The estimate window: what the engine would actually load for the
+        // next message (assembly depth + compaction tail).
+        let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
+        let keep_tail =
+            usize::try_from(self.engine.settings().compaction_keep_tail).unwrap_or(usize::MAX);
+        let window = depth.saturating_add(keep_tail).max(1);
+        let usage = usage_lines(storage, &records_ns, &state, window, &usage_stats).await;
 
         // The effective prompt: what the model will actually see as slot 1,
         // override or not - with length, identity fingerprint and a head

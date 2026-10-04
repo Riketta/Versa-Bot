@@ -64,7 +64,8 @@ commands, permission tiers - lives in [Plugins](#plugins).
 
 ## Getting started
 
-Prerequisites: Rust 1.88+ (edition 2024).
+Prerequisites: Rust 1.98 (edition 2024) - the pinned toolchain, the same
+compiler CI and the Docker image use.
 
 1. Copy the checked-in example and fill in your Discord token:
 

@@ -44,10 +44,13 @@ url = "sqlite://versabot.db"
 # [llm]
 # default_system_prompt = "You are a helpful chat assistant."
 # default_compaction_prompt = "Summarize the conversation above, preserving facts, decisions, names and open questions. Be concise."
+# Live messages kept after each compaction (minimum 1 - zero would make
+# compaction unreachable).
 # compaction_keep_tail = 10
 # max_message_length = 2000
 # Streaming edit cadence while a channel streams its answer live
 # (`streaming` on); the final edit always carries the exact full text.
+# Floored at 250 ms - faster cadences would hammer Discord's edit limit.
 # stream_interval_ms = 2000
 # Cap for /llm_prompt_file attachment downloads, in bytes.
 # max_prompt_file_bytes = 131072
@@ -104,6 +107,7 @@ url = "sqlite://versabot.db"
 #
 # [llm.providers.local]
 # api_url = "http://192.168.1.35:8001/v1"
+# Request timeout in seconds (minimum 1).
 # timeout_secs = 180
 # Provider-specific fields merged into every completion body - knobs the
 # adapter does not model. llama.cpp example: stop a thinking template from

@@ -64,15 +64,48 @@ pub fn record_content(record: &ConversationRecord) -> String {
 /// capture-baked, so a rendered turn never changes after the fact; legacy
 /// records from before a field existed render it as an empty string
 /// (`{sender}` falls back to `user`).
+///
+/// Single pass by design: substituted values are never rescanned for
+/// placeholders. A display name is guild input - one containing
+/// `{message}` or `{time}` must not eat the message into the name slot,
+/// which chained `replace` calls would allow.
 #[must_use]
 pub fn render_user_turn(template: &str, record: &ConversationRecord) -> String {
     let content = record_content(record);
-    template
-        .replace("{sender}", record.author.as_deref().unwrap_or("user"))
-        .replace("{user_id}", &record.sender_id.map(|id| id.to_string()).unwrap_or_default())
-        .replace("{guild_name}", record.guild_name.as_deref().unwrap_or_default())
-        .replace("{time}", &record.captured_at.to_string())
-        .replace("{message}", &content)
+    let sender = record.author.as_deref().unwrap_or("user");
+    let user_id = record.sender_id.map(|id| id.to_string()).unwrap_or_default();
+    let guild_name = record.guild_name.as_deref().unwrap_or_default();
+    let time = record.captured_at.to_string();
+
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        // `find` returns a char boundary; `get` keeps the slicing lints happy.
+        if let Some(head) = rest.get(..open) {
+            out.push_str(head);
+        }
+        rest = rest.get(open..).unwrap_or(rest);
+        let substituted = rest
+            .strip_prefix("{sender}")
+            .map(|tail| (sender, tail))
+            .or_else(|| rest.strip_prefix("{user_id}").map(|tail| (user_id.as_str(), tail)))
+            .or_else(|| rest.strip_prefix("{guild_name}").map(|tail| (guild_name, tail)))
+            .or_else(|| rest.strip_prefix("{time}").map(|tail| (time.as_str(), tail)))
+            .or_else(|| rest.strip_prefix("{message}").map(|tail| (content.as_str(), tail)));
+        match substituted {
+            Some((value, tail)) => {
+                out.push_str(value);
+                rest = tail;
+            }
+            // Not a known placeholder: keep the brace literally.
+            None => {
+                out.push('{');
+                rest = rest.get(1..).unwrap_or(rest);
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// One image attached to a captured user message: the recognition
@@ -877,6 +910,20 @@ mod tests {
         assert!(rendered.contains("user:[alice](<@42>): hi there\n"), "{rendered}");
         // Metadata beyond the template's parameters stays bookkeeping.
         assert!(!rendered.contains("1735689600"), "{rendered}");
+    }
+
+    /// A display name is guild input: placeholder-like text in it must
+    /// reach the prompt verbatim instead of being rescanned - chained
+    /// `replace` would substitute the message into the name slot.
+    #[test]
+    fn adversarial_sender_name_is_not_rescanned_for_placeholders() {
+        let mut user = user_record(10, "Ann {message} {time}", "hello");
+        user.sender_id = Some(42);
+        user.captured_at = 7;
+
+        let rendered = render_user_turn(DEFAULT_TURN_TEMPLATE, &user);
+
+        assert_eq!(rendered, "[Ann {message} {time}](<@42>): hello");
     }
 
     /// Custom templates reach every capture-baked field; legacy records

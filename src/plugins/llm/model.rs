@@ -169,6 +169,19 @@ pub struct ChannelConfig {
 }
 
 impl ChannelConfig {
+    /// Deserializes a stored channel config, normalizing fields that must
+    /// not be degenerate. `/llm_set` guards `depth` at the command layer,
+    /// but a hand-edited storage document can still carry `0` - which would
+    /// drop every turn (even the newest) from the context. Every parse site
+    /// goes through here so the guard cannot drift.
+    pub(crate) fn from_stored(raw: serde_json::Value) -> serde_json::Result<Self> {
+        let mut config: Self = serde_json::from_value(raw)?;
+        if config.history_depth == 0 {
+            config.history_depth = 1;
+        }
+        Ok(config)
+    }
+
     /// Fresh configuration with defaults and the given model - what
     /// `/llm_assign` stores before any per-channel tuning exists.
     #[must_use]
@@ -331,6 +344,19 @@ mod tests {
         // Stored before the feature existed: serde defaults keep it loadable.
         assert!(!config.react);
         assert!((config.random_react_chance_percent - 10.0).abs() < f64::EPSILON);
+    }
+
+    /// A hand-edited storage doc can carry `depth: 0` (the `/llm_set` guard
+    /// cannot see it): the stored-parse path must clamp it, or the context
+    /// would assemble with zero turns - not even the newest one.
+    #[test]
+    fn from_stored_clamps_a_hand_edited_zero_depth() {
+        let config = ChannelConfig::from_stored(serde_json::json!({
+            "model": "zai/glm-5.3-flash",
+            "history_depth": 0
+        }))
+        .expect("config expected to deserialize");
+        assert_eq!(config.history_depth, 1);
     }
 
     #[test]

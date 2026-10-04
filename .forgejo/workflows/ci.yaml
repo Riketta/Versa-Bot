@@ -103,12 +103,31 @@ jobs:
           }
           if fetch "$GITHUB_SHA"; then
             echo "fetched by SHA"
-          elif fetch "$FORGEJO_REF_NAME"; then
-            echo "fetched by ref name ($FORGEJO_REF_NAME)"
           else
-            echo "all archive attempts failed; repo API says:"
-            curl --silent --show-error --header "Authorization: token $GITHUB_TOKEN" "$API_REPO" | head -c 1500
-            exit 1
+            # Ref-name fallback: the archive may carry a newer tip than the
+            # commit the image tags claim (a push landing between the test
+            # and package jobs). Resolve the ref through the commits API and
+            # refuse to publish a mislabeled image; if the API cannot
+            # resolve it at all, say so loudly and proceed as before.
+            resolved=$(curl --fail-with-body --silent --show-error \
+              --header "Authorization: token $GITHUB_TOKEN" \
+              "$API_REPO/commits?sha=$FORGEJO_REF_NAME&limit=1" \
+              | sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' \
+              | head -1)
+            if [ -n "$resolved" ] && [ "$resolved" != "$GITHUB_SHA" ]; then
+              echo "ref $FORGEJO_REF_NAME is at $resolved, but the image would be tagged \
+  sha-$(echo "$GITHUB_SHA" | cut -c1-8) - refusing to publish a mislabeled image" >&2
+              exit 1
+            fi
+            if [ -z "$resolved" ]; then
+              echo "WARNING: could not verify $FORGEJO_REF_NAME against GITHUB_SHA (commits API unavailable?) - proceeding unverified" >&2
+            fi
+            if ! fetch "$FORGEJO_REF_NAME"; then
+              echo "all archive attempts failed; repo API says:"
+              curl --silent --show-error --header "Authorization: token $GITHUB_TOKEN" "$API_REPO" | head -c 1500
+              exit 1
+            fi
+            echo "fetched by ref name ($FORGEJO_REF_NAME)"
           fi
           tar -xzf source.tar.gz --strip-components=1
           rm source.tar.gz

@@ -226,7 +226,18 @@ async fn set_default_tier(
     policy.default_tier = tier;
     storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
 
-    reply(services, text(format!("✅ Default tier is now {tier}."))).await
+    // Legal but destructive settings get an explicit consequence line: the
+    // reply is ephemeral, so the warning costs nothing but an oversight.
+    let warning = match policy.default_tier {
+        AccessTier::Admin => {
+            "\n⚠️ Every member - including strangers - can now run admin commands."
+        }
+        AccessTier::Banned => {
+            "\n⚠️ The whole guild is now ignored silently: no replies, no denials."
+        }
+        _ => "",
+    };
+    reply(services, text(format!("✅ Default tier is now {}.{}", tier, warning))).await
 }
 
 async fn show_policy(storage: &dyn GuildStorage, services: &KernelServices) -> anyhow::Result<()> {
@@ -262,6 +273,11 @@ async fn read_policy(storage: &dyn GuildStorage) -> Result<AuthConfig, OutboundM
     serde_json::from_value(value).map_err(|_| unavailable())
 }
 
+/// Assignments rendered per embed section. Discord caps one embed's
+/// description at 4096 characters - a guild with hundreds of assignments
+/// would otherwise turn `/auth show` into a generic failure notice.
+const MAX_RENDERED_ASSIGNMENTS: usize = 20;
+
 fn render_assignments(
     assignments: &BTreeMap<String, AccessTier>,
     mention: fn(&str) -> String,
@@ -270,11 +286,18 @@ fn render_assignments(
         return " none".to_owned();
     }
     let mut rendered = String::new();
+    let mut shown = 0usize;
     for (id, tier) in assignments {
+        if shown >= MAX_RENDERED_ASSIGNMENTS {
+            let remaining = assignments.len() - shown;
+            rendered.push_str(&format!("\n…and {remaining} more"));
+            break;
+        }
         rendered.push('\n');
         rendered.push_str(&mention(id));
         rendered.push_str(": ");
         rendered.push_str(&tier.to_string());
+        shown += 1;
     }
     rendered
 }
@@ -626,6 +649,70 @@ mod tests {
 
         let message = output.messages().into_iter().next().expect("reply expected");
         assert!(message.contains("none"));
+    }
+
+    /// Destructive defaults get an explicit consequence line in the
+    /// ephemeral reply: admin opens the bot to everyone, banned silences it
+    /// for everyone.
+    #[tokio::test]
+    async fn destructive_default_tiers_warn() {
+        let (storage, services, output) = fixture();
+
+        AuthCommandHandler::default()
+            .invoke(&command_event(), &auth_args("default", Some("admin"), None, None), &services)
+            .await
+            .expect("default expected to succeed");
+        assert!(output.messages().into_iter().next().is_some_and(|message| {
+            message.contains("Default tier is now Admin") && message.contains("Every member")
+        }));
+
+        AuthCommandHandler::default()
+            .invoke(&command_event(), &auth_args("default", Some("banned"), None, None), &services)
+            .await
+            .expect("default expected to succeed");
+        let message = output.messages().into_iter().last().expect("reply expected");
+        assert!(message.contains("Default tier is now Banned"));
+        assert!(message.contains("silently"));
+
+        // A normal tier carries no warning.
+        AuthCommandHandler::default()
+            .invoke(&command_event(), &auth_args("default", Some("user"), None, None), &services)
+            .await
+            .expect("default expected to succeed");
+        let message = output.messages().into_iter().last().expect("reply expected");
+        assert!(message.contains("Default tier is now User"));
+        assert!(!message.contains("⚠️"));
+        let policy = stored_policy(&storage).await.expect("policy stored");
+        assert_eq!(policy.get("default_tier").and_then(serde_json::Value::as_str), Some("user"));
+    }
+
+    /// The show embed must stay within Discord's embed description cap: a
+    /// guild with many assignments renders the first few and a remainder
+    /// count instead of failing the whole command.
+    #[tokio::test]
+    async fn show_caps_long_assignment_lists() {
+        let (storage, services, output) = fixture();
+        let mut users = serde_json::Map::new();
+        for id in 1..=25 {
+            users.insert(format!("u{id:02}"), serde_json::json!("user"));
+        }
+        storage.seed(
+            Platform::Discord,
+            GuildId(1),
+            NAMESPACE,
+            CONFIG_KEY,
+            serde_json::json!({ "default_tier": "user", "users": users, "roles": {} }),
+        );
+
+        AuthCommandHandler::default()
+            .invoke(&command_event(), &auth_args("show", None, None, None), &services)
+            .await
+            .expect("show expected to succeed");
+
+        let message = output.messages().into_iter().next().expect("reply expected");
+        assert!(message.contains("<@u20>: User"), "20th assignment expected: {message}");
+        assert!(!message.contains("<@u21>"), "cap exceeded: {message}");
+        assert!(message.contains("and 5 more"), "remainder count expected: {message}");
     }
 
     /// A malformed policy blocks writes: the answer points at the config,

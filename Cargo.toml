@@ -66,4 +66,4 @@ indexing_slicing = "deny"
 multiple_crate_versions = "allow"
 pedantic = { level = "warn", priority = -1 }
 string_slice = "deny"
-# unwrap_used = "deny"
+unwrap_used = "deny"

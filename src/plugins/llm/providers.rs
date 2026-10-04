@@ -402,9 +402,7 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
             supports_reasoning,
             &provider.settings.extra_body,
         );
-        if let Some(map) = body.as_object_mut() {
-            map.insert("stream".to_owned(), json!(true));
-        }
+        apply_stream_fields(&mut body);
 
         let url = format!("{}/chat/completions", provider.settings.api_url.trim_end_matches('/'));
         let mut request_builder = provider.client.post(url).json(&body);
@@ -686,6 +684,19 @@ fn template_string_form(name: &str, effort: Option<&str>) -> String {
             tracing::warn!(variable = name, "extra_body template variable unknown - left as-is");
             format!("${{{name}}}")
         }
+    }
+}
+
+/// Marks a completion body as streaming and asks for token usage on the
+/// stream. OpenAI-semantics endpoints report `usage` in the final chunk
+/// only when asked via `stream_options.include_usage`; servers that predate
+/// the field (llama.cpp) either always report usage or ignore the unknown
+/// key - without the flag, strict-OpenAI providers never calibrate the
+/// channel's token estimate (see `ChatEngine::record_usage`).
+fn apply_stream_fields(body: &mut Value) {
+    if let Some(map) = body.as_object_mut() {
+        map.insert("stream".to_owned(), json!(true));
+        map.insert("stream_options".to_owned(), json!({ "include_usage": true }));
     }
 }
 
@@ -1242,6 +1253,33 @@ mod tests {
         assert_eq!(
             messages.first().and_then(|m| m.get("role")).and_then(Value::as_str),
             Some("system")
+        );
+    }
+
+    /// Streaming requests must ask the endpoint for token usage: without
+    /// `stream_options.include_usage`, strict-OpenAI providers never report
+    /// usage on a stream and the channel's token estimate stays uncalibrated
+    /// forever.
+    #[test]
+    fn streaming_body_requests_usage() {
+        let mut body = completion_body(
+            ReasoningStyle::OpenaiEffort,
+            "m",
+            &sample_messages(),
+            &GenParams::default(),
+            false,
+            &BTreeMap::new(),
+        );
+        assert!(body.get("stream").is_none(), "single-shot body must stay non-streaming");
+
+        apply_stream_fields(&mut body);
+
+        assert_eq!(body.get("stream").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            body.get("stream_options")
+                .and_then(|options| options.get("include_usage"))
+                .and_then(Value::as_bool),
+            Some(true)
         );
     }
 
