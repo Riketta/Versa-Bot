@@ -46,6 +46,16 @@ You may react to the message you are replying to. To react, emit a marker line i
 - Usually skip it, or pick ONE emoji that fits best; never more than 3.
 - The marker is removed from your answer before it is shown; never mention it in text.";
 
+/// Appended to the silent-react chime call only. That invocation is a
+/// reaction decision, not a reply: without a dedicated instruction the
+/// model answers conversationally, the prose is discarded, and markers
+/// stay rare - the roll would mostly waste the call. Templates that drop
+/// later system turns simply degrade to the ordinary context.
+pub(crate) const REACT_CHIME_PROMPT: &str = "[[tool: reactions]]
+This is not a reply turn: you are only choosing a reaction to the newest message.
+Respond with a single [[react: emoji]] marker - or with nothing at all when no reaction fits.
+Do not write conversational text; any prose is thrown away.";
+
 /// Hard cap on markers processed per message - a runaway model cannot spin
 /// the extractor (the react emoji cap applies after this).
 const MAX_TOOL_CALLS: usize = 8;

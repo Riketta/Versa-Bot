@@ -518,8 +518,10 @@ only fire on messages the bot actually captured; the chance draws from a
 per-channel deck, so hits balance out over each 100-draw cycle instead
 of clumping. With `react` on, a second independent roll
 (`random_react_chance`, default 10%) can silently react to a captured
-message without replying: one single-shot call whose prose is discarded,
-only the marker's emojis apply, nothing is recorded - the two rolls
+message without replying: one single-shot call carrying a dedicated
+reaction-only instruction (the model must choose a reaction, not write
+a reply), whose prose is discarded, only the marker's emojis apply,
+nothing is recorded - the two rolls
 each keep their own cooldown and never suppress one another.
 
 **Failures.** A message that tags the bot or replies to it is guaranteed a

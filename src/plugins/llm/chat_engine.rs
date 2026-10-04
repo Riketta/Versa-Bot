@@ -25,7 +25,8 @@ use crate::kernel::{
 };
 
 use super::completion_port::{
-    CompletionRequest, CompletionResponse, LlmCompletionPort, LlmError, ResponseTiming, TokenUsage,
+    ChatMessage, ChatRole, CompletionRequest, CompletionResponse, LlmCompletionPort, LlmError,
+    ResponseTiming, TokenUsage,
 };
 use super::conversation::{self, ConversationRecord, RecordRole};
 use super::model::{
@@ -966,8 +967,13 @@ impl ChatEngine {
     ) {
         let AnswerRequest { config, state, live, usage_stats, .. } = request;
         let channel_id = origin.channel_id.get();
-        let (request, context_chars, budget, _) =
+        let (mut request, context_chars, budget, _) =
             self.assemble_prompt(config, state, live, usage_stats);
+        // This invocation is a reaction decision, not a reply: without a
+        // dedicated instruction the model answers conversationally, the
+        // prose is discarded, and markers stay rare. Appended last so the
+        // context prefix stays byte-stable for provider caches.
+        request.messages.push(ChatMessage::text(ChatRole::System, tools::REACT_CHIME_PROMPT));
         let response = match self.completion.complete(request).await {
             Ok(response) => response,
             Err(err) => {
@@ -3441,6 +3447,44 @@ mod tests {
             .await
             .expect("stats readable");
         assert!(stats.is_some(), "react chime usage must be recorded");
+    }
+
+    /// The silent-react call carries a dedicated reaction-only instruction
+    /// (appended after the context): the model must know this invocation is
+    /// a reaction decision, or it answers conversationally and its prose is
+    /// thrown away unused.
+    #[tokio::test]
+    async fn react_chime_tells_the_model_to_react_not_reply() {
+        let ctx = ctx_random(
+            LlmSettings::default(),
+            Arc::new(FixedRandom(true)),
+            vec![Ok("[[react: 🐻]]".to_owned())],
+        );
+        let config = ChannelConfig {
+            capture_mode: CaptureMode::AllMessages,
+            react: true,
+            random_chance_percent: 0.0,
+            random_react_chance_percent: 100.0,
+            ..assigned_config()
+        };
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
+
+        let requests = ctx.fake.requests();
+        assert_eq!(requests.len(), 1);
+        let messages = &requests.first().expect("request expected").messages;
+        let last = messages.last().expect("hint message expected");
+        assert!(
+            last.content.contains("reaction to the newest message"),
+            "react-only hint expected as the final message: {:?}",
+            messages
+        );
+        // A normal reply call must NOT carry the hint - it rides only on
+        // the silent-react invocation.
+        let hint_count =
+            messages.iter().filter(|m| m.content.contains("reaction to the newest")).count();
+        assert_eq!(hint_count, 1);
     }
 
     /// Without a marker the silent-react chime stays invisible: no reply, no
