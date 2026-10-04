@@ -34,7 +34,8 @@ use versa_bot::plugins::lol_leaderboard::{
     LeaderboardPlugin, LeaderboardSourcePort, ResolvedView as LeaderboardView,
 };
 use versa_bot::plugins::lol_store::{
-    AnnounceFlags, EngineSettings, LcuClient, LolStorePlugin, StoreEngine,
+    AnnounceFlags, DEFAULT_GUILD_CAP, DEFAULT_USER_CAP, EngineSettings, LcuClient, LolStorePlugin,
+    StoreEngine,
 };
 use versa_bot::plugins::status::{StatusRotatorPlugin, StatusSettings};
 use versa_bot::plugins::tracker::UserActivityTrackerPlugin;
@@ -457,7 +458,12 @@ fn status_settings(config: &Configuration) -> StatusSettings {
 /// lockfile path or a zero poll all map to the disabled state (zero poll =
 /// the scheduler contract's dead handle).
 fn lol_store_engine_settings(lol_store: Option<&LolStoreConfig>) -> EngineSettings {
-    let disabled = EngineSettings { poll: Duration::ZERO, flags: AnnounceFlags::all_on() };
+    let disabled = EngineSettings {
+        poll: Duration::ZERO,
+        flags: AnnounceFlags::all_on(),
+        watch_user_cap: DEFAULT_USER_CAP,
+        watch_guild_cap: DEFAULT_GUILD_CAP,
+    };
     let Some(lol_store) = lol_store else { return disabled };
     if lol_store.lockfile_path.is_empty() {
         tracing::info!("config section [lol_store] has no lockfile_path - store watcher disabled");
@@ -475,6 +481,8 @@ fn lol_store_engine_settings(lol_store: Option<&LolStoreConfig>) -> EngineSettin
             mythic_rotation: lol_store.announce_mythic_rotation,
             yourshop: lol_store.announce_yourshop,
         },
+        watch_user_cap: lol_store.watch_user_cap,
+        watch_guild_cap: lol_store.watch_guild_cap,
     }
 }
 

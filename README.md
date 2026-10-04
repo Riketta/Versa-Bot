@@ -319,6 +319,9 @@ received.
 | `/lol_store_unassign` | moderator | stop posting store events in this guild |
 | `/lol_store_role` | moderator | tag this role on store announcements - the subscription role (run without the argument to clear) |
 | `/lol_store_dump` | moderator | force-post the latest store update summary in the current channel (public, no role tag) |
+| `/lol_store_watch` | user | watch a skin or a champion for sales, Mythic Shop rotations, new releases (ephemeral) |
+| `/lol_store_unwatch` | user | remove one own watch by its list id, or every own watch with `all` (ephemeral) |
+| `/lol_store_watchlist` | user | list your own watches (private, ephemeral) |
 
 The `/lol_store_role` subscription pattern: create a mentionable role
 (e.g. `Store Pings`), let members join it, and bind it once - every
@@ -326,6 +329,35 @@ announcement then tags the role, so only opted-in members are pinged.
 The tag rides the message content (embeds never notify on Discord); the
 role must be marked "allow anyone to mention", or the bot needs the
 mention-everyone permission.
+
+**Per-user watches.** Beyond the guild-wide role, any member can
+subscribe personally with `/lol_store_watch`: either a specific skin
+(`target: skin`, e.g. *Blood Moon Evelynn*) or a champion's whole skin
+line (`target: champion`, e.g. *Evelynn* - future skins are caught by
+construction). The `kinds` argument selects what fires: `sale`,
+`mythic`, `release`, or `all` (default). Matching runs on the same
+store deltas the announcements use, so catch-up after a restart covers
+watches too, and the per-guild announce flags (`announce_sales`, ...)
+never suppress personal watches. When something fires, the assigned
+announcement channel gets one embed with the matched items, and every
+watcher is tagged in the message content (never the announcement role).
+
+Watch notes:
+
+- Name resolution searches the last known store catalog, so subscribing
+  requires the League client to have been reachable; matching afterwards
+  is pure id/name comparison. An ambiguous name replies with a candidate
+  list - re-run it with the exact name.
+- `/lol_store_watch` reports current activity in its confirmation
+  ("currently on sale", "currently in the mythic rotation"). Firing is
+  edge-based: a skin already on sale when you subscribe will not notify
+  until its next sale starts.
+- The `release` kind only ever fires for champion watches - a skin the
+  catalog can resolve is by definition already released.
+- Watchlists are private (`/lol_store_watchlist` shows only your own),
+  watches are guild-scoped, and a leaver's stale watch is inert (tags
+  just do not resolve). Caps: `watch_user_cap` per member,
+  `watch_guild_cap` per guild.
 
 Operator configuration lives in the optional `[lol_store]` section
 (**startup-only** - an absent section, an empty `lockfile_path`, or a
@@ -340,6 +372,8 @@ zero `poll_secs` keep the watcher off):
 | `announce_new_skins` | bool | `true` | announce newly listed skins (champion, skin, RP price) |
 | `announce_mythic_rotation` | bool | `true` | announce Mythic Shop rotation changes (skin, Mythic Essence price) |
 | `announce_yourshop` | bool | `true` | announce Your Shop starts (start and end times) |
+| `watch_user_cap` | integer | `20` | maximum `/lol_store_watch` subscriptions per member per guild |
+| `watch_guild_cap` | integer | `300` | maximum `/lol_store_watch` subscriptions per guild |
 
 Announced trackers that are toggled off still update the watcher's
 state, so re-enabling never replays old events. The watcher publishes

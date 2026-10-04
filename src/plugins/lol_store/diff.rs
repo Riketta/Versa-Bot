@@ -61,9 +61,12 @@ pub struct RotationDelta {
     pub entries: Vec<MythicEntry>,
 }
 
-/// One Mythic Shop slot: display name + Mythic Essence price.
+/// One Mythic Shop slot: raw entry id (for watch matching - it joins to
+/// the catalog when it is a catalog item id), display name + Mythic
+/// Essence price.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MythicEntry {
+    pub entry_id: Option<String>,
     pub name: Option<String>,
     pub mythic_price: Option<u64>,
 }
@@ -257,8 +260,10 @@ pub fn compute(previous: &LastSeen, snapshot: &Snapshot) -> StoreDelta {
     delta
 }
 
-/// Projects a store entry onto its display name and Mythic Essence price.
-fn mythic_entry(entry: &StoreEntry) -> MythicEntry {
+/// Projects a store entry onto its raw id, display name and Mythic
+/// Essence price.
+pub(crate) fn mythic_entry(entry: &StoreEntry) -> MythicEntry {
+    let entry_id = entry.id.clone();
     let name = entry
         .purchase_units
         .first()
@@ -272,7 +277,7 @@ fn mythic_entry(entry: &StoreEntry) -> MythicEntry {
         .flat_map(|option| option.payments.iter())
         .find(|payment| payment.name.as_deref() == Some("lol_mythic_essence"))
         .and_then(|payment| payment.final_delta);
-    MythicEntry { name, mythic_price }
+    MythicEntry { entry_id, name, mythic_price }
 }
 
 #[cfg(test)]

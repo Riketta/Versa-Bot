@@ -29,6 +29,10 @@ pub struct LolStoreConfig {
     pub announce_mythic_rotation: bool,
     /// Announce Your Shop event starts.
     pub announce_yourshop: bool,
+    /// Maximum store watches per user per guild (`/lol_store_watch`).
+    pub watch_user_cap: u32,
+    /// Maximum store watches per guild.
+    pub watch_guild_cap: u32,
 }
 
 impl Default for LolStoreConfig {
@@ -41,6 +45,8 @@ impl Default for LolStoreConfig {
             announce_new_skins: true,
             announce_mythic_rotation: true,
             announce_yourshop: true,
+            watch_user_cap: 20,
+            watch_guild_cap: 300,
         }
     }
 }
@@ -60,6 +66,11 @@ mod tests {
         assert!(config.announce_new_skins);
         assert!(config.announce_mythic_rotation);
         assert!(config.announce_yourshop);
+        assert_eq!(config.watch_user_cap, 20);
+        assert_eq!(config.watch_guild_cap, 300);
+        // The documented defaults must not drift from the plugin's own.
+        assert_eq!(config.watch_user_cap, crate::plugins::lol_store::DEFAULT_USER_CAP);
+        assert_eq!(config.watch_guild_cap, crate::plugins::lol_store::DEFAULT_GUILD_CAP);
     }
 
     #[test]
@@ -69,7 +80,9 @@ mod tests {
                 "lockfile_path": "E:/Games/Riot Games/League of Legends/lockfile",
                 "address": "192.168.1.10",
                 "poll_secs": 60,
-                "announce_sales": false
+                "announce_sales": false,
+                "watch_user_cap": 5,
+                "watch_guild_cap": 50
             }"#,
         )
         .expect("section expected to deserialize");
@@ -80,5 +93,7 @@ mod tests {
         assert!(config.announce_new_skins);
         assert!(config.announce_mythic_rotation);
         assert!(config.announce_yourshop);
+        assert_eq!(config.watch_user_cap, 5);
+        assert_eq!(config.watch_guild_cap, 50);
     }
 }

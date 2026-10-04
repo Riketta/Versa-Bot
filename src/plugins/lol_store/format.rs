@@ -52,27 +52,36 @@ impl NameIndex {
     /// (`championId * 1000 + n`) as fallback. Other item kinds (chests,
     /// orbs, bundles) get no champion prefix: their ids mean nothing by
     /// that convention.
-    fn skin_champion(&self, item: &CatalogItem) -> Option<String> {
+    pub(crate) fn skin_champion(&self, item: &CatalogItem) -> Option<String> {
+        let champion_id = self.champion_id(item)?;
+        Some(self.champion_name(champion_id))
+    }
+
+    /// The champion id behind a catalog item (see [`NameIndex::skin_champion`]).
+    fn champion_id(&self, item: &CatalogItem) -> Option<u64> {
         let from_requirements = item
             .item_requirements
             .iter()
             .find(|req| req.inventory_type.as_deref() == Some("CHAMPION"))
             .and_then(|req| req.item_id)
             .filter(|id| *id > 0);
-        let champion_id = match from_requirements {
-            Some(id) => id,
+        match from_requirements {
+            Some(id) => Some(id),
             None => {
                 if item.inventory_type.as_deref() != Some("CHAMPION_SKIN") {
                     return None;
                 }
                 let id = item.item_id / 1000;
-                if id == 0 {
-                    return None;
-                }
-                id
+                if id == 0 { None } else { Some(id) }
             }
-        };
-        Some(self.champion_name(champion_id))
+        }
+    }
+
+    /// Champion id behind a store item id, via the catalog. Watch matching
+    /// joins on this - base champions and non-skin items join to nothing.
+    pub(crate) fn champion_id_of_item(&self, item_id: u64) -> Option<u64> {
+        let item = self.catalog.get(&item_id)?;
+        self.champion_id(item)
     }
 
     fn original_price(&self, item_id: u64) -> Option<u64> {
@@ -95,16 +104,7 @@ pub fn announce_text(delta: &StoreDelta, index: &NameIndex) -> Option<String> {
         push_section(&mut sections, "New in store", &lines);
     }
     for rotation in &delta.rotations {
-        let lines: Vec<String> = rotation
-            .entries
-            .iter()
-            .map(|entry| match (entry.name.clone(), entry.mythic_price) {
-                (Some(name), Some(price)) => format!("- {name} \u{b7} {price} ME"),
-                (Some(name), None) => format!("- {name}"),
-                (None, Some(price)) => format!("- Unknown item \u{b7} {price} ME"),
-                (None, None) => "- Unknown item".to_owned(),
-            })
-            .collect();
+        let lines: Vec<String> = rotation.entries.iter().map(mythic_line).collect();
         if !lines.is_empty() {
             push_section(&mut sections, &format!("Mythic rotation ({})", rotation.label), &lines);
         }
@@ -127,7 +127,7 @@ pub fn announce_text(delta: &StoreDelta, index: &NameIndex) -> Option<String> {
 /// dropped from the tail (lowest build priority) until the join fits, a
 /// hidden-count footer records what was cut, and a single pathological
 /// section (absurd item names) is hard-cut char-safely.
-fn fit(mut sections: Vec<String>) -> Option<String> {
+pub(crate) fn fit(mut sections: Vec<String>) -> Option<String> {
     let join_len = |sections: &[String]| {
         sections.iter().map(String::len).sum::<usize>() + sections.len().saturating_sub(1) * 2
     };
@@ -162,7 +162,7 @@ pub fn champion_map(
     entries.into_iter().filter_map(|(id, name)| name.map(|name| (id, name))).collect()
 }
 
-fn push_section(sections: &mut Vec<String>, title: &str, lines: &[String]) {
+pub(crate) fn push_section(sections: &mut Vec<String>, title: &str, lines: &[String]) {
     if lines.is_empty() {
         return;
     }
@@ -177,14 +177,14 @@ fn push_section(sections: &mut Vec<String>, title: &str, lines: &[String]) {
 
 /// Best display name of a catalog item (any localization wins over a
 /// synthetic placeholder).
-fn localized_name(item: &CatalogItem) -> String {
+pub(crate) fn localized_name(item: &CatalogItem) -> String {
     item.localizations
         .values()
         .find_map(|text| text.name.clone())
         .unwrap_or_else(|| format!("Skin {}", item.item_id))
 }
 
-fn sale_line(sale: &super::lcu::Sale, index: &NameIndex) -> String {
+pub(crate) fn sale_line(sale: &super::lcu::Sale, index: &NameIndex) -> String {
     let item_id = sale.item.item_id.unwrap_or(0);
     let is_champion_sale = sale.item.inventory_type.as_deref() == Some("CHAMPION");
 
@@ -222,7 +222,7 @@ fn sale_line(sale: &super::lcu::Sale, index: &NameIndex) -> String {
     line
 }
 
-fn skin_line(item: &CatalogItem, index: &NameIndex) -> String {
+pub(crate) fn skin_line(item: &CatalogItem, index: &NameIndex) -> String {
     let subject = match index.skin_champion(item) {
         Some(champion) => format!("{champion} — {}", localized_name(item)),
         None => localized_name(item),
@@ -232,6 +232,16 @@ fn skin_line(item: &CatalogItem, index: &NameIndex) -> String {
         line.push_str(&format!(" · {price} RP"));
     }
     line
+}
+
+/// One Mythic Shop slot line - shared by announcements and watch pings.
+pub(crate) fn mythic_line(entry: &super::diff::MythicEntry) -> String {
+    match (entry.name.clone(), entry.mythic_price) {
+        (Some(name), Some(price)) => format!("- {name} \u{b7} {price} ME"),
+        (Some(name), None) => format!("- {name}"),
+        (None, Some(price)) => format!("- Unknown item \u{b7} {price} ME"),
+        (None, None) => "- Unknown item".to_owned(),
+    }
 }
 
 /// `2026-10-05T17:00:00.000+00:00` -> `2026-10-05`.
@@ -356,6 +366,7 @@ mod tests {
                 rotation_start: None,
                 next_rotation: None,
                 entries: vec![super::super::diff::MythicEntry {
+                    entry_id: None,
                     name: Some("Prestige Ocean Song Seraphine".to_owned()),
                     mythic_price: Some(35),
                 }],
@@ -492,6 +503,7 @@ mod tests {
             next_rotation: None,
             entries: (0..15)
                 .map(|n| super::super::diff::MythicEntry {
+                    entry_id: None,
                     name: Some(format!("Prestige Skin Entry {n} of {label} {}", "x".repeat(90))),
                     mythic_price: Some(100),
                 })

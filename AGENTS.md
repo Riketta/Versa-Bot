@@ -28,8 +28,9 @@ Core capabilities:
 
 Default plugins: auth (five-tier access ladder, see below), command/ping,
 tracker (member lifecycle audit), audit log, status rotator, LoL store
-tracker (poll-driven: watches the local League client's store; the one
-case of a plugin with NO inbound events - it discovers subscribers via
+tracker (poll-driven: watches the local League client's store, plus
+per-user skin/champion watch subscriptions; the one case of a plugin
+with NO inbound events - it discovers subscribers via
 `StoragePort::list_guilds` instead of an event origin), LoL leaderboard
 (command-driven `/lol_leaderboard`: world-data statistics over a
 pluggable source port, in-process TTL cache, no storage), LLM chat bot

@@ -52,6 +52,9 @@ url = "sqlite://versabot.db"
 # announce_new_skins = true
 # announce_mythic_rotation = true
 # announce_yourshop = true
+# Per-user / per-guild caps on /lol_store_watch subscriptions.
+# watch_user_cap = 20
+# watch_guild_cap = 300
 
 # Optional: LoL leaderboard - the on-demand /lol_leaderboard statistics
 # dump (role distributions, most picked champions per role) from a public

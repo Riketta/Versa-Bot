@@ -18,6 +18,7 @@ mod engine;
 mod events;
 mod format;
 pub mod lcu;
+pub mod watch;
 
 use std::sync::Arc;
 
@@ -33,11 +34,12 @@ use crate::kernel::{
 
 pub use commands::{
     AssignHandler, ClientStatusHandler, DisableHandler, DumpHandler, EnableHandler, RoleHandler,
-    UnassignHandler,
+    UnassignHandler, UnwatchHandler, WatchHandler, WatchlistHandler,
 };
 pub use diff::LastSeen;
 pub use engine::{AnnounceFlags, CONFIG_KEY, EngineSettings, GuildConfig, NAMESPACE, StoreEngine};
 pub use lcu::{LcuClient, LcuPort};
+pub use watch::{DEFAULT_GUILD_CAP, DEFAULT_USER_CAP, WATCH_KEY};
 
 /// The plugin facade: command registration (`init`), poll scheduling
 /// (`start`), cancellation (`stop`).
@@ -162,6 +164,80 @@ impl<B: EventBusPort> PluginPort for LolStorePlugin<B> {
             },
             Arc::new(DumpHandler { engine: Arc::clone(&self.engine) }),
         );
+        register(
+            CommandDescriptor {
+                plugin_id: self.name().to_owned(),
+                name: "lol_store_watch".to_owned(),
+                description: "Watch a skin or champion for sales, Mythic Shop rotations, \
+                     new releases"
+                    .to_owned(),
+                arguments: vec![
+                    ArgDescriptor {
+                        name: "target".to_owned(),
+                        description: "Watch one skin or a champion's whole skin line".to_owned(),
+                        required: true,
+                        kind: ArgKind::String,
+                        choices: Some(vec!["skin".to_owned(), "champion".to_owned()]),
+                    },
+                    ArgDescriptor {
+                        name: "name".to_owned(),
+                        description: "Skin name (e.g. Blood Moon Evelynn) or champion name"
+                            .to_owned(),
+                        required: true,
+                        kind: ArgKind::String,
+                        choices: None,
+                    },
+                    ArgDescriptor {
+                        name: "kinds".to_owned(),
+                        description: "Notify on sale, mythic, release - or all (default)"
+                            .to_owned(),
+                        required: false,
+                        kind: ArgKind::String,
+                        choices: Some(vec![
+                            "sale".to_owned(),
+                            "mythic".to_owned(),
+                            "release".to_owned(),
+                            "all".to_owned(),
+                        ]),
+                    },
+                ],
+                required_permission: None,
+                required_tier: Some(AccessTier::User),
+                guild_only: true,
+            },
+            Arc::new(WatchHandler { engine: Arc::clone(&self.engine) }),
+        );
+        register(
+            CommandDescriptor {
+                plugin_id: self.name().to_owned(),
+                name: "lol_store_unwatch".to_owned(),
+                description: "Remove a store watch by its list id, or every watch with `all`"
+                    .to_owned(),
+                arguments: vec![ArgDescriptor {
+                    name: "what".to_owned(),
+                    description: "Watch id from /lol_store_watchlist, or `all`".to_owned(),
+                    required: true,
+                    kind: ArgKind::String,
+                    choices: None,
+                }],
+                required_permission: None,
+                required_tier: Some(AccessTier::User),
+                guild_only: true,
+            },
+            Arc::new(UnwatchHandler),
+        );
+        register(
+            CommandDescriptor {
+                plugin_id: self.name().to_owned(),
+                name: "lol_store_watchlist".to_owned(),
+                description: "List your store watches (private to you)".to_owned(),
+                arguments: Vec::new(),
+                required_permission: None,
+                required_tier: Some(AccessTier::User),
+                guild_only: true,
+            },
+            Arc::new(WatchlistHandler),
+        );
         Ok(())
     }
 
@@ -246,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn init_registers_the_seven_commands_within_discord_limits() {
+    fn init_registers_the_ten_commands_within_discord_limits() {
         let registry = Arc::new(CapturingRegistry::default());
         let plugin = LolStorePlugin::new(
             Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
@@ -266,6 +342,9 @@ mod tests {
                 "lol_store_unassign",
                 "lol_store_role",
                 "lol_store_dump",
+                "lol_store_watch",
+                "lol_store_unwatch",
+                "lol_store_watchlist",
             ]
         );
         assert_descriptions_fit_discord(&descriptors);
@@ -281,7 +360,12 @@ mod tests {
             Arc::new(InMemoryStorage::new()) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecordingBus::default(),
-            EngineSettings { poll: Duration::ZERO, flags: AnnounceFlags::all_on() },
+            EngineSettings {
+                poll: Duration::ZERO,
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: DEFAULT_USER_CAP,
+                watch_guild_cap: DEFAULT_GUILD_CAP,
+            },
         ))
     }
 
@@ -308,7 +392,12 @@ mod tests {
             Arc::new(InMemoryStorage::new()) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecordingBus::default(),
-            EngineSettings { poll: Duration::from_secs(90), flags: AnnounceFlags::all_on() },
+            EngineSettings {
+                poll: Duration::from_secs(90),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: DEFAULT_USER_CAP,
+                watch_guild_cap: DEFAULT_GUILD_CAP,
+            },
         ));
         let plugin = LolStorePlugin::new(
             Arc::new(CapturingRegistry::default()) as Arc<dyn CommandRegistryPort>,
@@ -347,6 +436,47 @@ mod tests {
     /// LCU double that is always offline (engine commands never fetch).
     struct OfflineLcu;
 
+    /// LCU double that is always online with two Ahri skins in the catalog
+    /// (champion 103) - enough for exact-match and ambiguous candidate
+    /// flows in the watch commands.
+    struct OnlineLcu;
+
+    #[async_trait]
+    impl lcu::LcuPort for OnlineLcu {
+        async fn catalog(&self) -> Result<Vec<lcu::CatalogItem>, lcu::LcuError> {
+            let skin = |item_id: u64, name: &str| lcu::CatalogItem {
+                item_id,
+                inventory_type: Some("CHAMPION_SKIN".to_owned()),
+                prices: vec![lcu::Price { cost: Some(975), currency: Some("RP".to_owned()) }],
+                localizations: std::collections::BTreeMap::from([(
+                    "en_US".to_owned(),
+                    lcu::LocalizedText { name: Some(name.to_owned()) },
+                )]),
+                item_requirements: vec![lcu::ItemRef {
+                    inventory_type: Some("CHAMPION".to_owned()),
+                    item_id: Some(103),
+                }],
+            };
+            Ok(vec![skin(1031, "Foxfire Ahri"), skin(1032, "Dynastry Ahri")])
+        }
+
+        async fn sales(&self) -> Result<Vec<lcu::Sale>, lcu::LcuError> {
+            Ok(Vec::new())
+        }
+
+        async fn rotations(&self) -> Result<Vec<lcu::RotationStore>, lcu::LcuError> {
+            Ok(Vec::new())
+        }
+
+        async fn yourshop_status(&self) -> Result<lcu::YourShopStatus, lcu::LcuError> {
+            Ok(lcu::YourShopStatus::default())
+        }
+
+        async fn champion_names(&self) -> Result<Vec<lcu::ChampionEntry>, lcu::LcuError> {
+            Ok(vec![lcu::ChampionEntry { id: 103, name: Some("Ahri".to_owned()) }])
+        }
+    }
+
     #[async_trait]
     impl lcu::LcuPort for OfflineLcu {
         async fn catalog(&self) -> Result<Vec<lcu::CatalogItem>, lcu::LcuError> {
@@ -378,7 +508,10 @@ mod tests {
     }
 
     async fn command_fixture(guilded: bool) -> CommandFixture {
-        let storage = Arc::new(InMemoryStorage::new());
+        command_fixture_with(guilded, Arc::new(InMemoryStorage::new())).await
+    }
+
+    async fn command_fixture_with(guilded: bool, storage: Arc<InMemoryStorage>) -> CommandFixture {
         let output = RecordingChatOutput::new();
         let origin = Origin {
             platform: Platform::Discord,
@@ -404,6 +537,50 @@ mod tests {
             }),
         };
         CommandFixture { storage, output, services, event }
+    }
+
+    async fn stored_watch_doc(fixture: &CommandFixture) -> Option<serde_json::Value> {
+        fixture
+            .storage
+            .guild_scoped(Platform::Discord, GuildId(42))
+            .get(NAMESPACE, WATCH_KEY)
+            .await
+            .expect("watch doc read expected")
+    }
+
+    async fn seed_watch_doc(fixture: &CommandFixture, doc: serde_json::Value) {
+        fixture
+            .storage
+            .guild_scoped(Platform::Discord, GuildId(42))
+            .set(NAMESPACE, WATCH_KEY, doc)
+            .await
+            .expect("watch doc write expected");
+    }
+
+    /// Watch-command fixture: the fixture's guild storage is shared with
+    /// the engine, and one baseline tick fills the snapshot so name search
+    /// works. The catalog holds two Ahri skins - exact matches hit one,
+    /// the loose prefix hits both.
+    async fn watch_fixture(
+        user_cap: u32,
+        guild_cap: u32,
+    ) -> (CommandFixture, Arc<StoreEngine<RecordingBus>>) {
+        let storage = Arc::new(InMemoryStorage::new());
+        let f = command_fixture_with(true, Arc::clone(&storage)).await;
+        let engine = Arc::new(StoreEngine::new(
+            Arc::new(OnlineLcu),
+            Arc::clone(&storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
+            RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
+            RecordingBus::default(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: user_cap,
+                watch_guild_cap: guild_cap,
+            },
+        ));
+        engine.tick().await; // silent baseline: fills the raw snapshot
+        (f, engine)
     }
 
     async fn stored_config(fixture: &CommandFixture) -> Option<GuildConfig> {
@@ -485,6 +662,184 @@ mod tests {
         let messages = f.output.messages();
         let first = messages.first().expect("reply expected");
         assert!(first.contains("only works inside a server"));
+    }
+
+    fn watch_args(target: &str, name: &str, kinds: Option<&str>) -> CommandArgs {
+        let mut args =
+            vec![("target".to_owned(), target.to_owned()), ("name".to_owned(), name.to_owned())];
+        if let Some(kinds) = kinds {
+            args.push(("kinds".to_owned(), kinds.to_owned()));
+        }
+        CommandArgs(args)
+    }
+
+    #[tokio::test]
+    async fn watch_without_store_data_explains_and_stores_nothing() {
+        let f = command_fixture(true).await;
+        let engine = disabled_engine(); // offline: no snapshot ever
+        WatchHandler { engine }
+            .invoke(&f.event, &watch_args("skin", "Foxfire Ahri", None), &f.services)
+            .await
+            .expect("invoke");
+        let first = f.output.messages().first().expect("reply expected").clone();
+        assert!(first.contains("No store data yet"));
+        assert!(stored_watch_doc(&f).await.is_none(), "nothing stored on failure");
+    }
+
+    #[tokio::test]
+    async fn watch_resolves_a_unique_name_and_stores_the_subscription() {
+        let (f, engine) = watch_fixture(20, 300).await;
+        WatchHandler { engine }
+            .invoke(&f.event, &watch_args("skin", "Foxfire Ahri", Some("sale")), &f.services)
+            .await
+            .expect("invoke");
+        let first = f.output.messages().first().expect("reply expected").clone();
+        assert!(first.contains("Watch #1 added"), "reply: {first}");
+        assert!(first.contains("Ahri - Foxfire Ahri (sale)"));
+
+        let doc = stored_watch_doc(&f).await.expect("watch doc expected");
+        let subs = doc.get("subs").and_then(|subs| subs.as_array()).expect("subs array");
+        assert_eq!(subs.len(), 1);
+        let target = subs.first().expect("sub").get("target").expect("target");
+        assert_eq!(target.get("type").and_then(|t| t.as_str()), Some("skin"));
+        assert_eq!(target.get("item_id").and_then(|id| id.as_u64()), Some(1031));
+        assert_eq!(
+            subs.first().expect("sub").get("user_id").and_then(|user| user.as_str()),
+            Some("1"),
+            "the invoking user owns the watch"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_resolves_a_champion_and_reports_current_activity() {
+        let (f, engine) = watch_fixture(20, 300).await;
+        WatchHandler { engine }
+            .invoke(&f.event, &watch_args("champion", "aHRi", None), &f.services)
+            .await
+            .expect("invoke");
+        let first = f.output.messages().first().expect("reply expected").clone();
+        assert!(first.contains("Watch #1 added: Ahri (all)"), "reply: {first}");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_names_reply_with_candidates_and_store_nothing() {
+        let (f, engine) = watch_fixture(20, 300).await;
+        WatchHandler { engine }
+            .invoke(&f.event, &watch_args("skin", "ahri", None), &f.services)
+            .await
+            .expect("invoke");
+        let first = f.output.messages().first().expect("reply expected").clone();
+        assert!(first.contains("Several matches"), "reply: {first}");
+        assert!(first.contains("Foxfire Ahri"));
+        assert!(first.contains("Dynastry Ahri"));
+        assert!(stored_watch_doc(&f).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn watch_enforces_the_user_and_guild_caps() {
+        let (f, engine) = watch_fixture(1, 300).await;
+        seed_watch_doc(
+            &f,
+            serde_json::json!({
+                "version": 1, "next_id": 2,
+                "subs": [{ "id": 1, "user_id": "1",
+                    "target": { "type": "skin", "item_id": 1031,
+                        "champion": "Ahri", "skin": "Foxfire Ahri" }, "kinds": "all" }]
+            }),
+        )
+        .await;
+        WatchHandler { engine }
+            .invoke(&f.event, &watch_args("skin", "Dynastry Ahri", None), &f.services)
+            .await
+            .expect("invoke");
+        let first = f.output.messages().first().expect("reply expected").clone();
+        assert!(first.contains("Watch limit reached (1/1 per user)"), "reply: {first}");
+
+        // A different user can still watch, and the guild cap is checked
+        // across all users.
+        let (f2, engine2) = watch_fixture(20, 1).await;
+        WatchHandler { engine: engine2 }
+            .invoke(&f.event, &watch_args("champion", "Ahri", None), &f2.services)
+            .await
+            .expect("invoke");
+        let (f3, engine3) = watch_fixture(20, 1).await;
+        seed_watch_doc(
+            &f3,
+            serde_json::json!({
+                "version": 1, "next_id": 2,
+                "subs": [{ "id": 1, "user_id": "999",
+                    "target": { "type": "champion", "champion_id": 103, "champion": "Ahri" },
+                    "kinds": "all" }]
+            }),
+        )
+        .await;
+        WatchHandler { engine: engine3 }
+            .invoke(&f3.event, &watch_args("skin", "Foxfire Ahri", None), &f3.services)
+            .await
+            .expect("invoke");
+        let reply = f3.output.messages().first().expect("reply expected").clone();
+        assert!(reply.contains("guild reached its watch limit"), "reply: {reply}");
+        let _ = f2; // user 2's successful watch covers the non-cap path
+    }
+
+    #[tokio::test]
+    async fn unwatch_and_watchlist_manage_only_own_watches() {
+        let f = command_fixture(true).await;
+        seed_watch_doc(
+            &f,
+            serde_json::json!({
+                "version": 1, "next_id": 3,
+                "subs": [
+                    { "id": 1, "user_id": "1",
+                      "target": { "type": "skin", "item_id": 1031,
+                          "champion": "Ahri", "skin": "Foxfire Ahri" }, "kinds": "sale" },
+                    { "id": 2, "user_id": "1",
+                      "target": { "type": "champion", "champion_id": 103, "champion": "Ahri" },
+                      "kinds": "all" },
+                    { "id": 3, "user_id": "2",
+                      "target": { "type": "champion", "champion_id": 103, "champion": "Ahri" },
+                      "kinds": "all" }
+                ]
+            }),
+        )
+        .await;
+
+        // Removing another user's watch by id is a no-op with a hint.
+        let args = CommandArgs(vec![("what".to_owned(), "3".to_owned())]);
+        UnwatchHandler.invoke(&f.event, &args, &f.services).await.expect("invoke");
+        let first = f.output.messages().first().expect("reply expected").clone();
+        assert!(first.contains("No watch #3 of yours"), "reply: {first}");
+
+        // Watchlist shows only the invoker's watches.
+        WatchlistHandler.invoke(&f.event, &Default::default(), &f.services).await.expect("invoke");
+        let list = f.output.messages().last().expect("reply expected").clone();
+        assert!(list.contains("#1 Ahri - Foxfire Ahri (sale)"), "list: {list}");
+        assert!(list.contains("#2 Ahri (all)"));
+        assert!(!list.contains("#3"));
+
+        // `all` clears only the invoker's watches.
+        let args = CommandArgs(vec![("what".to_owned(), "all".to_owned())]);
+        UnwatchHandler.invoke(&f.event, &args, &f.services).await.expect("invoke");
+        let reply = f.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("Removed 2 watch(es)"), "reply: {reply}");
+        let doc = stored_watch_doc(&f).await.expect("doc expected");
+        let subs = doc.get("subs").and_then(|subs| subs.as_array()).expect("subs array");
+        assert_eq!(subs.len(), 1, "only user 2's watch survives");
+    }
+
+    #[tokio::test]
+    async fn watch_commands_outside_a_guild_reply_guild_only() {
+        let f = command_fixture(false).await;
+        let engine = disabled_engine();
+        WatchHandler { engine }
+            .invoke(&f.event, &watch_args("skin", "Foxfire Ahri", None), &f.services)
+            .await
+            .expect("invoke");
+        UnwatchHandler.invoke(&f.event, &Default::default(), &f.services).await.expect("invoke");
+        WatchlistHandler.invoke(&f.event, &Default::default(), &f.services).await.expect("invoke");
+        let messages = f.output.messages();
+        assert_eq!(messages.len(), 3, "every watch command replied");
+        assert!(messages.iter().all(|m| m.contains("only works inside a server")));
     }
 
     #[tokio::test]
