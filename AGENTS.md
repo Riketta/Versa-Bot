@@ -1,212 +1,318 @@
 # AGENTS Instructions
 
+This file is the map and the rulebook for working in this repo:
+architecture invariants, conventions, and the development gate. It is
+deliberately NOT a feature manual - `README.md` documents what the bot
+does today (features, config, commands), and rustdoc documents module
+contracts. Where this file and the code disagree, the code wins; then fix
+the doc.
+
 ## Project overview
 
-This project is complex chat bot framework that should:
+Multi-tenant chat bot for many unrelated Discord guilds - per-guild data
+isolation is a privacy requirement, not a feature. Rust, shipped as a
+Docker container. Hexagonal architecture (ports & adapters) around a
+micro-kernel core. Discord first; other platforms (Telegram, Matrix,
+IRC, ...) arrive later as new adapters, not kernel changes.
 
-- Have advanced observability (powerful logging, tracing and metrics) via `tracing` and `sentry` crates.
-- Support config files with hot-reloading.
-- Have database (using repository pattern and some ORM (maybe just `sqlx`) with SQLite and PostgreSQL support) that will allow to store guild specific settings and plugin specific settings (probably via JSON documents). Storage and it's API should be designed the way arbitrary plugins can store own arbitrary data and configs (on per guild basis).
-- Support plugin system using middleware pattern to handle all kinds of Discord events (messages, user events, etc.), and event bus to let plugins exchange data with each other. Plugins will not be external (like DLLs) but source code extensions: `src/plugins/admin/*`).
-- Support chat command system based on native platform commands (e.g. Discord slash commands). Plugins register their own commands with arguments via `CommandRegistryPort`; the platform adapter publishes them to the platform and normalizes invocations onto the taxonomy.
-- Some default plugins:
-  - Authorization and roles for per guild bot access control: a five-tier ladder (banned / guest / user / moderator / admin) resolved per member from per-user, per-role and default assignments; Discord guild administrators are admin by construction (an unremovable clamp, not a stored entry); the adapter resolves the admin bit for commands AND plain messages (payload bits when present, else the gateway cache: owner => all, else @everyone + member roles union), so the clamp holds everywhere. Policy writes serialize on one process-wide lock - deliberately coarse; `/auth` is rare and correctness outranks its latency.
-  - Administration tools so guild administrators can manage bot like they want.
-  - Guild and plugin config manager plugin.
-  - Chat bot plugin based on LLM. Chat bot can be assigned to various channels with various identities. So system prompt and LLM parameters assigned to channel inside of guild, not guild itself, but guild still store some LLM-bot related settings: e.g. limit of channels that chat-bot can be assigned to, so it can be used for premium features in future, and other things. Implemented on plain `reqwest` against OpenAI-compatible endpoints behind the plugin's own provider port - no `rig` (see the LLM chat plugin paragraph below).
-  - Message history accessible by other plugins (e.g. by LLM plugin for context) - deferred: the LLM plugin keeps its own bot-scoped history; a generic history plugin waits for a real consumer.
-  - Random user statuses for bot once in a while (if appropriate for current messenger, e.g. Discord).
-  - User activity tracker (user joined guild, user left from guild, user created invite link, etc.) that will log such events to assigned channel.
+Core capabilities:
 
-Bot will work as a service: a lot of different not connected with each other Discord guilds use it. So data about each guild should be isolated to others due to privacy concerns.
+- Observability via `tracing` + `sentry` (facade, no telemetry port).
+- Hot-reloadable config files.
+- Guild-partitioned document storage (`sqlx`, SQLite/PostgreSQL) that
+  arbitrary plugins extend with their own data.
+- Plugin system: source-code plugins (`src/plugins/*`) joined by a
+  middleware pipeline + an event bus.
+- Commands registered by plugins as native platform commands (Discord
+  slash commands) - no prefix parsing in core.
 
-It will be implemented as hexagonal architecture (ports & adapters) micro-kernel core. It will be initially implemented as walking skeleton.
-Bot will be used as a Docker container.
+Default plugins: auth (five-tier access ladder, see below), command/ping,
+tracker (member lifecycle audit), audit log, status rotator, LLM chat bot
+(per-channel identity, config, and history; plain `reqwest` against
+OpenAI-compatible endpoints - no `rig`). A generic message-history plugin
+is deferred until a real consumer appears.
 
-Initially it will be used with Discord, but later it should be possible to use framework with Telegram, Matrix, Jabber, IRC or any other chat.
-
-**Platform strategy (calibrated):** universal feature parity across chats is explicitly NOT a goal. The kernel and the taxonomy are platform-blind; core plugins work off the taxonomy and degrade gracefully where a platform lacks a concept (e.g. no roles -> user allow-lists only). Platform-specific features live in adapters or clearly scoped platform plugins without pretending to be universal. Platform types never enter the kernel or core plugins - because of economics, not purity: platform branching inside every plugin scales with (plugins x platforms), while new-adapter integration scales with 1.
+**Platform strategy:** universal feature parity across chats is NOT a
+goal. The kernel and the event taxonomy are platform-blind; core plugins
+work off the taxonomy and degrade gracefully where a platform lacks a
+concept. Platform-specific features live in adapters or platform-scoped
+plugins. Platform types never enter the kernel or core plugins - because
+of economics, not purity: platform branching inside every plugin scales
+with (plugins x platforms); new-adapter integration scales with 1.
 
 ## README maintenance
 
-`README.md` is user-facing documentation and must stay in sync with reality. When a change adds or alters features, configuration, commands, project layout, or setup steps, update the README in the same change. The README describes what the bot does today; the Roadmap section is the only forward-looking part.
+`README.md` is user-facing documentation and must stay in sync with
+reality. When a change adds or alters features, configuration, commands,
+project layout, or setup steps, update the README in the same change. The
+README describes what the bot does today; the Roadmap section is the only
+forward-looking part.
 
 ## Build & CI
 
-Both forges run the same pipeline (`.github/workflows/ci.yml` -> GHCR, `.forgejo/workflows/ci.yaml` -> the instance registry) on pushes to `main` and `v*` tags: `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked`, `cargo test --locked`, then the Docker image build (`cargo build --release --locked` inside the Dockerfile), gated on the test job. The toolchain is pinned to `rust:1.98-bookworm` in CI and in the Dockerfile - the same compiler everywhere, with the Debian suite pinned alongside it so the binary's glibc ABI matches the `debian:bookworm-slim` runtime stage.
-
-- The clippy gate is deny-level lints only, deliberately NOT `-D warnings`: the codebase carries tolerated pedantic/doc warnings. Do not switch to `-D warnings` until a zero-warning cleanup pass lands.
-- Every cargo gate runs `--locked` (tests, clippy, and the image build alike): a stale `Cargo.lock` must fail fast in the test job, not in packaging. Dependency changes ship with an updated lockfile.
-- The local gate IS the CI gate: run exactly what CI runs - same commands, same order, same flags (`cargo fmt --all -- --check`, then `cargo clippy --all-targets --locked`, then `cargo test --locked`). The deny lints are declared in the `[lints.clippy]` table in `Cargo.toml`, so cargo applies them to every local clippy run exactly as in CI, and the pinned toolchain is the same - a lint error that appears in CI is always reproducible locally with the exact CI command. If it was not caught locally, the gate was not run after the final edit.
-- Run the full trio after the LAST edit of a change, and read the clippy run's exit status and `error:` lines, not the warning count: a deny-level lint failure adds an error without changing the warning tally, so a count-based check is blind to it.
-- `cargo test` does not execute clippy lints (`[lints.clippy]` applies only under clippy-driver): green tests never imply a clean clippy gate.
-- Docker BuildKit cache mounts persist on the Forgejo host builder (docker-socket packaging job) but do not survive between GitHub hosted runners - image builds there recompile dependencies whenever source changes. Accepted for now.
-
-## Hexagonal Micro-Kernel Architecture
-
-- The plugin contracts ARE ports.
-- The plugins ARE adapters.
-- The kernel IS the inner hexagon.
-
-The kernel assembles the chain, but never knows what's in it.
-
-- Kernel never imports plugins - it only knows `PluginPort`, `MiddlewarePluginPort`, etc.
-- Plugins never import each other - they communicate only via kernel's event bus `EventBusPort`.
-- Internally, a plugin MAY be structured as its own hexagon (own domain, app layer, adapters) - but this is optional; any internal structure is valid as long as it honors the plugin contract.
-- Kernel domain stays minimal - if logic needs a plugin to exist, it doesn't belong in the kernel.
-
-Ports in the kernel fall into two families:
-
-- Kernel service ports - infra the kernel needs and exposes to plugins (e.g. `StoragePort`, `ConfigPort`, `SchedulerPort`, `EventBusPort` access).
-- Plugin-facing ports - the contracts plugins implement (`PluginPort`, `MiddlewarePluginPort`). Every plugin implements `PluginPort` (identity + lifecycle). `MiddlewarePluginPort` is opt-in - only plugins that intercept inbound events join the pipeline. A single plugin object that does both is registered once and cast to both traits - the same `Arc` goes into the `plugins` list (as `Arc<dyn PluginPort>`) and the `middleware` list (as `Arc<dyn MiddlewarePluginPort>`).
-
-**Cardinality:**
-
-A kernel service port like `EventBusPort` has a single active adapter and a single instance per kernel - owned by the kernel, wired at its composition root, and the same instance is shared with plugins via injection (the event bus adapter is `Clone`/`Copy`; each plugin receives its own clone at construction).
-A plugin-facing port like `MiddlewarePluginPort` is the inverse: it has many adapters (one per participating plugin). The kernel collects those adapters into an ordered list and runs them through a kernel-owned pipeline runner (the `KernelService` `RequestHandlerPort` implementation) - `MiddlewarePluginPort` itself is the per-plugin step contract, not the pipeline.
-So `EventBusPort` is injected into the kernel; `MiddlewarePluginPort` implementers are registered into the kernel.
-
-**Communication:**
-
-- Kernel to Plugin: two channels - `PluginPort` lifecycle calls (`init`/`start`/`stop`), and the middleware pipeline (runtime event flow).
-- Plugin to Kernel: via kernel-owned service ports injected at registration, so plugins can have access to kernel and infrastructure over kernel.
-- Plugin to Plugin: never directly - always via `EventBusPort`.
-- Kernel owns the bus - it routes events but never defines their meaning.
-- Plugins own their events - `UserJoinedGuild` is defined in `UserActivityTrackerPlugin`, not in the kernel. A subscriber therefore imports the event's *type* from the owning plugin's module: that type-level import IS the bus contract itself - no calls, no shared behavior - and is not a violation of plugin independence (the typed `audit_log` -> `tracker` import is the precedent).
-
-**Kernel lifecycle:**
-
-`KernelService::boot()` is the kernel's own entrypoint - it runs the plugin lifecycle in two phases, `init()` on all plugins first, then `start()` on all, so every plugin is initialized before any starts (a plugin's `start` may rely on others being ready). `boot()` validates the wiring: every `MiddlewarePluginPort` must also be registered in `plugins` (dual registration is the only supported shape - a middleware-only plugin would intercept events with no lifecycle), and duplicate names from distinct plugin instances are rejected; a failed `start()` rolls back the already-started plugins (reverse-order `stop`). `KernelService::shutdown()` stops the plugins that reached a successful `start()` under a successful boot, in reverse start order - idempotent (explicit call + `Drop` fallback stop exactly once, tracked via the kernel's started-list, so a failed boot leaves nothing to stop: rolled-back plugins were stopped by the rollback, and a plugin that never started owes no stop).
-
-Inbound events enter via a chat driving adapter and flow through the middleware pipeline (core -> plugins, forward `pre` then backward `post`, chain-breakable, run by `KernelService`).
-
-**Event-scoped storage & guild isolation:** `StoragePort` is guild-partitioned document storage (plain `sqlx`, chosen over an ORM: the schema is tiny, isolation is visible in every query, boring dependency - SQLite and PostgreSQL via URL, one shared migration set). The kernel binds a `GuildStorage` handle to the event's `(platform, guild_id)` origin and carries it in the service context; a handle exposes no guild parameter, so reading or writing another guild's data is impossible by construction (DMs get no handle at all). Namespaces are per-plugin (the plugin's registered slug); plugins may
-sub-partition their own namespace (the LLM plugin keeps one record log per
-channel, `llm:c:<channel>`, so one channel's context can never read another
-channel's conversation); the `guild` namespace is reserved for guild settings - enforced, not conventional: the adapter rejects plugin writes/deletes/appends targeting `guild` with `StorageError::Forbidden` (reads stay permitted; the future config manager reaches it kernel-side). Alongside key-value documents, `GuildStorage` exposes an append-only record log (`append`/`list_after`/`list_last`/`count_after` over one shared `guild_records` table, guild-scoped sequence numbers) for high-volume ordered data that outgrows documents - e.g. LLM conversation history; documents remain the tool for settings and state. The LLM engine bounds its per-message history load to the newest `history_depth + compaction_keep_tail` records (the operational window): a log longer than that serves its newest part, keeping per-message cost flat even when compaction is off or failing - records are never deleted, and the cutoff moves only through committed compactions.
-
-**Observability:** `tracing` itself is the observability port - it is a facade, not infrastructure (same exception category as `serde`), so the kernel and plugins emit tracing events/spans directly and there is deliberately no `TelemetryPort`. The composition root installs the subscribers: stdout fmt layer plus a `sentry-tracing` layer. The Sentry endpoint (Sentry SaaS or self-hosted GlitchTip) is DSN-driven via config (`sentry.dsn`, optional - absent or empty disables reporting); error events carry the release (`sentry::release_name!`), an optional `sentry.traces_sample_rate` (0.0..=1.0, out-of-range warns and stays off) samples performance transactions, and session tracking stays off (the SDK default; GlitchTip does not support it). The `sentry-tracing` `logs` feature ships `warn`/`info`/`error` as Sentry log items (debug/trace stay stdout-only); whether a backend's Logs tab displays them is backend-side (GlitchTip documents OTel for its Logs tab), while `error`-grade events and panics always arrive as Issues - which is why storage/LLM failures log at `error`. The kernel opens a span per event carrying origin fields (`platform`, `kind`, guild/channel/user), so records correlate across backends without plugin effort. The level contract: `debug` (stdout-only breadcrumbs) covers pipeline traversal (event ingest, chain outcome - ran/stopped-by/aborted), provider request/response traces, scheduler job ticks and chime roll decisions; `info` (also ships to Sentry/GlitchTip as log items) is the audit grade - command dispatch (who ran what, with a per-argument summary: short values rendered, long ones as `<N chars>` shapes), the command registration trail (the registry logs each plugin's registration; the Discord registrar logs the completed sync with its count), and the per-completion LLM record (model, trigger, latency - engine wall clock plus the complete provider time with its source, endpoint-reported when the provider publishes timings (llama.cpp `timings`), else adapter-measured - token usage incl. cached/reasoning breakdowns when reported, window sizes). Privacy rule at every level: shapes and counters, never contents - no message text, no prompts, no endpoint response bodies. The single, explicit exception is the LLM plugin's `[llm] log_raw_traffic` operator diagnostic: it dumps raw request/response bodies at `debug` (stdout only, never the Sentry layer) to prove what went on the wire; it is off by default and carries conversation content. If real metrics are ever needed, use the `metrics` crate facade directly - same argument, still no port.
-The pipeline is **event-driven, not request/response**: there is no `ResponseContext` - `RequestHandlerPort::handle` is fire-and-forget (replies go out via ports, not return values). Plugins produce output (replies, reactions, presence) by calling injected outbound ports (`ChatOutputPort`, `PresencePort`, ...) carried in the event-scoped service context. An event may yield zero, one, or many outputs (e.g. an LLM plugin streams tokens via repeated `chat_output.send`); an event no plugin handles simply yields no output - there is no "not found" default.
-
-**Inbound event model:**
-
-`RequestContext` is a chat-agnostic inbound EVENT, not just a message - it carries multiple kinds (`MessageReceived`, `MemberJoined`, `CommandInvoked`, ...) plus the origin context (guild, channel, source platform, optional opaque reply token for transactional events like interactions) needed to scope outbound ports.
-The driving adapter (`DiscordGatewayAdapter`) normalizes ALL Discord gateway events into this taxonomy (structural ACL & DTOs) and pushes each through the pipeline - including message content: user/role/channel mention tags (`<@id>`, `<@&id>`, `<#id>`) are rewritten to `[Name]<@id>` (names from the payload's mentions and the gateway cache; unresolvable ids stay raw; custom emoji already self-descriptive), and outbound Discord sends invert the shape back to the bare tag, so model-assembled tags ping cleanly. Message attachments ride `MessagePayload` as platform-blind DTOs (the platform's own CDN URL - the pinned trusted host - MIME type, name, size, dimensions); no extra gateway intent is needed (`GUILD_MESSAGES` carries them), and the LLM plugin's image recognition is the consumer. Middleware plugins match on event kind (`CommandPlugin` -> `CommandInvoked`, `AuthPlugin` -> invocation kinds, `UserActivityTrackerPlugin` -> `MemberJoined`); others ignore kinds they don't care about. Cross-platform reach comes from the common taxonomy - each platform adapter maps its native events onto it.
-
-**Commands:** native platform commands (Discord slash) are the primary UX - no prefix parsing in core. Plugins declare `CommandDescriptor`s via `CommandRegistryPort` during `init()` (meaning lives in the owning plugin); the kernel aggregates them meaning-free; the Discord adapter publishes descriptors as global application commands and normalizes `InteractionCreate` onto `CommandInvoked` (deferring the interaction at ingestion to satisfy the ~3s deadline - the defer carries the EPHEMERAL flag inside the callback `data`, so the loading state and every command reply stay visible to the invoker alone; a top-level `flags` field is silently dropped by Discord and would make the whole exchange public, since the first followup edits the original response and inherits its visibility). Command replies reuse the event-scoped `ChatOutputPort`: when the origin carries an interaction reply token, the factory binds it to the interaction followup endpoint - plugins cannot tell the difference. `CommandHandler` receives the event itself, so channel-anchored commands (e.g. `/assign_tracker` assigns the channel it is run in) work without platform types. `required_permission` is interpreted platform-side (the Discord adapter maps it onto `default_member_permissions`, so Discord gates presentation natively) and is reserved for commands whose audience matches a native platform permission (today: only `/auth`); tier-based access control is `required_tier` - an `AccessTier` (banned < guest < user < moderator < admin) on the descriptor, kernel-side ACL data the kernel never interprets: the auth plugin resolves the caller's effective tier against the guild policy and denies below-requirement invocations with an ephemeral notice. Tier-gated commands deliberately ship without `required_permission` - a moderator may lack the native platform permission, and hiding the command would break the tier promise; enforcement is entirely kernel-side. Descriptor arguments are typed (`ArgKind` - string, user, role so far) and may carry `choices`; `guild_only` marks DM-unsupported commands. The registrar maps these onto platform mechanics (Discord option types 3/6/8, option `choices`, `dm_permission`); entity-typed arguments arrive in `args` as ID strings. Prefix parsing, if a platform ever needs it, is that platform's adapter concern synthesizing `CommandInvoked`. Command and argument descriptions are Discord users' only in-app documentation - write them as self-sufficient mini-docs (what the command does, what the value expects, what `clear` does), keep every description within Discord's 100-character cap (the platform rejects longer ones at sync time; each plugin's registration test guards this via `test_support::assert_descriptions_fit_discord`), and keep them in sync whenever a command's behavior changes - README documents commands for the project page, the descriptors document them in the UI.
-
-**Gateway intents:** the driving adapter requests a minimal, feature-justified intent set - every intent must map to a concrete plugin or core feature. Current set: `GUILD_MESSAGES` + `DIRECT_MESSAGES` (framework-level message/DM intake feeding the pipeline), `GUILD_MEMBERS` (tracker plugin member lifecycle events), and `MESSAGE_CONTENT` (the LLM plugin reads guild message content for conversation history - the feature that justified requesting this privileged intent). Privileged intents are minimized deliberately: they need Developer Portal toggles and gate bot verification at scale.
-
-**Translations (i18n):** split by concern - no kernel port, no adapter catalogs. Catalogs (the strings themselves) belong to each plugin, which owns its meaning like its storage docs and derived events; the lookup engine is at most a shared utility under `src/common/`, added when catalog pressure demands it (no fluent/ICU unless plurals/genders are actually needed). The language is per-guild data in the reserved `guild` storage namespace (key `language`, written by the config plugin), resolved by whoever sends the message; fallback chain: guild setting -> event locale hint -> default (`en`). The platform reports its native locale (Discord guild preferred locale / interaction locale) via an optional `locale` hint on `Origin` - taxonomy, like IDs and `reply_token`; platforms without the concept leave it `None`. Slash-command localization is plugin-declared data on `CommandDescriptor`, mapped by the adapter onto the platform's native mechanism (Discord `name_localizations`/`description_localizations`). Rejected alternatives: a kernel `TranslationPort` (the kernel would own user-facing meaning) and adapter-side catalogs (content would move into the transport layer). Implementation is deferred until the config/LLM plugins create real pressure.
-
-**Pipeline <-> bus bridge:**
-
-`EventBusPort` never carries raw inbound events. But a middleware plugin that processed an inbound event MAY publish a DERIVED domain event onto the bus.
-E.g. `UserActivityTrackerPlugin` receives `MemberJoined` via the pipeline, logs to the audit channel via `ChatOutputPort`, and publishes `UserJoinedGuild`; `AuditLogPlugin` (a `PluginPort`-only bus subscriber, not in the pipeline) reacts. So the bridge between inbound happenings and bus-only plugins is plugin behavior, not kernel or adapter logic.
-
-**Bus runtime contract:** `EventBusPort` handlers run inline on the publishing task, in subscription order - keep them fast and non-blocking. A panicking handler is caught, logged, and skipped: a broken subscriber cannot crash the publisher, the pipeline, or other subscribers. `subscribe` returns an `EventBusSubscription` (explicit `unsubscribe`, same style as `JobHandle`; dropping the handle does not unsubscribe) - bus-only plugins hold their subscriptions and release them in `stop()`, which keeps `init()` idempotent. Delivery isolation, cross-task ordering, and backpressure (e.g. an external broker) are deferred until a real consumer needs them.
-
-**Pipeline failure policy:** hooks are fire-and-forget (they return `Next`, never `Result`); plugins log their own recoverable failures internally. Panics are the kernel's concern: a `pre` that panics is logged (plugin + event) and treated as `Stop` - the event does not flow to remaining plugins (fail closed), while `post` still runs for the plugins that ran, the panicking one included (only its call frame unwound, its state is intact); a `post` that panics is logged and remaining posts still run - one broken observer must not skip the others' cleanup. No plugin panic may reach the driving adapter's task - plugins must not be able to crash the bot. A command handler that returns `Err` is answered with a generic ephemeral failure notice when the origin is transactional (a deferred interaction must never hang on "thinking").
-
-**Scheduler contract:** `SchedulerPort::schedule` requires a non-zero interval - a zero interval returns an already-cancelled handle instead of spawning a task that would panic `tokio::time::interval`. Jobs tick with `MissedTickBehavior::Delay`: a slow job skips missed ticks instead of burst-catching-up. Derived domain events (e.g. membership facts) are published regardless of the publishing plugin's own configuration readability - the fact happened; only the plugin's reaction to it may be skipped.
-
-**Configuration hot reload:** `ConfigPort<C>` (spi) is generic over the configuration type - the kernel never depends on the concrete infrastructure config; the composition root wires the concrete instance. The adapter is a polling watcher: it rebuilds file+env configuration on a scheduler tick, diffs it against the last snapshot, and notifies subscribers only on change; a failed reload (half-written file) keeps the last good snapshot. Handlers run inline, panic-isolated, like bus subscribers. What reloads is a per-section decision: global runtime connections (token, proxy, storage, Sentry, LLM providers) cannot hot-apply and are ignored; `[status]` demonstrates the pattern. Subscribers must treat identical snapshots as no-ops so unrelated edits don't reset running state.
-
-**LLM chat plugin:** the first plugin built as its own hexagon. Driven side: an `LlmCompletionPort` with one OpenAI-compatible adapter covering every operator-declared provider (per-provider reqwest client: url, `api_key_env` resolved from the environment, optional proxy, timeout, reasoning style, and an `extra_body` passthrough merging provider-specific request fields with `model`/`messages` engine-owned; string values may carry `${enable_reasoning}` (JSON false only when the channel's `reasoning_effort` is `off`) and `${reasoning_effort}` (the effort string, or `null` when unset/off) template variables resolved per request, so endpoint-specific knobs like llama.cpp `chat_template_kwargs` can follow per-channel reasoning changes) plus a model capability registry gating the per-channel `reasoning_effort` (the registry doubles as the legal assignment set - see Isolation below; configs stored before that validation may still reference undeclared models - they run with default capabilities, warn-once); a scope-aware `RandomPort` (deck-style "fake random" by default - per-scope decks balance chime-ins out per 100-draw cycle, the plain RNG adapter is the swap; the scope carries the roll purpose, so a channel's reply and silent-react rolls draw from independent bags) whose per-channel state lives inside the adapter. Storage: conversation records per channel in `llm:c:<channel>` namespaces - never deleted, the cutoff moves - plus config/state documents under `llm`; the state doc holds `{summary, cutoff_seq, cutoff_at}` so a compaction commit is one atomic write. Context schema: system prompt -> always-present summary slot (compaction summary or placeholder; separate second system message), then the live window. Per-model `summary_placement` in `[llm.models]` (`system_turn` default | `system_suffix` | `assistant_turn`) can instead merge the summary into the end of the system prompt - appended last so the bytes before the summary stay stable and provider prompt caches keep the prefix across compactions; the merge is the escape hatch for templates that honor only a single system message, since some templates silently drop later system turns, which would erase the summary after every compaction. User turns rendered via the channel's turn template (default `[{sender}](<@{user_id}>): {message}` - the `[Name]<@id>` tag shape normalized inbound messages carry; `{guild_name}` and `{time}` (unix capture time) available; all template fields baked into records at capture), bot turns as assistant role (self-recorded at send time - bot messages never re-enter from the gateway). Compaction runs after the reply once the window outgrows `history_depth`: everything but `compaction_keep_tail` newest records folds into the summary via the compaction model - chunked, never a sliding window, so prompt prefixes stay byte-stable for provider caches. Streaming is real endpoint streaming: channels with `streaming` on request `stream: true` over SSE through the completion port's streaming method - content deltas reveal live on one message (begun with the first delta, edits throttled to `stream_interval_ms`), reasoning deltas are cut at the adapter boundary and never surface, and the final edit plus any length splits use the authoritative assembled text - the message is only ever behind, never wrong. Non-streaming channels and compaction stay single-shot; the port's streaming method degrades to single-shot for providers without SSE. Image recognition is capture-time and opt-in: a per-channel `images` toggle (off by default - image-flooded channels are the reason it is per-channel) enables describing image attachments through a dedicated operator-declared recognition model (`[llm] image_model`, per-channel `image_model` override, resolved and validated like `compaction_model`; absent globally = feature off, channels record undescribed placeholders). Each image is downloaded from the pinned Discord CDN host under `image_max_source_bytes`, rescaled to `image_max_side` (aspect kept, JPEG re-encode; animated input decodes to its first frame) and described under the customizable `image_prompt` (channel override -> plugin default -> built-in) via the port's multipart wire shape (text part + `image_url` data-URL parts; chat and compaction contexts stay text-only by design). Descriptions are baked into the immutable record at capture - the rendered prompt stays byte-stable - and render as markdown image references (`![description](image.png)`; numbered placeholders for multi-image messages, `![image](image.png)` for undescribed, so the model still sees THAT an image existed); `max_images_per_message` bounds vision calls, recognition usage stays out of the channel's chat stats (compaction precedent), and every failure (oversize, undecodable, endpoint error) records an undescribed image instead of breaking capture or the guaranteed answer. A stream that dies mid-answer finalizes what was already revealed (delivered = recorded; the fallback notice never contradicts visible text) and reports through the service channel. Reasoning output is cut at the adapter boundary (`reasoning_content`/`reasoning` response fields are never read; a complete inline `<think>...</think>` pair anywhere is reasoning and is stripped; a leading unclosed block means the answer never got past thinking = no answer; an unclosed mid-text opener is literal text) - it never enters history, the reply, or the progressive reveal, so it cannot reach a channel. An operator option (`[llm] max_consecutive_newlines`) collapses newline runs in the authoritative content down to `N` (absent = untouched; like reasoning stripping it applies to the final text, so a live reveal may briefly show more blank lines than the final edit keeps). Reasoning control is a real three-state, because the wire differs per provider style: unset/`clear` sends no reasoning parameter (the provider default applies - Z.ai GLM defaults to `max` effort, so "nothing sent" means heavy thinking, not no thinking); a value is sent as-is on effort-style providers and enables thinking on switch-style ones; `off` stores `Some("off")` and renders an explicit `thinking: {"type": "disabled"}` for switch-style providers (GLM-4.5 through 5.2) while effort-style providers have no off wire value and fall back to the default - GLM-5.3 series thinks forcibly regardless, `reasoning_effort=low` is its minimum, so operators throttle it with `low`, not `off`. `/llm_status` shows the effective reasoning setting so this distinction is visible. Random chime-ins roll per channel (purpose-scoped RNG decks + per-channel cooldown, `random_cooldown_secs`, 5s default) and only on captured messages. Intake is admission-controlled: at most 64 accepted-but-unfinished engine runs per channel (generous - regular multi-guild traffic never approaches it); a flood past the cap sheds excess messages with a warning (not captured), and plugin `stop` cancels admission so shutdown spawns no new runs (already-admitted runs finish naturally). Per-channel in-memory state (processing locks, admission permits, notice/chime cooldowns, RNG decks, the warn-once model set) is process-lifetime and never evicted - bounded by distinct channels/guilds ever touched, not by message volume. Failure policy: a triggered message (mention or reply to the bot) is guaranteed a visible response - when the generated answer is impossible (provider error, reasoning-only response, unreadable history, failed capture append), the channel gets a generic fallback notice that is never recorded as a bot turn and carries no error detail; unprompted chime-ins stay silent on failure. Logs + rate-limited service-channel embeds carry the error classification only ("endpoint unreachable/rejected the request") - endpoint response bodies can name operator accounts/projects, so they stay in logs, never in guild-visible embeds. History integrity is never guessed around: an unreadable record log or a failed capture append never produces a model answer (it would fabricate context) - only the fallback. The state-mutating admin commands (`/llm_cutoff`, `/llm_set`, `/llm_prompt`, `/llm_prompt_file`) run under the same per-channel processing lock as the engine, so an in-flight run cannot commit an older state over a fresh cutoff and concurrent admin read-modify-writes cannot lose an update. `/llm_assign` is the deliberate exception (one idempotent document write): a concurrent `/llm_set` on the same channel can lose one update - admins-only and self-inflicted; documented, accepted. Prompts longer than Discord's inline option limit load from an uploaded attachment (`/llm_prompt_file`): the adapter resolves the attachment option to its Discord CDN URL - the pinned trusted host, the only network peer guild input may ever name - and the plugin downloads it under `max_prompt_file_bytes`. Isolation: provider endpoints, keys and capabilities are operator config; guild admins choose only among declared models, so guild config can never introduce an endpoint or reach another guild's data - enforced at the command layer: `/llm_assign` and `/llm_set` model refs (`model`, `image_model`, `compaction_model`) validate against the declared registry and reject unknown refs with an ephemeral list of the declared models, the `/llm_assign` `model` argument ships the declared refs as Discord choices (platform cap 25 - beyond it the dropdown truncates with an operator warn, validation is unaffected), and `/llm_models` shows the catalog. Token usage from the endpoint's `usage` block is stored per channel (`channel:{id}:stats`) and blended into a rolling tokens-per-character estimate; the complete response time is stored alongside it for every completed answer - endpoint-reported when the provider publishes timings (llama.cpp `timings`), else adapter-measured; context filling is token-budget based whenever the budget is resolvable and usage has been calibrated: channel `context_budget_tokens` overrides, else the declared model `context_window` minus the completion reserve (`max_tokens` or 1024) and a 10% estimator margin - uncalibrated channels fall back to message-count filling with `history_depth` as the cap in all cases. `/llm_status` shows the active system prompt (override or plugin default: char count, an in-process identity fingerprint for version checks, head preview), the effective reasoning setting, image recognition (state, resolved model, resolved prompt length), the last request's tokens (including cached and, when the endpoint reports the breakdown, reasoning tokens), the last response time with its source, the calibrated estimate, and the enforced budget. Tool calls are a text-marker protocol, not the OpenAI `tools` wire API - it works on every endpoint regardless of chat-template tool support, keeps the wire shape and the records untouched (the byte-stable prefix survives), and reuses the reasoning-strip precedent for boundary parsing: `[[name: payload]]` markers parsed generically by the plugin's `tools` module under frozen rules - R1 shape (lowercase snake name, payload to the first `]]`, which payloads must not contain); R2 unknown names pass through untouched, so old parsers never eat future tools' markers; R3 markers are never revealed live (a bounded hold-back filter rides the SSE path next to the think stripper); R4 the cleaned text is what is delivered and recorded - markers are ephemeral side effects; R5 degradation is per-tool and per-item, and a tool failure never fails the answer; R6 an unclosed marker stays visible as literal text (honest garbage beats silently eaten prose). The first tool is reactions (`react`, per-channel opt-in via `/llm_set react on`; plugin-wide `react_max_per_message`, default 3): a constant prompt appendix (appended after the operator prompt - cache-stable bytes) teaches the model to emit `[[react: emoji ...]]`; tokens fire through the kernel's event-scoped `ReactionPort` (obtained via `ChatOutputFactoryPort::react`; the Discord adapter resolves bare `:name:` against the guild emoji list, honors qualified `:name:id`/`<:name:id>`/`<a:name:id>` directly, and fails foreign-guild names per-token silently) against the reply target after delivery; a marker-only answer is answered with just the reaction (no fallback, no bot turn recorded); a stream-died partial never fires reactions; hallucinated markers in react-off channels are stripped but fire nothing. Random chime-ins gain a second INDEPENDENT silent-react roll (`random_react_chance_percent`, 10% default, own cooldown tracker and own RNG deck behind the same `random_cooldown_secs`): one single-shot call carrying a dedicated reaction-only system instruction (the model must choose a reaction to the newest message, not write a reply - otherwise the prose is thrown away and markers stay rare) whose prose is discarded and never recorded (delivered = recorded), only the markers act, no marker means silence, and the two rolls never consume or suppress one another - high-stakes future tools (moderation, spending) must not ride this protocol ungated.
-
-**Event-scoped outbound ports:**
-
-Outbound ports injected into the pipeline are bound to the current event's origin - a plugin's `ChatOutputPort::send` lands in the source channel/guild. The driving adapter (or kernel) constructs these scoped ports per event. This is how a plugin knows where to reply without a returned response.
-
-Plugins that log to a *configured* channel instead of replying (activity tracker, audit log) obtain a channel-scoped port via `ChatOutputFactoryPort::channel_output(origin, channel_id)` - same platform+guild scope as the event, arbitrary channel inside it. The factory rides in `KernelServices`; the adapter enforces the degenerate cases (DM origins and the `ChannelId(0)` sentinel yield an undeliverable port), while verifying that a channel id actually belongs to the origin guild needs the gateway cache and is deferred - until then, guild scoping of configured channels is backed by storage partitioning, not structural impossibility. Member lifecycle events (join/leave) have no channel at all - `Origin::channel_id` is `0` for them and replying is meaningless; only configured-channel sends make sense.
-
-Progressive rendering of long answers rides a second factory output: `ChatOutputFactoryPort::stream_output(origin)` yields a `ChatStreamPort` (`begin` creates the message and returns its platform message id as the handle; `update(handle, content)` edits in place). Content-only by design. Origins that cannot stream - transactional reply tokens, channel-less events, DMs - get an undeliverable port; a plain `chat_output` stays available there. The streaming cadence (throttle between edits, final full-content update, oversized-content splitting into follow-up sends) is caller-side policy, not port behavior. `ChatOutputFactoryPort::start_typing(origin)` holds the platform typing indicator for the origin channel - adapter-refreshed on the platform's cadence, stopped when the returned guard drops; the LLM engine holds it for the duration of every generated answer. `ChatOutputFactoryPort::react(origin)` yields an event-scoped `ReactionPort` (`add_reaction(message_id, emoji)`) for decorating already-delivered messages - the LLM react tool's executor. Cosmetic by contract: failures are per-token, debug-logged, never fatal; DM and channel-less origins get the undeliverable default (the trait method's own default - adapters override only when the platform has the concept), and the Discord adapter resolves bare `:name:` tokens against the guild emoji list while honoring fully qualified forms directly.
-
-`OutboundMessage` carries a platform-blind `ephemeral` visibility hint, minimal embed payloads, and an optional `reply_to` native reply reference - a message id *in the destination channel* (Discord: a reply-chain header, no mention). Adapters degrade gracefully when the reference is unusable (platform without the concept, deleted target: the send goes out as a normal message, `fail_if_not_exists` off) and ignore it on transactional followups, which are already anchored to their interaction. The LLM plugin uses it so every answer - triggered and chime-in alike, streaming begin included, and the guaranteed-answer fallback - natively replies to the message that provoked it; only the first part of a split answer carries the reference, follow-up parts continue plainly. Adapters honor `ephemeral` only on transactional replies - Discord sets the `EPHEMERAL` flag on interaction followups, so the message is visible to the invoking user alone (e.g. auth denials) - and ignore it for plain channel sends, which are always public. Consequently plugins answer denials only on events with a `reply_token`; denied plain messages stay silent, since a public rejection is a spam vector. Command replies default to ephemeral through the shared `common::command_reply` helper: confirmations, usage notices, corrections and reports stay between the bot and the invoking admin - config and policy details are nobody else's business, and public replies would only add channel noise. Channel-visible outputs (LLM answers, chime-ins, the guaranteed-answer fallback, tracker audit messages, service-channel embeds) are plain sends, deliberately public.
-
-**Development Sequence:**
-
-Prepare the directory structure. The kernel splits its ports by direction: `api_ports` (driving ports the kernel implements - e.g. `RequestHandlerPort`, the inbound entry point driving adapters call), `spi_ports` (driven ports the kernel consumes - e.g. `StoragePort`, `ConfigPort`), and `plugin_ports` (the plugin-facing contracts - `PluginPort`, `MiddlewarePluginPort`, `EventBusPort`). So plugin-specific ports live at `src/kernel/app/plugin_ports/`, separate from the driven ports at `src/kernel/app/spi_ports/`. Services live at `src/kernel/app/services/` (`KernelService`, `KernelServices`). Plugins live at `src/plugins/<name>/`, and their concrete adapters at `src/infrastructure/{inbound_adapters,outbound_adapters,plugin_adapters}/`.
-
-- Define the minimal kernel domain - only what cannot live in a plugin.
-- Define `PluginPort` - the base trait every plugin implements: identity (`name`/`meta`) and lifecycle (`init`/`start`/`stop`). It is the primary contract the kernel holds plugins behind - the plugin's actual implementation surface, not a lifecycle-only interface.
-- Define `MiddlewarePluginPort` - the per-plugin step contract (NOT the pipeline itself). A plugin that intercepts inbound events implements it as one step in the chain, exposing `pre` (forward hook, may short-circuit) and `post` (backward hook, observability/cleanup) over the event + injected service context. `Next` is a pure control signal carrying no payload: `Continue` (proceed), `Stop` (short-circuit remaining `pre`, still run `post` for plugins that ran - was `Respond`), `Abort` (hard stop, skip remaining `pre` AND all `post`). The pipeline that runs these steps is a kernel-owned runner (`KernelService` implementing `RequestHandlerPort`).
-- Define `EventBusPort` - the kernel-owned pub/sub bus for runtime plugin-to-plugin messaging. Plugins publish/subscribe to events they own; the kernel routes but never defines event meanings. It never carries raw inbound events.
-- Define which kernel-owned service ports will be injected into plugins at registration.
-
-After that - iterations of the Walking Skeleton for the kernel and the plugins separately.
-
-Kernel:
-
-1. Kernel Driving Side. Test the kernel producing a constant. A driving test calls the Kernel App Service with a fake chat event and asserts a constant reply was sent via a fake `ChatOutputPort`.
-2. Kernel Driven Side. Add `EventBusPort` and `MiddlewarePluginPort` with stub implementations. The kernel registers a `FakePlugin`; the plugin receives an event through the pipeline and produces a constant reply via the fake port.
-3. Kernel Driving Side. Wire up the real kernel driving adapter - `DiscordGatewayAdapter` (WebSocket) that translates Discord events into the `RequestContext` DTO.
-4. Kernel Driven Side. Wire up the real `InMemoryEventBus` instead of the stub implementation. If the system is distributed - replace it with an external broker (NATS, RMQ) through the same `EventBusPort` without changes to the kernel.
-
-Plugins:
-
-1. Plugin Driving Side. Test the plugin in isolation. The test calls the `CommandPlugin` App Service with an event and asserts a reply was sent via a fake `ChatOutputPort` (the plugin returns `Next::Stop`).
-2. Plugin Driven Side. Add the plugin's driven ports with a stub implementation. The test calls the `CommandPlugin` App Service, which calls `FakeGuildConfigRepository` and returns a constant.
-3. Plugin Driving Side. Register the plugin in the kernel via `PluginPort`. The plugin receives `RequestContext` from the kernel through the middleware pipeline. `AuthPlugin` is wired into the kernel's `MiddlewarePluginPort` pipeline.
-4. Plugin Driven Side. Wire up the plugin's real driven actors. `CommandPlugin` wires up the real `GuildConfigRepository` (Sqlx, Postgres/SQLite). `AuthPlugin` wires up the real `PermissionRepository` / `RoleService`.
-
-In standard P&A the skeleton "walks" after step 1. In a Micro-Kernel the skeleton "walks" only when:
-
-- The kernel can register plugins.
-- `TestEventBus` can route at least one event.
-- The `MiddlewarePluginPort` pipeline passes at least one event to a plugin.
-- At least one plugin is registered and producing output.
-
-**Kernel or Plugin:**
-
-> If users can uninstall it and framework still makes sense, it should be a plugin.
-
-Kernel = Operating System:
-
-- Process model -> Plugins.
-- Filesystem -> Config/State/Storage.
-- Scheduler -> Jobs/Tasks.
-- Permissions -> Capability checks.
-- Events -> Bus
-- Drivers -> Transports.
-
-Plugins = Applications:
-
-- LLM assistant.
-- Guild admin panel.
-- Audit logger.
-- Status rotator.
-- Moderation suite.
-- Premium monetization.
-
-**Kernel or Plugin checklist:**
-
-1. Is it required for every deployment?
-
-If yes - likely kernel. E.g.: plugin loading, lifecycle management, message dispatch, etc.
-If some users don't need it - plugin.
-
-2. Does removing it break the platform itself?
-
-If yes - kernel.
-If removing it only removes capability - plugin.
-
-3. Does it change often?
-
-Fast-changing logic should be plugin. E.g.: custom commands, moderation policies, etc.
-
-4. Is it organization/community specific?
-
-If yes - plugin.
-
-5. Is it infrastructural plumbing?
-
-Likely kernel or adapter. E.g.: event bus, scheduler runtime, state store abstraction, plugin sandboxing.
-
-6. Does it need independent release cadence?
-
-If yes - plugin.
-
-7. Would third parties want to replace it?
-
-If yes - plugin or strategy port.
+Both forges (`.github/workflows/ci.yml` -> GHCR, `.forgejo/workflows/
+ci.yaml` -> the instance registry) run the same pipeline on `main` and
+`v*` tags: fmt, clippy, tests, then the Docker image build gated on the
+test job. The toolchain is pinned to the same compiler in CI, the
+Dockerfile, and local dev.
+
+- The local gate IS the CI gate. Run exactly what CI runs, in this order,
+  after the LAST edit of a change:
+  `cargo fmt --all -- --check` -> `cargo clippy --all-targets --locked`
+  -> `cargo test --locked`.
+- Read the clippy run's exit status and `error:` lines, not the warning
+  count: a deny-level lint failure adds an error without changing the
+  warning tally. Deny lints are declared in `[lints.clippy]` in
+  `Cargo.toml` (including `unwrap_used` outside tests). Pedantic/doc
+  warnings are tolerated - do not switch to `-D warnings` until a
+  zero-warning cleanup pass lands.
+- Every cargo gate runs `--locked`: dependency changes ship with an
+  updated lockfile, and a stale lockfile must fail fast in tests, not in
+  packaging.
+- `cargo test` does not execute clippy lints (`[lints]` apply only under
+  clippy-driver): green tests never imply a clean clippy gate.
+
+## Hexagonal micro-kernel architecture
+
+- The plugin contracts ARE ports. The plugins ARE adapters. The kernel IS
+  the inner hexagon. The kernel assembles the chain but never knows
+  what's in it.
+- The kernel never imports plugins - it only knows the port traits.
+- Plugins never import each other - they communicate only via the
+  kernel's event bus. The one allowed coupling: a bus subscriber imports
+  the event *type* from the owning plugin's module. That type-level
+  import IS the bus contract (no calls, no shared behavior);
+  `audit_log` -> `tracker` is the precedent.
+- A plugin MAY internally be its own hexagon (the LLM plugin is), but any
+  internal structure is valid as long as it honors the plugin contract.
+- Kernel domain stays minimal: if logic needs a plugin to exist, it
+  doesn't belong in the kernel.
+
+**Port families and cardinality:**
+
+- Kernel service ports (`StoragePort`, `ConfigPort`, `SchedulerPort`,
+  `EventBusPort`, ...): infra the kernel consumes and exposes to plugins.
+  One active adapter, one instance per kernel, owned by the kernel, wired
+  at the composition root, shared with plugins via injection.
+- Plugin-facing ports (`PluginPort`, `MiddlewarePluginPort`): contracts
+  plugins implement - many adapters, one per participating plugin.
+  `PluginPort` is the full implementation surface: identity + lifecycle
+  (`init`/`start`/`stop`). `MiddlewarePluginPort` is the opt-in
+  per-plugin pipeline STEP, not the pipeline itself: `pre` (forward hook,
+  may short-circuit) and `post` (backward cleanup hook). The pipeline is
+  a kernel-owned runner (`KernelService` implementing
+  `RequestHandlerPort`). A plugin doing both is registered once - the
+  same `Arc` is cast into the `plugins` and `middleware` lists.
+
+**Communication:** kernel -> plugin via lifecycle calls and the pipeline;
+plugin -> kernel via injected service ports; plugin -> plugin never
+directly, always via `EventBusPort` (derived domain events only - the bus
+never carries raw inbound events). The kernel routes the bus but never
+defines event meanings; the emitting plugin owns the event type.
+
+**Kernel lifecycle:** `KernelService::boot()` runs `init()` on all
+plugins, then `start()` on all, so every plugin is initialized before any
+starts. It validates wiring (middleware must dual-register in `plugins`;
+duplicate names rejected) and rolls back already-started plugins in
+reverse order on a failed `start()`. `shutdown()` (explicit call or
+`Drop` fallback) stops what reached a successful start, in reverse order,
+exactly once.
+
+**Pipeline semantics:** event-driven, not request/response. `handle` is
+fire-and-forget - there is no `ResponseContext`; replies go out through
+ports. An event may yield zero, one, or many outputs; an unhandled event
+simply yields none. `Next` is a pure control signal: `Continue`,
+`Stop` (skip remaining `pre`, still run `post` for plugins that ran),
+`Abort` (skip everything remaining). Failure policy: hooks return
+`Next`, never `Result` - plugins log their own recoverable failures. A
+panicking `pre` is logged and treated as `Stop` (fail closed); a
+panicking `post` does not skip the other posts. No plugin panic may reach
+the driving adapter - plugins must not be able to crash the bot. A
+command handler `Err` is answered with a generic ephemeral notice when
+the origin is transactional.
+
+**Guild isolation:** `StoragePort` is guild-partitioned document storage
+(`sqlx` over an ORM by decision: tiny schema, isolation visible in every
+query; SQLite/PostgreSQL via URL, one shared migration set). The kernel
+binds a `GuildStorage` handle to the event's `(platform, guild_id)`
+origin; the handle exposes no guild parameter, so cross-guild access is
+impossible by construction (DMs get no handle). Namespaces are per-plugin
+slug; plugins may sub-partition (the LLM plugin keeps one record log per
+channel). The `guild` namespace is reserved for guild settings -
+enforced: plugin writes/deletes there are rejected with
+`StorageError::Forbidden`. Besides documents, `GuildStorage` exposes an
+append-only record log for high-volume ordered data; records are never
+deleted - cutoffs move.
+
+**Observability:** `tracing` IS the observability port - a facade, not
+infrastructure (same exception category as `serde`); there is
+deliberately no `TelemetryPort`. The composition root installs the
+subscribers: stdout fmt layer plus an optional `sentry-tracing` layer
+(DSN-driven config; absent/empty DSN disables reporting; Sentry SaaS or
+self-hosted GlitchTip). Level contract: `debug` = stdout-only breadcrumbs
+(pipeline traversal, provider traces, job ticks, roll decisions); `info`
+= audit grade, also shipped to Sentry as log items (command dispatch,
+command registration trail, per-completion LLM record). Privacy rule at
+every level: shapes and counters, never contents - no message text, no
+prompts, no endpoint bodies in logs or guild-visible embeds. The single
+explicit exception is the LLM plugin's `[llm] log_raw_traffic` operator
+diagnostic (off by default, stdout only, never the Sentry layer). Real
+metrics would use the `metrics` crate facade directly - still no port.
+
+**Inbound events:** `RequestContext` is a chat-agnostic EVENT, not just a
+message: kinds (`MessageReceived`, `MemberJoined`, `CommandInvoked`, ...)
+plus origin context (platform, guild, channel, optional transactional
+`reply_token`, optional `locale`). The driving adapter normalizes ALL
+platform events onto this taxonomy, including mention-tag rewriting
+(`<@id>` -> `[Name]<@id>` inbound, so models see name + id; outbound
+sends invert the shape back to the bare tag). Attachments ride
+`MessagePayload` as platform-blind DTOs.
+
+**Commands:** plugins declare `CommandDescriptor`s via
+`CommandRegistryPort` during `init()` (meaning lives in the owning
+plugin); the kernel aggregates them meaning-free; the adapter publishes
+descriptors as native commands and normalizes invocations onto
+`CommandInvoked` (deferring interactions to meet the platform deadline).
+ACL is two-layer: `required_permission` is interpreted platform-side and
+reserved for commands whose audience matches a native platform
+permission; `required_tier` (`AccessTier`: banned < guest < user <
+moderator < admin) is kernel-side data the auth plugin enforces with
+ephemeral denials - tier-gated commands deliberately ship without
+`required_permission` so the command stays visible. Command replies
+default to ephemeral via the shared `common::command_reply` helper.
+Descriptions are the users' only in-app documentation: write them as
+self-sufficient mini-docs, keep each within Discord's 100-character cap
+(guarded by `test_support::assert_descriptions_fit_discord`), and keep
+them in sync whenever behavior changes.
+
+**Gateway intents:** minimal, feature-justified set - every requested
+intent must map to a concrete plugin or core feature. Privileged intents
+are minimized deliberately (Developer Portal toggles, verification
+gating).
+
+**Translations (deferred):** catalogs belong to each plugin; the language
+is per-guild data in the reserved `guild` namespace; fallback chain:
+guild setting -> event locale hint -> `en`. No kernel port; slash-command
+localization, if added, is plugin-declared descriptor data mapped by the
+adapter onto the platform's native mechanism.
+
+**Pipeline <-> bus bridge:** a middleware plugin that processed an
+inbound event MAY publish a derived domain event onto the bus (the
+tracker logs `MemberJoined` to its audit channel, then publishes
+`UserJoinedGuild`; bus-only plugins react). The bridge is plugin
+behavior, not kernel or adapter logic.
+
+**Bus runtime contract:** handlers run inline on the publishing task, in
+subscription order - keep them fast and non-blocking; a panicking handler
+is caught, logged, and skipped. `subscribe` returns an explicit
+unsubscribe handle; bus-only plugins hold subscriptions and release them
+in `stop()` (keeps `init()` idempotent).
+
+**Scheduler contract:** non-zero intervals only (a zero interval returns
+an already-cancelled handle); jobs tick with `MissedTickBehavior::Delay`
+- a slow job skips missed ticks instead of burst-catching-up.
+
+**Config hot reload:** `ConfigPort<C>` is generic over the config type -
+the kernel never depends on the concrete infrastructure config; the
+composition root wires it. A polling watcher rebuilds file+env config on
+a scheduler tick, diffs against the last snapshot, and notifies only on
+change; a failed reload keeps the last good snapshot. What reloads is a
+per-section decision: global runtime connections (token, proxy, storage,
+Sentry, LLM providers) cannot hot-apply. Subscribers treat identical
+snapshots as no-ops.
+
+**Event-scoped outbound ports:** outbound ports are bound to the event's
+origin - a plugin's `ChatOutputPort::send` lands in the source
+channel/guild without any returned response. `ChatOutputFactoryPort`
+yields the scoped variants: `channel_output` (a configured channel in the
+same guild), `stream_output` (progressive in-place editing of one
+message; throttle/split policy is caller-side), `start_typing`, and
+`react` (cosmetic by contract - per-token failures, never fatal).
+Origins that cannot stream or react (DMs, transactional tokens,
+channel-less events) get undeliverable defaults. `OutboundMessage`
+carries an `ephemeral` hint - honored only on transactional replies;
+plain channel sends are always public, and denied plain messages stay
+silent (a public rejection is a spam vector) - plus an optional
+`reply_to` reference that degrades gracefully to a normal send.
+
+**LLM chat plugin** (`src/plugins/llm/`): the first plugin built as its
+own hexagon. Invariants only - behavior, configuration, and commands are
+documented in the README; mechanics in rustdoc:
+
+- Operator config owns providers, endpoints, keys, and the model
+  capability registry. Guild admins choose only among declared models -
+  guild config can never introduce an endpoint or reach another guild's
+  data (enforced at the command layer).
+- Per-channel config and history: conversation records live in
+  per-channel record-log namespaces, are immutable once captured
+  (template fields baked in), and are never deleted; the cutoff moves
+  only through committed compactions.
+- Compaction runs after the reply, is chunked, and is never a sliding
+  window - prompt prefixes stay byte-stable for provider caches. This
+  constraint shapes many rules: constant prompt appendices appended
+  last, capture-time baking, summary placement options.
+- Reasoning output never reaches a channel: it is cut at the adapter
+  boundary before history, reply, or live reveal.
+- Tools are a text-marker protocol (`[[name: payload]]`), not the OpenAI
+  tools API - frozen parse rules live in the plugin's `tools` module;
+  markers are ephemeral side effects, and a tool failure never fails the
+  answer.
+- A triggered message (mention/reply) is guaranteed a visible response;
+  when an answer is impossible, the channel gets a generic fallback
+  notice that is never recorded and carries no error detail. An
+  unreadable history never produces a model answer. Unprompted
+  chime-ins stay silent on failure.
+- State-mutating admin commands run under the same per-channel
+  processing lock as the engine; `/llm_assign` is the documented
+  single-write exception.
+- Random chime-ins are two independent rolls (reply, silent react), each
+  with its own cooldown tracker and its own purpose-scoped RNG deck
+  (deck-style "fake random"; the plain RNG adapter is the swap).
+- Per-channel in-memory state (locks, admission permits, cooldowns,
+  decks) is process-lifetime and never evicted - bounded by distinct
+  channels ever touched, not message volume.
+
+## Codebase map
+
+- `src/kernel/` - the micro-kernel: minimal domain; `app/api_ports/`
+  (driving ports the kernel implements, e.g. `RequestHandlerPort`);
+  `app/spi_ports/` (driven ports it consumes: storage, config,
+  scheduler); `app/plugin_ports/` (plugin contracts); `app/services/`
+  (`KernelService` - boot, pipeline runner, wiring; `KernelServices` -
+  the per-event service context carrying scoped ports and
+  `GuildStorage`).
+- `src/plugins/<name>/` - plugins; each owns its commands, storage
+  namespaces, string catalogs, and derived events.
+- `src/infrastructure/` - concrete adapters: `inbound_adapters/`
+  (Discord gateway -> taxonomy), `outbound_adapters/` (Discord sends,
+  sqlx storage, command registrar), `plugin_adapters/` (event bus,
+  scheduler, command registry, config watcher); plus `config/` and
+  `observability.rs`.
+- `src/common/` - shared utilities (e.g. `command_reply`).
+- `src/test_support.rs` - shared fakes and assertion helpers for plugin
+  and kernel tests.
+- `migrations/` - the single sqlx migration set.
+
+Adding a plugin: implement `PluginPort` (plus `MiddlewarePluginPort` if
+it intercepts inbound events), declare commands in `init()`, scope
+storage under your own slug, publish derived events you own, and wire it
+in the composition root (`main.rs`). Reach new platform features through
+an adapter - never by letting platform types into the kernel or core
+plugins.
+
+**Kernel or plugin:** if users can uninstall it and the framework still
+makes sense, it is a plugin. Checklist:
+
+1. Required by every deployment? -> kernel.
+2. Removing it breaks the platform itself? -> kernel.
+3. Changes often? -> plugin.
+4. Organization/community specific? -> plugin.
+5. Infrastructural plumbing? -> kernel or adapter.
+6. Needs independent release cadence? -> plugin.
+7. Third parties would want to replace it? -> plugin or strategy port.
+
+Kernel = operating system (process model -> plugins, filesystem ->
+config/state/storage, scheduler -> jobs, permissions -> capability
+checks, events -> bus, drivers -> transports). Plugins = applications
+(LLM assistant, admin panel, audit logger, status rotator, moderation
+suite, monetization).
