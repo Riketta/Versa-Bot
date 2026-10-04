@@ -127,7 +127,6 @@ pub struct ChannelConfig {
     /// Reply splitting limit override; `None` = plugin-wide default.
     #[serde(default)]
     pub max_length: Option<usize>,
-    /// Template for rendering user turns into the context; `{sender}` and
     /// User-turn rendering in the context; `{sender}`, `{user_id}`,
     /// `{guild_name}`, `{time}` (unix seconds) and `{message}` are
     /// substituted. `None` = `[{sender}](<@{user_id}>): {message}`.

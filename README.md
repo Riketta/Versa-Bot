@@ -27,62 +27,39 @@ a slash command from any other reply path.
 
 ## Current features
 
+Every capability is a plugin; the full manual of each one - behavior,
+commands, permission tiers - lives in [Plugins](#plugins).
+
 - Native Discord slash commands, auto-registered at startup from plugin
-  declarations (`/ping` ships as the demo command).
-- Per-guild authorization (`auth` plugin): a five-tier access ladder
-  (banned / guest / user / moderator / admin) with per-user, per-role and
-  default assignments, administered from Discord via `/auth` - guild
-  administrators are always admin, bans are silent, corruption fails
-  closed. Details in [Plugins](#plugins).
-- User activity tracker (`tracker` plugin): logs member joins/leaves to the
-  guild's audit channel and publishes `UserJoinedGuild` / `UserLeftGuild`
-  domain events on the plugin bus for other plugins to react to. Channel
-  assignment is self-service: `/assign_tracker` run in a channel makes it
-  the audit channel, `/unassign_tracker` turns tracking off (both need the
-  `moderator` tier; replies are visible only to the invoker).
-- Audit trail (`audit_log` plugin): the event bus's first consumer - logs
-  membership changes published on the bus as structured `audit` tracing
-  events (stdout + Sentry/GlitchTip), with origin fields, no per-guild
-  configuration needed.
-- LLM chat bot (`llm` plugin): per-channel chat with conversation history,
-  compaction, streaming, token-budget context filling, image recognition
-  (described attachments), an emoji-reaction tool (`[[react: ...]]`
-  markers, stripped before delivery) and random chime-ins (reply and
-  silent-react rolls). Operators declare
-  OpenAI-compatible providers in `[llm]` (keys via env); guild moderators
-  assign and tune each channel via `/llm_*` commands. The guild message
-  content the bot reads is why `MESSAGE_CONTENT` is requested. Full manual
-  in [Plugins](#llm-chat-bot-llm-plugin).
-- Status rotator (`status_rotator` plugin): rotates the bot's activity
-  through a configured list on a configured interval - both come from the
-  optional `[status]` section of the config file (presence is bot-wide,
-  not per-guild); omitted or empty means the rotation is off. Statuses
-  draw from a shuffled deck - every status shows once per cycle, in
-  fake-random order - and the first status lands exactly on connect.
-- Guild-partitioned document storage: plugins persist JSON documents scoped
-  to `(platform, guild)` - reading another guild's data is impossible by
-  construction. An append-only record log (`append`/`list_after`/`count_after`)
-  sits alongside the documents for high-volume ordered data such as
-  conversation history. SQLite (default) and PostgreSQL.
-- Observability: `tracing` logging to stdout plus optional Sentry/GlitchTip
-  reporting (DSN-driven) with release tagging; every event is traced with
-  its origin, an optional sample rate feeds performance transactions, and
-  warn/info/error ship as Sentry log items while error-grade failures
-  (storage, LLM provider) surface as Issues. Audit-grade records at `info`
-  cover command dispatch (who ran what; short argument values are logged
-  verbatim, long free text only as a `<N chars>` shape),
-  the command registration trail (per-plugin registrations plus the
-  completed Discord sync) and every LLM answer (model, trigger, latency,
-  token usage, window sizes); `debug` adds pipeline traversal, provider
-  request/response traces, scheduler ticks and chime roll decisions.
-- Fault isolation: a panicking plugin cannot crash the bot - pipeline hooks
-  and event-bus subscribers are caught and logged (plugin + event), the
-  event is dropped, and the rest of the chain or bus keeps working.
-- Configuration hot reload: the configuration (file + env overrides) is
-  re-read every few seconds; changes to hot-reloadable sections apply
-  without a restart - e.g. editing `[status]` re-applies the rotation live
-  (identical settings are ignored, removing the section stops it). Startup
-  -only settings (token, storage, Sentry, LLM providers) are not affected.
+  declarations.
+- Per-guild authorization: a five-tier access ladder (banned / guest /
+  user / moderator / admin) with per-user, per-role and default
+  assignments, administered from Discord via `/auth`.
+- User activity tracker: logs member joins/leaves to a guild audit
+  channel and publishes membership events on the plugin bus.
+- Audit trail: records the bus membership events as structured `audit`
+  tracing events.
+- LLM chat bot: per-channel conversations with history, compaction,
+  streaming, token-budget context filling, image recognition, an
+  emoji-reaction tool and random chime-ins.
+- Status rotator: cycles the bot's activity through a configured list.
+- Guild-partitioned storage: JSON documents plus an append-only record
+  log, scoped to `(platform, guild)` - reading another guild's data is
+  impossible by construction. SQLite (default) and PostgreSQL.
+- Observability: `tracing` logging to stdout plus optional
+  Sentry/GlitchTip reporting (DSN-driven) with release tagging; every
+  event is traced with its origin, and error-grade failures surface as
+  Issues. Audit-grade records at `info` cover command dispatch, the
+  command registration trail and every LLM answer (model, trigger,
+  latency, token usage); `debug` adds pipeline traversal, provider
+  traces and scheduler ticks. Privacy rule: shapes and counters, never
+  contents.
+- Fault isolation: a panicking plugin cannot crash the bot - pipeline
+  hooks and event-bus subscribers are caught and logged, the event is
+  dropped, and the rest of the chain or bus keeps working.
+- Configuration hot reload: hot-reloadable sections apply live
+  (`[status]`); startup-only settings (token, storage, Sentry, LLM
+  providers) require a restart.
 - Graceful shutdown on Ctrl-C (plugins stop in reverse order).
 
 ## Getting started
@@ -160,7 +137,17 @@ Environment variables override the file:
 
 ## Plugins
 
-### Authorization: who can use the bot (`auth` plugin)
+Every capability is a plugin under `src/plugins/`. Each section below is
+the plugin's manual: what it does, its commands, and the access tier
+every command requires. Tiers are the auth plugin's ladder - `banned` <
+`guest` < `user` < `moderator` < `admin`. Every command reply, denial
+included, is ephemeral (visible to the invoker alone); a member below a
+command's tier gets an ephemeral notice naming the required and actual
+tier. Discord guild administrators are always `admin`, and a fresh
+guild starts with default tier `user`, so configuration commands are
+usable on day one.
+
+### Authorization (`auth` plugin)
 
 The auth plugin is the bot's per-guild access gate. It runs first in the
 middleware pipeline on every guild message and slash command; whatever it
@@ -210,21 +197,71 @@ Robustness rules:
   auth decides who may *use* the bot, not what happens in the guild.
 
 **Usage.** `/auth` is guild-only, requires the `admin` tier, and is
-additionally hidden behind Discord's **Manage Server** permission. Every
-answer is ephemeral, so policy data stays between the bot and the admin.
+additionally hidden behind Discord's **Manage Server** permission
+(defense in depth on top of the tier check). Every answer is ephemeral,
+so policy data stays between the bot and the admin.
 
-| Command | Effect |
-|---|---|
-| `/auth action:show` | show the current policy: default tier, user and role assignments |
-| `/auth action:set tier:<tier> user:@member` | assign a tier to a user |
-| `/auth action:set tier:<tier> role:@role` | grant a tier to everyone holding the role |
-| `/auth action:clear user:@member` or `role:@role` | remove an assignment |
-| `/auth action:default tier:<tier>` | set the default tier for unlisted members |
+| Command | Tier | Effect |
+|---|---|---|
+| `/auth action:show` | admin | show the current policy: default tier, user and role assignments |
+| `/auth action:set tier:<tier> user:@member` | admin | assign a tier to a user |
+| `/auth action:set tier:<tier> role:@role` | admin | grant a tier to everyone holding the role |
+| `/auth action:clear user:@member` or `role:@role` | admin | remove an assignment |
+| `/auth action:default tier:<tier>` | admin | set the default tier for unlisted members |
 
-Specify either `user` or `role`, never both. Managing the policy requires
-the `admin` tier. Lowering your own tier is possible and warns in the
-reply: Discord administrators keep `admin` regardless, but without that
-you may need another admin to undo it.
+Specify either `user` or `role`, never both. Lowering your own tier is
+possible and warns in the reply: Discord administrators keep `admin`
+regardless, but without that you may need another admin to undo it.
+
+### Command demo (`command` plugin)
+
+Ships `/ping` - the walking-skeleton command proving the full loop
+(plugin declaration -> Discord sync -> interaction -> dispatch ->
+reply). It answers `Pong` and works in DMs too. Real commands belong to
+the feature plugins that own their meaning; this one exists to keep the
+loop honest.
+
+| Command | Tier | Effect |
+|---|---|---|
+| `/ping` | user | check that the bot is alive - it replies with Pong |
+
+### User activity tracker (`tracker` plugin)
+
+Logs guild membership activity. Member joins and leaves arrive as
+gateway events; the tracker publishes `UserJoinedGuild` /
+`UserLeftGuild` domain events on the plugin bus for other plugins (the
+audit log) to react to - unconditionally, even with no audit channel
+assigned or its config unreadable - and, when a channel is assigned,
+posts a short join/leave notice there. The assignment is per guild,
+self-service: run `/assign_tracker` in the channel that should become
+the audit channel. Needs the privileged `GUILD_MEMBERS` intent (see
+[Gateway intents](#gateway-intents)).
+
+| Command | Tier | Effect |
+|---|---|---|
+| `/assign_tracker` | moderator | make this channel the guild's audit channel (one per guild, last write wins) |
+| `/unassign_tracker` | moderator | stop tracking for this guild |
+
+### Audit log (`audit_log` plugin)
+
+The event bus's first consumer: subscribes to the membership events the
+tracker publishes and records each one as a structured `audit` tracing
+event with origin fields - stdout, plus Sentry/GlitchTip when reporting
+is configured (`info` grade). No per-guild configuration and no
+commands; removing the plugin removes only the trail, not the tracking.
+
+### Status rotator (`status_rotator` plugin)
+
+Cycles the bot's Discord activity through a configured list. Presence
+is bot-wide, not per-guild. Statuses draw from a shuffled deck - every
+status shows once per cycle, in fake-random order - and the first
+status lands exactly on connect.
+
+Operator configuration lives in the optional `[status]` config section
+(`interval_seconds`, `statuses`); omitted, empty, or a zero interval
+means the rotation is off. The section hot-reloads: editing it
+re-applies the rotation live, removing it stops the rotation. No
+commands.
 
 ### LLM chat bot (`llm` plugin)
 
@@ -234,11 +271,11 @@ split of responsibilities is deliberate:
 - The **bot operator** declares providers (endpoints + keys) and model
   capabilities once in the `[llm]` config section. Startup-only:
   changes require a restart.
-- **Guild admins** assign the bot to channels and tune each channel via
-  slash commands - picking among the declared models, never configuring
-  endpoints. Only declared models are legal: `/llm_assign` and
-  `/llm_set model=` reject anything else, and `/llm_models` lists the
-  catalog. Keys never appear in config files or guild storage; they
+- **Guild moderators** assign the bot to channels and tune each channel
+  via slash commands - picking among the declared models, never
+  configuring endpoints. Only declared models are legal: `/llm_assign`
+  and `/llm_set model=` reject anything else, and `/llm_models` lists
+  the catalog. Keys never appear in config files or guild storage; they
   are resolved from environment variables at boot.
 
 Every channel's conversation lives in its own storage namespace inside
@@ -410,53 +447,57 @@ margin - with `depth` remaining the secondary cap. Until then (or
 without a declared window) only the message limit applies.
 `/llm_status` shows which mechanism is active.
 
-**Commands.** All are guild-only. `/llm_status` and `/llm_models` need
-the `user` tier; every other `/llm_*` command needs `moderator` (see the
-[auth plugin](#authorization-who-can-use-the-bot-auth-plugin)). Every
-reply is **ephemeral** - visible only to the member who ran the command:
-config confirmations, usage notices and reports never appear in the
-channel; tier denials are ephemeral too.
+**Commands.** All are guild-only, and every reply is **ephemeral** -
+visible only to the member who ran the command: confirmations, usage
+notices and reports never appear in the channel; tier denials are
+ephemeral too (tiers are enforced by the [auth
+plugin](#authorization-auth-plugin)).
 
-| Command | Effect |
-|---|---|
-| `/llm_assign model:<provider/model>` | assign the bot to this channel - `model` must be one of the operator-declared models (offered as a dropdown, listed by `/llm_models`); re-assigning retunes in place |
-| `/llm_models` | lists the declared models - the legal assignment set, with declared capabilities (reasoning, context window) |
-| `/llm_unassign` | remove the bot from this channel (history is kept) |
-| `/llm_prompt prompt:<text>` | set the channel system prompt; `clear` falls back to the plugin default (inline limit: Discord's ~6000-character option cap) |
-| `/llm_prompt_file file:<attachment>` | set the system prompt from an uploaded text/markdown file - for prompts beyond the inline limit; fetched from Discord's CDN only, capped by `[llm] max_prompt_file_bytes` (128 KiB default) |
-| `/llm_set key:<key> value:<value>` | tune one channel setting (table below); value `clear`/`none`/`default` resets it |
-| `/llm_get key:<key>` | show a setting's current value (defaults render as the effective value, long text truncated); omit `key` to list every setting |
-| `/llm_cutoff` | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
-| `/llm_status` | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, compaction, image recognition (state, model, prompt length), reactions (state, silent-react chance), capture mode, chime-in chance, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
-| `/llm_admin` | make this channel the guild's service channel for error notices (one per guild, last write wins) |
-| `/llm_admin_clear` | stop service notices |
-
-**`/llm_set` keys** (invalid values are answered with usage and never
-saved; `/llm_get` reads the same keys back - the channel system prompt
-itself is `/llm_prompt`'s, visible via `/llm_status`):
-
-| Key | Meaning | Default |
+| Command | Tier | Effect |
 |---|---|---|
-| `model` | provider/model reference - declared models only (see `/llm_models`) | set by `/llm_assign` |
-| `temperature` `top_p` `top_k` `min_p` `frequency_penalty` `presence_penalty` | sampling parameters; cleared = not sent | provider defaults |
-| `max_tokens` | completion size cap | provider default |
-| `reasoning_effort` | reasoning hint sent only when the model declares `reasoning = true`; any value is sent as-is for effort-style providers (Z.ai GLM: `low`/`high`/`max` on GLM-5.3) and enables thinking for switch-style providers; `off` explicitly disables thinking where the provider supports a switch; `clear`/`none`/`default` sends no reasoning parameter at all (provider default applies - on Z.ai GLM that default is `max`, so prefer `low` over `off` on GLM-5.3) | none |
-| `depth` | live-window size in messages; reaching it triggers compaction | 100 |
-| `context_budget` | prompt-side token budget; cleared = auto (model window) once calibrated | auto |
-| `capture_mode` | `bot_related` or `all_messages` | `bot_related` |
-| `compaction` | summarize-and-cutoff on/off | on |
-| `compaction_model` | model used for summaries | the channel's chat model |
-| `compaction_prompt` | summarization instruction | plugin default |
-| `images` | image recognition for captured messages (needs operator `[llm] image_model`) | off |
-| `image_model` | recognition model for this channel | plugin `image_model` |
-| `image_prompt` | recognition instruction (e.g. pin the description language) | plugin `image_prompt` |
-| `react` | emoji-reaction tool: the model may react to the message it replies to via a `[[react: ...]]` marker (stripped from the answer) | off |
-| `streaming` | stream the answer live from the provider (SSE, `stream: true`); the message is created with the first tokens and edited at `stream_interval_ms` - needs a streaming-capable endpoint | off |
-| `random_chance` | percent chance to chime in on a captured non-trigger message | 2 |
-| `random_cooldown` | minimum seconds between chime-ins (`0` = none) | 5 |
-| `random_react_chance` | percent chance for a silent react (emoji only, no reply) on a captured non-trigger message; independent of `random_chance` and its own cooldown; needs `react` on | 10 |
-| `max_length` | per-channel reply-splitting limit | 2000 (`max_message_length`) |
-| `turn_template` | user-turn rendering; must contain `{sender}` and `{message}`; params: `{sender}`, `{user_id}`, `{guild_name}`, `{time}` (unix), `{message}` | `[{{sender}}](<@{user_id}>): {message}` |
+| `/llm_assign model:<provider/model>` | moderator | assign the bot to this channel - `model` must be one of the operator-declared models (offered as a dropdown, listed by `/llm_models`); re-assigning retunes in place |
+| `/llm_models` | user | list the declared models - the legal assignment set, with declared capabilities (reasoning, context window) |
+| `/llm_unassign` | moderator | remove the bot from this channel (history is kept) |
+| `/llm_prompt prompt:<text>` | moderator | set the channel system prompt; `clear` falls back to the plugin default (inline limit: Discord's ~6000-character option cap) |
+| `/llm_prompt_file file:<attachment>` | moderator | set the system prompt from an uploaded text/markdown file - for prompts beyond the inline limit; fetched from Discord's CDN only, capped by `[llm] max_prompt_file_bytes` (128 KiB default) |
+| `/llm_set key:<key> value:<value>` | moderator | tune one channel setting (table below) |
+| `/llm_get key:<key>` | moderator | show a setting's current value (defaults render as the effective value, long text truncated); omit `key` to list every setting |
+| `/llm_cutoff` | moderator | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
+| `/llm_status` | user | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, compaction, image recognition (state, model, prompt length), reactions (state, silent-react chance), capture mode, chime-in chance, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
+| `/llm_admin` | moderator | make this channel the guild's service channel for error notices (one per guild, last write wins) |
+| `/llm_admin_clear` | moderator | stop service notices |
+
+**`/llm_set` keys.** Every key takes one value; `clear`, `none` or
+`default` as the value resets the key to its default - the two keys
+without a default (`model`, `depth`) refuse and point at
+`/llm_unassign`. On/off keys accept `on`/`off` (also
+`true`/`yes`/`1` and `false`/`no`/`0`). Invalid values are answered
+with usage and never saved. `/llm_get` reads the same keys back (the
+channel system prompt itself is `/llm_prompt`'s, visible via
+`/llm_status`).
+
+| Key | Values | Default | Meaning |
+|---|---|---|---|
+| `model` | declared model ref | set by `/llm_assign` | switch this channel's chat model; unknown refs are rejected with the declared list |
+| `temperature` `top_p` `top_k` `min_p` `frequency_penalty` `presence_penalty` | finite number | not sent | sampling knobs, one per key - tune per-channel tone (an educational channel can run low temperature, an entertainment one high); cleared = not sent |
+| `max_tokens` | whole number | not sent | completion size cap |
+| `reasoning_effort` | free string, or `off` | none - no parameter sent | reasoning hint, sent only when the model declares `reasoning = true`. Any other value is sent as-is to effort-style providers (Z.ai GLM: `low`/`high`/`max`) and enables thinking on switch-style ones. `off` renders an explicit disable on switch-style providers (GLM-4.5-5.2); effort-style endpoints have no off wire value, so their default applies - on Z.ai GLM that default is `max`, and GLM-5.3 thinks forcibly regardless, so throttle it with `low` |
+| `depth` | whole number >= 1 | 100 | live-window size in messages; reaching it triggers compaction |
+| `context_budget` | whole number of tokens | auto | prompt-side token budget. Auto = the model's declared `context_window` minus the completion reserve and a margin, active once the endpoint has reported its first usage (before that, count-only filling by `depth`) |
+| `capture_mode` | `bot_related` or `all_messages` | `bot_related` | what enters the channel's history: only messages mentioning or replying the bot, or everything (random chime-ins need `all_messages` to have material) |
+| `compaction` | on / off | on | summarize-and-cutoff when the window outgrows `depth` |
+| `compaction_model` | declared model ref | plugin `[llm] compaction_model`, else the channel's chat model | which model writes the summaries |
+| `compaction_prompt` | text | plugin default | summarization instruction |
+| `images` | on / off | off | describe attached images on captured messages via the recognition model; needs an operator `[llm] image_model` |
+| `image_model` | declared model ref | plugin `[llm] image_model` | recognition model override for this channel |
+| `image_prompt` | text | plugin `[llm] image_prompt` | recognition instruction, e.g. pin the description language |
+| `react` | on / off | off | emoji-reaction tool: the model may decorate the message it replies to by emitting a `[[react: ...]]` marker, stripped before the answer is shown |
+| `streaming` | on / off | off | stream the answer live from the provider (SSE): the message appears with the first tokens and is edited at `stream_interval_ms` |
+| `random_chance` | 0-100 (clamped) | 2 | percent chance to chime in on a captured non-trigger message; 0 = off |
+| `random_cooldown` | whole seconds | 5 | minimum seconds between chime-ins - the reply and silent-react rolls each keep their own tracker behind it; 0 = none |
+| `random_react_chance` | 0-100 (clamped) | 10 | percent chance for a silent react (emoji only, no reply) on a captured non-trigger message; independent of `random_chance`; needs `react` on |
+| `max_length` | 1-2000 characters | `max_message_length` (2000) | per-channel reply-splitting limit |
+| `turn_template` | template containing `{sender}` and `{message}` | `[{sender}](<@{user_id}>): {message}` | how user turns render into the model context; fields: `{sender}`, `{user_id}`, `{guild_name}`, `{time}` (unix), `{message}` |
 
 **Delivery.** While an answer generates and delivers, the bot holds the
 channel's typing indicator - users see it composing, not frozen. The

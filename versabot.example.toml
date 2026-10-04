@@ -38,9 +38,9 @@ url = "sqlite://versabot.db"
 # statuses = ["with the API", "versa-bot", "over the guild"]
 
 # Optional: LLM chat runtime. This section is the bot operator's domain -
-# guild admins only pick among the declared models via /llm_assign and
-# /llm_set, never configure endpoints. Startup-only: changes require a
-# restart. Without the section the chat engine has no providers.
+# guild moderators only pick among the declared models via /llm_assign
+# and /llm_set, never configure endpoints. Startup-only: changes require
+# a restart. Without the section the chat engine has no providers.
 # [llm]
 # default_system_prompt = "You are a helpful chat assistant."
 # default_compaction_prompt = "Summarize the conversation above, preserving facts, decisions, names and open questions. Be concise."
@@ -72,9 +72,8 @@ url = "sqlite://versabot.db"
 # Absent image_model = recognition off globally, whatever channels set.
 # image_model = "local/unsloth/gemma-4-26B-A4B-it-qat-GGUF"
 # Recognition prompt; channels can override per-channel
-# (/llm_set image_prompt). The default asks for a concise description
-# including any visible text.
-# image_prompt = "Describe this image concisely: the scene, notable objects and people, and any visible text verbatim."
+# (/llm_set image_prompt). Text below is the built-in default.
+# image_prompt = "Describe this image concisely for a chat transcript: the scene, notable objects and people, and any visible text verbatim."
 # Images are rescaled to this max side (aspect kept) before recognition;
 # smaller images pass through. Keeps cost and latency low.
 # image_max_side = 512
@@ -132,8 +131,13 @@ url = "sqlite://versabot.db"
 # [llm.models."zai/glm-5.3-flash"]
 # reasoning = true
 # context_window = 131072
-# summary_placement = "system_turn"   # default; "system_suffix" merges the
-#                                     # summary into the system prompt
+# How the compaction summary enters the context: "system_turn" (default)
+# keeps it a separate second system message; "system_suffix" merges it
+# into the end of the system prompt - the escape hatch for templates
+# that silently drop later system turns, which would erase the summary
+# after every compaction; "assistant_turn" posts it as an assistant
+# message before the live window.
+# summary_placement = "system_turn"
 #
 # [llm.models."local/unsloth/gemma-4-26B-A4B-it-qat-GGUF"]
 # reasoning = false
