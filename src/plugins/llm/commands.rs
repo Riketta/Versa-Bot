@@ -1152,6 +1152,66 @@ impl CommandHandler for GetLlmHandler {
     }
 }
 
+/// `/llm_dump`: every `/llm_set` key with its effective value at once, in
+/// one copy-pasteable code fence. Read-only sibling of `/llm_get` - same
+/// tier, same value renderer, one document read, no channel lock. The
+/// fence is FOUR backticks deep: rendered values are channel-managed text
+/// (prompt previews, templates) that may themselves contain code fences.
+pub(super) struct DumpLlmHandler {
+    engine: Arc<ChatEngine>,
+}
+
+impl DumpLlmHandler {
+    pub(super) fn new(engine: Arc<ChatEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+/// A rendered value past this many characters degrades to a head preview
+/// in the dump - 25 keys must stay inside one Discord message, and the
+/// full text is one `/llm_get key` away.
+const DUMP_VALUE_PREVIEW: usize = 120;
+
+#[async_trait]
+impl CommandHandler for DumpLlmHandler {
+    async fn invoke(
+        &self,
+        event: &RequestContext,
+        _args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
+        let Some(config) = load_assigned_config(event, services).await? else {
+            return Ok(());
+        };
+        let lines: Vec<String> = SET_KEYS
+            .iter()
+            .map(|key| {
+                let value = current_value(&config, key, self.engine.settings())
+                    .unwrap_or_else(|| "?".to_owned());
+                let value = if value.chars().count() > DUMP_VALUE_PREVIEW {
+                    format!(
+                        "{}… ({} chars total)",
+                        preview(&value, DUMP_VALUE_PREVIEW),
+                        value.chars().count()
+                    )
+                } else {
+                    value
+                };
+                format!("{key} = {value}")
+            })
+            .collect();
+        services
+            .chat_output
+            .send(command_reply(format!(
+                "Channel settings ({} keys):\n````\n{}\n````",
+                SET_KEYS.len(),
+                lines.join("\n")
+            )))
+            .await?;
+        Ok(())
+    }
+}
+
 /// The current value of one `/llm_set` key, rendered for `/llm_get`.
 /// `None` = unknown key. Defaults render as the EFFECTIVE value (what the
 /// engine would use now), so an admin never has to guess what "default"

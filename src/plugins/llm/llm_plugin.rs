@@ -21,8 +21,8 @@ use crate::kernel::{
 use super::chat_engine::ChatEngine;
 use super::commands::{
     AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler, CutoffLlmHandler,
-    GetLlmHandler, ModelsLlmHandler, PromptFileLlmHandler, PromptLlmHandler, SET_KEYS,
-    SetLlmHandler, StatusLlmHandler, UnassignLlmHandler, model_choices,
+    DumpLlmHandler, GetLlmHandler, ModelsLlmHandler, PromptFileLlmHandler, PromptLlmHandler,
+    SET_KEYS, SetLlmHandler, StatusLlmHandler, UnassignLlmHandler, model_choices,
 };
 use super::conversation::{ConversationRecord, RecordRole};
 use super::model::{
@@ -395,6 +395,15 @@ impl PluginPort for LlmPlugin {
             ),
             Arc::new(GetLlmHandler::new(Arc::clone(&self.engine))),
         );
+        self.registry.register(
+            self.descriptor(
+                "llm_dump",
+                "Dump every channel chat setting at once as one copy-pasteable block",
+                Vec::new(),
+                AccessTier::Moderator,
+            ),
+            Arc::new(DumpLlmHandler::new(Arc::clone(&self.engine))),
+        );
         self.register_prompt_commands();
         Ok(())
     }
@@ -711,6 +720,7 @@ mod tests {
                 "llm_admin_clear",
                 "llm_assign",
                 "llm_cutoff",
+                "llm_dump",
                 "llm_get",
                 "llm_models",
                 "llm_prompt",
@@ -781,6 +791,66 @@ mod tests {
         assert!(reply.contains("`react`: off"), "unexpected: {reply}");
         assert!(reply.contains("`model`: local/gemma"), "unexpected: {reply}");
         assert!(reply.contains("plugin default"), "unexpected: {reply}");
+    }
+
+    /// `/llm_dump`: every key at once, `key = value` inside a four-backtick
+    /// fence, effective values - including long free text, which degrades
+    /// to a head preview so the whole dump stays one Discord message.
+    #[tokio::test]
+    async fn dump_lists_every_setting_in_a_fence() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        AssignLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("model".to_owned(), "local/gemma".to_owned())]),
+                &fixture.services,
+            )
+            .await
+            .expect("assign expected to succeed");
+        let long_prompt = "ário ".repeat(400); // 2400 chars, multibyte-safe
+        SetLlmHandler::new(ChannelLocks::new(), Arc::clone(&fixture.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![
+                    ("key".to_owned(), "compaction_prompt".to_owned()),
+                    ("value".to_owned(), long_prompt.clone()),
+                ]),
+                &fixture.services,
+            )
+            .await
+            .expect("set expected to succeed");
+
+        DumpLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("dump expected to succeed");
+
+        let reply = fixture.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("````"), "four-backtick fence expected: {reply}");
+        for key in SET_KEYS {
+            assert!(reply.contains(&format!("{key} = ")), "key {key} missing: {reply}");
+        }
+        assert!(reply.contains("model = local/gemma"), "unexpected: {reply}");
+        assert!(reply.contains("react = off"), "unexpected: {reply}");
+        // Long free text: head preview, never the full body.
+        assert!(!reply.contains(&long_prompt), "full prompt leaked: {reply}");
+        assert!(reply.contains("chars total"), "preview note expected: {reply}");
+        // One Discord message: even with a long prompt the dump fits.
+        assert!(reply.chars().count() <= 2000, "dump exceeds Discord's cap");
+    }
+
+    #[tokio::test]
+    async fn dump_without_assignment_replies_not_assigned() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+
+        DumpLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("dump expected to succeed");
+
+        assert!(fixture.output.messages().last().expect("reply expected").contains("not assigned"));
     }
 
     #[tokio::test]
