@@ -463,7 +463,7 @@ plugin](#authorization-auth-plugin)).
 | `/llm_prompt_file file:<attachment>` | moderator | set the system prompt from an uploaded text/markdown file - for prompts beyond the inline limit; fetched from Discord's CDN only, capped by `[llm] max_prompt_file_bytes` (128 KiB default) |
 | `/llm_set key:<key> value:<value>` | moderator | tune one channel setting (table below) |
 | `/llm_get key:<key>` | moderator | show a setting's current value (defaults render as the effective value, long text truncated); omit `key` to list every setting |
-| `/llm_dump` | moderator | dump every setting at once in one copy-pasteable code fence (`key = value`, effective values; long text degrades to a head preview - the full text is one `/llm_get key` away) |
+| `/llm_dump` | moderator | dump every setting at once in one copy-pasteable code fence (`key = value`, effective values); prompts are not dumped at all - only set-or-not and size, the text is one `/llm_get key` away |
 | `/llm_cutoff` | moderator | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
 | `/llm_status` | user | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, compaction, image recognition (state, model, prompt length), reactions (state, silent-react chance), capture mode, chime-in chance, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
 | `/llm_admin` | moderator | make this channel the guild's service channel for error notices (one per guild, last write wins) |

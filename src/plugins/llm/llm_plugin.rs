@@ -794,8 +794,10 @@ mod tests {
     }
 
     /// `/llm_dump`: every key at once, `key = value` inside a four-backtick
-    /// fence, effective values - including long free text, which degrades
-    /// to a head preview so the whole dump stays one Discord message.
+    /// fence, effective values. Prompts never enter the dump - not even as
+    /// a preview: only set-or-not and size, the text is one `/llm_get key`
+    /// away. Long non-prompt values (templates) degrade to head previews so
+    /// the whole dump stays one Discord message.
     #[tokio::test]
     async fn dump_lists_every_setting_in_a_fence() {
         let (plugin, fixture) = fixture();
@@ -833,10 +835,12 @@ mod tests {
         }
         assert!(reply.contains("model = local/gemma"), "unexpected: {reply}");
         assert!(reply.contains("react = off"), "unexpected: {reply}");
-        // Long free text: head preview, never the full body.
-        assert!(!reply.contains(&long_prompt), "full prompt leaked: {reply}");
-        assert!(reply.contains("chars total"), "preview note expected: {reply}");
-        // One Discord message: even with a long prompt the dump fits.
+        // Prompts: shape only - set-or-not and size, never the text.
+        let expected = format!("compaction_prompt = <set, {} chars>", long_prompt.chars().count());
+        assert!(reply.contains(&expected), "unexpected: {reply}");
+        assert!(reply.contains("image_prompt = <plugin default>"), "unexpected: {reply}");
+        assert!(!reply.contains("ário"), "prompt content leaked: {reply}");
+        // One Discord message.
         assert!(reply.chars().count() <= 2000, "dump exceeds Discord's cap");
     }
 

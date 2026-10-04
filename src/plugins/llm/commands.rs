@@ -1154,9 +1154,11 @@ impl CommandHandler for GetLlmHandler {
 
 /// `/llm_dump`: every `/llm_set` key with its effective value at once, in
 /// one copy-pasteable code fence. Read-only sibling of `/llm_get` - same
-/// tier, same value renderer, one document read, no channel lock. The
+/// tier, same value renderer, one document read, no channel lock. Prompts
+/// are never dumped - not even as a preview; the dump only says whether
+/// one is set and how big it is, the text is one `/llm_get key` away. The
 /// fence is FOUR backticks deep: rendered values are channel-managed text
-/// (prompt previews, templates) that may themselves contain code fences.
+/// (templates) that may themselves contain code fences.
 pub(super) struct DumpLlmHandler {
     engine: Arc<ChatEngine>,
 }
@@ -1168,9 +1170,17 @@ impl DumpLlmHandler {
 }
 
 /// A rendered value past this many characters degrades to a head preview
-/// in the dump - 25 keys must stay inside one Discord message, and the
-/// full text is one `/llm_get key` away.
+/// in the dump (long custom templates) - 25 keys must stay inside one
+/// Discord message, and the full text is one `/llm_get key` away.
 const DUMP_VALUE_PREVIEW: usize = 120;
+
+/// Dump shape of one prompt: set-or-not and size only - never the text.
+fn prompt_shape(value: Option<&String>) -> String {
+    value.map_or_else(
+        || "<plugin default>".to_owned(),
+        |text| format!("<set, {} chars>", text.chars().count()),
+    )
+}
 
 #[async_trait]
 impl CommandHandler for DumpLlmHandler {
@@ -1186,16 +1196,22 @@ impl CommandHandler for DumpLlmHandler {
         let lines: Vec<String> = SET_KEYS
             .iter()
             .map(|key| {
-                let value = current_value(&config, key, self.engine.settings())
-                    .unwrap_or_else(|| "?".to_owned());
-                let value = if value.chars().count() > DUMP_VALUE_PREVIEW {
-                    format!(
-                        "{}… ({} chars total)",
-                        preview(&value, DUMP_VALUE_PREVIEW),
-                        value.chars().count()
-                    )
-                } else {
-                    value
+                let value = match *key {
+                    "compaction_prompt" => prompt_shape(config.compaction_prompt.as_ref()),
+                    "image_prompt" => prompt_shape(config.image_prompt.as_ref()),
+                    _ => {
+                        let value = current_value(&config, key, self.engine.settings())
+                            .unwrap_or_else(|| "?".to_owned());
+                        if value.chars().count() > DUMP_VALUE_PREVIEW {
+                            format!(
+                                "{}… ({} chars total)",
+                                preview(&value, DUMP_VALUE_PREVIEW),
+                                value.chars().count()
+                            )
+                        } else {
+                            value
+                        }
+                    }
                 };
                 format!("{key} = {value}")
             })
