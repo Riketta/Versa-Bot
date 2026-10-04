@@ -181,6 +181,18 @@ above the stored data:
 - **Discord guild administrators are always `admin`**, by construction -
   the clamp cannot be removed, so an admin can never be locked out.
 
+Two resolution rules that surprise people:
+
+- **Discord's role hierarchy is irrelevant here.** The bot sees role ids,
+  not their position in Server Settings. A member holding two mapped
+  roles gets the higher *tier* - even when it comes from a role placed
+  below the other one in Discord's list. Arrange seniority in Discord as
+  you like; the ladder follows tier values only.
+- An explicit user assignment is a **floor**, not a ceiling: roles lift
+  above it. A member assigned `guest` who holds a role granting
+  `moderator` is a `moderator`. Only `banned` (above) overrides role
+  grants.
+
 A fresh guild starts open (default tier `user`), so the commands that
 configure the bot are usable on day one. The policy is stored in the
 guild's own storage namespace, so guilds never see each other's
