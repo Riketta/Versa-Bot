@@ -10,6 +10,12 @@ use super::lcu::CatalogItem;
 /// Lines shown per section before the "+N more" cut.
 const MAX_LINES_PER_SECTION: usize = 15;
 
+/// Hard cap for the joined announcement. The embed-description limit is
+/// 4096 chars and the send path truncates nothing - an oversized embed is
+/// rejected and silently loses the update for every guild. Stay under it
+/// with margin for the hidden-count footer.
+const MAX_ANNOUNCEMENT_CHARS: usize = 3800;
+
 /// Name/pricing joins for one announcement. The catalog doubles as the
 /// original-price source for the sale percentage (the sale payload's own
 /// `discount` field is dead - always `0.0`).
@@ -41,16 +47,32 @@ impl NameIndex {
             .unwrap_or_else(|| format!("Champion {champion_id}"))
     }
 
-    /// Champion behind a skin: the catalog's `itemRequirements` champion, or
-    /// the skin-id convention (`championId * 1000 + n`) as fallback.
+    /// Champion behind a skin: the catalog's `itemRequirements` champion,
+    /// or - for actual champion skins only - the skin-id convention
+    /// (`championId * 1000 + n`) as fallback. Other item kinds (chests,
+    /// orbs, bundles) get no champion prefix: their ids mean nothing by
+    /// that convention.
     fn skin_champion(&self, item: &CatalogItem) -> Option<String> {
-        let champion_id = item
+        let from_requirements = item
             .item_requirements
             .iter()
             .find(|req| req.inventory_type.as_deref() == Some("CHAMPION"))
             .and_then(|req| req.item_id)
-            .unwrap_or(item.item_id / 1000);
-        (champion_id > 0).then(|| self.champion_name(champion_id))
+            .filter(|id| *id > 0);
+        let champion_id = match from_requirements {
+            Some(id) => id,
+            None => {
+                if item.inventory_type.as_deref() != Some("CHAMPION_SKIN") {
+                    return None;
+                }
+                let id = item.item_id / 1000;
+                if id == 0 {
+                    return None;
+                }
+                id
+            }
+        };
+        Some(self.champion_name(champion_id))
     }
 
     fn original_price(&self, item_id: u64) -> Option<u64> {
@@ -58,8 +80,8 @@ impl NameIndex {
     }
 }
 
-/// Renders the full announcement; `None` when nothing renders (all sections
-/// empty or every line stripped).
+/// Renders the full announcement within the embed-description budget;
+/// `None` when nothing renders (all sections empty or every line stripped).
 #[must_use]
 pub fn announce_text(delta: &StoreDelta, index: &NameIndex) -> Option<String> {
     let mut sections: Vec<String> = Vec::new();
@@ -77,9 +99,9 @@ pub fn announce_text(delta: &StoreDelta, index: &NameIndex) -> Option<String> {
             .entries
             .iter()
             .map(|entry| match (entry.name.clone(), entry.mythic_price) {
-                (Some(name), Some(price)) => format!("- {name} · {price} ME"),
+                (Some(name), Some(price)) => format!("- {name} \u{b7} {price} ME"),
                 (Some(name), None) => format!("- {name}"),
-                (None, Some(price)) => format!("- Unknown item · {price} ME"),
+                (None, Some(price)) => format!("- Unknown item \u{b7} {price} ME"),
                 (None, None) => "- Unknown item".to_owned(),
             })
             .collect();
@@ -90,15 +112,46 @@ pub fn announce_text(delta: &StoreDelta, index: &NameIndex) -> Option<String> {
     if let Some(start) = &delta.yourshop {
         let mut line = String::from("**Your Shop started**");
         if let Some(started) = start.start.as_deref() {
-            line.push_str(&format!(" · started {}", timestamp(started)));
+            line.push_str(&format!(" \u{b7} started {}", timestamp(started)));
         }
         if let Some(ends) = start.end.as_deref() {
-            line.push_str(&format!(" · ends {}", timestamp(ends)));
+            line.push_str(&format!(" \u{b7} ends {}", timestamp(ends)));
         }
         sections.push(line);
     }
 
-    if sections.is_empty() { None } else { Some(sections.join("\n\n")) }
+    fit(sections)
+}
+
+/// Fits the built sections into the embed budget: whole sections are
+/// dropped from the tail (lowest build priority) until the join fits, a
+/// hidden-count footer records what was cut, and a single pathological
+/// section (absurd item names) is hard-cut char-safely.
+fn fit(mut sections: Vec<String>) -> Option<String> {
+    let join_len = |sections: &[String]| {
+        sections.iter().map(String::len).sum::<usize>() + sections.len().saturating_sub(1) * 2
+    };
+    let mut hidden = 0usize;
+    while sections.len() > 1 && join_len(&sections) > MAX_ANNOUNCEMENT_CHARS {
+        sections.pop();
+        hidden += 1;
+    }
+    if join_len(&sections) > MAX_ANNOUNCEMENT_CHARS {
+        if let Some(first) = sections.first_mut() {
+            *first = format!(
+                "{}\u{2026}",
+                first.chars().take(MAX_ANNOUNCEMENT_CHARS).collect::<String>()
+            );
+        }
+    }
+    if sections.is_empty() {
+        return None;
+    }
+    let mut text = sections.join("\n\n");
+    if hidden > 0 {
+        text.push_str(&format!("\n\n\u{2026}and {hidden} more update groups hidden"));
+    }
+    Some(text)
 }
 
 /// Builds the name index's champions map source: champion id -> name.
@@ -153,7 +206,10 @@ fn sale_line(sale: &super::lcu::Sale, index: &NameIndex) -> String {
     // payload's own `discount` field is dead - always 0.0).
     if let (Some(original), Some(cost)) = (index.original_price(item_id), sale_price) {
         if original > cost && original > 0 {
-            let percent = ((original - cost) * 200 + original) / (original * 2);
+            // u128 intermediates: catalog prices are untrusted LCU data, and
+            // `original * 200` would overflow u64 on corrupted values.
+            let percent = (u128::from(original - cost) * 200 + u128::from(original))
+                / (u128::from(original) * 2);
             line.push_str(&format!(" \u{2212}{percent}%"));
         }
     }
@@ -183,15 +239,22 @@ fn date(iso: &str) -> String {
     iso.split('T').next().unwrap_or(iso).to_owned()
 }
 
-/// `2026-10-01T09:00:00Z` -> `2026-10-01 09:00 UTC`; falls back to the raw
-/// string on any deviation.
+/// `2026-10-01T09:00:00Z` -> `2026-10-01 09:00 UTC`; a zero offset renders
+/// the same, a non-zero offset is rendered as-is instead of mislabeled as
+/// UTC. Falls back to the raw string on any deviation.
 #[must_use]
 pub(crate) fn timestamp(iso: &str) -> String {
     let mut parts = iso.split('T');
     let day = parts.next().unwrap_or(iso);
     let Some(time) = parts.next() else { return iso.to_owned() };
     let hhmm: String = time.chars().take(5).collect();
-    format!("{day} {hhmm} UTC")
+    let offset = time
+        .split_once(['+', '-'])
+        .map(|(_, offset)| offset)
+        .filter(|offset| !offset.is_empty())
+        .unwrap_or("Z");
+    let label = if offset == "Z" || offset == "00:00" { "UTC" } else { offset };
+    format!("{day} {hhmm} {label}")
 }
 
 #[cfg(test)]
@@ -344,5 +407,133 @@ mod tests {
     fn timestamp_trims_to_minutes() {
         assert_eq!(timestamp("2026-10-01T09:07:33.000Z"), "2026-10-01 09:07 UTC");
         assert_eq!(timestamp("weird"), "weird");
+    }
+
+    /// A non-zero offset is rendered as given, never mislabeled as UTC.
+    #[test]
+    fn timestamp_keeps_nonzero_offsets() {
+        assert_eq!(timestamp("2026-10-01T09:07:33.000+00:00"), "2026-10-01 09:07 UTC");
+        assert_eq!(timestamp("2026-10-01T09:07:33.000+02:00"), "2026-10-01 09:07 02:00");
+        assert_eq!(timestamp("2026-10-01T09:07:33-05:30"), "2026-10-01 09:07 05:30");
+    }
+
+    /// A discounted non-skin item (chest, orb, bundle) gets no champion
+    /// prefix: the `id / 1000` convention only means anything for skins.
+    #[test]
+    fn non_skin_sales_get_no_champion_prefix() {
+        let mut catalog_index = index();
+        catalog_index.catalog.insert(
+            4_001,
+            CatalogItem {
+                item_id: 4_001,
+                inventory_type: Some("CHEST".to_owned()),
+                prices: vec![Price { cost: Some(300), currency: Some("RP".to_owned()) }],
+                localizations: BTreeMap::from([(
+                    "en_US".to_owned(),
+                    LocalizedText { name: Some("Hextech Chest".to_owned()) },
+                )]),
+                item_requirements: Vec::new(),
+            },
+        );
+        let sale = super::super::lcu::Sale {
+            id: 9,
+            item: ItemRef { inventory_type: Some("CHEST".to_owned()), item_id: Some(4_001) },
+            sale: SaleInfo {
+                start_date: None,
+                end_date: None,
+                prices: vec![Price { cost: Some(150), currency: Some("RP".to_owned()) }],
+            },
+        };
+        let line = sale_line(&sale, &catalog_index);
+        assert_eq!(line, "- Hextech Chest −50% · 150 RP");
+    }
+
+    /// Corrupted catalog prices must not overflow the percentage math.
+    #[test]
+    fn percent_math_survives_absurd_prices() {
+        let mut catalog_index = index();
+        catalog_index.catalog.insert(
+            u64::MAX,
+            CatalogItem {
+                item_id: u64::MAX,
+                inventory_type: Some("CHAMPION_SKIN".to_owned()),
+                prices: vec![Price { cost: Some(u64::MAX), currency: Some("RP".to_owned()) }],
+                localizations: BTreeMap::from([(
+                    "en_US".to_owned(),
+                    LocalizedText { name: Some("Broken Item".to_owned()) },
+                )]),
+                item_requirements: Vec::new(),
+            },
+        );
+        let sale = super::super::lcu::Sale {
+            id: 10,
+            item: ItemRef {
+                inventory_type: Some("CHAMPION_SKIN".to_owned()),
+                item_id: Some(u64::MAX),
+            },
+            sale: SaleInfo {
+                start_date: None,
+                end_date: None,
+                prices: vec![Price { cost: Some(1), currency: Some("RP".to_owned()) }],
+            },
+        };
+        let line = sale_line(&sale, &catalog_index);
+        assert!(line.contains("\u{2212}100%"), "deep discount clamps to ~100: {line}");
+    }
+
+    /// Sections exceeding the embed budget are dropped from the tail, and
+    /// the hidden count is recorded - the whole point is that the send path
+    /// truncates nothing, so the text must always fit.
+    #[test]
+    fn oversized_announcements_drop_tail_sections() {
+        let fat_rotation = |label: &str| super::super::diff::RotationDelta {
+            label: label.to_owned(),
+            rotation_start: None,
+            next_rotation: None,
+            entries: (0..15)
+                .map(|n| super::super::diff::MythicEntry {
+                    name: Some(format!("Prestige Skin Entry {n} of {label} {}", "x".repeat(90))),
+                    mythic_price: Some(100),
+                })
+                .collect(),
+        };
+        let delta = StoreDelta {
+            sales: vec![skin_sale(607, None)],
+            rotations: vec![
+                fat_rotation("daily"),
+                fat_rotation("weekly"),
+                fat_rotation("biweekly"),
+                fat_rotation("monthly"),
+            ],
+            ..Default::default()
+        };
+        let text = announce_text(&delta, &index()).expect("announcement expected");
+        assert!(text.contains("**New sales**"), "the headline section always survives");
+        assert!(text.contains("more update groups hidden"));
+        assert!(text.len() < 4096, "must fit the embed description limit");
+        assert!(!text.contains("monthly"), "the lowest-priority tail goes first");
+    }
+
+    /// A single pathological section (absurd names) is hard-cut to the
+    /// budget instead of being dropped wholesale.
+    #[test]
+    fn single_oversized_section_is_hard_cut() {
+        let long_name = "A".repeat(400);
+        let skins: Vec<CatalogItem> = (0..15)
+            .map(|n| CatalogItem {
+                item_id: 1000 + n,
+                inventory_type: Some("CHAMPION_SKIN".to_owned()),
+                prices: Vec::new(),
+                localizations: BTreeMap::from([(
+                    "en_US".to_owned(),
+                    LocalizedText { name: Some(format!("{long_name} {n}")) },
+                )]),
+                item_requirements: Vec::new(),
+            })
+            .collect();
+        let delta = StoreDelta { skins, ..Default::default() };
+        let text = announce_text(&delta, &NameIndex::empty()).expect("announcement expected");
+        assert!(text.len() < 4096, "must fit the embed description limit");
+        assert!(text.ends_with('\u{2026}'), "hard cut marker expected");
     }
 }

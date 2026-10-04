@@ -58,7 +58,6 @@ pub struct LeaderboardStats {
     pub requested: usize,
     pub region_count: usize,
     pub failures: Vec<String>,
-    pub stale: bool,
     pub age_seconds: u64,
     pub role_sections: Vec<RoleSection>,
     pub champ_blocks: Vec<ChampBlock>,
@@ -186,7 +185,6 @@ pub fn build(snapshot: &Snapshot) -> LeaderboardStats {
         requested: snapshot.requested_players,
         region_count: snapshot.regions.len(),
         failures: snapshot.failures.clone(),
-        stale: snapshot.stale,
         age_seconds: snapshot.age.as_secs(),
         role_sections,
         champ_blocks,
@@ -388,7 +386,6 @@ mod tests {
         assert_eq!(stats.parsed, 1000);
         assert_eq!(stats.requested, 3000);
         assert_eq!(stats.failures, vec!["na"]);
-        assert!(stats.stale);
         assert_eq!(stats.age_seconds, 3600);
     }
 }

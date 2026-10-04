@@ -149,9 +149,10 @@ Every capability is a plugin under `src/plugins/`. Each section below is
 the plugin's manual: what it does, its commands, and the access tier
 every command requires. Tiers are the auth plugin's ladder - `banned` <
 `guest` < `user` < `moderator` < `admin`. Every command reply, denial
-included, is ephemeral (visible to the invoker alone); a member below a
-command's tier gets an ephemeral notice naming the required and actual
-tier. Discord guild administrators are always `admin`, and a fresh
+included, is ephemeral (visible to the invoker alone) unless the
+documentation marks it public - the deliberate exceptions post in the
+channel; a member below a command's tier gets an ephemeral notice
+naming the required and actual tier. Discord guild administrators are always `admin`, and a fresh
 guild starts with default tier `user`, so configuration commands are
 usable on day one.
 
@@ -297,10 +298,17 @@ poll window merge into a single line.
 Setup: point `[lol_store]` at the client's `lockfile` (the bot reads the
 per-start port and token from it, so client restarts self-heal), enable
 per guild with `/lol_store_enable`, and assign the announcement channel
-with `/lol_store_assign`. Announcements batch into one embed per poll
+With `/lol_store_assign`. Announcements batch into one embed per poll
 cycle; the first successful poll after a restart is a catch-up
 (announcing what changed while the bot was down) or, with no stored
-state, a silent baseline.
+state, a silent baseline. The embed has a length budget: if one cycle
+finds more than fits, the lowest-priority sections are dropped and the
+hidden count is noted at the bottom. Delivery is at-most-once: a guild
+whose send fails gets a log line, not a replay - the poll state still
+advances so nothing is announced twice. `/lol_store_dump` and
+`/lol_client_status` show the bot-global watcher state (there is one
+League client per bot), which may differ from what an individual guild
+received.
 
 | Command | Tier | Effect |
 |---|---|---|
@@ -370,7 +378,9 @@ data age 2h`), renders a bucket row only when the parses actually cover
 it, degrades holes (a player without role/champion data leaves that
 table but never breaks the answer), and splits across messages on line
 boundaries. A failing region is named in the dump and served from cache
-when possible; only a total failure replies with an error.
+when possible; only a total failure replies with an error. Concurrent
+invocations share the refresh (singleflight) but each gets its own full
+dump.
 
 | Command | Tier | Effect |
 |---|---|---|
@@ -384,7 +394,7 @@ the source - keeps the command in "not configured" mode):
 |---|---|---|---|
 | `regions` | string array | *(empty)* | regions to aggregate: `kr`, `euw`, `eun`, `na`, `jp`, `br`, `tr`, `tw`, `vn`, `sea`; empty = plugin off |
 | `request_interval_secs` | integer | `1` | minimum delay between source requests (sequential, rate-limit politeness); `0` disables the plugin |
-| `parse_depth` | integer | `1000` | top players parsed per region (clamped to what the source's board has); `0` disables |
+| `parse_depth` | integer | `1000` | top players parsed per region (clamped to what the source's board has); `0` disables; capped at 10 000 |
 | `display_buckets` | integer array | `[300, 1000]` | player-count rows for the role tables; values are clamped to `parse_depth`, sorted, deduplicated; empty = a single full-depth row |
 | `champ_pool_depth` | integer | `1000` | per-region player pool (highest ranked first) behind the champion tables; clamped to `parse_depth` |
 | `champs_per_role` | integer | `5` | champions listed per role |

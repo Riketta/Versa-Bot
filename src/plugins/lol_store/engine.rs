@@ -25,7 +25,7 @@ use crate::kernel::spi_ports::{ChatOutputFactoryPort, StoragePort};
 use super::diff::{self, LastSeen, Snapshot, StoreDelta};
 use super::events::{LolStoreAnnounced, StoreEventKind};
 use super::format::{NameIndex, announce_text, champion_map};
-use super::lcu::LcuPort;
+use super::lcu::{CatalogItem, LcuPort};
 
 /// Guild storage namespace (the plugin's slug).
 pub const NAMESPACE: &str = "lol_store";
@@ -66,18 +66,6 @@ pub struct GuildConfig {
     pub role_id: Option<String>,
 }
 
-/// What `/lol_client_status` and `/lol_store_dump` render.
-pub struct StatusSnapshot {
-    pub configured: bool,
-    pub online: bool,
-    pub last_poll_ago: Option<Duration>,
-    pub last_announcement_ago: Option<Duration>,
-    pub sales_tracked: usize,
-    pub skins_tracked: usize,
-    pub rotations: Vec<(String, String)>,
-    pub yourshop_active: Option<bool>,
-}
-
 /// The poll engine (see module docs). Generic over the bus like every
 /// bus-publishing plugin.
 pub struct StoreEngine<B: EventBusPort> {
@@ -88,6 +76,10 @@ pub struct StoreEngine<B: EventBusPort> {
     settings: EngineSettings,
     state: Mutex<Option<LastSeen>>,
     champions: Mutex<Option<Arc<HashMap<u64, String>>>>,
+    /// Last good catalog, kept so a same-tick catalog failure degrades name
+    /// joins to the previous cycle instead of synthetic ids that would be
+    /// frozen into the permanent announcement record.
+    last_catalog: Mutex<Option<Vec<CatalogItem>>>,
     online: AtomicBool,
     last_poll: Mutex<Option<Instant>>,
     last_announcement: Mutex<Option<(Instant, String)>>,
@@ -110,6 +102,7 @@ impl<B: EventBusPort> StoreEngine<B> {
             settings,
             state: Mutex::new(None),
             champions: Mutex::new(None),
+            last_catalog: Mutex::new(None),
             online: AtomicBool::new(false),
             last_poll: Mutex::new(None),
             last_announcement: Mutex::new(None),
@@ -151,7 +144,12 @@ impl<B: EventBusPort> StoreEngine<B> {
             Err(_) => failures.push("sales"),
         }
         match catalog {
-            Ok(data) => snapshot.catalog = Some(data),
+            Ok(data) => {
+                // Cache at fetch time: the join fallback must exist even for
+                // cycles where the catalog itself failed and nothing announces.
+                *self.last_catalog.lock() = Some(data.clone());
+                snapshot.catalog = Some(data);
+            }
             Err(_) => failures.push("catalog"),
         }
         match rotations {
@@ -206,9 +204,12 @@ impl<B: EventBusPort> StoreEngine<B> {
         if announces {
             let delta = delta.unwrap_or_default();
             match self.announce(&delta, &snapshot).await {
-                Ok(text) => {
+                // An empty render announces nothing - storing it would make
+                // `/lol_client_status` report a phantom announcement.
+                Ok(text) if !text.is_empty() => {
                     *self.last_announcement.lock() = Some((Instant::now(), text));
                 }
+                Ok(_) => {}
                 Err(err) => tracing::warn!(%err, "store announcement fan-out failed"),
             }
         }
@@ -229,6 +230,11 @@ impl<B: EventBusPort> StoreEngine<B> {
 
     /// Formats and fans one delta out: per enabled guild - embed, record,
     /// bus event. Returns the rendered text (for the status memory).
+    ///
+    /// Delivery is at-most-once by design: a guild whose send fails only
+    /// logs the miss (no record, no bus event) and the state swap still
+    /// advances, so the delta is not replayed next poll. Cosmetic pings,
+    /// not a delivery contract.
     async fn announce(&self, delta: &StoreDelta, snapshot: &Snapshot) -> anyhow::Result<String> {
         let index = self.name_index(snapshot).await;
         let Some(text) = announce_text(delta, &index) else {
@@ -308,8 +314,9 @@ impl<B: EventBusPort> StoreEngine<B> {
         Ok(text)
     }
 
-    /// Catalog + champion joins, with a lazily loaded and cached champion
-    /// name table (one process-lifetime fetch unless a name is missing).
+    /// Catalog + champion joins, with a lazily loaded champion name table
+    /// (fetched once per process; a failed fetch retries next cycle while
+    /// the cache stays empty).
     async fn name_index(&self, snapshot: &Snapshot) -> NameIndex {
         // Load-once champion table; the guard never crosses an await.
         if self.champions.lock().is_none() {
@@ -333,7 +340,14 @@ impl<B: EventBusPort> StoreEngine<B> {
                 .map(|cached| cached.iter().map(|(id, name)| (*id, name.clone())).collect())
                 .unwrap_or_default()
         };
-        let catalog = snapshot.catalog.clone().unwrap_or_default();
+        let catalog = match &snapshot.catalog {
+            Some(catalog) => catalog.clone(),
+            // Catalog source failed this cycle: join against the last good
+            // catalog (kept at fetch time in `tick`) so sale lines keep real
+            // names - the alternative would bake "Skin 1031" into the
+            // permanent record and `/lol_store_dump`.
+            None => self.last_catalog.lock().clone().unwrap_or_default(),
+        };
         NameIndex::new(catalog, champions)
     }
 
@@ -345,8 +359,17 @@ impl<B: EventBusPort> StoreEngine<B> {
         };
         for (platform, guild_id) in guilds {
             let storage = self.storage.guild_scoped(platform, guild_id);
-            let Ok(Some(raw)) = storage.get(NAMESPACE, CONFIG_KEY).await else {
-                continue;
+            let raw = match storage.get(NAMESPACE, CONFIG_KEY).await {
+                Ok(Some(raw)) => raw,
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        guild = guild_id.get(),
+                        "store tracker config unreadable - skipping guild this cycle"
+                    );
+                    continue;
+                }
             };
             let Ok(config) = serde_json::from_value::<GuildConfig>(raw) else {
                 tracing::warn!(guild = guild_id.get(), "store tracker config malformed - skipping");
@@ -360,6 +383,14 @@ impl<B: EventBusPort> StoreEngine<B> {
                 tracing::warn!(guild = guild_id.get(), "store tracker enabled but channel missing");
                 continue;
             };
+            if let Some(role) = &config.role_id {
+                if role.parse::<u64>().is_err() {
+                    tracing::warn!(
+                        guild = guild_id.get(),
+                        "store tracker announce role is not a role id - pings disabled for this guild"
+                    );
+                }
+            }
             targets.push((platform, guild_id, ChannelId(channel), config.role_id));
         }
         targets
@@ -371,12 +402,20 @@ impl<B: EventBusPort> StoreEngine<B> {
         let guilds = self.storage.list_guilds().await.ok()?;
         for (platform, guild_id) in guilds {
             let storage = self.storage.guild_scoped(platform, guild_id);
-            if let Ok(Some(raw)) = storage.get(NAMESPACE, LAST_SEEN_KEY).await {
-                match serde_json::from_value::<LastSeen>(raw) {
+            match storage.get(NAMESPACE, LAST_SEEN_KEY).await {
+                Ok(Some(raw)) => match serde_json::from_value::<LastSeen>(raw) {
                     Ok(state) => return Some(state),
                     Err(err) => {
                         tracing::warn!(%err, guild = guild_id.get(), "persisted store state malformed")
                     }
+                },
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        guild = guild_id.get(),
+                        "persisted store state unreadable - boot catch-up skipped for it"
+                    );
                 }
             }
         }
@@ -395,9 +434,17 @@ impl<B: EventBusPort> StoreEngine<B> {
         };
         for (platform, guild_id) in guilds {
             let storage = self.storage.guild_scoped(platform, guild_id);
-            let has_config = matches!(storage.get(NAMESPACE, CONFIG_KEY).await, Ok(Some(_)));
-            if !has_config {
-                continue;
+            match storage.get(NAMESPACE, CONFIG_KEY).await {
+                Ok(Some(_)) => {}
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        guild = guild_id.get(),
+                        "config unreadable - catch-up persistence skipped for this guild"
+                    );
+                    continue;
+                }
             }
             if let Err(err) = storage.set(NAMESPACE, LAST_SEEN_KEY, value.clone()).await {
                 tracing::warn!(%err, guild = guild_id.get(), "failed to persist store state");
@@ -595,7 +642,7 @@ mod tests {
         engine: Arc<StoreEngine<RecorderBus>>,
     }
 
-    async fn fixture(lcu: Arc<FakeLcu>) -> Fixture {
+    async fn fixture_with(lcu: Arc<FakeLcu>, flags: AnnounceFlags) -> Fixture {
         let storage = Arc::new(InMemoryStorage::new());
         let output = RecordingChatOutput::new();
         let factory = RecordingChatOutputFactory::new(Arc::clone(&output)).boxed();
@@ -606,9 +653,13 @@ mod tests {
             Arc::clone(&storage) as Arc<dyn StoragePort>,
             factory,
             bus.clone(),
-            EngineSettings { poll: Duration::from_secs(60), flags: AnnounceFlags::all_on() },
+            EngineSettings { poll: Duration::from_secs(60), flags },
         ));
         Fixture { storage, output, bus, lcu, engine }
+    }
+
+    async fn fixture(lcu: Arc<FakeLcu>) -> Fixture {
+        fixture_with(lcu, AnnounceFlags::all_on()).await
     }
 
     async fn enable_guild(storage: &InMemoryStorage, guild: u64, channel: Option<&str>) {
@@ -720,6 +771,69 @@ mod tests {
         let records = scoped.list_last(NAMESPACE, 10).await.expect("records read expected");
         assert_eq!(records.len(), 1, "the announcement must be recorded");
         assert_eq!(f.bus.log(), vec![("lol_store.announced", GUILD, "sales")]);
+    }
+
+    #[tokio::test]
+    async fn catalog_failure_degrades_to_the_last_good_catalog() {
+        let f = fixture(FakeLcu::online()).await;
+        enable_guild(&f.storage, GUILD, Some("55")).await;
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        f.engine.tick().await; // silent baseline; caches the catalog
+
+        // The catalog source fails this cycle; the sale still announces -
+        // joined against the cached catalog, not synthetic ids.
+        *f.lcu.catalog.lock() = None;
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        f.engine.tick().await;
+
+        let messages = f.output.messages();
+        assert_eq!(messages.len(), 1, "the sale must still announce");
+        let first = messages.first().expect("announcement expected");
+        assert!(first.contains("Ahri \u{2014} Foxfire Ahri"), "cached join expected: {first}");
+        assert!(!first.contains("Skin 1031"), "no synthetic id may reach the record");
+    }
+
+    /// One failed source must not kill the cycle: the other sections still
+    /// announce, the failed source keeps its previous state, and the client
+    /// counts as online (3 of 4 sources answering).
+    #[tokio::test]
+    async fn a_partial_source_failure_keeps_previous_state_and_stays_online() {
+        let f = fixture(FakeLcu::online()).await;
+        enable_guild(&f.storage, GUILD, Some("55")).await;
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        f.engine.tick().await; // baseline
+
+        *f.lcu.sales.lock() = None; // sales source fails this cycle
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975), skin_item(1101, 975)]);
+        f.engine.tick().await;
+
+        let messages = f.output.messages();
+        assert_eq!(messages.len(), 1, "the catalog change still announces");
+        let first = messages.first().expect("announcement expected");
+        assert!(
+            first.contains("**New in store**"),
+            "a failed source must not block other sections: {first}"
+        );
+        assert!(f.engine.status_text().contains("League client: online"));
+    }
+
+    /// A tracker toggled off must not announce - but the state still
+    /// advances, so re-enabling never replays old events.
+    #[tokio::test]
+    async fn a_disabled_tracker_still_updates_state_silently() {
+        let mut flags = AnnounceFlags::all_on();
+        flags.sales = false;
+        let f = fixture_with(FakeLcu::online(), flags).await;
+        enable_guild(&f.storage, GUILD, Some("55")).await;
+        f.engine.tick().await; // baseline without sales
+
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        f.engine.tick().await; // sale found, sales announcements off
+
+        assert!(f.output.messages().is_empty(), "no announcement with the flag off");
+        assert!(f.bus.log().is_empty());
+        assert!(f.engine.status_text().contains("Sales tracked: 1"));
     }
 
     #[tokio::test]

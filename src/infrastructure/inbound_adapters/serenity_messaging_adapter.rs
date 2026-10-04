@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serenity::all::{
     ChannelId as SerenityChannelId, CommandDataOption, CommandDataOptionValue, CommandDataResolved,
@@ -171,13 +172,11 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
         // as long as they need; their replies go out as followups bound to
         // the interaction token. Type 5 = DeferredChannelMessageWithSource.
         // `flags` must live INSIDE `data`: a top-level `flags` field is
-        // ignored, and a non-ephemeral defer makes the whole exchange public
-        // - the first followup edits the original response and inherits its
-        // ephemeral state (an existing message's ephemeral state cannot be
-        // changed later). All command replies are admin-only, so the defer
-        // carries EPHEMERAL (64) and the loading state already shows to the
-        // invoker alone. (A future public-reply command would follow up a
-        // second time with its own flags.)
+        // ignored, and a non-ephemeral defer makes the whole exchange public.
+        // The defer carries EPHEMERAL (64): the loading state shows to the
+        // invoker alone, ephemeral replies edit it in place (inheriting its
+        // state), and public replies are routed around that inheritance rule
+        // by `InteractionFollowupOutput` - see there.
         //
         // The age/duration pair in the logs below separates the two ways
         // this deadline can blow: a large `interaction_age_ms` means the
@@ -292,12 +291,12 @@ fn member_origin(guild_id: SerenityGuildId, user: &User) -> Origin {
 }
 
 /// The acknowledgement sent for every slash-command interaction: a deferred
-/// channel message whose loading state carries the EPHEMERAL flag (64). The
-/// first followup then edits this response and inherits its ephemeral state,
-/// so the whole exchange stays visible to the invoker alone. `flags` sits
-/// inside `data` per the interaction-callback data shape - a top-level
-/// `flags` field is silently ignored by Discord and would make the defer
-/// (and with it every command reply) public.
+/// channel message whose loading state carries the EPHEMERAL flag (64).
+/// `flags` sits inside `data` per the interaction-callback data shape - a
+/// top-level `flags` field is silently ignored by Discord and would make the
+/// defer (and with it every command reply) public. Delivery halves live in
+/// [`InteractionFollowupOutput`]: ephemeral replies edit this response
+/// (inheriting its ephemeral state), public replies are posted past it.
 fn deferred_ephemeral_response() -> serde_json::Value {
     serde_json::json!({ "type": 5, "data": { "flags": 64 } })
 }
@@ -595,6 +594,7 @@ impl ChatOutputFactoryPort for SerenityChatOutputFactory {
             return Arc::new(InteractionFollowupOutput {
                 http: Arc::clone(&self.http),
                 token: token.clone(),
+                first_followup_used: AtomicBool::new(false),
             });
         }
 
@@ -931,6 +931,12 @@ impl ChatStreamPort for UndeliverableChatStream {
 struct InteractionFollowupOutput {
     http: Arc<Http>,
     token: String,
+    /// Whether the first-followup slot has been consumed. The first followup
+    /// of an interaction edits the deferred ephemeral original response and
+    /// inherits its ephemeral state regardless of the flags it carries, so a
+    /// PUBLIC first reply must be routed around that slot (see [`send`]).
+    /// Fresh per interaction: one output instance is built per event origin.
+    first_followup_used: AtomicBool,
 }
 
 #[async_trait]
@@ -940,22 +946,77 @@ impl ChatOutputPort for InteractionFollowupOutput {
             tracing::warn!("dropping empty interaction followup (no content, no embeds)");
             return Ok(());
         }
+        // Ephemeral replies are invoker-only wherever they land: the first
+        // followup edits the deferred ephemeral original (inheriting its
+        // state), later ones carry the flag explicitly. Single post.
+        if message.ephemeral {
+            let body = followup_body(&message);
+            return self.post(&body).await;
+        }
+        // Public reply. The first followup would edit the deferred ephemeral
+        // original and inherit its ephemeral state - public content cannot
+        // ride it. Consume the slot on a small invoker-only placeholder,
+        // then post the real content as a second followup (a new message
+        // whose flags we control), and clean the placeholder up. Handlers
+        // send sequentially, so "first" is well defined. If the placeholder
+        // itself fails, the content post degrades to the inheritance
+        // behavior (invoker-only) - the same shape the pre-dance adapter had.
+        if !self.first_followup_used.swap(true, Ordering::Relaxed) {
+            match self
+                .http
+                .create_followup_message(&self.token, &placeholder_body(), Vec::new())
+                .await
+            {
+                Ok(placeholder) => {
+                    if let Err(err) =
+                        self.http.delete_followup_message(&self.token, placeholder.id).await
+                    {
+                        tracing::warn!(
+                            %err,
+                            "failed to delete the public-reply placeholder (invoker-only, harmless)"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "public-reply placeholder failed; content may land invoker-only"
+                    );
+                }
+            }
+        }
         // Normalized mention tags invert back to bare mentions on the way
         // out, like every other Discord send - see `followup_body`.
         let body = followup_body(&message);
-        self.http
-            .create_followup_message(&self.token, &body, Vec::new())
-            .await
-            .map_err(|err| OutboundError::Send(err.to_string()))?;
-        Ok(())
+        self.post(&body).await
     }
 }
 
-/// Builds the interaction-followup JSON body. Pure so the two halves of the
-/// "command replies stay invoker-only" contract are verifiable side by side:
-/// the deferred loading state carries EPHEMERAL inside its `data` (see
-/// `deferred_ephemeral_response`), and every followup built here carries the
-/// same flag when the message is ephemeral. `reply_to` is ignored: a
+impl InteractionFollowupOutput {
+    /// Posts one followup body for this interaction.
+    async fn post(&self, body: &serde_json::Value) -> Result<(), OutboundError> {
+        self.http
+            .create_followup_message(&self.token, body, Vec::new())
+            .await
+            .map(|_: serenity::all::Message| ())
+            .map_err(|err| OutboundError::Send(err.to_string()))
+    }
+}
+
+/// Body for the sacrificial first followup that precedes a public send (see
+/// [`InteractionFollowupOutput::send`]): invoker-only, generic wording -
+/// the adapter is command-agnostic. Deleted again once the real content is
+/// out; if deletion fails it lingers as a harmless status line.
+fn placeholder_body() -> serde_json::Value {
+    serde_json::json!({ "content": "Processing…", "flags": 64 })
+}
+
+/// Builds the interaction-followup JSON body. Pure so the flag half of the
+/// reply-visibility contract is verifiable side by side with the defer (see
+/// `deferred_ephemeral_response`): a followup carries EPHEMERAL when the
+/// message is ephemeral; public bodies omit flags - they are only ever
+/// posted as second-or-later followups (or past a consumed first slot), so
+/// they land as fresh public messages. `reply_to` is ignored: a
 /// transactional reply is already anchored to its interaction. Normalized
 /// mention tags invert back to bare mentions, like every other Discord send.
 fn followup_body(message: &OutboundMessage) -> serde_json::Value {
@@ -1200,6 +1261,17 @@ mod tests {
 
         let public = OutboundMessage::text("hello".to_owned());
         assert!(followup_body(&public).get("flags").is_none());
+    }
+
+    /// The public-reply placeholder consumes the first-followup slot: it
+    /// must be non-empty (Discord rejects empty posts) and explicitly
+    /// ephemeral, and it stays generic - the adapter is command-agnostic.
+    #[test]
+    fn placeholder_is_ephemeral_and_non_empty() {
+        let body = placeholder_body();
+        let content = body.get("content").and_then(serde_json::Value::as_str);
+        assert!(content.is_some_and(|text| !text.is_empty()), "placeholder needs content");
+        assert_eq!(body.get("flags").and_then(serde_json::Value::as_u64), Some(64));
     }
 
     /// Followup content and embeds denormalize mention tags back to bare

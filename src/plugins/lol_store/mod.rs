@@ -20,7 +20,6 @@ mod format;
 pub mod lcu;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 
@@ -37,9 +36,7 @@ pub use commands::{
     UnassignHandler,
 };
 pub use diff::LastSeen;
-pub use engine::{
-    AnnounceFlags, CONFIG_KEY, EngineSettings, GuildConfig, NAMESPACE, StatusSnapshot, StoreEngine,
-};
+pub use engine::{AnnounceFlags, CONFIG_KEY, EngineSettings, GuildConfig, NAMESPACE, StoreEngine};
 pub use lcu::{LcuClient, LcuPort};
 
 /// The plugin facade: command registration (`init`), poll scheduling
@@ -49,7 +46,6 @@ pub struct LolStorePlugin<B: EventBusPort> {
     scheduler: Arc<dyn SchedulerPort>,
     engine: Arc<StoreEngine<B>>,
     job: Mutex<Option<JobHandle>>,
-    stopped: AtomicBool,
 }
 
 impl<B: EventBusPort> LolStorePlugin<B> {
@@ -59,7 +55,7 @@ impl<B: EventBusPort> LolStorePlugin<B> {
         scheduler: Arc<dyn SchedulerPort>,
         engine: Arc<StoreEngine<B>>,
     ) -> Self {
-        Self { registry, scheduler, engine, job: Mutex::new(None), stopped: AtomicBool::new(false) }
+        Self { registry, scheduler, engine, job: Mutex::new(None) }
     }
 }
 
@@ -170,7 +166,6 @@ impl<B: EventBusPort> PluginPort for LolStorePlugin<B> {
     }
 
     fn start(&self) -> Result<(), PluginError> {
-        self.stopped.store(false, Ordering::Release);
         let settings = self.engine.settings();
         if settings.poll.is_zero() {
             tracing::info!("lol store plugin has no poll interval - watcher disabled");
@@ -187,7 +182,6 @@ impl<B: EventBusPort> PluginPort for LolStorePlugin<B> {
     }
 
     fn stop(&self) -> Result<(), PluginError> {
-        self.stopped.store(true, Ordering::Release);
         if let Some(job) = self.job.lock().take() {
             job.cancel();
         }
@@ -209,7 +203,7 @@ mod tests {
     use crate::kernel::models::{
         CommandPayload, EventKind, EventPayload, GuildId, Origin, Platform, UserId,
     };
-    use crate::kernel::plugin_ports::{CommandArgs, CommandHandler};
+    use crate::kernel::plugin_ports::{CommandArgs, CommandHandler, Job};
     use crate::kernel::services::KernelServices;
     use crate::kernel::spi_ports::{ChatOutputPort, StoragePort};
     use crate::test_support::{
@@ -252,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn init_registers_the_six_commands_within_discord_limits() {
+    fn init_registers_the_seven_commands_within_discord_limits() {
         let registry = Arc::new(CapturingRegistry::default());
         let plugin = LolStorePlugin::new(
             Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
@@ -289,6 +283,50 @@ mod tests {
             RecordingBus::default(),
             EngineSettings { poll: Duration::ZERO, flags: AnnounceFlags::all_on() },
         ))
+    }
+
+    /// Scheduler double recording what the plugin asked for; handles are
+    /// dead (like `NoopScheduler`), so cancellation mechanics stay the
+    /// adapter's tested concern - this pins the plugin's scheduling call.
+    #[derive(Default)]
+    struct RecordingScheduler {
+        jobs: std::sync::Mutex<Vec<(String, Duration)>>,
+    }
+
+    impl SchedulerPort for RecordingScheduler {
+        fn schedule(&self, name: &str, interval: Duration, _job: Arc<dyn Job>) -> JobHandle {
+            self.jobs.lock().expect("jobs lock").push((name.to_owned(), interval));
+            JobHandle::new(Arc::new(|| {}))
+        }
+    }
+
+    #[test]
+    fn start_schedules_the_poll_and_stop_is_idempotent() {
+        let scheduler = Arc::new(RecordingScheduler::default());
+        let engine = Arc::new(StoreEngine::new(
+            Arc::new(OfflineLcu),
+            Arc::new(InMemoryStorage::new()) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
+            RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
+            RecordingBus::default(),
+            EngineSettings { poll: Duration::from_secs(90), flags: AnnounceFlags::all_on() },
+        ));
+        let plugin = LolStorePlugin::new(
+            Arc::new(CapturingRegistry::default()) as Arc<dyn CommandRegistryPort>,
+            Arc::clone(&scheduler) as Arc<dyn SchedulerPort>,
+            engine,
+        );
+
+        plugin.init().expect("init expected");
+        plugin.start().expect("start expected");
+        assert_eq!(
+            scheduler.jobs.lock().expect("jobs lock").as_slice(),
+            vec![("lol_store_poll".to_owned(), Duration::from_secs(90))],
+            "the poll job is scheduled under the plugin's name at the configured cadence"
+        );
+
+        plugin.stop().expect("stop expected");
+        plugin.stop().expect("a second stop must be a no-op, not a panic");
+        assert_eq!(scheduler.jobs.lock().expect("jobs lock").len(), 1, "stop never re-schedules");
     }
 
     /// Bus double accepting publications without subscribers.

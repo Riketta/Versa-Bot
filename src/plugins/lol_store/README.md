@@ -16,7 +16,7 @@ The client writes a lockfile next to its executable on every start:
 Format: `name:pid:port:token:protocol`, e.g.
 
 ```
-LeagueClient:49044:38436:BVBIHh_JNV1HtEViSVb7rA:https
+LeagueClient:49044:38436:SyntheticTestTokenABC123xyz:https
 ```
 
 - Base URL: `{protocol}://127.0.0.1:{port}` - the port is random per

@@ -498,6 +498,19 @@ fn leaderboard_settings(
         tracing::warn!("config section [lol_leaderboard] ignored: parse_depth must be > 0");
         return None;
     }
+    // The source adapter caps its own page walk, but an absurd depth would
+    // still bloat memory and the rendered dump before any cap helps.
+    const MAX_PARSE_DEPTH: u32 = 10_000;
+    let parse_depth = if config.parse_depth > MAX_PARSE_DEPTH {
+        tracing::warn!(
+            requested = config.parse_depth,
+            cap = MAX_PARSE_DEPTH,
+            "config [lol_leaderboard] parse_depth capped"
+        );
+        MAX_PARSE_DEPTH
+    } else {
+        config.parse_depth
+    };
     if config.cache_ttl_secs == 0 {
         tracing::warn!("config section [lol_leaderboard] ignored: cache_ttl_secs must be > 0");
         return None;
@@ -505,11 +518,11 @@ fn leaderboard_settings(
     let settings = LeaderboardEngineSettings::new(
         source,
         &config.regions,
-        config.parse_depth,
+        parse_depth,
         Duration::from_secs(config.cache_ttl_secs),
         Duration::from_secs(config.request_interval_secs),
         LeaderboardView::resolve(
-            config.parse_depth,
+            parse_depth,
             &config.display_buckets,
             config.champ_pool_depth,
             config.champs_per_role,

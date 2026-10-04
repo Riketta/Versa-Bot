@@ -35,13 +35,17 @@ Gotchas, all live-verified:
   and champion tables come from one sweep - never query per lane.
 - **Page size is 100 players.** The answer carries `total_page`; pages
   beyond it 500. Clamp pagination to it - requesting more than exists
-  is an error, not an empty page.
+  is an error, not an empty page. The bot additionally stops on an
+  empty page and at a computed page cap (depth / 10 + 10), so a
+  degraded board can never keep the walk alive.
 - A missing required parameter is the one clean failure: FastAPI
   answers `422` with a `detail` array. If you get `422`, read it - it
   names the missing parameter.
-- Per-entry fields we consume (all defaulted in our structs, so schema
-  drift degrades one field, never the parse): `rank` (sparse - hidden
-  players create gaps; we re-number positions densely after sorting),
+- Per-entry fields we consume (all defaulted in our structs, so added
+  or removed fields degrade to defaults - a wrong-typed field still
+  fails that page and errors the region for the cycle): `rank` (sparse
+  - hidden players create gaps; we re-number positions densely after
+  sorting),
   `most_role` (always a concrete lane in practice, no "All" players),
   `most_champion` (ordered id list, first = most played; can be
   missing/empty).

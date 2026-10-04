@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::common::command_reply;
 use crate::kernel::{
@@ -15,20 +16,33 @@ use crate::kernel::{
 
 use super::engine::{CONFIG_KEY, GuildConfig, NAMESPACE, StoreEngine};
 
+/// Serializes the guild-config read-modify-write across ALL config commands
+/// (and guilds - admin-frequency operations, contention is negligible).
+/// Without it, two concurrent commands can interleave and drop one field's
+/// change: last document write wins.
+static CONFIG_WRITE: AsyncMutex<()> = AsyncMutex::const_new(());
+
 /// Read-modify-write of the guild config document, so enable/disable and
-/// assign/unassign never clobber each other's fields.
+/// assign/unassign never clobber each other's fields (serialized by
+/// [`CONFIG_WRITE`]). A doc that fails to deserialize is logged and treated
+/// as defaults for this operation - the corruption predates the command.
 async fn update_config(
     services: &KernelServices,
     change: impl FnOnce(&mut GuildConfig),
 ) -> anyhow::Result<GuildConfig> {
+    let _guard = CONFIG_WRITE.lock().await;
     let storage = services
         .guild_storage
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("guild storage unavailable outside a guild"))?;
     let mut config = match storage.get(NAMESPACE, CONFIG_KEY).await? {
-        Some(raw) => {
-            serde_json::from_value::<GuildConfig>(raw).unwrap_or_else(|_| GuildConfig::default())
-        }
+        Some(raw) => match serde_json::from_value::<GuildConfig>(raw) {
+            Ok(config) => config,
+            Err(err) => {
+                tracing::warn!(%err, "store tracker config unreadable - resetting to defaults");
+                GuildConfig::default()
+            }
+        },
         None => GuildConfig::default(),
     };
     change(&mut config);

@@ -313,11 +313,6 @@ impl LcuClient {
         Ok(Self { http, lockfile_path: lockfile_path.into(), address: address.into() })
     }
 
-    #[must_use]
-    pub fn lockfile_path(&self) -> &Path {
-        &self.lockfile_path
-    }
-
     async fn read_credentials(&self) -> Result<LcuCredentials, LcuError> {
         if self.lockfile_path.as_os_str().is_empty() {
             return Err(LcuError::Offline("lockfile path is not configured".to_owned()));
@@ -331,10 +326,20 @@ impl LcuClient {
     }
 
     /// One GET with the lockfile credentials; one immediate credential
-    /// re-read + retry on 401 or transport failure (client mid-restart).
+    /// re-read + retry on 401 or transport failure (client mid-restart). A
+    /// re-read that lands while the lockfile is momentarily absent (the file
+    /// rewrite races the poll) gets a short beat and one more read before
+    /// the cycle gives up - an instant bail here would skip whole polls.
     async fn get_json(&self, path: &str) -> Result<reqwest::Response, LcuError> {
         for attempt in 0..2 {
-            let creds = self.read_credentials().await?;
+            let creds = match self.read_credentials().await {
+                Ok(creds) => creds,
+                Err(err) if attempt == 0 => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    self.read_credentials().await.map_err(|_| err)?
+                }
+                Err(err) => return Err(err),
+            };
             let url =
                 format!("{}://{}:{port}{path}", creds.protocol, self.address, port = creds.port);
             let response =
@@ -409,10 +414,10 @@ mod tests {
 
     #[test]
     fn lockfile_parses_all_five_fields() {
-        let creds = parse_lockfile("LeagueClient:49044:38436:BVBIHh_JNV1HtEViSVb7rA:https")
+        let creds = parse_lockfile("LeagueClient:49044:38436:SyntheticTestTokenABC123xyz:https")
             .expect("valid lockfile expected to parse");
         assert_eq!(creds.port, 38436);
-        assert_eq!(creds.token, "BVBIHh_JNV1HtEViSVb7rA");
+        assert_eq!(creds.token, "SyntheticTestTokenABC123xyz");
         assert_eq!(creds.protocol, "https");
     }
 

@@ -187,7 +187,6 @@ mod tests {
             requested: 3000,
             region_count: 3,
             failures: Vec::new(),
-            stale: false,
             age_seconds: 7500,
             role_sections: vec![
                 section_of("average", &role_row, lines_per_role_section),
@@ -209,7 +208,6 @@ mod tests {
     fn header_line_carries_coverage_age_and_failures() {
         let mut stats = stats_with_lines(1);
         stats.failures = vec!["na".to_owned()];
-        stats.stale = true;
         let rendered = render(&stats);
         let header = rendered.first().expect("header message");
         assert!(header.starts_with("# LoL Leaderboard Statistics"));

@@ -170,7 +170,9 @@ impl LeaderboardEngine {
         let now = Instant::now();
         let ttl = self.settings.cache_ttl;
 
-        // Short lock: decide what is stale. Fetches happen outside locks.
+        // Short cache-lock: decide what is stale. The fetches below run
+        // outside the cache lock - but inside the singleflight lock, so a
+        // long refresh delays other callers (bounded by the source caps).
         let stale_regions: Vec<String> = {
             let state = self.cache.lock();
             self.settings
@@ -426,6 +428,21 @@ mod tests {
 
     fn engine(source: &Arc<FakeSource>, regions: &[&str]) -> Arc<LeaderboardEngine> {
         engine_with(source, regions, Duration::from_secs(3600))
+    }
+
+    /// A stale region must refetch: without this, the dump would serve
+    /// frozen data forever after one failed refresh cycle.
+    #[tokio::test]
+    async fn ttl_expiry_triggers_a_refetch() {
+        let source = FakeSource::ungated();
+        let engine = engine_with(&source, &["kr"], Duration::from_millis(60));
+        let _ = engine.snapshot().await.expect("first snapshot");
+        let _ = engine.snapshot().await.expect("fresh snapshot");
+        assert_eq!(source.leaderboard_calls(), 1, "fresh cache answers without the source");
+
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        let _ = engine.snapshot().await.expect("stale snapshot");
+        assert_eq!(source.leaderboard_calls(), 2, "TTL expiry must trigger a refetch");
     }
 
     #[test]

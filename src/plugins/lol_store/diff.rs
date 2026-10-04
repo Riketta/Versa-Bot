@@ -125,33 +125,63 @@ pub fn merge(previous: &LastSeen, snapshot: &Snapshot) -> LastSeen {
         merged.sales = sales.iter().map(|sale| sale.id).collect();
     }
     if let Some(catalog) = &snapshot.catalog {
-        merged.skins = catalog
+        let skins: BTreeSet<u64> = catalog
             .iter()
             .filter(|item| item.inventory_type.as_deref() == Some("CHAMPION_SKIN"))
             .map(|item| item.item_id)
             .collect();
+        // Collapse guard: an Ok payload that empties a non-empty skin set is
+        // almost certainly a glitch (e.g. a mid-login store cold start), not
+        // the store losing every skin at once - adopting it would mass
+        // false-announce the whole catalog next poll. Keep the previous set.
+        if !previous.skins.is_empty() && skins.is_empty() {
+            tracing::warn!(
+                kept = previous.skins.len(),
+                "store catalog answered Ok but listed no skins - keeping the previous set"
+            );
+        } else {
+            merged.skins = skins;
+        }
     }
     if let Some(stores) = &snapshot.rotations {
-        merged.rotations = rotation_stores(stores)
-            .into_iter()
-            .filter_map(|store| {
-                let name = store.name.clone()?;
-                let meta = store.rotating_store_metadata.as_ref()?;
-                let entry_ids = store
-                    .catalog_entries
-                    .iter()
-                    .map(|entry| entry.id.clone().unwrap_or_default())
-                    .collect();
-                Some((
-                    name,
-                    RotationState {
-                        entry_ids,
-                        rotation_start: meta.curr_rotation_start_time.clone(),
-                        next_rotation: meta.next_rotation_start_time.clone(),
-                    },
-                ))
-            })
-            .collect();
+        // Per-store merge over the previous map: a store absent from the
+        // payload simply ends its rotation, but a present store whose entry
+        // list collapsed to nothing gets the same suspicion as the skins -
+        // its previous set is kept.
+        let mut rotations = previous.rotations.clone();
+        for store in rotation_stores(stores) {
+            let Some(name) = store.name.clone() else { continue };
+            let Some(meta) = store.rotating_store_metadata.as_ref() else { continue };
+            let entry_ids: BTreeSet<String> = store
+                .catalog_entries
+                .iter()
+                .map(|entry| entry.id.clone().unwrap_or_default())
+                .collect();
+            if entry_ids.is_empty()
+                && previous.rotations.get(&name).is_some_and(|state| !state.entry_ids.is_empty())
+            {
+                tracing::warn!(
+                    rotation = %name,
+                    "rotation answered Ok but empty - keeping the previous entry set"
+                );
+                continue;
+            }
+            rotations.insert(
+                name,
+                RotationState {
+                    entry_ids,
+                    rotation_start: meta.curr_rotation_start_time.clone(),
+                    next_rotation: meta.next_rotation_start_time.clone(),
+                },
+            );
+        }
+        // Stores absent from the payload end their rotations (the original
+        // whole-map replacement semantics) - the collapse keep above only
+        // applies to stores that are present.
+        let present: BTreeSet<String> =
+            rotation_stores(stores).iter().filter_map(|store| store.name.clone()).collect();
+        rotations.retain(|name, _| present.contains(name));
+        merged.rotations = rotations;
     }
     if let Some(status) = &snapshot.yourshop {
         merged.yourshop = Some(YourShopState {
@@ -381,6 +411,96 @@ mod tests {
                 .yourshop
                 .is_none()
         );
+    }
+
+    #[test]
+    fn merge_keeps_the_skin_set_when_an_ok_catalog_collapses() {
+        let previous = LastSeen { skins: BTreeSet::from([100, 200]), ..Default::default() };
+        // Ok-but-empty catalog: a mid-login glitch, not the store losing
+        // every skin. The previous set must survive.
+        let merged =
+            merge(&previous, &Snapshot { catalog: Some(Vec::new()), ..Default::default() });
+        assert_eq!(merged.skins, BTreeSet::from([100, 200]));
+
+        // A genuinely empty store from the start (no previous) adopts empty.
+        let merged = merge(
+            &LastSeen::default(),
+            &Snapshot { catalog: Some(Vec::new()), ..Default::default() },
+        );
+        assert!(merged.skins.is_empty());
+
+        // A shrink that stays non-empty adopts normally: skins legitimately
+        // rotate out of the catalog.
+        let merged = merge(
+            &previous,
+            &Snapshot { catalog: Some(vec![catalog_skin(999)]), ..Default::default() },
+        );
+        assert_eq!(merged.skins, BTreeSet::from([999]));
+    }
+
+    /// Only rotating MYTHIC_SHOP stores are tracked: a non-rotating shelf
+    /// or a different shoppefront family must never enter the state (and
+    /// thus never announce).
+    #[test]
+    fn non_rotating_and_non_mythic_stores_are_excluded() {
+        let mut featured = rotation_store("FEATURED_SHELF", &["a"]);
+        featured.rotating_store_metadata = None; // not rotating at all
+        let mut other_family = rotation_store("OTHER_FAMILY", &["b"]);
+        if let Some(meta) = other_family.display_metadata.as_mut() {
+            if let Some(shoppefront) = meta.shoppefront.as_mut() {
+                shoppefront.id = Some("ARAM_SHOP".to_owned());
+            }
+        }
+        let merged = merge(
+            &LastSeen::default(),
+            &Snapshot { rotations: Some(vec![featured, other_family]), ..Default::default() },
+        );
+        assert!(merged.rotations.is_empty(), "neither store is a tracked rotation");
+
+        // The real thing still lands.
+        let merged = merge(
+            &LastSeen::default(),
+            &Snapshot {
+                rotations: Some(vec![rotation_store("WEEKLY_ROTATION", &["a"])]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(merged.rotations.len(), 1);
+    }
+
+    #[test]
+    fn merge_keeps_a_rotation_whose_entries_collapse_but_drops_gone_stores() {
+        let previous = LastSeen {
+            rotations: BTreeMap::from([
+                (
+                    "WEEKLY_ROTATION".to_owned(),
+                    RotationState {
+                        entry_ids: BTreeSet::from(["a".to_owned(), "b".to_owned()]),
+                        rotation_start: None,
+                        next_rotation: None,
+                    },
+                ),
+                (
+                    "DAILY_ROTATION".to_owned(),
+                    RotationState {
+                        entry_ids: BTreeSet::from(["x".to_owned()]),
+                        rotation_start: None,
+                        next_rotation: None,
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        // WEEKLY answers Ok with an empty entry list (suspect collapse:
+        // kept), DAILY vanishes from the payload (rotation ended: dropped).
+        let snapshot = Snapshot {
+            rotations: Some(vec![rotation_store("WEEKLY_ROTATION", &[])]),
+            ..Default::default()
+        };
+        let merged = merge(&previous, &snapshot);
+        let weekly = merged.rotations.get("WEEKLY_ROTATION").expect("kept rotation");
+        assert_eq!(weekly.entry_ids, BTreeSet::from(["a".to_owned(), "b".to_owned()]));
+        assert!(merged.rotations.get("DAILY_ROTATION").is_none());
     }
 
     #[test]
