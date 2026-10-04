@@ -307,7 +307,9 @@ client's REST API is read-only here: your logged-in account is only the
 API key, and no account data (wallet, inventory, purchases) is ever
 read or announced. Because there is no purchase-history endpoint, every
 event is detected by diffing store snapshots - two changes inside one
-poll window merge into a single line.
+poll window merge into a single line. Listings print cheapest-first
+(priceless items last); sales keep their end-date grouping (soonest
+date first, price order within a date).
 
 Setup: point `[lol_store]` at the client's `lockfile` (the bot reads the
 per-start port and token from it, so client restarts self-heal), enable

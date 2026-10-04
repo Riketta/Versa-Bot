@@ -121,34 +121,46 @@ impl Section {
     }
 }
 
+/// Sort key for the price-ascending listings: priceless items sink to the
+/// end; equal prices keep the API's arrival order (stable sort).
+fn by_price(price: Option<u64>) -> u64 {
+    price.unwrap_or(u64::MAX)
+}
+
 /// Sales grouped by end date: most of a cycle's sales share one end date,
 /// and repeating it per line burns embed budget. Groups sort by date
-/// ascending; undated sales land in a trailing untitled group.
+/// ascending; within a group by sale price ascending (priceless last);
+/// undated sales land in a trailing untitled group in the same order.
 fn sales_sections(sales: &[super::lcu::Sale], index: &NameIndex) -> Vec<Section> {
-    let mut dated: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut undated: Vec<String> = Vec::new();
+    let mut dated: BTreeMap<String, Vec<&super::lcu::Sale>> = BTreeMap::new();
+    let mut undated: Vec<&super::lcu::Sale> = Vec::new();
     for sale in sales {
         match sale.sale.end_date.as_deref() {
-            Some(ends) => {
-                dated.entry(date(ends)).or_default().push(sale_line(sale, index, false));
-            }
-            None => undated.push(sale_line(sale, index, false)),
+            Some(ends) => dated.entry(date(ends)).or_default().push(sale),
+            None => undated.push(sale),
         }
     }
     let mut sections: Vec<Section> = dated
         .into_iter()
-        .map(|(day, lines)| Section::new(format!("New sales \u{b7} until {day}"), lines))
+        .map(|(day, mut group)| {
+            group.sort_by_key(|sale| by_price(rp_price(&sale.sale.prices)));
+            let lines = group.iter().map(|sale| sale_line(sale, index, false)).collect();
+            Section::new(format!("New sales \u{b7} until {day}"), lines)
+        })
         .collect();
     if !undated.is_empty() {
-        sections.push(Section::new("New sales", undated));
+        undated.sort_by_key(|sale| by_price(rp_price(&sale.sale.prices)));
+        let lines = undated.iter().map(|sale| sale_line(sale, index, false)).collect();
+        sections.push(Section::new("New sales", lines));
     }
     sections
 }
 
 /// Renders the full announcement into embed-sized pages - every section,
 /// every line: sales grouped by end date, new skins, each mythic rotation,
-/// the Your Shop start. Nothing is dropped or cut (a page pack that would
-/// overflow starts a new page instead). Empty when nothing renders.
+/// the Your Shop start - items within a section cheapest first (priceless
+/// last). Nothing is dropped or cut (a page pack that would overflow
+/// starts a new page instead). Empty when nothing renders.
 #[must_use]
 pub fn announce_pages(delta: &StoreDelta, index: &NameIndex) -> Vec<String> {
     let mut sections: Vec<Section> = Vec::new();
@@ -156,11 +168,15 @@ pub fn announce_pages(delta: &StoreDelta, index: &NameIndex) -> Vec<String> {
         sections.extend(sales_sections(&delta.sales, index));
     }
     if !delta.skins.is_empty() {
-        let lines: Vec<String> = delta.skins.iter().map(|item| skin_line(item, index)).collect();
+        let mut skins: Vec<&CatalogItem> = delta.skins.iter().collect();
+        skins.sort_by_key(|item| by_price(rp_price(&item.prices)));
+        let lines: Vec<String> = skins.into_iter().map(|item| skin_line(item, index)).collect();
         sections.push(Section::new("New in store", lines));
     }
     for rotation in &delta.rotations {
-        let lines: Vec<String> = rotation.entries.iter().map(mythic_line).collect();
+        let mut entries: Vec<&super::diff::MythicEntry> = rotation.entries.iter().collect();
+        entries.sort_by_key(|entry| by_price(entry.mythic_price));
+        let lines: Vec<String> = entries.into_iter().map(mythic_line).collect();
         if lines.is_empty() {
             continue;
         }
@@ -606,7 +622,87 @@ mod tests {
                 < position("**New sales · until 2026-10-12**")
         );
         assert!(text.contains("**New sales**\n- Skin 30001"), "undated sales trail: {text}");
-        assert!(!text.contains("RP · until"), "dates live in the titles only: {text}");
+        assert!(!text.contains("RP \u{b7} until"), "dates live in the titles only: {text}");
+    }
+
+    /// Within one end-date group the cheapest sale prints first and a
+    /// priceless sale (empty price list) sinks last; the same price order
+    /// applies to the undated trailing group.
+    #[test]
+    fn sales_sort_by_price_within_a_group() {
+        let priceless = super::super::lcu::Sale {
+            id: 9,
+            item: ItemRef {
+                inventory_type: Some("CHAMPION_SKIN".to_owned()),
+                item_id: Some(50_001),
+            },
+            sale: SaleInfo {
+                start_date: None,
+                end_date: Some("2026-10-05T17:00:00.000+00:00".to_owned()),
+                prices: Vec::new(),
+            },
+        };
+        let sales = vec![
+            skin_sale_named(2, 20_001, 700, Some("2026-10-05T17:00:00.000+00:00")),
+            priceless,
+            skin_sale_named(1, 10_001, 607, Some("2026-10-05T17:00:00.000+00:00")),
+            skin_sale_named(3, 40_001, 800, None),
+        ];
+        let delta = StoreDelta { sales, ..Default::default() };
+        let text = announce_pages(&delta, &NameIndex::empty()).join("\n\n");
+        let position = |needle: &str| text.find(needle).expect(needle);
+        // Grouped by day, cheapest first, priceless sinks to the group's end.
+        assert!(position("- Skin 10001 \u{b7} 607 RP") < position("- Skin 20001 \u{b7} 700 RP"));
+        assert!(position("- Skin 20001 \u{b7} 700 RP") < position("- Skin 50001"));
+        assert!(
+            position("**New sales \u{b7} until 2026-10-05**") < position("**New sales**\n"),
+            "dated groups precede the undated one"
+        );
+    }
+
+    /// The skins and mythic listings are price-ascending too, priceless
+    /// entries last.
+    #[test]
+    fn skins_and_mythic_sort_by_price() {
+        let skin = |id: u64, cost: Option<u64>| CatalogItem {
+            item_id: id,
+            inventory_type: Some("CHAMPION_SKIN".to_owned()),
+            prices: cost
+                .map(|cost| vec![Price { cost: Some(cost), currency: Some("RP".to_owned()) }])
+                .unwrap_or_default(),
+            ..CatalogItem::default()
+        };
+        let entry = |name: &str, price: Option<u64>| super::super::diff::MythicEntry {
+            entry_id: None,
+            name: Some(name.to_owned()),
+            mythic_price: price,
+        };
+        let delta = StoreDelta {
+            skins: vec![skin(20_002, Some(1350)), skin(10_002, Some(520)), skin(30_002, None)],
+            rotations: vec![super::super::diff::RotationDelta {
+                label: "weekly".to_owned(),
+                rotation_start: None,
+                next_rotation: None,
+                entries: vec![
+                    entry("Expensive", Some(100)),
+                    entry("Priceless", None),
+                    entry("Cheap", Some(35)),
+                ],
+            }],
+            ..Default::default()
+        };
+        let text = announce_pages(&delta, &NameIndex::empty()).join("\n\n");
+        let position = |needle: &str| text.find(needle).expect(needle);
+        assert!(
+            position("- Champion 10 — Skin 10002 · 520 RP")
+                < position("- Champion 20 — Skin 20002 · 1350 RP")
+        );
+        assert!(
+            position("- Champion 20 — Skin 20002 · 1350 RP")
+                < position("- Champion 30 — Skin 30002")
+        );
+        assert!(position("- Cheap · 35 ME") < position("- Expensive · 100 ME"));
+        assert!(position("- Expensive · 100 ME") < position("- Priceless"));
     }
 
     #[test]
