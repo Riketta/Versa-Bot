@@ -21,8 +21,8 @@ use crate::kernel::{
 use super::chat_engine::ChatEngine;
 use super::commands::{
     AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler, CutoffLlmHandler,
-    ModelsLlmHandler, PromptFileLlmHandler, PromptLlmHandler, SET_KEYS, SetLlmHandler,
-    StatusLlmHandler, UnassignLlmHandler, model_choices,
+    GetLlmHandler, ModelsLlmHandler, PromptFileLlmHandler, PromptLlmHandler, SET_KEYS,
+    SetLlmHandler, StatusLlmHandler, UnassignLlmHandler, model_choices,
 };
 use super::model::{ChannelConfig, NAMESPACE, channel_config_key};
 
@@ -332,6 +332,22 @@ impl PluginPort for LlmPlugin {
             ),
             Arc::new(SetLlmHandler::new(Arc::clone(&self.channel_locks), Arc::clone(&self.engine))),
         );
+        self.registry.register(
+            self.descriptor(
+                "llm_get",
+                "Show the current value of a channel chat setting (all keys when omitted)",
+                vec![ArgDescriptor {
+                    name: "key".to_owned(),
+                    description: "Setting to read - see the dropdown; omit to list every setting"
+                        .to_owned(),
+                    required: false,
+                    kind: ArgKind::String,
+                    choices: Some(SET_KEYS.iter().map(|key| (*key).to_owned()).collect()),
+                }],
+                AccessTier::Moderator,
+            ),
+            Arc::new(GetLlmHandler::new(Arc::clone(&self.engine))),
+        );
         self.register_prompt_commands();
         Ok(())
     }
@@ -616,6 +632,7 @@ mod tests {
                 "llm_admin_clear",
                 "llm_assign",
                 "llm_cutoff",
+                "llm_get",
                 "llm_models",
                 "llm_prompt",
                 "llm_prompt_file",
@@ -635,6 +652,69 @@ mod tests {
             };
             assert_eq!(descriptor.required_tier, Some(expected), "command {}", descriptor.name);
         }
+    }
+
+    #[tokio::test]
+    async fn get_reads_back_the_channel_config() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        AssignLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("model".to_owned(), "local/gemma".to_owned())]),
+                &fixture.services,
+            )
+            .await
+            .expect("assign expected to succeed");
+
+        let handler = GetLlmHandler::new(Arc::clone(&fixture.engine));
+        let invoke = |key: Option<&str>| {
+            let args = key.map(|key| vec![("key".to_owned(), key.to_owned())]).unwrap_or_default();
+            (&handler, CommandArgs(args))
+        };
+
+        // Single key: the stored value.
+        let (handler_ref, args) = invoke(Some("model"));
+        handler_ref
+            .invoke(&command_event(Some(1)), &args, &fixture.services)
+            .await
+            .expect("get expected to succeed");
+        let reply = fixture.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("`model`: local/gemma"), "unexpected: {reply}");
+
+        // Unknown key: usage, not a value.
+        let (handler_ref, args) = invoke(Some("nonsense"));
+        handler_ref
+            .invoke(&command_event(Some(1)), &args, &fixture.services)
+            .await
+            .expect("get expected to succeed");
+        let reply = fixture.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("Unknown key"), "unexpected: {reply}");
+
+        // No key: one line per setting, defaults as effective values.
+        let (handler_ref, args) = invoke(None);
+        handler_ref
+            .invoke(&command_event(Some(1)), &args, &fixture.services)
+            .await
+            .expect("get expected to succeed");
+        let reply = fixture.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("Channel settings:"), "unexpected: {reply}");
+        assert!(reply.contains("`react`: off"), "unexpected: {reply}");
+        assert!(reply.contains("`model`: local/gemma"), "unexpected: {reply}");
+        assert!(reply.contains("plugin default"), "unexpected: {reply}");
+    }
+
+    #[tokio::test]
+    async fn get_without_assignment_replies_not_assigned() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+
+        GetLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("get expected to succeed");
+
+        assert!(fixture.output.messages().last().expect("reply expected").contains("not assigned"));
     }
 
     #[tokio::test]

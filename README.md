@@ -425,13 +425,15 @@ channel; tier denials are ephemeral too.
 | `/llm_prompt prompt:<text>` | set the channel system prompt; `clear` falls back to the plugin default (inline limit: Discord's ~6000-character option cap) |
 | `/llm_prompt_file file:<attachment>` | set the system prompt from an uploaded text/markdown file - for prompts beyond the inline limit; fetched from Discord's CDN only, capped by `[llm] max_prompt_file_bytes` (128 KiB default) |
 | `/llm_set key:<key> value:<value>` | tune one channel setting (table below); value `clear`/`none`/`default` resets it |
+| `/llm_get key:<key>` | show a setting's current value (defaults render as the effective value, long text truncated); omit `key` to list every setting |
 | `/llm_cutoff` | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
 | `/llm_status` | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, compaction, image recognition (state, model, prompt length), reactions (state, silent-react chance), capture mode, chime-in chance, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
 | `/llm_admin` | make this channel the guild's service channel for error notices (one per guild, last write wins) |
 | `/llm_admin_clear` | stop service notices |
 
 **`/llm_set` keys** (invalid values are answered with usage and never
-saved):
+saved; `/llm_get` reads the same keys back - the channel system prompt
+itself is `/llm_prompt`'s, visible via `/llm_status`):
 
 | Key | Meaning | Default |
 |---|---|---|

@@ -19,8 +19,8 @@ use super::chat_engine::ChatEngine;
 use super::conversation::ConversationRecord;
 use super::llm_plugin::ChannelLocks;
 use super::model::{
-    CaptureMode, ChannelConfig, ConversationState, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats,
-    channel_config_key, channel_state_key, channel_stats_key, default_random_cooldown,
+    CaptureMode, ChannelConfig, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY,
+    UsageStats, channel_config_key, channel_state_key, channel_stats_key, default_random_cooldown,
     records_namespace, unix_now,
 };
 use super::providers::{LlmSettings, ModelSettings};
@@ -1083,6 +1083,177 @@ impl CommandHandler for SetLlmHandler {
     }
 }
 
+/// `/llm_get`: reads back a channel's current setting values - one key, or
+/// every key when the argument is omitted. Read-only twin of `/llm_set`:
+/// same moderator tier, same ephemeral visibility (config details are
+/// nobody else's business), no channel lock (a single document read; a
+/// concurrent `/llm_set` lands before or after it, both are fine).
+pub(super) struct GetLlmHandler {
+    engine: Arc<ChatEngine>,
+}
+
+impl GetLlmHandler {
+    pub(super) fn new(engine: Arc<ChatEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+#[async_trait]
+impl CommandHandler for GetLlmHandler {
+    async fn invoke(
+        &self,
+        event: &RequestContext,
+        args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
+        let Some(config) = load_assigned_config(event, services).await? else {
+            return Ok(());
+        };
+        match args.get("key") {
+            Some(key) => match current_value(&config, key, self.engine.settings()) {
+                Some(value) => {
+                    services.chat_output.send(command_reply(format!("`{key}`: {value}"))).await?;
+                }
+                None => {
+                    services
+                        .chat_output
+                        .send(command_reply(format!(
+                            "Unknown key `{key}`. Keys: {}.",
+                            SET_KEYS.join(", ")
+                        )))
+                        .await?;
+                }
+            },
+            // No key: every setting, one line each. Long free-text values
+            // render as shapes - the full text is one `/llm_get key` away.
+            None => {
+                let lines: Vec<String> = SET_KEYS
+                    .iter()
+                    .map(|key| {
+                        let value = current_value(&config, key, self.engine.settings())
+                            .unwrap_or_else(|| "?".to_owned());
+                        format!("`{key}`: {value}")
+                    })
+                    .collect();
+                services
+                    .chat_output
+                    .send(command_reply(format!("Channel settings:\n{}", lines.join("\n"))))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The current value of one `/llm_set` key, rendered for `/llm_get`.
+/// `None` = unknown key. Defaults render as the EFFECTIVE value (what the
+/// engine would use now), so an admin never has to guess what "default"
+/// means; long free-text values stay full unless they would blow the reply
+/// budget, where they degrade to a head preview plus a length note.
+fn current_value(config: &ChannelConfig, key: &str, settings: &LlmSettings) -> Option<String> {
+    let not_sent = || "not sent (provider default)".to_owned();
+    let on_off = |enabled: bool| if enabled { "on" } else { "off" }.to_owned();
+    let text_or = |value: &Option<String>, fallback: String| {
+        value.clone().map_or(fallback, |text| shape_or_preview(&text))
+    };
+    match key {
+        "model" => Some(config.model.clone()),
+        "temperature" | "top_p" | "top_k" | "min_p" | "frequency_penalty" | "presence_penalty" => {
+            Some(
+                sampling_value(&config.params, key)
+                    .map_or_else(not_sent, |value| format!("{value}")),
+            )
+        }
+        "max_tokens" => {
+            Some(config.params.max_tokens.map_or_else(not_sent, |value| format!("{value}")))
+        }
+        "reasoning_effort" => Some(
+            config
+                .params
+                .reasoning_effort
+                .clone()
+                .map_or_else(not_sent, |value| format!("`{value}`")),
+        ),
+        "depth" => Some(format!("{} messages", config.history_depth)),
+        "context_budget" => Some(
+            config
+                .context_budget_tokens
+                .map_or_else(|| "auto".to_owned(), |tokens| format!("{tokens} tokens")),
+        ),
+        "streaming" => Some(on_off(config.streaming)),
+        "react" => Some(on_off(config.react)),
+        "capture_mode" => Some(match config.capture_mode {
+            CaptureMode::BotRelated => "bot_related".to_owned(),
+            CaptureMode::AllMessages => "all_messages".to_owned(),
+        }),
+        "compaction" => Some(on_off(config.compaction_enabled)),
+        "compaction_model" => Some(
+            config
+                .compaction_model
+                .clone()
+                .unwrap_or_else(|| format!("the channel's chat model (`{}`)", config.model)),
+        ),
+        "compaction_prompt" => Some(text_or(
+            &config.compaction_prompt,
+            format!(
+                "<plugin default, {} chars>",
+                settings.default_compaction_prompt.chars().count()
+            ),
+        )),
+        "images" => Some(on_off(config.images)),
+        "image_model" => Some(config.image_model.clone().unwrap_or_else(|| {
+            settings.image_model.clone().map_or_else(
+                || "off (no operator image model)".to_owned(),
+                |model| format!("plugin `image_model` (`{model}`)"),
+            )
+        })),
+        "image_prompt" => Some(text_or(
+            &config.image_prompt,
+            settings.image_prompt.clone().map_or_else(
+                || "<built-in default>".to_owned(),
+                |prompt| format!("<plugin default, {} chars>", prompt.chars().count()),
+            ),
+        )),
+        "random_chance" => Some(format!("{:.1}%", config.random_chance_percent)),
+        "random_cooldown" => Some(format!("{} seconds", config.random_cooldown_secs)),
+        "random_react_chance" => Some(format!("{:.1}%", config.random_react_chance_percent)),
+        "max_length" => Some(config.max_length.map_or_else(
+            || format!("{} (max_message_length)", settings.max_message_length),
+            |limit| format!("{limit}"),
+        )),
+        "turn_template" => Some(config.turn_template.clone().map_or_else(
+            || format!("`{}` (plugin default)", super::conversation::DEFAULT_TURN_TEMPLATE),
+            |template| format!("`{template}`"),
+        )),
+        _ => None,
+    }
+}
+
+/// Read half of [`set_float`]: the sampling parameter a `/llm_set` key
+/// addresses, `None` when unset (not sent to the provider).
+fn sampling_value(params: &GenParams, key: &str) -> Option<f64> {
+    match key {
+        "temperature" => params.temperature,
+        "top_p" => params.top_p,
+        "top_k" => params.top_k,
+        "min_p" => params.min_p,
+        "frequency_penalty" => params.frequency_penalty,
+        "presence_penalty" => params.presence_penalty,
+        _ => None,
+    }
+}
+
+/// Long free-text values stay full while they fit a Discord reply; beyond
+/// that they degrade to a head preview plus a length note (same shapes-not-
+/// contents convention as the audit log).
+fn shape_or_preview(text: &str) -> String {
+    const FULL_UP_TO: usize = 1200;
+    if text.chars().count() <= FULL_UP_TO {
+        return format!("`{text}`");
+    }
+    format!("`{}` ... ({} chars total)", preview(text, FULL_UP_TO), text.chars().count())
+}
+
 /// `/llm_prompt`: sets the channel's system prompt (long free text); the
 /// value `clear` falls back to the plugin-wide default. Like `/llm_set`, the
 /// read-modify-write runs under the channel's processing lock.
@@ -1520,6 +1691,72 @@ mod tests {
         assert!(err.contains("on or off"), "unexpected reply: {err}");
         assert!(!err.contains("Unknown key"), "unexpected reply: {err}");
         assert!(!config.streaming, "the failed set must not mutate");
+    }
+
+    #[test]
+    fn current_value_renders_set_and_default_states() {
+        let settings = LlmSettings::default();
+        let mut config = ChannelConfig::assigned("local/gemma".to_owned());
+
+        // Default state renders the EFFECTIVE value - what the engine uses.
+        assert_eq!(current_value(&config, "model", &settings).as_deref(), Some("local/gemma"));
+        assert_eq!(
+            current_value(&config, "temperature", &settings).as_deref(),
+            Some("not sent (provider default)")
+        );
+        assert_eq!(
+            current_value(&config, "reasoning_effort", &settings).as_deref(),
+            Some("not sent (provider default)")
+        );
+        assert_eq!(current_value(&config, "depth", &settings).as_deref(), Some("100 messages"));
+        assert_eq!(current_value(&config, "context_budget", &settings).as_deref(), Some("auto"));
+        assert_eq!(current_value(&config, "streaming", &settings).as_deref(), Some("off"));
+        assert_eq!(
+            current_value(&config, "capture_mode", &settings).as_deref(),
+            Some("bot_related")
+        );
+        assert_eq!(current_value(&config, "compaction", &settings).as_deref(), Some("on"));
+        assert!(
+            current_value(&config, "compaction_model", &settings)
+                .expect("compaction_model expected")
+                .contains("chat model")
+        );
+        assert_eq!(current_value(&config, "images", &settings).as_deref(), Some("off"));
+        assert_eq!(current_value(&config, "react", &settings).as_deref(), Some("off"));
+        assert_eq!(current_value(&config, "random_chance", &settings).as_deref(), Some("2.0%"));
+        assert_eq!(
+            current_value(&config, "random_react_chance", &settings).as_deref(),
+            Some("10.0%")
+        );
+        assert_eq!(
+            current_value(&config, "max_length", &settings).as_deref(),
+            Some("2000 (max_message_length)")
+        );
+        assert!(
+            current_value(&config, "turn_template", &settings)
+                .expect("turn_template expected")
+                .contains("plugin default")
+        );
+        assert_eq!(current_value(&config, "nope", &settings), None);
+
+        // Set state renders the stored value.
+        config.params.temperature = Some(0.7);
+        config.params.reasoning_effort = Some("off".to_owned());
+        config.context_budget_tokens = Some(4096);
+        config.streaming = true;
+        config.react = true;
+        config.random_chance_percent = 7.5;
+        config.max_length = Some(500);
+        assert_eq!(current_value(&config, "temperature", &settings).as_deref(), Some("0.7"));
+        assert_eq!(current_value(&config, "reasoning_effort", &settings).as_deref(), Some("`off`"));
+        assert_eq!(
+            current_value(&config, "context_budget", &settings).as_deref(),
+            Some("4096 tokens")
+        );
+        assert_eq!(current_value(&config, "streaming", &settings).as_deref(), Some("on"));
+        assert_eq!(current_value(&config, "react", &settings).as_deref(), Some("on"));
+        assert_eq!(current_value(&config, "random_chance", &settings).as_deref(), Some("7.5%"));
+        assert_eq!(current_value(&config, "max_length", &settings).as_deref(), Some("500"));
     }
 
     #[test]
