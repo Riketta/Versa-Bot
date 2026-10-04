@@ -30,57 +30,6 @@ url = "sqlite://versabot.db"
 # reporting. Low rates like 0.01 keep the data volume down.
 # traces_sample_rate = 0.01
 
-# Optional: status rotator - cycles the bot's activity through the list.
-# Presence is bot-wide (not per-guild). Remove the section, empty the list,
-# or set interval_seconds to 0 to disable the rotation.
-# [status]
-# interval_seconds = 300
-# statuses = ["with the API", "versa-bot", "over the guild"]
-
-# Optional: LoL store watcher - announces store events (new sales, new
-# skins, Mythic Shop rotations, Your Shop start) from the locally running
-# League client to a per-guild assigned channel (/lol_store_enable +
-# /lol_store_assign). Startup-only: an absent section, an empty
-# lockfile_path, or poll_secs = 0 keeps the watcher off. Your logged-in
-# account is only the API key - no account data is ever read or announced.
-# [lol_store]
-# lockfile_path = "C:/Riot Games/League of Legends/lockfile"
-# Host the client API listens on; the port always comes from the lockfile.
-# address = "127.0.0.1"
-# poll_secs = 300
-# announce_sales = true
-# announce_new_skins = true
-# announce_mythic_rotation = true
-# announce_yourshop = true
-# Per-user / per-guild caps on /lol_store_watch subscriptions.
-# watch_user_cap = 20
-# watch_guild_cap = 300
-
-# Optional: LoL leaderboard - the on-demand /lol_leaderboard statistics
-# dump (role distributions, most picked champions per role) from a public
-# leaderboard source. Startup-only: an absent section, no regions, or a
-# zero request_interval_secs / parse_depth / cache_ttl_secs keeps the
-# command in "not configured" mode. No per-guild setup - the command
-# answers wherever it is invoked. All display windows (buckets, champ
-# pool) are clamped to parse_depth.
-# [lol_leaderboard]
-# Regions (servers) to aggregate - empty = plugin off.
-# regions = ["kr", "euw", "na"]
-# Minimum delay in seconds between source requests (sequential).
-# request_interval_secs = 1
-# Top players parsed per region.
-# parse_depth = 1000
-# Player-count rows for the role-distribution tables.
-# display_buckets = [300, 1000]
-# Player pool (per region, best first) behind the champion tables.
-# champ_pool_depth = 1000
-# Champions listed per role.
-# champs_per_role = 5
-# How long cached data stays fresh (default 18h).
-# cache_ttl_secs = 64800
-# Optional proxy for source requests (socks5:// or http://).
-# proxy = "socks5://192.168.1.35:8081"
-
 # Optional: LLM chat runtime. This section is the bot operator's domain -
 # guild moderators only pick among the declared models via /llm_assign
 # and /llm_set, never configure endpoints. Startup-only: changes require
@@ -107,10 +56,6 @@ url = "sqlite://versabot.db"
 # [[react: ...]] marker, which is stripped before the answer is shown;
 # channels opt in via /llm_set react on.
 # react_max_per_message = 3
-# Diagnostic: dump every LLM request and response body at DEBUG level
-# (stdout only, never Sentry). The bodies carry full conversation
-# content - enable only while debugging a provider.
-# log_raw_traffic = false
 #
 # Image recognition: attached images in assigned channels are described by
 # a vision-capable model at capture time; the description is stored with
@@ -132,6 +77,11 @@ url = "sqlite://versabot.db"
 # Cap on images described per captured message; images beyond it are
 # recorded undescribed.
 # max_images_per_message = 2
+#
+# Diagnostic: dump every LLM request and response body at DEBUG level
+# (stdout only, never Sentry). The bodies carry full conversation
+# content - enable only while debugging a provider.
+# log_raw_traffic = false
 
 # Providers are OpenAI-compatible endpoints. `api_key_env` NAMES the
 # environment variable holding the key - it must never contain the key
@@ -190,3 +140,54 @@ url = "sqlite://versabot.db"
 # [llm.models."local/unsloth/gemma-4-26B-A4B-it-qat-GGUF"]
 # reasoning = false
 # context_window = 32768
+
+# Optional: status rotator - cycles the bot's activity through the list.
+# Presence is bot-wide (not per-guild). Remove the section, empty the list,
+# or set interval_seconds to 0 to disable the rotation.
+# [status]
+# interval_seconds = 300
+# statuses = ["with the API", "versa-bot", "over the guild"]
+
+# Optional: LoL store watcher - announces store events (new sales, new
+# skins, Mythic Shop rotations, Your Shop start) from the locally running
+# League client to a per-guild assigned channel (/lol_store_enable +
+# /lol_store_assign). Startup-only: an absent section, an empty
+# lockfile_path, or poll_secs = 0 keeps the watcher off. Your logged-in
+# account is only the API key - no account data is ever read or announced.
+# [lol_store]
+# lockfile_path = "C:/Riot Games/League of Legends/lockfile"
+# Host the client API listens on; the port always comes from the lockfile.
+# address = "127.0.0.1"
+# poll_secs = 300
+# announce_sales = true
+# announce_new_skins = true
+# announce_mythic_rotation = true
+# announce_yourshop = true
+# Per-user / per-guild caps on /lol_store_watch subscriptions.
+# watch_user_cap = 20
+# watch_guild_cap = 300
+
+# Optional: LoL leaderboard - the on-demand /lol_leaderboard statistics
+# dump (role distributions, most picked champions per role) from a public
+# leaderboard source. Startup-only: an absent section, no regions, or a
+# zero request_interval_secs / parse_depth / cache_ttl_secs keeps the
+# command in "not configured" mode. No per-guild setup - the command
+# answers wherever it is invoked. All display windows (buckets, champ
+# pool) are clamped to parse_depth.
+# [lol_leaderboard]
+# Regions (servers) to aggregate - empty = plugin off.
+# regions = ["kr", "euw", "na"]
+# Minimum delay in seconds between source requests (sequential).
+# request_interval_secs = 1
+# Top players parsed per region.
+# parse_depth = 1000
+# Player-count rows for the role-distribution tables.
+# display_buckets = [300, 1000]
+# Player pool (per region, best first) behind the champion tables.
+# champ_pool_depth = 1000
+# Champions listed per role.
+# champs_per_role = 5
+# How long cached data stays fresh (default 18h).
+# cache_ttl_secs = 64800
+# Optional proxy for source requests (socks5:// or http://).
+# proxy = "socks5://192.168.1.35:8081"
