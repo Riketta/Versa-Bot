@@ -58,6 +58,11 @@ async fn reply_guild_only(services: &KernelServices) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Storage key where an unreadable watch document is preserved before the
+/// first overwrite - the fresh doc repairs the commands, the copy keeps the
+/// corruption recoverable.
+pub(crate) const WATCH_RECOVERY_KEY: &str = "subscriptions.unreadable";
+
 /// `/lol_store_enable`: guild-level switch (admin).
 pub struct EnableHandler;
 
@@ -228,6 +233,11 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for ClientStat
         _args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
+        // Same self-guard as every other handler: defense in depth next to
+        // the descriptor's `guild_only`.
+        if services.guild_storage.is_none() {
+            return reply_guild_only(services).await;
+        }
         services.chat_output.send(command_reply(self.engine.status_text())).await?;
         Ok(())
     }
@@ -237,22 +247,35 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for ClientStat
 /// User-frequency operations, but the same last-write-wins hazard applies.
 static WATCH_WRITE: AsyncMutex<()> = AsyncMutex::const_new(());
 
-/// Loads the guild's watch document; an unreadable doc is logged and treated
-/// as empty (ids may restart - mutations only ever save on real change, so
-/// a reset is never persisted by a read-only command path).
+/// Loads the guild's watch document alongside its raw form when that form
+/// fails to deserialize: mutations move the unreadable raw aside (see
+/// [`quarantine_unreadable`]) instead of silently destroying it, while
+/// read-only paths never persist anything.
 async fn load_watch_doc(
     storage: &dyn crate::kernel::spi_ports::GuildStorage,
-) -> anyhow::Result<WatchDoc> {
+) -> anyhow::Result<(WatchDoc, Option<serde_json::Value>)> {
     match storage.get(NAMESPACE, WATCH_KEY).await? {
-        Some(raw) => match serde_json::from_value::<WatchDoc>(raw) {
-            Ok(doc) => Ok(doc),
+        Some(raw) => match serde_json::from_value::<WatchDoc>(raw.clone()) {
+            Ok(doc) => Ok((doc, None)),
             Err(err) => {
                 tracing::warn!(%err, "watch doc unreadable - treating as empty");
-                Ok(WatchDoc::default())
+                Ok((WatchDoc::default(), Some(raw)))
             }
         },
-        None => Ok(WatchDoc::default()),
+        None => Ok((WatchDoc::default(), None)),
     }
+}
+
+/// Preserves an unreadable watch document under a recovery key before the
+/// caller's fresh document overwrites it. Idempotent: a newer unreadable
+/// doc replaces the stashed one.
+async fn quarantine_unreadable(
+    storage: &dyn crate::kernel::spi_ports::GuildStorage,
+    raw: &serde_json::Value,
+) -> anyhow::Result<()> {
+    tracing::warn!("moving the unreadable watch doc aside before overwrite");
+    storage.set(NAMESPACE, WATCH_RECOVERY_KEY, raw.clone()).await?;
+    Ok(())
 }
 
 /// One `/lol_store_watch` name-resolution outcome.
@@ -411,7 +434,7 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for WatchHandl
 
         // Read-modify-write: caps are enforced between load and save.
         let _guard = WATCH_WRITE.lock().await;
-        let mut doc = load_watch_doc(storage.as_ref()).await?;
+        let (mut doc, unreadable) = load_watch_doc(storage.as_ref()).await?;
         let settings = self.engine.settings();
         let user_cap = usize::try_from(settings.watch_user_cap).unwrap_or(usize::MAX);
         let guild_cap = usize::try_from(settings.watch_guild_cap).unwrap_or(usize::MAX);
@@ -439,6 +462,9 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for WatchHandl
             return Ok(());
         }
         let id = doc.insert(user_id, target.clone(), kinds);
+        if let Some(raw) = &unreadable {
+            quarantine_unreadable(storage.as_ref(), raw).await?;
+        }
         storage.set(NAMESPACE, WATCH_KEY, serde_json::to_value(&doc)?).await?;
         drop(_guard);
 
@@ -480,7 +506,7 @@ impl CommandHandler for UnwatchHandler {
         };
 
         let _guard = WATCH_WRITE.lock().await;
-        let mut doc = load_watch_doc(storage.as_ref()).await?;
+        let (mut doc, unreadable) = load_watch_doc(storage.as_ref()).await?;
         let (changed, reply_text) = if what.eq_ignore_ascii_case("all") {
             let removed = doc.remove_all_of(&user_id);
             let text = if removed == 0 {
@@ -499,6 +525,9 @@ impl CommandHandler for UnwatchHandler {
             }
         };
         if changed {
+            if let Some(raw) = &unreadable {
+                quarantine_unreadable(storage.as_ref(), raw).await?;
+            }
             storage.set(NAMESPACE, WATCH_KEY, serde_json::to_value(&doc)?).await?;
         }
         drop(_guard);
@@ -523,12 +552,9 @@ impl CommandHandler for WatchlistHandler {
             return reply_guild_only(services).await;
         };
         let user_id = event.origin.user_id.get().to_string();
-        let mut mine: Vec<_> = load_watch_doc(storage.as_ref())
-            .await?
-            .subs
-            .into_iter()
-            .filter(|watch| watch.user_id == user_id)
-            .collect();
+        let (doc, _) = load_watch_doc(storage.as_ref()).await?;
+        let mut mine: Vec<_> =
+            doc.subs.into_iter().filter(|watch| watch.user_id == user_id).collect();
         mine.sort_by_key(|watch| watch.id);
         let reply_text = if mine.is_empty() {
             "No watches yet - add one with `/lol_store_watch`.".to_owned()
@@ -562,6 +588,11 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for DumpHandle
         _args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
+        // Same self-guard as every other handler: defense in depth next to
+        // the descriptor's `guild_only`.
+        if services.guild_storage.is_none() {
+            return reply_guild_only(services).await;
+        }
         let mut pages = self.engine.last_announcement_pages();
         let mut title = "LoL Store - latest update";
         if pages.is_empty() {

@@ -510,7 +510,7 @@ mod tests {
                     item_id: Some(103),
                 }],
             };
-            Ok(vec![skin(1031, "Foxfire Ahri"), skin(1032, "Dynastry Ahri")])
+            Ok(vec![skin(1031, "Foxfire Ahri"), skin(1032, "Dynasty Ahri")])
         }
 
         async fn sales(&self) -> Result<Vec<lcu::Sale>, lcu::LcuError> {
@@ -784,7 +784,7 @@ mod tests {
         let first = f.output.messages().first().expect("reply expected").clone();
         assert!(first.contains("Several matches"), "reply: {first}");
         assert!(first.contains("Foxfire Ahri"));
-        assert!(first.contains("Dynastry Ahri"));
+        assert!(first.contains("Dynasty Ahri"));
         assert!(stored_watch_doc(&f).await.is_none());
     }
 
@@ -802,7 +802,7 @@ mod tests {
         )
         .await;
         WatchHandler { engine }
-            .invoke(&f.event, &watch_args("skin", "Dynastry Ahri", None), &f.services)
+            .invoke(&f.event, &watch_args("skin", "Dynasty Ahri", None), &f.services)
             .await
             .expect("invoke");
         let first = f.output.messages().first().expect("reply expected").clone();
@@ -886,6 +886,35 @@ mod tests {
         assert_eq!(subs.len(), 1, "only user 2's watch survives");
     }
 
+    /// A corrupted watch document is moved aside (recoverable) before a
+    /// mutation overwrites it - the fresh document repairs the commands
+    /// without silently destroying whatever the corruption held.
+    #[tokio::test]
+    async fn unreadable_watch_doc_is_quarantined_before_overwrite() {
+        let (f, engine) = watch_fixture(20, 300).await;
+        let garbage = serde_json::json!({ "next_id": "not-a-number" });
+        seed_watch_doc(&f, garbage.clone()).await;
+
+        WatchHandler { engine }
+            .invoke(&f.event, &watch_args("skin", "Foxfire Ahri", None), &f.services)
+            .await
+            .expect("invoke");
+
+        let doc = stored_watch_doc(&f).await.expect("fresh doc expected");
+        assert_eq!(
+            doc.get("subs").and_then(|subs| subs.as_array()).map(Vec::len),
+            Some(1),
+            "the fresh doc carries the new watch: {doc}"
+        );
+        let recovered = f
+            .storage
+            .guild_scoped(Platform::Discord, GuildId(42))
+            .get(NAMESPACE, crate::plugins::lol_store::commands::WATCH_RECOVERY_KEY)
+            .await
+            .expect("recovery read expected");
+        assert_eq!(recovered.as_ref(), Some(&garbage), "the corruption was preserved");
+    }
+
     #[tokio::test]
     async fn watch_commands_outside_a_guild_reply_guild_only() {
         let f = command_fixture(false).await;
@@ -911,8 +940,17 @@ mod tests {
         RoleHandler.invoke(&f.event, &Default::default(), &f.services).await.expect("invoke");
         UnwatchHandler.invoke(&f.event, &Default::default(), &f.services).await.expect("invoke");
         WatchlistHandler.invoke(&f.event, &Default::default(), &f.services).await.expect("invoke");
+        let engine = disabled_engine();
+        ClientStatusHandler { engine: Arc::clone(&engine) }
+            .invoke(&f.event, &Default::default(), &f.services)
+            .await
+            .expect("invoke");
+        DumpHandler { engine }
+            .invoke(&f.event, &Default::default(), &f.services)
+            .await
+            .expect("invoke");
         let messages = f.output.messages();
-        assert_eq!(messages.len(), 5, "every command replied: {messages:?}");
+        assert_eq!(messages.len(), 7, "every command replied: {messages:?}");
         assert!(messages.iter().all(|m| m.contains("only works inside a server")));
     }
 

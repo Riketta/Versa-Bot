@@ -214,23 +214,32 @@ impl<B: EventBusPort> StoreEngine<B> {
         // and subscribe-time watch status); failed sections keep their
         // previous data. Cached at fetch time: the fallback must exist even
         // for cycles where a source failed and nothing announces. The
-        // generation bump invalidates the cached name index.
+        // generation keys the name-index cache - it bumps only when a
+        // retained section actually changed, so an unchanged store does not
+        // force a full-catalog rebuild for the next watch command.
         {
             let mut retained = self.last_snapshot.lock();
             let slot = retained.get_or_insert_with(Snapshot::default);
+            let mut changed = false;
             if snapshot.sales.is_some() {
+                changed |= slot.sales != snapshot.sales;
                 slot.sales = snapshot.sales.clone();
             }
             if snapshot.catalog.is_some() {
+                changed |= slot.catalog != snapshot.catalog;
                 slot.catalog = snapshot.catalog.clone();
             }
             if snapshot.rotations.is_some() {
+                changed |= slot.rotations != snapshot.rotations;
                 slot.rotations = snapshot.rotations.clone();
             }
             if snapshot.yourshop.is_some() {
+                changed |= slot.yourshop != snapshot.yourshop;
                 slot.yourshop = snapshot.yourshop.clone();
             }
-            self.snapshot_generation.fetch_add(1, Ordering::Release);
+            if changed {
+                self.snapshot_generation.fetch_add(1, Ordering::Release);
+            }
         }
 
         let current = match &previous {
@@ -250,6 +259,10 @@ impl<B: EventBusPort> StoreEngine<B> {
         // against the freshly fetched catalog.
         if let Some(delta) = full {
             let index = self.name_index(&snapshot).await;
+            // One fan-out scan per cycle: announcements and watch pings see
+            // the same enabled-guild snapshot (a config change landing
+            // between two scans would split the update).
+            let targets = self.enabled_guilds().await;
             // The general feed honors the announce flags (stripped copy);
             // personal watches see the full delta below.
             let mut feed = delta.clone();
@@ -266,18 +279,14 @@ impl<B: EventBusPort> StoreEngine<B> {
                 feed.yourshop = None;
             }
             if !feed.is_empty() {
-                match self.announce(&feed, &index).await {
-                    // An empty render announces nothing - storing it would
-                    // make `/lol_client_status` report a phantom
-                    // announcement.
-                    Ok(pages) if !pages.is_empty() => {
-                        *self.last_announcement.lock() = Some((Instant::now(), pages));
-                    }
-                    Ok(_) => {}
-                    Err(err) => tracing::warn!(%err, "store announcement fan-out failed"),
+                let pages = self.announce(&feed, &index, &targets).await;
+                // An empty render announces nothing - storing it would make
+                // `/lol_client_status` report a phantom announcement.
+                if !pages.is_empty() {
+                    *self.last_announcement.lock() = Some((Instant::now(), pages));
                 }
             }
-            self.notify_subscriptions(delta, &index).await;
+            self.notify_subscriptions(delta, &index, &targets).await;
         }
         let delta_found = full.is_some();
 
@@ -303,7 +312,12 @@ impl<B: EventBusPort> StoreEngine<B> {
     /// what landed, logs the miss, and gets no record - and the state swap
     /// still advances, so the delta is not replayed next poll. Cosmetic
     /// pings, not a delivery contract.
-    async fn announce(&self, delta: &StoreDelta, index: &NameIndex) -> anyhow::Result<Vec<String>> {
+    async fn announce(
+        &self,
+        delta: &StoreDelta,
+        index: &NameIndex,
+        targets: &[(Platform, GuildId, ChannelId, Option<String>)],
+    ) -> Vec<String> {
         if index.catalog.is_empty() {
             tracing::warn!(
                 "store catalog unavailable - sale names degrade to bare ids \
@@ -312,13 +326,12 @@ impl<B: EventBusPort> StoreEngine<B> {
         }
         let pages = announce_pages(delta, index);
         if pages.is_empty() {
-            return Ok(Vec::new());
+            return Vec::new();
         }
 
-        let targets = self.enabled_guilds().await;
         if targets.is_empty() {
             tracing::debug!("store updates found but no guild is tracking them");
-            return Ok(pages);
+            return pages;
         }
 
         let mut kinds: Vec<StoreEventKind> = Vec::new();
@@ -352,7 +365,8 @@ impl<B: EventBusPort> StoreEngine<B> {
             SystemTime::now().duration_since(UNIX_EPOCH).map(|since| since.as_secs()).unwrap_or(0);
         let record_text = pages.join("\n\n");
 
-        for &(platform, guild_id, channel_id, ref role_id) in &targets {
+        let mut delivered_guilds = 0usize;
+        for &(platform, guild_id, channel_id, ref role_id) in targets {
             let origin = Origin {
                 platform,
                 guild_id: Some(guild_id),
@@ -362,17 +376,18 @@ impl<B: EventBusPort> StoreEngine<B> {
                 reply_token: None,
             };
             // The role tag rides the CONTENT: Discord fires notifications
-            // from message content only, never from embeds.
-            let content = role_id
+            // from message content only, never from embeds. First page
+            // only - one event, one ping, not one per continuation.
+            let role_tag = role_id
                 .as_deref()
                 .and_then(|id| id.parse::<u64>().ok())
                 .map_or(String::new(), |id| format!("<@&{id}>"));
             let storage = self.storage.guild_scoped(platform, guild_id);
             let output = self.factory.channel_output(&origin, channel_id);
             let mut delivered = true;
-            for embed in &embeds {
+            for (n, embed) in embeds.iter().enumerate() {
                 let message = OutboundMessage {
-                    content: content.clone(),
+                    content: if n == 0 { role_tag.clone() } else { String::new() },
                     embeds: vec![embed.clone()],
                     ..OutboundMessage::default()
                 };
@@ -385,6 +400,7 @@ impl<B: EventBusPort> StoreEngine<B> {
             if !delivered {
                 continue;
             }
+            delivered_guilds += 1;
             if let Err(err) = storage
                 .append(
                     NAMESPACE,
@@ -399,13 +415,15 @@ impl<B: EventBusPort> StoreEngine<B> {
             }
         }
 
+        // Audit-grade and honest: how many guilds actually got it.
         tracing::info!(
             guilds = targets.len(),
+            delivered = delivered_guilds,
             pages = total,
             kinds = ?kinds.iter().map(|kind| kind.as_str()).collect::<Vec<_>>(),
             "store announcements delivered"
         );
-        Ok(pages)
+        pages
     }
 
     /// Catalog + champion joins, with a lazily loaded champion name table
@@ -462,12 +480,16 @@ impl<B: EventBusPort> StoreEngine<B> {
     /// against the guild's watch document and ping the watchers in the
     /// assigned channel - tags ride the content, embeds never notify.
     /// At-most-once like announcements: a failed send is a log line.
-    async fn notify_subscriptions(&self, delta: &StoreDelta, index: &NameIndex) {
-        let targets = self.enabled_guilds().await;
+    async fn notify_subscriptions(
+        &self,
+        delta: &StoreDelta,
+        index: &NameIndex,
+        targets: &[(Platform, GuildId, ChannelId, Option<String>)],
+    ) {
         if targets.is_empty() {
             return;
         }
-        for (platform, guild_id, channel_id, _) in targets {
+        for &(platform, guild_id, channel_id, _) in targets {
             let storage = self.storage.guild_scoped(platform, guild_id);
             let doc = match storage.get(NAMESPACE, watch::WATCH_KEY).await {
                 Ok(Some(raw)) => match serde_json::from_value::<WatchDoc>(raw) {
@@ -883,6 +905,9 @@ mod tests {
         sales: PLMutex<Option<Vec<Sale>>>,
         rotations: PLMutex<Option<Vec<RotationStore>>>,
         yourshop: PLMutex<Option<YourShopStatus>>,
+        /// When set, the champion-table fetch fails - fixture for the
+        /// fallback-names degradation path.
+        champions_fail: PLMutex<bool>,
     }
 
     impl FakeLcu {
@@ -892,6 +917,7 @@ mod tests {
                 sales: PLMutex::new(Some(Vec::new())),
                 rotations: PLMutex::new(Some(Vec::new())),
                 yourshop: PLMutex::new(Some(YourShopStatus::default())),
+                champions_fail: PLMutex::new(false),
             })
         }
 
@@ -901,6 +927,7 @@ mod tests {
                 sales: PLMutex::new(None),
                 rotations: PLMutex::new(None),
                 yourshop: PLMutex::new(None),
+                champions_fail: PLMutex::new(false),
             })
         }
     }
@@ -924,6 +951,9 @@ mod tests {
         }
 
         async fn champion_names(&self) -> Result<Vec<ChampionEntry>, LcuError> {
+            if *self.champions_fail.lock() {
+                return Err(LcuError::Offline("test".to_owned()));
+            }
             Ok(vec![ChampionEntry { id: 103, name: Some("Ahri".to_owned()) }])
         }
     }
@@ -1089,16 +1119,28 @@ mod tests {
     async fn first_poll_is_a_silent_baseline_but_persists_state() {
         let f = fixture(FakeLcu::online()).await;
         enable_guild(&f.storage, GUILD, Some("55")).await;
-        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        // Champion sales are dropped at ingestion - only the skin sale enters
+        // the baseline state.
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031), champion_sale()]);
         *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
 
         f.engine.tick().await;
 
         assert!(f.output.messages().is_empty(), "baseline must stay silent");
         assert!(f.bus.log().is_empty());
-        let scoped = f.storage.guild_scoped(Platform::Discord, GuildId(GUILD));
-        let persisted = scoped.get(NAMESPACE, LAST_SEEN_KEY).await.expect("read expected");
-        assert!(persisted.is_some(), "last_seen must be persisted for boot catch-up");
+        let persisted = f
+            .storage
+            .guild_scoped(Platform::Discord, GuildId(GUILD))
+            .get(NAMESPACE, LAST_SEEN_KEY)
+            .await
+            .expect("read expected")
+            .expect("last_seen must be persisted for boot catch-up");
+        assert_eq!(
+            persisted.get("sales"),
+            Some(&serde_json::json!([1])),
+            "only skin sales enter the baseline: {persisted}"
+        );
+        assert_eq!(persisted.get("skins"), Some(&serde_json::json!([1031])));
     }
 
     /// A fresh launch has no announcement to dump - the dump falls back to
@@ -1250,6 +1292,83 @@ mod tests {
         assert_eq!(message.content, "<@&999>", "the role tag rides the content");
         let embed = message.embeds.first().expect("embed expected");
         assert!(!embed.description.contains("<@&"), "embeds never notify");
+    }
+
+    /// The subscription-role ping rides the FIRST page only: one event, one
+    /// ping - continuations stay silent instead of re-pinging per page.
+    #[tokio::test]
+    async fn role_tag_rides_only_the_first_page() {
+        let f = fixture(FakeLcu::online()).await;
+        f.storage
+            .guild_scoped(Platform::Discord, GuildId(GUILD))
+            .set(
+                NAMESPACE,
+                CONFIG_KEY,
+                serde_json::json!({ "enabled": true, "channel_id": "55", "role_id": "999" }),
+            )
+            .await
+            .expect("config write expected");
+        // Enough sales that the announcement paginates.
+        *f.lcu.sales.lock() = Some((0..300u64).map(|i| skin_sale(i + 1, 10_000 + i)).collect());
+        f.engine.tick().await; // baseline
+
+        *f.lcu.sales.lock() = Some((0..300u64).map(|i| skin_sale(1_000 + i, 20_000 + i)).collect());
+        f.engine.tick().await;
+
+        let mut sent = f.output.sent();
+        assert!(sent.len() >= 2, "a multi-page announcement was expected");
+        let first = sent.first().expect("first page expected");
+        assert_eq!(first.content, "<@&999>", "first page pings the role");
+        for message in sent.iter().skip(1) {
+            assert!(message.content.is_empty(), "continuations stay silent");
+        }
+    }
+
+    /// A failed champion-table fetch degrades the champion prefix to the
+    /// fallback name - but never stalls the run or swallows the
+    /// announcement.
+    #[tokio::test]
+    async fn champion_table_failure_degrades_names_but_still_announces() {
+        let f = fixture(FakeLcu::online()).await;
+        enable_guild(&f.storage, GUILD, Some("55")).await;
+        *f.lcu.champions_fail.lock() = true;
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        f.engine.tick().await; // baseline
+
+        *f.lcu.sales.lock() = Some(vec![skin_sale(2, 1031)]);
+        f.engine.tick().await;
+
+        let text = f.output.messages().join("\n");
+        // The catalog join keeps the skin name; the champion prefix falls
+        // back to the id-derived name ("Ahri" would mean the table loaded).
+        assert!(text.contains("Champion 103 \u{2014} Foxfire Ahri"), "degraded line: {text}");
+    }
+
+    /// A guild whose tracker config is malformed is skipped for the cycle -
+    /// it must not poison the fan-out for healthy guilds.
+    #[tokio::test]
+    async fn malformed_config_skips_only_that_guild() {
+        let f = fixture(FakeLcu::online()).await;
+        enable_guild(&f.storage, GUILD, Some("55")).await;
+        f.storage
+            .guild_scoped(Platform::Discord, GuildId(999))
+            .set(NAMESPACE, CONFIG_KEY, serde_json::json!({ "enabled": "not-a-bool" }))
+            .await
+            .expect("config write expected");
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        f.engine.tick().await; // silent baseline
+
+        *f.lcu.sales.lock() = Some(vec![skin_sale(2, 1031)]);
+        f.engine.tick().await;
+
+        // The healthy guild announced; the malformed one is absent from the
+        // bus trail entirely.
+        let log = f.bus.log();
+        assert!(!log.is_empty(), "healthy guild announced: {log:?}");
+        assert!(log.iter().all(|(_, guild, _)| *guild == GUILD), "skipped guild leaked: {log:?}");
+        assert_eq!(f.output.sent().len(), 1, "only the healthy guild was messaged");
     }
 
     #[tokio::test]
@@ -1417,7 +1536,7 @@ mod tests {
         let f = fixture(FakeLcu::online()).await;
         enable_guild(&f.storage, GUILD, Some("55")).await;
         seed_watch(&f.storage, GUILD, champion_target_value(), "sale").await;
-        *f.lcu.catalog.lock() = Some(vec![skin_item_named(1032, 975, "Dynastry Ahri")]);
+        *f.lcu.catalog.lock() = Some(vec![skin_item_named(1032, 975, "Dynasty Ahri")]);
         f.engine.tick().await; // baseline
 
         *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1032)]);
@@ -1454,7 +1573,7 @@ mod tests {
         f.engine.tick().await; // baseline
 
         *f.lcu.catalog.lock() =
-            Some(vec![skin_item(1031, 975), skin_item_named(1032, 975, "Dynastry Ahri")]);
+            Some(vec![skin_item(1031, 975), skin_item_named(1032, 975, "Dynasty Ahri")]);
         f.engine.tick().await;
 
         let messages = f.output.messages();
@@ -1601,7 +1720,7 @@ mod tests {
         let factory = Arc::new(ChannelRecordingFactory::new());
         let lcu = FakeLcu::online();
         *lcu.catalog.lock() =
-            Some(vec![skin_item(1031, 975), skin_item_named(1032, 975, "Dynastry Ahri")]);
+            Some(vec![skin_item(1031, 975), skin_item_named(1032, 975, "Dynasty Ahri")]);
         let engine = Arc::new(StoreEngine::new(
             lcu.clone(),
             Arc::clone(&storage) as Arc<dyn StoragePort>,

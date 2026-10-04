@@ -3,7 +3,7 @@
 //! the locally running League client). Data is store-catalog-shaped, not
 //! chat-shaped, and never crosses into the kernel.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -197,12 +197,12 @@ impl RotationStore {
         Some(self.display_metadata.as_ref()?.shoppefront.as_ref()?.id.as_deref()?)
     }
 
-    /// First display category (`WEEKLY`, `DAILY`, ...), lowercased - the
-    /// human label of a rotation store.
+    /// First display category (`WEEKLY`, `DAILY`, ...), lowercased and
+    /// length-clamped - it is interpolated into announcement titles.
     #[must_use]
     pub fn category_label(&self) -> Option<String> {
         let categories = &self.display_metadata.as_ref()?.shoppefront.as_ref()?.categories;
-        categories.first().map(|category| category.to_lowercase())
+        categories.first().map(|category| category.to_lowercase().chars().take(32).collect())
     }
 
     /// True when the store is a rotating one (has a rotation cadence).
@@ -279,6 +279,49 @@ pub fn parse_lockfile(contents: &str) -> Option<LcuCredentials> {
     Some(LcuCredentials { port, token: token.to_owned(), protocol })
 }
 
+/// The raw shape of one LCU HTTP answer, stripped of reqwest: what the
+/// retry ladder in [`LcuClient::get_json`] reasons about. `body` is `Err`
+/// only for a 2xx whose body failed to decode; non-2xx bodies are not read
+/// at all.
+#[derive(Debug)]
+pub(crate) struct RawAnswer {
+    pub(crate) status: u16,
+    pub(crate) body: Result<serde_json::Value, String>,
+}
+
+/// The HTTP seam under the retry ladder: one GET with the token, nothing
+/// else. The real impl wraps the shared reqwest client; tests script
+/// [`RawAnswer`]s to pin the self-heal behavior.
+#[async_trait]
+pub(crate) trait Transport: Send + Sync {
+    async fn get(&self, url: &str, token: &str) -> Result<RawAnswer, String>;
+}
+
+/// Real transport over the client-wide reqwest handle (self-signed cert
+/// accepted - inherent to the LCU).
+struct ReqwestTransport {
+    http: reqwest::Client,
+}
+
+#[async_trait]
+impl Transport for ReqwestTransport {
+    async fn get(&self, url: &str, token: &str) -> Result<RawAnswer, String> {
+        let response = self
+            .http
+            .get(url)
+            .basic_auth("riot", Some(token.to_owned()))
+            .send()
+            .await
+            .map_err(|err| err.to_string())?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            return Ok(RawAnswer { status, body: Err(format!("HTTP {status}")) });
+        }
+        let body = response.json::<serde_json::Value>().await.map_err(|err| err.to_string());
+        Ok(RawAnswer { status, body })
+    }
+}
+
 /// The real [`LcuPort`] adapter: HTTPS to `{protocol}://{address}:{port}` with
 /// lockfile basic auth and the client's self-signed certificate accepted.
 ///
@@ -289,7 +332,7 @@ pub fn parse_lockfile(contents: &str) -> Option<LcuCredentials> {
 /// retry (the client rewrites the lockfile on start; a poll can land mid-
 /// restart), after which the failure is reported.
 pub struct LcuClient {
-    http: reqwest::Client,
+    transport: Box<dyn Transport>,
     lockfile_path: PathBuf,
     address: String,
 }
@@ -310,7 +353,21 @@ impl LcuClient {
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(60))
             .build()?;
-        Ok(Self { http, lockfile_path: lockfile_path.into(), address: address.into() })
+        Ok(Self {
+            transport: Box::new(ReqwestTransport { http }),
+            lockfile_path: lockfile_path.into(),
+            address: address.into(),
+        })
+    }
+
+    /// Test constructor: script the transport, keep the real ladder.
+    #[cfg(test)]
+    fn with_transport(
+        transport: Box<dyn Transport>,
+        lockfile_path: PathBuf,
+        address: String,
+    ) -> Self {
+        Self { transport, lockfile_path, address }
     }
 
     async fn read_credentials(&self) -> Result<LcuCredentials, LcuError> {
@@ -329,35 +386,39 @@ impl LcuClient {
     /// re-read + retry on 401 or transport failure (client mid-restart). A
     /// re-read that lands while the lockfile is momentarily absent (the file
     /// rewrite races the poll) gets a short beat and one more read before
-    /// the cycle gives up - an instant bail here would skip whole polls.
-    async fn get_json(&self, path: &str) -> Result<reqwest::Response, LcuError> {
+    /// the cycle gives up - an instant bail here would skip whole polls. A
+    /// re-read failing a second time reports the FIRST error - the original
+    /// failure is the diagnosis, the follow-up is its echo (the second is
+    /// logged at debug).
+    async fn get_json(&self, path: &str) -> Result<serde_json::Value, LcuError> {
         for attempt in 0..2 {
             let creds = match self.read_credentials().await {
                 Ok(creds) => creds,
                 Err(err) if attempt == 0 => {
                     tokio::time::sleep(Duration::from_millis(500)).await;
-                    self.read_credentials().await.map_err(|_| err)?
+                    self.read_credentials().await.map_err(|second| {
+                        tracing::debug!(second = %second, "credential re-read also failed");
+                        err
+                    })?
                 }
                 Err(err) => return Err(err),
             };
             let url =
                 format!("{}://{}:{port}{path}", creds.protocol, self.address, port = creds.port);
-            let response =
-                self.http.get(&url).basic_auth("riot", Some(creds.token.clone())).send().await;
+            let answer = self.transport.get(&url, &creds.token).await;
 
-            match response {
-                Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+            match answer {
+                Ok(answer) if answer.status == 401 => {
                     if attempt == 0 {
                         continue;
                     }
                     return Err(LcuError::Auth("rejected after credential re-read".to_owned()));
                 }
-                Ok(resp) => {
-                    if let Err(err) = resp.error_for_status_ref() {
-                        let status = err.status().map_or("unknown".to_owned(), |s| s.to_string());
-                        return Err(LcuError::Transport(format!("{path} answered {status}")));
-                    }
-                    return Ok(resp);
+                Ok(answer) if !(200..300).contains(&answer.status) => {
+                    return Err(LcuError::Transport(format!("{path} answered {}", answer.status)));
+                }
+                Ok(answer) => {
+                    return answer.body.map_err(|err| LcuError::Parse(format!("{path}: {err}")));
                 }
                 Err(err) => {
                     if attempt == 0 {
@@ -375,13 +436,8 @@ impl LcuClient {
         &self,
         path: &str,
     ) -> Result<T, LcuError> {
-        let value = self
-            .get_json(path)
-            .await?
-            .json::<T>()
-            .await
-            .map_err(|err| LcuError::Parse(format!("{path}: {err}")))?;
-        Ok(value)
+        let value = self.get_json(path).await?;
+        serde_json::from_value(value).map_err(|err| LcuError::Parse(format!("{path}: {err}")))
     }
 }
 
@@ -508,5 +564,215 @@ mod tests {
         .expect("yourshop status shape expected to parse");
         assert_eq!(status.hub_enabled, Some(false));
         assert_eq!(status.start_time.as_deref(), Some("2020-01-01T09:00:00Z"));
+    }
+
+    // --- the credential retry ladder, pinned against a scripted transport
+
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
+    /// Scripts answers in call order and records every (url, token) pair.
+    /// `rewrite` models the client finishing its restart: written to disk
+    /// before the first request lands.
+    struct ScriptedTransport {
+        answers: Mutex<Vec<Result<RawAnswer, String>>>,
+        seen: Mutex<Vec<(String, String)>>,
+        rewrite: Option<(PathBuf, String)>,
+    }
+
+    impl ScriptedTransport {
+        fn ok(status: u16, body: serde_json::Value) -> Result<RawAnswer, String> {
+            Ok(RawAnswer { status, body: Ok(body) })
+        }
+
+        fn status(status: u16) -> Result<RawAnswer, String> {
+            Ok(RawAnswer { status, body: Err(format!("HTTP {status}")) })
+        }
+    }
+
+    #[async_trait]
+    impl Transport for ScriptedTransport {
+        async fn get(&self, url: &str, token: &str) -> Result<RawAnswer, String> {
+            self.seen.lock().push((url.to_owned(), token.to_owned()));
+            if let Some((path, contents)) = &self.rewrite {
+                std::fs::write(path, contents).expect("lockfile rewrite expected to succeed");
+            }
+            self.answers.lock().remove(0)
+        }
+    }
+
+    /// Arc wrapper: the test keeps the fake to inspect `seen` while the
+    /// client owns it behind the box.
+    #[async_trait]
+    impl Transport for Arc<ScriptedTransport> {
+        async fn get(&self, url: &str, token: &str) -> Result<RawAnswer, String> {
+            (**self).get(url, token).await
+        }
+    }
+
+    fn lockfile_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("versa-lcu-{tag}-{}.txt", std::process::id()))
+    }
+
+    fn write_lockfile(path: &Path, token: &str) {
+        std::fs::write(path, format!("LeagueClient:1:12345:{token}:https"))
+            .expect("lockfile write expected to succeed");
+    }
+
+    fn client_at(transport: Arc<ScriptedTransport>, lockfile: PathBuf) -> LcuClient {
+        LcuClient::with_transport(Box::new(transport), lockfile, "127.0.0.1".to_owned())
+    }
+
+    /// The self-heal happy path: a 401 against the stale token is followed
+    /// by a credential re-read (the fake rewrites the lockfile mid-retry,
+    /// modeling the client finishing its restart) and a successful retry.
+    #[tokio::test]
+    async fn unauthorized_retries_with_reread_credentials() {
+        let lockfile = lockfile_path("rotate");
+        write_lockfile(&lockfile, "stale-token");
+        let transport = Arc::new(ScriptedTransport {
+            answers: Mutex::new(vec![
+                ScriptedTransport::status(401),
+                ScriptedTransport::ok(200, serde_json::json!({ "ok": true })),
+            ]),
+            seen: Mutex::new(Vec::new()),
+            rewrite: Some((lockfile.clone(), "LeagueClient:1:12345:fresh-token:https".to_owned())),
+        });
+        let client = client_at(Arc::clone(&transport), lockfile);
+
+        // The typed port methods deserialize; the ladder is asserted raw.
+        let value =
+            client.get_json("/lol-store/v1/catalog").await.expect("retry expected to succeed");
+        assert_eq!(value, serde_json::json!({ "ok": true }));
+
+        let seen = transport.seen.lock();
+        assert_eq!(seen.len(), 2, "one 401, one retry: {seen:?}");
+        let (first_url, first_token) = seen.first().expect("first call expected");
+        assert_eq!(first_token, "stale-token");
+        assert_eq!(
+            first_url, "https://127.0.0.1:12345/lol-store/v1/catalog",
+            "url joins lockfile protocol+port, config address, request path"
+        );
+        assert_eq!(seen.get(1).map(|(_, token)| token.as_str()), Some("fresh-token"));
+    }
+
+    /// A refused connection (client restarting) retries once against the
+    /// same credentials and succeeds.
+    #[tokio::test]
+    async fn transport_failure_retries_once() {
+        let lockfile = lockfile_path("transport");
+        write_lockfile(&lockfile, "token");
+        let transport = Arc::new(ScriptedTransport {
+            answers: Mutex::new(vec![
+                Err("connection refused".to_owned()),
+                ScriptedTransport::ok(200, serde_json::json!([])),
+            ]),
+            seen: Mutex::new(Vec::new()),
+            rewrite: None,
+        });
+        let client = client_at(transport, lockfile);
+
+        client.sales().await.expect("retry expected to succeed");
+    }
+
+    /// A lockfile momentarily absent (the rewrite race) gets the 500 ms
+    /// beat and one more read before the cycle gives up.
+    #[tokio::test]
+    async fn missing_lockfile_waits_and_recovers() {
+        let lockfile = lockfile_path("race");
+        let _ = std::fs::remove_file(&lockfile);
+        let spawner = lockfile.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            write_lockfile(&spawner, "late-token");
+        });
+        let transport = Arc::new(ScriptedTransport {
+            answers: Mutex::new(vec![ScriptedTransport::ok(200, serde_json::json!([]))]),
+            seen: Mutex::new(Vec::new()),
+            rewrite: None,
+        });
+        let client = client_at(transport, lockfile);
+
+        client.rotations().await.expect("recovery expected to succeed");
+    }
+
+    /// A re-read failing a second time surfaces the FIRST failure - the
+    /// original diagnosis, not its echo.
+    #[tokio::test]
+    async fn double_creds_failure_reports_the_first_error() {
+        let lockfile = lockfile_path("double");
+        let _ = std::fs::remove_file(&lockfile);
+        let transport = Arc::new(ScriptedTransport {
+            answers: Mutex::new(vec![ScriptedTransport::ok(200, serde_json::json!({}))]),
+            seen: Mutex::new(Vec::new()),
+            rewrite: None,
+        });
+        let client = client_at(transport, lockfile.clone());
+
+        let err = client.catalog().await.expect_err("no lockfile expected to fail");
+        assert!(matches!(err, LcuError::Offline(_)), "{err}");
+        assert!(err.to_string().contains("unreadable"), "first error expected: {err}");
+    }
+
+    /// Rejected after the retry is an auth failure, and exactly two calls
+    /// were made.
+    #[tokio::test]
+    async fn unauthorized_twice_is_auth_failure() {
+        let lockfile = lockfile_path("auth");
+        write_lockfile(&lockfile, "token");
+        let transport = Arc::new(ScriptedTransport {
+            answers: Mutex::new(vec![
+                ScriptedTransport::status(401),
+                ScriptedTransport::status(401),
+            ]),
+            seen: Mutex::new(Vec::new()),
+            rewrite: None,
+        });
+        let client = client_at(Arc::clone(&transport), lockfile);
+
+        let err = client.catalog().await.expect_err("401 twice expected to fail");
+        assert!(matches!(err, LcuError::Auth(_)), "{err}");
+        assert_eq!(transport.seen.lock().len(), 2);
+    }
+
+    /// An HTTP error status is a transport error and does NOT retry - the
+    /// ladder is for restart races, not server bugs.
+    #[tokio::test]
+    async fn http_error_status_fails_without_retry() {
+        let lockfile = lockfile_path("http500");
+        write_lockfile(&lockfile, "token");
+        let transport = Arc::new(ScriptedTransport {
+            answers: Mutex::new(vec![ScriptedTransport::status(500)]),
+            seen: Mutex::new(Vec::new()),
+            rewrite: None,
+        });
+        let client = client_at(Arc::clone(&transport), lockfile);
+
+        let err = client.catalog().await.expect_err("500 expected to fail");
+        assert!(matches!(err, LcuError::Transport(_)), "{err}");
+        assert!(err.to_string().contains("500"), "{err}");
+        assert_eq!(transport.seen.lock().len(), 1);
+    }
+
+    /// A 2xx body that fails to decode is a parse error, distinct from
+    /// transport/auth failures.
+    #[tokio::test]
+    async fn undecodable_body_is_parse_error() {
+        let lockfile = lockfile_path("parse");
+        write_lockfile(&lockfile, "token");
+        let transport = Arc::new(ScriptedTransport {
+            answers: Mutex::new(vec![Ok(RawAnswer {
+                status: 200,
+                body: Err("expected value".to_owned()),
+            })]),
+            seen: Mutex::new(Vec::new()),
+            rewrite: None,
+        });
+        let client = client_at(transport, lockfile);
+
+        let err = client.catalog().await.expect_err("bad body expected to fail");
+        assert!(matches!(err, LcuError::Parse(_)), "{err}");
     }
 }

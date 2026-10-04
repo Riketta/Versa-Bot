@@ -13,8 +13,25 @@ const MAX_LINES_PER_SECTION: usize = 15;
 /// Hard cap for the joined announcement. The embed-description limit is
 /// 4096 chars and the send path truncates nothing - an oversized embed is
 /// rejected and silently loses the update for every guild. Stay under it
-/// with margin for the hidden-count footer.
+/// with margin (the bytes count BYTES, Discord counts code points).
 const MAX_ANNOUNCEMENT_CHARS: usize = 3800;
+
+/// Clamp for payload strings interpolated into section TITLES (dates,
+/// timestamps, rotation labels). The lines of a section are cut per page
+/// budget, but the title rides every chunk - an unbounded one would poison
+/// the whole budget arithmetic.
+const MAX_TITLE_FIELD_BYTES: usize = 32;
+
+/// One catalog skin pre-joined for the `/lol_store_watch` name search:
+/// champion prefix and display name resolved once at index build time, in
+/// name-sorted order - the search is a linear filter over this list, not a
+/// per-query re-sort of the ~9.5k catalog.
+#[derive(Debug, Clone)]
+pub(crate) struct SkinEntry {
+    pub(crate) item_id: u64,
+    pub(crate) champion: String,
+    pub(crate) skin: String,
+}
 
 /// Name/pricing joins for one announcement. The catalog doubles as the
 /// original-price source for the sale percentage (the sale payload's own
@@ -22,22 +39,38 @@ const MAX_ANNOUNCEMENT_CHARS: usize = 3800;
 pub struct NameIndex {
     pub catalog: HashMap<u64, CatalogItem>,
     pub champions: HashMap<u64, String>,
+    pub(crate) skins: Vec<SkinEntry>,
 }
 
 impl NameIndex {
     #[must_use]
     pub fn new(catalog: Vec<CatalogItem>, champions: BTreeMap<u64, String>) -> Self {
-        Self {
+        let mut index = Self {
             catalog: catalog.into_iter().map(|item| (item.item_id, item)).collect(),
             champions: champions.into_iter().collect(),
-        }
+            skins: Vec::new(),
+        };
+        let mut skins: Vec<SkinEntry> = index
+            .catalog
+            .values()
+            .filter(|item| item.inventory_type.as_deref() == Some("CHAMPION_SKIN"))
+            .filter_map(|item| {
+                let champion = index.skin_champion(item)?;
+                Some(SkinEntry { item_id: item.item_id, champion, skin: localized_name(item) })
+            })
+            .collect();
+        // Deterministic order: name, then id - the search's exact-before-
+        // partial split preserves this order within each bucket.
+        skins.sort_by(|a, b| a.skin.cmp(&b.skin).then(a.item_id.cmp(&b.item_id)));
+        index.skins = skins;
+        index
     }
 
     /// Empty index: everything degrades to synthetic names.
     #[cfg(test)]
     #[must_use]
     pub fn empty() -> Self {
-        Self { catalog: HashMap::new(), champions: HashMap::new() }
+        Self { catalog: HashMap::new(), champions: HashMap::new(), skins: Vec::new() }
     }
 
     fn champion_name(&self, champion_id: u64) -> String {
@@ -217,19 +250,21 @@ fn explode(section: &Section) -> Vec<Section> {
     if section.byte_len() <= MAX_ANNOUNCEMENT_CHARS {
         return vec![Section::new(section.title.clone(), section.lines.clone())];
     }
-    // A line longer than a fresh continuation chunk's body can never fit
-    // and is cut once, up front; shorter lines only ever move to the next
-    // chunk. `chunk_len` keeps the accounting exact (the ** markers count).
-    let fresh_budget = MAX_ANNOUNCEMENT_CHARS - section.title.len() - " (cont.)".len() - 5;
+    // A title longer than half a page cannot share a page with anything -
+    // cut it once, up front, so the budget subtraction below can never
+    // underflow. (Title text is clamped at its sources already; this is
+    // the belt to those braces.)
+    let base_title = cut_to_budget(&section.title, MAX_ANNOUNCEMENT_CHARS / 2);
+    let fresh_budget = MAX_ANNOUNCEMENT_CHARS - base_title.len() - " (cont.)".len() - 5;
     let mut chunks: Vec<Section> = Vec::new();
     let mut current: Vec<String> = Vec::new();
-    let mut title = section.title.clone();
+    let mut title = base_title.clone();
     let mut used = chunk_len(&title, &current);
     for line in &section.lines {
         let line = cut_to_budget(line, fresh_budget);
         if used + 1 + line.len() > MAX_ANNOUNCEMENT_CHARS {
             chunks.push(Section::new(std::mem::take(&mut title), std::mem::take(&mut current)));
-            title = format!("{} (cont.)", section.title);
+            title = format!("{base_title} (cont.)");
             used = chunk_len(&title, &current);
         }
         used += 1 + line.len();
@@ -419,19 +454,22 @@ pub(crate) fn mythic_line(entry: &super::diff::MythicEntry) -> String {
     }
 }
 
-/// `2026-10-05T17:00:00.000+00:00` -> `2026-10-05`.
+/// `2026-10-05T17:00:00.000+00:00` -> `2026-10-05`. The input is untrusted
+/// payload text that lands inside section titles - anything implausibly
+/// long degrades to a cut.
 fn date(iso: &str) -> String {
-    iso.split('T').next().unwrap_or(iso).to_owned()
+    cut_to_budget(iso.split('T').next().unwrap_or(iso), MAX_TITLE_FIELD_BYTES)
 }
 
 /// `2026-10-01T09:00:00Z` -> `2026-10-01 09:00 UTC`; a non-zero offset is
 /// rendered as-is WITH its sign (dropping it would misread `-05:30` as
-/// `+05:30`). Falls back to the raw string on any deviation.
+/// `+05:30`). Any deviation degrades to the raw string, clamped - never a
+/// title-budget hazard.
 #[must_use]
 pub(crate) fn timestamp(iso: &str) -> String {
     let mut parts = iso.split('T');
-    let day = parts.next().unwrap_or(iso);
-    let Some(time) = parts.next() else { return iso.to_owned() };
+    let day = cut_to_budget(parts.next().unwrap_or(iso), MAX_TITLE_FIELD_BYTES);
+    let Some(time) = parts.next() else { return day };
     let hhmm: String = time.chars().take(5).collect();
     // Locate the sign char itself (split_once would strip it): everything
     // after it is the offset body.
@@ -440,7 +478,8 @@ pub(crate) fn timestamp(iso: &str) -> String {
         .find(|(_, ch)| *ch == '+' || *ch == '-')
         .and_then(|(idx, sign)| {
             let rest = time.get(idx + 1..)?;
-            (!rest.is_empty()).then(|| format!("{sign}{rest}"))
+            (!rest.is_empty())
+                .then(|| cut_to_budget(&format!("{sign}{rest}"), MAX_TITLE_FIELD_BYTES))
         })
         .unwrap_or_else(|| "Z".to_owned());
     let label = if offset == "Z" || offset == "+00:00" || offset == "-00:00" {
@@ -703,6 +742,57 @@ mod tests {
         );
         assert!(position("- Cheap · 35 ME") < position("- Expensive · 100 ME"));
         assert!(position("- Expensive · 100 ME") < position("- Priceless"));
+    }
+
+    /// Payload strings interpolated into section titles are clamped: a
+    /// multi-kilobyte date (no `T`, so `date` keeps it whole) must neither
+    /// underflow the pagination budget nor produce an oversized page - the
+    /// pre-fix failure mode this pins.
+    #[test]
+    fn oversized_title_fields_are_clamped() {
+        assert!(date(&"x".repeat(5000)).chars().count() <= 33);
+        assert!(timestamp(&"y".repeat(4000)).chars().count() <= 70);
+
+        let corrupted_end = "corrupted-without-T-".repeat(200);
+        let sale = |id: u64| super::super::lcu::Sale {
+            id,
+            item: ItemRef {
+                inventory_type: Some("CHAMPION_SKIN".to_owned()),
+                item_id: Some(10_000 + id),
+            },
+            sale: SaleInfo {
+                start_date: None,
+                end_date: Some(corrupted_end.clone()),
+                prices: vec![Price { cost: Some(607), currency: Some("RP".to_owned()) }],
+            },
+        };
+        // Many lines force `explode` to run with the clamped title.
+        let sales: Vec<super::super::lcu::Sale> = (0..300u64).map(sale).collect();
+        let delta = StoreDelta { sales, ..Default::default() };
+        let pages = announce_pages(&delta, &NameIndex::empty());
+        assert!(!pages.is_empty(), "the pathological delta still renders");
+        for page in &pages {
+            assert!(page.len() <= MAX_ANNOUNCEMENT_CHARS, "page budget: {}", page.len());
+        }
+    }
+
+    /// A budget landing mid-codepoint cuts on chars, not bytes, and still
+    /// respects the byte budget (the ellipsis's 3 bytes included).
+    #[test]
+    fn cut_to_budget_is_char_safe_and_byte_bounded() {
+        let line = "ж".repeat(100); // 2 bytes per char
+        let cut = cut_to_budget(&line, 21);
+        assert!(cut.len() <= 21, "byte budget respected: {}", cut.len());
+        assert!(cut.chars().count() <= 10, "char-safe cut: {cut}");
+        let stem = cut.trim_end_matches('\u{2026}');
+        assert!(line.starts_with(stem), "the cut keeps a whole-char prefix");
+    }
+
+    /// Degenerate timestamps degrade to the (clamped) raw string.
+    #[test]
+    fn timestamp_degrades_to_clamped_raw() {
+        assert_eq!(timestamp("weird"), "weird");
+        assert!(timestamp(&"y".repeat(400)).chars().count() <= 40);
     }
 
     #[test]

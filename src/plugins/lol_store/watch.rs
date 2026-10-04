@@ -11,10 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::diff::StoreDelta;
-use super::format::{
-    NameIndex, fit, localized_name, mythic_line, push_section, sale_line, skin_line,
-};
-use super::lcu::CatalogItem;
+use super::format::{NameIndex, fit, mythic_line, push_section, sale_line, skin_line};
 
 /// Storage key of the guild's watch document (plugin namespace).
 pub const WATCH_KEY: &str = "subscriptions";
@@ -123,7 +120,9 @@ pub struct Watch {
 /// The guild's watch document (`subscriptions` key, plugin namespace).
 /// A doc that fails to deserialize is logged and treated as empty - ids may
 /// restart, but the alternative (refusing mutations) bricks the guild's
-/// watch commands until manual storage surgery.
+/// watch commands until manual storage surgery. The unreadable raw is
+/// preserved under a recovery key before the first overwrite, so the
+/// corruption stays diagnosable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchDoc {
     /// Forward-compat scaffolding: no reader or migration exists yet - a
@@ -273,26 +272,24 @@ pub struct StoreSearch {
 }
 
 /// Name search over catalog skins: exact (normalized) matches first, then
-/// substring matches, deterministic order, capped.
+/// substring matches, deterministic order, capped. The index carries the
+/// champion-joined skins pre-sorted by name - the search is a linear
+/// filter, not a per-query re-sort of the catalog.
 #[must_use]
 pub fn search_skins(query: &str, index: &NameIndex) -> Vec<SkinHit> {
     let needle = normalize_name(query);
     if needle.is_empty() {
         return Vec::new();
     }
-    let mut items: Vec<&CatalogItem> = index
-        .catalog
-        .values()
-        .filter(|item| item.inventory_type.as_deref() == Some("CHAMPION_SKIN"))
-        .collect();
-    items.sort_by_key(|item| localized_name(item));
     let mut exact = Vec::new();
     let mut partial = Vec::new();
-    for item in items {
-        let Some(champion) = index.skin_champion(item) else { continue };
-        let skin = localized_name(item);
-        let normalized = normalize_name(&skin);
-        let hit = SkinHit { item_id: item.item_id, champion, skin };
+    for entry in &index.skins {
+        let normalized = normalize_name(&entry.skin);
+        let hit = SkinHit {
+            item_id: entry.item_id,
+            champion: entry.champion.clone(),
+            skin: entry.skin.clone(),
+        };
         if normalized == needle {
             exact.push(hit);
         } else if normalized.contains(&needle) {
@@ -315,7 +312,7 @@ pub fn search_champions<'a>(
     let mut exact = Vec::new();
     let mut partial = Vec::new();
     let mut entries: Vec<(&u64, &String)> = champions.into_iter().collect();
-    entries.sort_by_key(|(_, name)| (*name).clone());
+    entries.sort_by(|a, b| a.1.cmp(b.1));
     for (id, name) in entries {
         let normalized = normalize_name(name);
         let hit = ChampionHit { champion_id: *id, champion: name.clone() };
@@ -448,7 +445,7 @@ mod tests {
 
     use super::super::diff::MythicEntry;
     use super::super::format::champion_map;
-    use super::super::lcu::{ItemRef, LocalizedText, Price};
+    use super::super::lcu::{CatalogItem, ItemRef, LocalizedText, Price};
     use super::*;
 
     fn index() -> NameIndex {
@@ -473,7 +470,7 @@ mod tests {
                     prices: vec![Price { cost: Some(975), currency: Some("RP".to_owned()) }],
                     localizations: BTreeMap::from([(
                         "en_US".to_owned(),
-                        LocalizedText { name: Some("Dynastry Ahri".to_owned()) },
+                        LocalizedText { name: Some("Dynasty Ahri".to_owned()) },
                     )]),
                     item_requirements: vec![ItemRef {
                         inventory_type: Some("CHAMPION".to_owned()),
@@ -535,7 +532,7 @@ mod tests {
         doc.subs.push(Watch {
             id: 2,
             user_id: "222".to_owned(),
-            target: skin_target(1032, "Dynastry Ahri"),
+            target: skin_target(1032, "Dynasty Ahri"),
             kinds: WatchKind::All,
         });
         assert!(!doc.remove("111", 99), "unknown id");
@@ -601,7 +598,7 @@ mod tests {
         let junk = Subject::Name("Script generated price - ME: 35".to_owned());
         assert!(!target_matches(&watch, &junk, &index));
         // A different skin with a suffix must not cross-match.
-        let other = Subject::Name("Dynastry Ahri (SPECIAL)".to_owned());
+        let other = Subject::Name("Dynasty Ahri (SPECIAL)".to_owned());
         assert!(!target_matches(&watch, &other, &index));
     }
 

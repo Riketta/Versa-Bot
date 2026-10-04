@@ -41,6 +41,9 @@ pub struct YourShopState {
 /// JSON is stable and comparisons are order-insensitive.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastSeen {
+    /// Riot's sale ids. Sale identity is the raw id: a reused id for a
+    /// different item/window would be silently suppressed (not observed in
+    /// practice - revisit if a sale ever fails to announce).
     #[serde(default)]
     pub sales: BTreeSet<u64>,
     #[serde(default)]
@@ -100,7 +103,7 @@ impl StoreDelta {
 
 /// The store data of one successful poll cycle (any part may be absent when
 /// that source failed).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub sales: Option<Vec<Sale>>,
     pub catalog: Option<Vec<CatalogItem>>,
@@ -217,10 +220,21 @@ pub fn merge(previous: &LastSeen, snapshot: &Snapshot) -> LastSeen {
         }
         // Stores absent from the payload end their rotations (the original
         // whole-map replacement semantics) - the collapse keep above only
-        // applies to stores that are present.
-        let present: BTreeSet<String> =
-            rotation_stores(stores).iter().filter_map(|store| store.name.clone()).collect();
-        rotations.retain(|name, _| present.contains(name));
+        // applies to stores that are present. A rotating store answering
+        // WITHOUT its name is a payload glitch, not a rotation end - and
+        // the prune cannot tell WHICH tracked rotation went nameless, so
+        // the whole prune is skipped for the cycle (mirroring the collapse
+        // keeps; one poll later it resolves).
+        if stores.iter().any(|store| store.is_rotating() && store.name.is_none()) {
+            tracing::warn!(
+                kept = rotations.len(),
+                "a rotation store answered without a name - keeping all previous rotations"
+            );
+        } else {
+            let present: BTreeSet<String> =
+                rotation_stores(stores).iter().filter_map(|store| store.name.clone()).collect();
+            rotations.retain(|name, _| present.contains(name));
+        }
         merged.rotations = rotations;
     }
 
@@ -244,8 +258,16 @@ pub fn merge(previous: &LastSeen, snapshot: &Snapshot) -> LastSeen {
         }
     }
     if let Some(status) = &snapshot.yourshop {
+        // A null hubEnabled is the field not answering, not "event over" -
+        // keep the previous active bit; only an explicit false flips it
+        // off. (A transient null must not arm a duplicate start announcement
+        // on the next true payload.)
+        let active = status
+            .hub_enabled
+            .or_else(|| previous.yourshop.as_ref().map(|state| state.active))
+            .unwrap_or(false);
         merged.yourshop = Some(YourShopState {
-            active: status.hub_enabled.unwrap_or(false),
+            active,
             start: status.start_time.clone(),
             end: status.end_time.clone(),
         });
@@ -675,5 +697,69 @@ mod tests {
         let json = serde_json::to_string(&state).expect("serialize expected");
         let back: LastSeen = serde_json::from_str(&json).expect("deserialize expected");
         assert_eq!(back, state);
+    }
+
+    /// A rotating store answering without its name is a glitch, not a
+    /// rotation end - every previously tracked rotation survives the cycle
+    /// instead of being pruned and phantom-re-announced next poll.
+    #[test]
+    fn nameless_rotation_store_keeps_previous_state() {
+        let previous = LastSeen {
+            rotations: BTreeMap::from([(
+                "WEEKLY_ROTATION".to_owned(),
+                RotationState {
+                    entry_ids: BTreeSet::from(["a".to_owned()]),
+                    rotation_start: None,
+                    next_rotation: None,
+                },
+            )]),
+            ..Default::default()
+        };
+        // WEEKLY present with its entries; a second, NAMELESS rotating store
+        // arrives alongside it.
+        let snapshot = Snapshot {
+            rotations: Some(vec![
+                rotation_store("WEEKLY_ROTATION", &["a"]),
+                RotationStore { name: None, ..rotation_store("glitch", &["b"]) },
+            ]),
+            ..Default::default()
+        };
+        let merged = merge(&previous, &snapshot);
+        assert_eq!(
+            merged.rotations.get("WEEKLY_ROTATION").map(|state| state.entry_ids.clone()),
+            Some(BTreeSet::from(["a".to_owned()])),
+            "the named store still updates in place"
+        );
+        assert_eq!(merged.rotations.len(), 1, "nothing was pruned this cycle");
+    }
+
+    /// A null hubEnabled is the field not answering: the previous active
+    /// bit survives, so a transient null cannot arm a duplicate start
+    /// announcement when the next payload says true again. An explicit
+    /// false still flips it off.
+    #[test]
+    fn null_hub_enabled_keeps_previous_active() {
+        let active = LastSeen {
+            yourshop: Some(YourShopState { active: true, start: None, end: None }),
+            ..Default::default()
+        };
+        let null_status = Snapshot {
+            yourshop: Some(YourShopStatus { hub_enabled: None, ..Default::default() }),
+            ..Default::default()
+        };
+        let merged = merge(&active, &null_status);
+        assert!(merged.yourshop.as_ref().is_some_and(|state| state.active), "kept active");
+
+        // Explicit false still ends the event.
+        let ended = Snapshot {
+            yourshop: Some(YourShopStatus { hub_enabled: Some(false), ..Default::default() }),
+            ..Default::default()
+        };
+        let merged = merge(&active, &ended);
+        assert!(!merged.yourshop.as_ref().is_some_and(|state| state.active));
+
+        // And with no previous state at all, null is just "inactive".
+        let merged = merge(&LastSeen::default(), &null_status);
+        assert!(!merged.yourshop.as_ref().is_some_and(|state| state.active));
     }
 }
