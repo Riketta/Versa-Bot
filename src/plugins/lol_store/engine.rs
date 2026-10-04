@@ -44,7 +44,7 @@ pub struct AnnounceFlags {
     pub yourshop: bool,
 }
 
-/// Engine construction settings (`[lol]` config section, startup-only).
+/// Engine construction settings (`[lol_store]` config section, startup-only).
 #[derive(Debug, Clone)]
 pub struct EngineSettings {
     pub poll: Duration,

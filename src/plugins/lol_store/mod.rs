@@ -7,7 +7,7 @@
 //! scheduler job, not chat events. Own hexagon inside: the engine depends on
 //! the [`lcu::LcuPort`] boundary, [`lcu::LcuClient`] is the one adapter.
 //!
-//! Disabled by default at both levels: without a configured `[lol]` section
+//! Disabled by default at both levels: without a configured `[lol_store]` section
 //! the engine never schedules, and per guild nothing announces until
 //! `/lol_store_enable` + `/lol_store_assign`. The poll cadence and feature
 //! flags are startup-only ([`EngineSettings`]).
