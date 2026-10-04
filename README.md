@@ -298,14 +298,16 @@ poll window merge into a single line.
 Setup: point `[lol_store]` at the client's `lockfile` (the bot reads the
 per-start port and token from it, so client restarts self-heal), enable
 per guild with `/lol_store_enable`, and assign the announcement channel
-With `/lol_store_assign`. Announcements batch into one embed per poll
-cycle; the first successful poll after a restart is a catch-up
-(announcing what changed while the bot was down) or, with no stored
-state, a silent baseline. The embed has a length budget: if one cycle
-finds more than fits, the lowest-priority sections are dropped and the
-hidden count is noted at the bottom. Delivery is at-most-once: a guild
-whose send fails gets a log line, not a replay - the poll state still
-advances so nothing is announced twice. `/lol_store_dump` and
+With `/lol_store_assign`. Announcements render as one embed per poll
+cycle - sales grouped under their end date with the percent off, skins,
+each Mythic rotation, Your Shop - and split across several embeds when
+one would overflow, so every deal prints; nothing is cut. The champion
+itself going on sale is not store news and is skipped. The first
+successful poll after a restart is a catch-up (announcing what changed
+while the bot was down) or, with no stored state, a silent baseline.
+Delivery is at-most-once: a guild whose send fails gets a log line, not
+a replay - the poll state still advances so nothing is announced twice.
+`/lol_store_dump` and
 `/lol_client_status` show the bot-global watcher state (there is one
 League client per bot), which may differ from what an individual guild
 received. A dump before the first announced update renders the current

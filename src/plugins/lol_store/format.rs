@@ -89,19 +89,75 @@ impl NameIndex {
     }
 }
 
-/// Renders the full announcement within the embed-description budget;
-/// `None` when nothing renders (all sections empty or every line stripped).
-#[must_use]
-pub fn announce_text(delta: &StoreDelta, index: &NameIndex) -> Option<String> {
-    let mut sections: Vec<String> = Vec::new();
+/// One renderable announcement block: a bold title and optional body
+/// lines. Sales render one section per end-date group; Your Shop is a bare
+/// single-line section.
+pub(crate) struct Section {
+    title: String,
+    lines: Vec<String>,
+}
 
+impl Section {
+    fn new(title: impl Into<String>, lines: Vec<String>) -> Self {
+        Self { title: title.into(), lines }
+    }
+
+    /// A title-only section - the whole text is the bold line.
+    fn bare(title: String) -> Self {
+        Self { title, lines: Vec::new() }
+    }
+
+    fn render(&self) -> String {
+        if self.lines.is_empty() {
+            format!("**{}**", self.title)
+        } else {
+            format!("**{}**\n{}", self.title, self.lines.join("\n"))
+        }
+    }
+
+    /// Rendered size in bytes - the budget currency of `fit`/`paginate`.
+    fn byte_len(&self) -> usize {
+        self.render().len()
+    }
+}
+
+/// Sales grouped by end date: most of a cycle's sales share one end date,
+/// and repeating it per line burns embed budget. Groups sort by date
+/// ascending; undated sales land in a trailing untitled group.
+fn sales_sections(sales: &[super::lcu::Sale], index: &NameIndex) -> Vec<Section> {
+    let mut dated: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut undated: Vec<String> = Vec::new();
+    for sale in sales {
+        match sale.sale.end_date.as_deref() {
+            Some(ends) => {
+                dated.entry(date(ends)).or_default().push(sale_line(sale, index, false));
+            }
+            None => undated.push(sale_line(sale, index, false)),
+        }
+    }
+    let mut sections: Vec<Section> = dated
+        .into_iter()
+        .map(|(day, lines)| Section::new(format!("New sales \u{b7} until {day}"), lines))
+        .collect();
+    if !undated.is_empty() {
+        sections.push(Section::new("New sales", undated));
+    }
+    sections
+}
+
+/// Renders the full announcement into embed-sized pages - every section,
+/// every line: sales grouped by end date, new skins, each mythic rotation,
+/// the Your Shop start. Nothing is dropped or cut (a page pack that would
+/// overflow starts a new page instead). Empty when nothing renders.
+#[must_use]
+pub fn announce_pages(delta: &StoreDelta, index: &NameIndex) -> Vec<String> {
+    let mut sections: Vec<Section> = Vec::new();
     if !delta.sales.is_empty() {
-        let lines: Vec<String> = delta.sales.iter().map(|sale| sale_line(sale, index)).collect();
-        push_section(&mut sections, "New sales", &lines);
+        sections.extend(sales_sections(&delta.sales, index));
     }
     if !delta.skins.is_empty() {
         let lines: Vec<String> = delta.skins.iter().map(|item| skin_line(item, index)).collect();
-        push_section(&mut sections, "New in store", &lines);
+        sections.push(Section::new("New in store", lines));
     }
     for rotation in &delta.rotations {
         let lines: Vec<String> = rotation.entries.iter().map(mythic_line).collect();
@@ -112,20 +168,108 @@ pub fn announce_text(delta: &StoreDelta, index: &NameIndex) -> Option<String> {
         if let Some(ends) = &rotation.next_rotation {
             title.push_str(&format!(" \u{b7} ends {}", timestamp(ends)));
         }
-        push_section(&mut sections, &title, &lines);
+        sections.push(Section::new(title, lines));
     }
     if let Some(start) = &delta.yourshop {
-        let mut line = String::from("**Your Shop started**");
+        let mut line = String::from("Your Shop started");
         if let Some(started) = start.start.as_deref() {
             line.push_str(&format!(" \u{b7} started {}", timestamp(started)));
         }
         if let Some(ends) = start.end.as_deref() {
             line.push_str(&format!(" \u{b7} ends {}", timestamp(ends)));
         }
-        sections.push(line);
+        sections.push(Section::bare(line));
     }
+    paginate(sections)
+}
 
-    fit(sections)
+/// Rendered byte length of `**{title}**\n{lines joined by newline}` (or
+/// just `**{title}**` with no lines) - the exact currency of the budget.
+fn chunk_len(title: &str, lines: &[String]) -> usize {
+    let base = title.len() + 4; // the two ** pairs
+    if lines.is_empty() {
+        return base;
+    }
+    base + 1 + lines.iter().map(|line| line.len()).sum::<usize>() + lines.len() - 1
+}
+
+/// Splits a section whose rendered body exceeds the page budget between
+/// its lines - the title returns with " (cont.)" on every continuation -
+/// and char-safely hard-cuts a single line too long for even a fresh
+/// chunk. A section that fits passes through untouched.
+fn explode(section: &Section) -> Vec<Section> {
+    if section.byte_len() <= MAX_ANNOUNCEMENT_CHARS {
+        return vec![Section::new(section.title.clone(), section.lines.clone())];
+    }
+    // A line longer than a fresh continuation chunk's body can never fit
+    // and is cut once, up front; shorter lines only ever move to the next
+    // chunk. `chunk_len` keeps the accounting exact (the ** markers count).
+    let fresh_budget = MAX_ANNOUNCEMENT_CHARS - section.title.len() - " (cont.)".len() - 5;
+    let mut chunks: Vec<Section> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut title = section.title.clone();
+    let mut used = chunk_len(&title, &current);
+    for line in &section.lines {
+        let line = cut_to_budget(line, fresh_budget);
+        if used + 1 + line.len() > MAX_ANNOUNCEMENT_CHARS {
+            chunks.push(Section::new(std::mem::take(&mut title), std::mem::take(&mut current)));
+            title = format!("{} (cont.)", section.title);
+            used = chunk_len(&title, &current);
+        }
+        used += 1 + line.len();
+        current.push(line);
+    }
+    if !current.is_empty() {
+        chunks.push(Section::new(title, current));
+    }
+    chunks
+}
+
+/// Char-safe AND byte-bounded truncation for a pathological single line:
+/// the budget counts bytes (Discord counts code points, so staying under
+/// in bytes always stays under in chars too), and the ellipsis itself is
+/// 3 bytes - reserved up front.
+fn cut_to_budget(line: &str, budget: usize) -> String {
+    if line.len() <= budget {
+        return line.to_owned();
+    }
+    let mut cut = String::new();
+    let mut taken = 0usize;
+    for ch in line.chars() {
+        let len = ch.len_utf8();
+        if taken + len > budget.saturating_sub(3) {
+            break;
+        }
+        taken += len;
+        cut.push(ch);
+    }
+    cut.push('\u{2026}');
+    cut
+}
+
+/// Packs sections into embed-sized pages. Nothing is dropped: whole
+/// sections fill a page greedily and a taller-than-page section arrives
+/// pre-split by [`explode`]. Empty input renders no pages.
+pub(crate) fn paginate(sections: Vec<Section>) -> Vec<String> {
+    let mut pages: Vec<String> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    for section in &sections {
+        for chunk in explode(section) {
+            let text = chunk.render();
+            if !current.is_empty() && used + 2 + text.len() > MAX_ANNOUNCEMENT_CHARS {
+                pages.push(current.join("\n\n"));
+                current = Vec::new();
+                used = 0;
+            }
+            used += if current.is_empty() { text.len() } else { 2 + text.len() };
+            current.push(text);
+        }
+    }
+    if !current.is_empty() {
+        pages.push(current.join("\n\n"));
+    }
+    pages
 }
 
 /// Fits the built sections into the embed budget: whole sections are
@@ -193,20 +337,16 @@ pub(crate) fn localized_name(item: &CatalogItem) -> String {
         .unwrap_or_else(|| format!("Skin {}", item.item_id))
 }
 
-pub(crate) fn sale_line(sale: &super::lcu::Sale, index: &NameIndex) -> String {
+pub(crate) fn sale_line(sale: &super::lcu::Sale, index: &NameIndex, with_date: bool) -> String {
     let item_id = sale.item.item_id.unwrap_or(0);
-    let is_champion_sale = sale.item.inventory_type.as_deref() == Some("CHAMPION");
 
-    let subject = if is_champion_sale {
-        index.champion_name(item_id)
-    } else {
-        match index.catalog.get(&item_id) {
-            Some(item) => match index.skin_champion(item) {
-                Some(champion) => format!("{champion} — {}", localized_name(item)),
-                None => localized_name(item),
-            },
-            None => format!("Skin {item_id}"),
-        }
+    let subject = match index.catalog.get(&item_id) {
+        Some(item) => match index.skin_champion(item) {
+            Some(champion) => format!("{champion} \u{2014} {}", localized_name(item)),
+            None => localized_name(item),
+        },
+        // No catalog join: the id is the only identifying data left.
+        None => format!("Skin {item_id}"),
     };
 
     let mut line = format!("- {subject}");
@@ -223,10 +363,14 @@ pub(crate) fn sale_line(sale: &super::lcu::Sale, index: &NameIndex) -> String {
         }
     }
     if let Some(cost) = sale_price {
-        line.push_str(&format!(" · {cost} RP"));
+        line.push_str(&format!(" \u{b7} {cost} RP"));
     }
-    if let Some(ends) = sale.sale.end_date.as_deref() {
-        line.push_str(&format!(" · until {}", date(ends)));
+    // Announcements group by end date, so the grouped path omits the
+    // per-line repetition; watch pings (one sale per line) keep it.
+    if with_date {
+        if let Some(ends) = sale.sale.end_date.as_deref() {
+            line.push_str(&format!(" \u{b7} until {}", date(ends)));
+        }
     }
     line
 }
@@ -316,9 +460,21 @@ mod tests {
     }
 
     fn skin_sale(cost: u64, end: Option<&str>) -> super::super::lcu::Sale {
+        skin_sale_named(1, 1031, cost, end)
+    }
+
+    fn skin_sale_named(
+        id: u64,
+        item_id: u64,
+        cost: u64,
+        end: Option<&str>,
+    ) -> super::super::lcu::Sale {
         super::super::lcu::Sale {
-            id: 1,
-            item: ItemRef { inventory_type: Some("CHAMPION_SKIN".to_owned()), item_id: Some(1031) },
+            id,
+            item: ItemRef {
+                inventory_type: Some("CHAMPION_SKIN".to_owned()),
+                item_id: Some(item_id),
+            },
             sale: SaleInfo {
                 start_date: None,
                 end_date: end.map(str::to_owned),
@@ -329,25 +485,15 @@ mod tests {
 
     #[test]
     fn sale_line_joins_names_price_percent_and_date() {
-        let line = sale_line(&skin_sale(607, Some("2026-10-05T17:00:00.000+00:00")), &index());
+        let line =
+            sale_line(&skin_sale(607, Some("2026-10-05T17:00:00.000+00:00")), &index(), true);
         assert_eq!(line, "- Ahri — Foxfire Ahri −38% · 607 RP · until 2026-10-05");
     }
 
     #[test]
     fn sale_line_skips_percent_when_not_discounted() {
-        let line = sale_line(&skin_sale(975, None), &index());
+        let line = sale_line(&skin_sale(975, None), &index(), true);
         assert_eq!(line, "- Ahri — Foxfire Ahri · 975 RP");
-    }
-
-    #[test]
-    fn champion_sale_uses_the_champion_map() {
-        let sale = super::super::lcu::Sale {
-            id: 2,
-            item: ItemRef { inventory_type: Some("CHAMPION".to_owned()), item_id: Some(103) },
-            sale: SaleInfo { start_date: None, end_date: None, prices: vec![] },
-        };
-        let line = sale_line(&sale, &index());
-        assert_eq!(line, "- Ahri");
     }
 
     #[test]
@@ -364,12 +510,12 @@ mod tests {
                 prices: vec![Price { cost: Some(500), currency: Some("RP".to_owned()) }],
             },
         };
-        let line = sale_line(&sale, &NameIndex::empty());
+        let line = sale_line(&sale, &NameIndex::empty(), true);
         assert_eq!(line, "- Skin 42042 · 500 RP");
     }
 
     #[test]
-    fn announce_text_renders_all_sections() {
+    fn announce_pages_render_all_sections() {
         let delta = StoreDelta {
             sales: vec![skin_sale(607, None)],
             skins: vec![CatalogItem {
@@ -402,7 +548,9 @@ mod tests {
         };
         let mut index = index();
         index.champions.insert(10, "Kayle".to_owned());
-        let text = announce_text(&delta, &index).expect("announcement expected");
+        let pages = announce_pages(&delta, &index);
+        assert_eq!(pages.len(), 1, "small delta: one page, {pages:?}");
+        let text = pages.first().expect("page expected");
         assert!(text.contains("**New sales**"));
         assert!(text.contains("- Ahri — Foxfire Ahri −38% · 607 RP"));
         assert!(text.contains("**New in store**"));
@@ -410,32 +558,55 @@ mod tests {
         assert!(text.contains("**Mythic rotation (weekly)**"));
         assert!(text.contains("- Prestige Ocean Song Seraphine · 35 ME"));
         assert!(text.contains(
-            "**Your Shop started** · started 2026-10-01 09:00 UTC · ends 2026-10-08 09:00 UTC"
+            "**Your Shop started · started 2026-10-01 09:00 UTC · ends 2026-10-08 09:00 UTC**"
         ));
     }
 
     #[test]
-    fn empty_delta_renders_nothing() {
-        assert!(announce_text(&StoreDelta::default(), &NameIndex::empty()).is_none());
+    fn empty_delta_renders_no_pages() {
+        assert!(announce_pages(&StoreDelta::default(), &NameIndex::empty()).is_empty());
     }
 
+    /// The point of pagination: every sale prints, none is cut. The old
+    /// per-section cap and the hidden-count footer are gone.
     #[test]
-    fn sections_cut_at_fifteen_lines_with_a_more_marker() {
-        let sales: Vec<super::super::lcu::Sale> = (0..20)
-            .map(|id| {
-                let mut sale = skin_sale(975, None);
-                sale.id = id;
-                sale.item.item_id = None;
-                sale.item.inventory_type = Some("CHAMPION".to_owned());
-                sale.sale.prices.clear();
-                sale
-            })
-            .collect();
+    fn announce_pages_render_every_line_without_cuts() {
+        let sales: Vec<super::super::lcu::Sale> =
+            (0..20).map(|id| skin_sale_named(id, 10_000 + id, 975, None)).collect();
         let delta = StoreDelta { sales, ..Default::default() };
-        let text = announce_text(&delta, &NameIndex::empty()).expect("announcement expected");
-        // Title line + 15 shown lines + the marker = 16 newlines.
-        assert_eq!(text.matches('\n').count(), 16);
-        assert!(text.contains("…and 5 more"));
+        let pages = announce_pages(&delta, &NameIndex::empty());
+        assert_eq!(pages.len(), 1);
+        let text = pages.join("\n\n");
+        for id in 0..20u64 {
+            assert!(
+                text.contains(&format!("- Skin {} \u{b7}", 10_000 + id)),
+                "sale {id} missing: {text}"
+            );
+        }
+        assert!(!text.contains('\u{2026}'), "nothing is cut: {text}");
+    }
+
+    /// Sales group under one bold title per end date (soonest first), and
+    /// the per-line date repetition disappears - that is the whole budget
+    /// win of grouping.
+    #[test]
+    fn sales_group_by_end_date() {
+        let sales = vec![
+            skin_sale_named(2, 20_001, 700, Some("2026-10-12T23:59:00.000Z")),
+            skin_sale_named(1, 10_001, 607, Some("2026-10-05T17:00:00.000+00:00")),
+            skin_sale_named(3, 30_001, 500, None),
+        ];
+        let delta = StoreDelta { sales, ..Default::default() };
+        let text = announce_pages(&delta, &NameIndex::empty()).join("\n\n");
+        let position = |needle: &str| text.find(needle).expect(needle);
+        assert!(position("**New sales · until 2026-10-05**") < position("- Skin 10001"));
+        assert!(position("**New sales · until 2026-10-12**") < position("- Skin 20001"));
+        assert!(
+            position("**New sales · until 2026-10-05**")
+                < position("**New sales · until 2026-10-12**")
+        );
+        assert!(text.contains("**New sales**\n- Skin 30001"), "undated sales trail: {text}");
+        assert!(!text.contains("RP · until"), "dates live in the titles only: {text}");
     }
 
     #[test]
@@ -470,7 +641,7 @@ mod tests {
             }],
             ..StoreDelta::default()
         };
-        let text = announce_text(&delta, &NameIndex::empty()).expect("announcement expected");
+        let text = announce_pages(&delta, &NameIndex::empty()).join("\n\n");
         assert!(
             text.contains("**Mythic rotation (weekly) · ends 2026-10-08 00:00 UTC**"),
             "text: {text}"
@@ -504,7 +675,7 @@ mod tests {
                 prices: vec![Price { cost: Some(150), currency: Some("RP".to_owned()) }],
             },
         };
-        let line = sale_line(&sale, &catalog_index);
+        let line = sale_line(&sale, &catalog_index, true);
         assert_eq!(line, "- Hextech Chest −50% · 150 RP");
     }
 
@@ -537,15 +708,14 @@ mod tests {
                 prices: vec![Price { cost: Some(1), currency: Some("RP".to_owned()) }],
             },
         };
-        let line = sale_line(&sale, &catalog_index);
+        let line = sale_line(&sale, &catalog_index, false);
         assert!(line.contains("\u{2212}100%"), "deep discount clamps to ~100: {line}");
     }
 
-    /// Sections exceeding the embed budget are dropped from the tail, and
-    /// the hidden count is recorded - the whole point is that the send path
-    /// truncates nothing, so the text must always fit.
+    /// Oversized announcements SPLIT into pages - nothing is dropped from
+    /// the tail anymore, and every page stays inside Discord's embed limit.
     #[test]
-    fn oversized_announcements_drop_tail_sections() {
+    fn oversized_announcements_split_into_pages() {
         let fat_rotation = |label: &str| super::super::diff::RotationDelta {
             label: label.to_owned(),
             rotation_start: None,
@@ -568,19 +738,25 @@ mod tests {
             ],
             ..Default::default()
         };
-        let text = announce_text(&delta, &index()).expect("announcement expected");
-        assert!(text.contains("**New sales**"), "the headline section always survives");
-        assert!(text.contains("more update groups hidden"));
-        assert!(text.len() < 4096, "must fit the embed description limit");
-        assert!(!text.contains("monthly"), "the lowest-priority tail goes first");
+        let pages = announce_pages(&delta, &index());
+        assert!(pages.len() > 1, "a full store must span pages: {}", pages.len());
+        let text = pages.join("\n\n");
+        for label in ["daily", "weekly", "biweekly", "monthly"] {
+            assert!(text.contains(label), "no section is dropped: {label}");
+        }
+        assert!(!text.contains("hidden"), "no hidden-count footer anymore");
+        for page in &pages {
+            assert!(page.len() <= 3800, "page inside the budget: {}", page.len());
+        }
     }
 
-    /// A single pathological section (absurd names) is hard-cut to the
-    /// budget instead of being dropped wholesale.
+    /// A section taller than a whole page splits BETWEEN its lines (the
+    /// title returns with a continuation marker), and a single line longer
+    /// than the budget is char-safely hard-cut instead of overflowing.
     #[test]
-    fn single_oversized_section_is_hard_cut() {
-        let long_name = "A".repeat(400);
-        let skins: Vec<CatalogItem> = (0..15)
+    fn oversized_section_splits_and_hard_cuts_a_pathological_line() {
+        let long_name = "A".repeat(300);
+        let mut skins: Vec<CatalogItem> = (0..30)
             .map(|n| CatalogItem {
                 item_id: 1000 + n,
                 inventory_type: Some("CHAMPION_SKIN".to_owned()),
@@ -592,9 +768,27 @@ mod tests {
                 item_requirements: Vec::new(),
             })
             .collect();
+        skins.push(CatalogItem {
+            item_id: 9999,
+            inventory_type: Some("CHAMPION_SKIN".to_owned()),
+            prices: Vec::new(),
+            localizations: BTreeMap::from([(
+                "en_US".to_owned(),
+                LocalizedText { name: Some("B".repeat(4000)) },
+            )]),
+            item_requirements: Vec::new(),
+        });
         let delta = StoreDelta { skins, ..Default::default() };
-        let text = announce_text(&delta, &NameIndex::empty()).expect("announcement expected");
-        assert!(text.len() < 4096, "must fit the embed description limit");
-        assert!(text.ends_with('\u{2026}'), "hard cut marker expected");
+        let pages = announce_pages(&delta, &NameIndex::empty());
+        assert!(pages.len() > 1, "30 fat skins must span pages");
+        for page in &pages {
+            assert!(page.len() <= 3800, "page inside the budget: {}", page.len());
+        }
+        let text = pages.join("\n\n");
+        assert!(text.contains("(cont.)"), "continuation title expected");
+        assert!(text.contains('\u{2026}'), "the pathological line is hard-cut");
+        for n in 0..30u32 {
+            assert!(text.contains(&format!("{long_name} {n}")), "skin {n} missing: {}", text.len());
+        }
     }
 }

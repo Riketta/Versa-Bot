@@ -562,25 +562,37 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for DumpHandle
         _args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
-        let message = if let Some(text) =
-            self.engine.last_announcement_text().filter(|text| !text.is_empty())
-        {
-            OutboundMessage::embed(Embed {
-                title: "LoL Store - latest update".to_owned(),
-                description: text,
-            })
-        } else if let Some(text) = self.engine.current_store_text().await {
-            OutboundMessage::embed(Embed {
-                title: "LoL Store - current state".to_owned(),
-                description: text,
-            })
-        } else {
-            command_reply(
-                "No store update has been announced yet, and no store snapshot is \
+        let mut pages = self.engine.last_announcement_pages();
+        let mut title = "LoL Store - latest update";
+        if pages.is_empty() {
+            pages = self.engine.current_store_pages().await;
+            title = "LoL Store - current state";
+        }
+        if pages.is_empty() {
+            services
+                .chat_output
+                .send(command_reply(
+                    "No store update has been announced yet, and no store snapshot is \
                      available yet (the client may not have been polled).",
-            )
-        };
-        services.chat_output.send(message).await?;
+                ))
+                .await?;
+            return Ok(());
+        }
+        let total = pages.len();
+        for (n, page) in pages.iter().enumerate() {
+            let embed_title = if total == 1 {
+                title.to_owned()
+            } else {
+                format!("{title} ({}/{})", n + 1, total)
+            };
+            services
+                .chat_output
+                .send(OutboundMessage::embed(Embed {
+                    title: embed_title,
+                    description: page.clone(),
+                }))
+                .await?;
+        }
         Ok(())
     }
 }

@@ -357,7 +357,7 @@ pub(crate) fn build_notification(
         let Some(matched) = matching_users(doc, Edge::Sale, &Subject::Item(item_id), index) else {
             continue;
         };
-        lines.push(sale_line(sale, index));
+        lines.push(sale_line(sale, index, true));
         collect_users(&mut users, matched);
     }
     push_section(&mut sections, "On sale", &lines);

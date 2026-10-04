@@ -29,7 +29,7 @@ use super::diff::{
     self, LastSeen, Snapshot, StoreDelta, YourShopStart, rotation_delta, rotation_stores,
 };
 use super::events::{LolStoreAnnounced, StoreEventKind};
-use super::format::{NameIndex, announce_text, champion_map};
+use super::format::{NameIndex, announce_pages, champion_map};
 use super::lcu::LcuPort;
 use super::watch::{self, StoreSearch, WatchDoc, WatchTarget};
 
@@ -110,7 +110,9 @@ pub struct StoreEngine<B: EventBusPort> {
     name_index_cache: Mutex<Option<(u64, Arc<NameIndex>)>>,
     online: AtomicBool,
     last_poll: Mutex<Option<Instant>>,
-    last_announcement: Mutex<Option<(Instant, String)>>,
+    /// The announcement as delivered: one entry per embed page. Process
+    /// lifetime - a fresh launch has none until the first delta renders.
+    last_announcement: Mutex<Option<(Instant, Vec<String>)>>,
 }
 
 impl<B: EventBusPort> StoreEngine<B> {
@@ -184,6 +186,14 @@ impl<B: EventBusPort> StoreEngine<B> {
         match yourshop {
             Ok(data) => snapshot.yourshop = Some(data),
             Err(_) => failures.push("yourshop"),
+        }
+
+        // The tracker is about skins: the champion ITSELF going on sale is
+        // noise in the feed (its id never joins a catalog skin, and it is
+        // not what the subscription role signed up for). Other non-skin
+        // items (chests, bundles) still pass.
+        if let Some(sales) = &mut snapshot.sales {
+            sales.retain(|sale| sale.item.inventory_type.as_deref() != Some("CHAMPION"));
         }
 
         if failures.len() == 4 {
@@ -260,8 +270,8 @@ impl<B: EventBusPort> StoreEngine<B> {
                     // An empty render announces nothing - storing it would
                     // make `/lol_client_status` report a phantom
                     // announcement.
-                    Ok(text) if !text.is_empty() => {
-                        *self.last_announcement.lock() = Some((Instant::now(), text));
+                    Ok(pages) if !pages.is_empty() => {
+                        *self.last_announcement.lock() = Some((Instant::now(), pages));
                     }
                     Ok(_) => {}
                     Err(err) => tracing::warn!(%err, "store announcement fan-out failed"),
@@ -285,22 +295,30 @@ impl<B: EventBusPort> StoreEngine<B> {
         );
     }
 
-    /// Formats and fans one delta out: per enabled guild - embed, record,
-    /// bus event. Returns the rendered text (for the status memory).
+    /// Formats and fans one delta out: per enabled guild - one embed per
+    /// page, record, bus event. Returns the rendered pages (for the status
+    /// memory); empty when nothing renders.
     ///
-    /// Delivery is at-most-once by design: a guild whose send fails only
-    /// logs the miss (no record, no bus event) and the state swap still
-    /// advances, so the delta is not replayed next poll. Cosmetic pings,
-    /// not a delivery contract.
-    async fn announce(&self, delta: &StoreDelta, index: &NameIndex) -> anyhow::Result<String> {
-        let Some(text) = announce_text(delta, index) else {
-            return Ok(String::new());
-        };
+    /// Delivery is at-most-once by design: a guild whose send fails keeps
+    /// what landed, logs the miss, and gets no record - and the state swap
+    /// still advances, so the delta is not replayed next poll. Cosmetic
+    /// pings, not a delivery contract.
+    async fn announce(&self, delta: &StoreDelta, index: &NameIndex) -> anyhow::Result<Vec<String>> {
+        if index.catalog.is_empty() {
+            tracing::warn!(
+                "store catalog unavailable - sale names degrade to bare ids \
+                 (check the 'some store sources failed' warnings)"
+            );
+        }
+        let pages = announce_pages(delta, index);
+        if pages.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let targets = self.enabled_guilds().await;
         if targets.is_empty() {
             tracing::debug!("store updates found but no guild is tracking them");
-            return Ok(text);
+            return Ok(pages);
         }
 
         let mut kinds: Vec<StoreEventKind> = Vec::new();
@@ -317,10 +335,22 @@ impl<B: EventBusPort> StoreEngine<B> {
             kinds.push(StoreEventKind::YourShop);
         }
 
-        let announcement_embed =
-            Embed { title: "LoL Store updates".to_owned(), description: text.clone() };
+        let total = pages.len();
+        let embeds: Vec<Embed> = pages
+            .iter()
+            .enumerate()
+            .map(|(n, page)| Embed {
+                title: if total == 1 {
+                    "LoL Store updates".to_owned()
+                } else {
+                    format!("LoL Store updates ({}/{})", n + 1, total)
+                },
+                description: page.clone(),
+            })
+            .collect();
         let at_unix =
             SystemTime::now().duration_since(UNIX_EPOCH).map(|since| since.as_secs()).unwrap_or(0);
+        let record_text = pages.join("\n\n");
 
         for &(platform, guild_id, channel_id, ref role_id) in &targets {
             let origin = Origin {
@@ -337,21 +367,28 @@ impl<B: EventBusPort> StoreEngine<B> {
                 .as_deref()
                 .and_then(|id| id.parse::<u64>().ok())
                 .map_or(String::new(), |id| format!("<@&{id}>"));
-            let message = OutboundMessage {
-                content,
-                embeds: vec![announcement_embed.clone()],
-                ..OutboundMessage::default()
-            };
             let storage = self.storage.guild_scoped(platform, guild_id);
             let output = self.factory.channel_output(&origin, channel_id);
-            if let Err(err) = output.send(message).await {
-                tracing::warn!(%err, guild = guild_id.get(), "failed to deliver store announcement");
+            let mut delivered = true;
+            for embed in &embeds {
+                let message = OutboundMessage {
+                    content: content.clone(),
+                    embeds: vec![embed.clone()],
+                    ..OutboundMessage::default()
+                };
+                if let Err(err) = output.send(message).await {
+                    tracing::warn!(%err, guild = guild_id.get(), "failed to deliver store announcement");
+                    delivered = false;
+                    break;
+                }
+            }
+            if !delivered {
                 continue;
             }
             if let Err(err) = storage
                 .append(
                     NAMESPACE,
-                    serde_json::json!({ "kind": "announcement", "text": text, "at_unix": at_unix }),
+                    serde_json::json!({ "kind": "announcement", "text": record_text, "at_unix": at_unix }),
                 )
                 .await
             {
@@ -364,10 +401,11 @@ impl<B: EventBusPort> StoreEngine<B> {
 
         tracing::info!(
             guilds = targets.len(),
+            pages = total,
             kinds = ?kinds.iter().map(|kind| kind.as_str()).collect::<Vec<_>>(),
             "store announcements delivered"
         );
-        Ok(text)
+        Ok(pages)
     }
 
     /// Catalog + champion joins, with a lazily loaded champion name table
@@ -722,12 +760,12 @@ impl<B: EventBusPort> StoreEngine<B> {
         lines.join("\n")
     }
 
-    /// The last delivered announcement text (first `/lol_store_dump`
-    /// choice; the command falls back to [`Self::current_store_text`]).
+    /// The announcement as delivered - one entry per embed page (first
+    /// `/lol_store_dump` choice; the command falls back to
+    /// [`Self::current_store_pages`]).
     #[must_use]
-    pub fn last_announcement_text(&self) -> Option<String> {
-        let last = self.last_announcement.lock();
-        last.as_ref().map(|(_, text)| text.clone())
+    pub fn last_announcement_pages(&self) -> Vec<String> {
+        self.last_announcement.lock().as_ref().map_or_else(Vec::new, |(_, pages)| pages.clone())
     }
 
     /// Renders the retained raw snapshot as a full "current store" dump -
@@ -735,13 +773,19 @@ impl<B: EventBusPort> StoreEngine<B> {
     /// has been announced. Sales, mythic rotations and an active Your Shop
     /// show their current contents; skins are omitted because "new in
     /// store" is a diff concept a lone snapshot cannot provide (the
-    /// alternative would print the whole catalog). `None` while nothing
+    /// alternative would print the whole catalog). Empty while nothing
     /// renderable has been fetched (no poll yet, client offline, or all
     /// sections empty).
-    pub async fn current_store_text(&self) -> Option<String> {
-        let snapshot = self.last_snapshot.lock().clone()?;
+    pub async fn current_store_pages(&self) -> Vec<String> {
+        let Some(snapshot) = self.last_snapshot.lock().clone() else { return Vec::new() };
         if snapshot.sales.is_none() && snapshot.rotations.is_none() && snapshot.yourshop.is_none() {
-            return None;
+            return Vec::new();
+        }
+        if snapshot.catalog.is_none() {
+            tracing::warn!(
+                "store catalog unavailable - sale names degrade to bare ids \
+                 (check the 'some store sources failed' warnings)"
+            );
         }
         let index = self.name_index(&snapshot).await;
         let mut delta = StoreDelta::default();
@@ -763,7 +807,7 @@ impl<B: EventBusPort> StoreEngine<B> {
                 });
             }
         }
-        announce_text(&delta, &index)
+        announce_pages(&delta, &index)
     }
 }
 
@@ -999,6 +1043,20 @@ mod tests {
         }
     }
 
+    /// A CHAMPION-typed sale (the champion itself, not a skin) - dropped at
+    /// ingestion since the feed is about skins.
+    fn champion_sale() -> Sale {
+        Sale {
+            id: 2,
+            item: ItemRef { inventory_type: Some("CHAMPION".to_owned()), item_id: Some(799) },
+            sale: SaleInfo {
+                start_date: None,
+                end_date: Some("2026-10-05T17:00:00.000+00:00".to_owned()),
+                prices: vec![Price { cost: Some(790), currency: Some("RP".to_owned()) }],
+            },
+        }
+    }
+
     fn rotation_store(name: &str, ids: &[&str]) -> RotationStore {
         use crate::plugins::lol_store::diff::MYTHIC_SHOP_ID;
         use crate::plugins::lol_store::lcu::{DisplayMetadata, RotatingMetadata, ShoppefrontMeta};
@@ -1051,18 +1109,33 @@ mod tests {
     async fn fresh_launch_dump_renders_the_current_store_without_skins() {
         let f = fixture(FakeLcu::online()).await;
         enable_guild(&f.storage, GUILD, Some("55")).await;
-        assert!(f.engine.current_store_text().await.is_none(), "no poll yet");
+        assert!(f.engine.current_store_pages().await.is_empty(), "no poll yet");
 
         *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
         *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
         *f.lcu.rotations.lock() = Some(vec![rotation_store("WEEKLY", &["e1", "e2"])]);
         f.engine.tick().await; // silent baseline
-        assert!(f.engine.last_announcement_text().is_none());
+        assert!(f.engine.last_announcement_pages().is_empty());
 
-        let text = f.engine.current_store_text().await.expect("snapshot dump expected");
+        let text = f.engine.current_store_pages().await.join("\n\n");
         assert!(text.contains("New sales"), "current sales show: {text}");
         assert!(text.contains("Mythic rotation"), "current rotation shows: {text}");
         assert!(!text.contains("New in store"), "skins need history: {text}");
+    }
+
+    /// The champion ITSELF going on sale is not store news: it is dropped
+    /// at ingestion and never reaches announcements, dumps or watches.
+    #[tokio::test]
+    async fn champion_sales_are_excluded_from_the_feed() {
+        let f = fixture(FakeLcu::online()).await;
+        enable_guild(&f.storage, GUILD, Some("55")).await;
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031), champion_sale()]);
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        f.engine.tick().await; // silent baseline keeps only the skin sale
+
+        let text = f.engine.current_store_pages().await.join("\n\n");
+        assert!(text.contains("Foxfire Ahri"), "skin sale present: {text}");
+        assert!(!text.contains("Champion 799"), "champion sale excluded: {text}");
     }
 
     #[tokio::test]
