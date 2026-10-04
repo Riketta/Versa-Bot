@@ -10,9 +10,17 @@ use crate::kernel::models::{GuildId, Platform, StorageError};
 pub const GUILD_SETTINGS: &str = "guild";
 
 /// Driven port: guild-partitioned document storage. The kernel consumes it to
-/// build event-scoped `GuildStorage` handles (see `KernelServices`).
+/// build event-scoped `GuildStorage` handles (see `KernelServices`);
+/// event-less plugins (scheduler-driven pollers) use [`StoragePort::list_guilds`]
+/// to discover which guilds exist at all.
+#[async_trait]
 pub trait StoragePort: Send + Sync {
     fn guild_scoped(&self, platform: Platform, guild_id: GuildId) -> Arc<dyn GuildStorage>;
+
+    /// Every guild that has at least one stored document, in stable
+    /// (platform, guild) order. Poll-driven plugins iterate this to find
+    /// their per-guild config instead of keeping their own registry.
+    async fn list_guilds(&self) -> Result<Vec<(Platform, GuildId)>, StorageError>;
 }
 
 /// One appended record: its guild-scoped sequence number and payload.

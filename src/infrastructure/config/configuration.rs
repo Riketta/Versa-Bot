@@ -2,6 +2,7 @@ use serde::Deserialize;
 
 use super::discord::DiscordConfig;
 use super::llm::LlmConfig;
+use super::lol::LolConfig;
 use super::sentry::SentryConfig;
 use super::status::StatusConfig;
 use super::storage::StorageConfig;
@@ -23,5 +24,9 @@ pub struct Configuration {
     /// Optional bot status rotation (`[status]` section). Global concern:
     /// interval and status list are bot-wide, not per-guild.
     pub status: Option<StatusConfig>,
+    /// Optional League-client store watcher (`[lol]` section). Startup-only:
+    /// absent section - or an empty `lockfile_path` - keeps the watcher off.
+    #[serde(default)]
+    pub lol: Option<LolConfig>,
     pub storage: StorageConfig,
 }

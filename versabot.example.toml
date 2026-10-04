@@ -37,6 +37,22 @@ url = "sqlite://versabot.db"
 # interval_seconds = 300
 # statuses = ["with the API", "versa-bot", "over the guild"]
 
+# Optional: LoL store watcher - announces store events (new sales, new
+# skins, Mythic Shop rotations, Your Shop start) from the locally running
+# League client to a per-guild assigned channel (/lol_store_enable +
+# /lol_store_assign). Startup-only: an absent section, an empty
+# lockfile_path, or poll_secs = 0 keeps the watcher off. Your logged-in
+# account is only the API key - no account data is ever read or announced.
+# [lol]
+# lockfile_path = "C:/Riot Games/League of Legends/lockfile"
+# Host the client API listens on; the port always comes from the lockfile.
+# address = "127.0.0.1"
+# poll_secs = 300
+# announce_sales = true
+# announce_new_skins = true
+# announce_mythic_rotation = true
+# announce_yourshop = true
+
 # Optional: LLM chat runtime. This section is the bot operator's domain -
 # guild moderators only pick among the declared models via /llm_assign
 # and /llm_set, never configure endpoints. Startup-only: changes require

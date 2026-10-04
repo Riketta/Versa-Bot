@@ -12,6 +12,7 @@ use async_trait::async_trait;
 
 use crate::kernel::{
     models::{GuildId, OutboundError, OutboundMessage, Platform, StorageError},
+    plugin_ports::{Job, JobHandle, SchedulerPort},
     spi_ports::{
         ChatOutputFactoryPort, ChatOutputPort, ChatTypingGuard, GUILD_SETTINGS, GuildStorage,
         StoragePort, StoredRecord,
@@ -59,6 +60,7 @@ impl InMemoryStorage {
     }
 }
 
+#[async_trait]
 impl StoragePort for InMemoryStorage {
     fn guild_scoped(&self, platform: Platform, guild_id: GuildId) -> Arc<dyn GuildStorage> {
         Arc::new(ScopedView {
@@ -66,6 +68,35 @@ impl StoragePort for InMemoryStorage {
             records: Arc::clone(&self.records),
             key_prefix: (platform.as_str().to_owned(), guild_id.get() as i64),
         })
+    }
+
+    /// Distinct scopes over seeded documents and record logs, ordered - the
+    /// fake mirrors the real adapter's shape so poll-driven plugins test
+    /// their discovery logic.
+    async fn list_guilds(&self) -> Result<Vec<(Platform, GuildId)>, StorageError> {
+        let mut scopes: Vec<(String, i64)> = Vec::new();
+        {
+            let documents = self.documents.lock();
+            scopes
+                .extend(documents.keys().map(|(platform, guild, _, _)| (platform.clone(), *guild)));
+        }
+        {
+            let records = self.records.lock();
+            scopes.extend(records.keys().map(|(platform, guild, _)| (platform.clone(), *guild)));
+        }
+        scopes.sort();
+        scopes.dedup();
+        Ok(scopes
+            .into_iter()
+            .filter_map(|(platform, guild)| {
+                let platform = match platform.as_str() {
+                    "discord" => Platform::Discord,
+                    _ => return None,
+                };
+                let guild = u64::try_from(guild).ok()?;
+                Some((platform, GuildId(guild)))
+            })
+            .collect())
     }
 }
 
@@ -317,9 +348,14 @@ impl GuildStorage for FailingView {
     }
 }
 
+#[async_trait]
 impl StoragePort for FailingStorage {
     fn guild_scoped(&self, _platform: Platform, _guild_id: GuildId) -> Arc<dyn GuildStorage> {
         Arc::new(FailingView)
+    }
+
+    async fn list_guilds(&self) -> Result<Vec<(Platform, GuildId)>, StorageError> {
+        Err(StorageError::Database("simulated storage failure".to_owned()))
     }
 }
 
@@ -409,6 +445,22 @@ impl crate::kernel::spi_ports::ChatStreamPort for NoopChatStream {
         Err(crate::kernel::models::OutboundError::Send(
             "streaming not supported by the test factory".to_owned(),
         ))
+    }
+}
+
+/// [`SchedulerPort`] double: accepts jobs, never runs them - the handle is
+/// already dead, so `stop()` paths stay exercisable without a runtime.
+#[derive(Default)]
+pub struct NoopScheduler;
+
+impl SchedulerPort for NoopScheduler {
+    fn schedule(
+        &self,
+        _name: &str,
+        _interval: std::time::Duration,
+        _job: Arc<dyn Job>,
+    ) -> JobHandle {
+        JobHandle::new(Arc::new(|| {}))
     }
 }
 

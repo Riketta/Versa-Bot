@@ -1906,9 +1906,14 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl StoragePort for RecordsFailStorage {
         fn guild_scoped(&self, platform: Platform, guild_id: GuildId) -> Arc<dyn GuildStorage> {
             Arc::new(RecordsFailView { guild: self.documents.guild_scoped(platform, guild_id) })
+        }
+
+        async fn list_guilds(&self) -> Result<Vec<(Platform, GuildId)>, StorageError> {
+            self.documents.list_guilds().await
         }
     }
 
@@ -1967,9 +1972,14 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl StoragePort for AppendFailStorage {
         fn guild_scoped(&self, platform: Platform, guild_id: GuildId) -> Arc<dyn GuildStorage> {
             Arc::new(AppendFailView { guild: self.documents.guild_scoped(platform, guild_id) })
+        }
+
+        async fn list_guilds(&self) -> Result<Vec<(Platform, GuildId)>, StorageError> {
+            self.documents.list_guilds().await
         }
     }
 

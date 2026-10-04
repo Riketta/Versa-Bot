@@ -103,6 +103,7 @@ impl SqlxStorage {
     }
 }
 
+#[async_trait]
 impl StoragePort for SqlxStorage {
     fn guild_scoped(&self, platform: Platform, guild_id: GuildId) -> Arc<dyn GuildStorage> {
         Arc::new(ScopedGuildStorage {
@@ -111,6 +112,43 @@ impl StoragePort for SqlxStorage {
             // Discord snowflakes fit i64; engines store integers natively.
             guild_id: guild_id.get() as i64,
         })
+    }
+
+    /// Distinct scopes over the documents table: the poll-driven plugins'
+    /// view of "which guilds exist". Unknown platform strings are skipped
+    /// (the enum is ahead of the storage, never behind).
+    async fn list_guilds(&self) -> Result<Vec<(Platform, GuildId)>, StorageError> {
+        let rows: Vec<(String, i64)> = match &*self.db {
+            Db::Sqlite(pool) => {
+                sqlx::query_as(
+                    "SELECT DISTINCT platform, guild_id FROM guild_documents \
+                     ORDER BY platform, guild_id",
+                )
+                .fetch_all(pool)
+                .await
+            }
+            Db::Postgres(pool) => {
+                sqlx::query_as(
+                    "SELECT DISTINCT platform, guild_id FROM guild_documents \
+                     ORDER BY platform, guild_id",
+                )
+                .fetch_all(pool)
+                .await
+            }
+        }
+        .map_err(|err| StorageError::Database(err.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|(platform, guild_id)| {
+                let platform = match platform.as_str() {
+                    "discord" => Platform::Discord,
+                    _ => return None,
+                };
+                let guild_id = u64::try_from(guild_id).ok()?;
+                Some((platform, GuildId(guild_id)))
+            })
+            .collect())
     }
 }
 

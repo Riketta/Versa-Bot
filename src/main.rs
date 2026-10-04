@@ -7,7 +7,8 @@ use config::{Config, Environment, File};
 use serenity::all::{ClientBuilder, GatewayIntents, Http, HttpBuilder};
 
 use versa_bot::infrastructure::{
-    Configuration, LlmConfig, LlmReasoningStyle, LlmSummaryPlacement, PollingConfigWatcher,
+    Configuration, LlmConfig, LlmReasoningStyle, LlmSummaryPlacement, LolConfig,
+    PollingConfigWatcher,
     inbound_adapters::{DiscordGatewayAdapter, SerenityChatOutputFactory},
     observability,
     outbound_adapters::{DiscordCommandRegistrar, SerenityPresence, SqlxStorage},
@@ -27,6 +28,9 @@ use versa_bot::plugins::llm::{
     ChatEngine, DISCORD_MESSAGE_LIMIT, DeckRandom, ImageDescriber, LlmCompletionPort, LlmPlugin,
     LlmSettings, ModelSettings, OpenAiCompatibleAdapter, ProviderSettings, RandomPort,
     ReasoningStyle, SummaryPlacement, VisionService,
+};
+use versa_bot::plugins::lol_store::{
+    AnnounceFlags, EngineSettings, LcuClient, LolStorePlugin, StoreEngine,
 };
 use versa_bot::plugins::status::{StatusRotatorPlugin, StatusSettings};
 use versa_bot::plugins::tracker::UserActivityTrackerPlugin;
@@ -71,6 +75,11 @@ async fn main() -> ExitCode {
     // the application id is not known before it runs.
     let http =
         Arc::new(build_http(&config.discord.token, config.discord.proxy.clone(), Some(app_id)));
+
+    // One shared outbound factory for event-scoped sends AND poll-driven
+    // sends (the store watcher has no inbound event to scope from).
+    let chat_factory: Arc<dyn ChatOutputFactoryPort> =
+        Arc::new(SerenityChatOutputFactory::new(Arc::clone(&http)));
 
     let storage = Arc::new(
         SqlxStorage::connect(&config.storage.url)
@@ -130,6 +139,30 @@ async fn main() -> ExitCode {
         status_settings(&config),
     ));
 
+    // LoL store watcher: always registered (its commands explain themselves
+    // when the watcher is off). `[lol]` is startup-only - the LCU client and
+    // the poll engine are built once here; changes require a restart. An
+    // absent section, an empty lockfile path or a zero poll keep the
+    // watcher disabled.
+    let lol_settings = lol_engine_settings(config.lol.as_ref());
+    let lcu_client = LcuClient::new(
+        config.lol.as_ref().map(|lol| lol.lockfile_path.clone()).unwrap_or_default(),
+        config.lol.as_ref().map(|lol| lol.address.clone()).unwrap_or_default(),
+    )
+    .expect("LCU http client expected to build");
+    let lol_engine = Arc::new(StoreEngine::new(
+        Arc::new(lcu_client) as Arc<dyn versa_bot::plugins::lol_store::lcu::LcuPort>,
+        Arc::clone(&storage) as Arc<dyn StoragePort>,
+        Arc::clone(&chat_factory),
+        event_bus.clone(),
+        lol_settings,
+    ));
+    let lol_store = Arc::new(LolStorePlugin::new(
+        Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
+        Arc::clone(&scheduler) as Arc<dyn SchedulerPort>,
+        Arc::clone(&lol_engine),
+    ));
+
     // Config hot reload: a polling watcher re-reads file+env configuration
     // and applies hot-reloadable sections without a restart. The handle is
     // kept and cancelled after the kernel shuts down - a post-shutdown tick
@@ -150,6 +183,7 @@ async fn main() -> ExitCode {
         Arc::clone(&llm) as Arc<dyn PluginPort>,
         Arc::clone(&audit) as Arc<dyn PluginPort>,
         Arc::clone(&status_plugin) as Arc<dyn PluginPort>,
+        Arc::clone(&lol_store) as Arc<dyn PluginPort>,
     ];
 
     let kernel = Arc::new(
@@ -162,8 +196,7 @@ async fn main() -> ExitCode {
                 Arc::clone(&llm) as Arc<dyn MiddlewarePluginPort>,
             ])
             .event_bus(event_bus)
-            .chat_output_factory(Arc::new(SerenityChatOutputFactory::new(Arc::clone(&http)))
-                as Arc<dyn ChatOutputFactoryPort>)
+            .chat_output_factory(Arc::clone(&chat_factory))
             .storage(Arc::clone(&storage) as Arc<dyn StoragePort>)
             .build(),
     );
@@ -379,6 +412,31 @@ fn status_settings(config: &Configuration) -> StatusSettings {
             StatusSettings::disabled()
         }
         None => StatusSettings::disabled(),
+    }
+}
+
+/// Extracts the store watcher's settings; absent `[lol]`, an empty lockfile
+/// path or a zero poll all map to the disabled state (zero poll = the
+/// scheduler contract's dead handle).
+fn lol_engine_settings(lol: Option<&LolConfig>) -> EngineSettings {
+    let disabled = EngineSettings { poll: Duration::ZERO, flags: AnnounceFlags::all_on() };
+    let Some(lol) = lol else { return disabled };
+    if lol.lockfile_path.is_empty() {
+        tracing::info!("config section [lol] has no lockfile_path - store watcher disabled");
+        return disabled;
+    }
+    if lol.poll_secs == 0 {
+        tracing::warn!("config section [lol] ignored: poll_secs must be > 0");
+        return disabled;
+    }
+    EngineSettings {
+        poll: Duration::from_secs(lol.poll_secs),
+        flags: AnnounceFlags {
+            sales: lol.announce_sales,
+            new_skins: lol.announce_new_skins,
+            mythic_rotation: lol.announce_mythic_rotation,
+            yourshop: lol.announce_yourshop,
+        },
     }
 }
 

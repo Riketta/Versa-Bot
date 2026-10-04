@@ -7,5 +7,5 @@ pub mod plugin_adapters;
 pub use config::configuration::Configuration;
 pub use config::{
     LlmConfig, LlmModelConfig, LlmProviderConfig, LlmReasoningStyle, LlmSummaryPlacement,
-    PollingConfigWatcher,
+    LolConfig, PollingConfigWatcher,
 };

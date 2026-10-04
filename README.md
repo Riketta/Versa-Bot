@@ -37,6 +37,9 @@ commands, permission tiers - lives in [Plugins](#plugins).
   assignments, administered from Discord via `/auth`.
 - User activity tracker: logs member joins/leaves to a guild audit
   channel and publishes membership events on the plugin bus.
+- LoL store tracker: watches the locally running League client's store
+  (sales, new skins, Mythic Shop rotations, Your Shop start) and announces
+  changes to a per-guild assigned channel.
 - Audit trail: records the bus membership events as structured `audit`
   tracing events.
 - LLM chat bot: per-channel conversations with history, compaction,
@@ -263,6 +266,63 @@ Operator configuration lives in the optional `[status]` config section
 means the rotation is off. The section hot-reloads: editing it
 re-applies the rotation live, removing it stops the rotation. No
 commands.
+
+### LoL store tracker (`lol_store` plugin)
+
+Announces League of Legends store events - new sales, newly listed
+skins, Mythic Shop rotation changes, Your Shop starts - from the
+**locally running League client** to a per-guild assigned channel. The
+client's REST API is read-only here: your logged-in account is only the
+API key, and no account data (wallet, inventory, purchases) is ever
+read or announced. Because there is no purchase-history endpoint, every
+event is detected by diffing store snapshots - two changes inside one
+poll window merge into a single line.
+
+Setup: point `[lol]` at the client's `lockfile` (the bot reads the
+per-start port and token from it, so client restarts self-heal), enable
+per guild with `/lol_store_enable`, and assign the announcement channel
+with `/lol_store_assign`. Announcements batch into one embed per poll
+cycle; the first successful poll after a restart is a catch-up
+(announcing what changed while the bot was down) or, with no stored
+state, a silent baseline.
+
+| Command | Tier | Effect |
+|---|---|---|
+| `/lol_client_status` | moderator | watcher health: client link, last poll, tracked counts, announce flags (ephemeral) |
+| `/lol_store_enable` | admin | enable store tracking for this guild |
+| `/lol_store_disable` | admin | disable store tracking for this guild (the channel binding is kept) |
+| `/lol_store_assign` | moderator | post store events in this channel (run it in the target channel) |
+| `/lol_store_unassign` | moderator | stop posting store events in this guild |
+| `/lol_store_dump` | moderator | force-post the latest store update summary in the current channel (public) |
+
+Operator configuration lives in the optional `[lol]` section
+(**startup-only** - an absent section, an empty `lockfile_path`, or a
+zero `poll_secs` keep the watcher off):
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `lockfile_path` | string | *(empty)* | path to the client's `lockfile`; empty = watcher disabled |
+| `address` | string | `"127.0.0.1"` | host the client API listens on (the port always comes from the lockfile) |
+| `poll_secs` | integer | `300` | poll cadence in seconds; `0` disables |
+| `announce_sales` | bool | `true` | announce new sales (name, % off, RP price, end date) |
+| `announce_new_skins` | bool | `true` | announce newly listed skins (champion, skin, RP price) |
+| `announce_mythic_rotation` | bool | `true` | announce Mythic Shop rotation changes (skin, Mythic Essence price) |
+| `announce_yourshop` | bool | `true` | announce Your Shop starts (start and end times) |
+
+Announced trackers that are toggled off still update the watcher's
+state, so re-enabling never replays old events. The watcher publishes
+`lol_store.announced` events on the plugin bus for other plugins.
+
+Maintainer notes - how to explore the League client's local API (the
+`/help` schema crawl, the vector-parameter encoding trap, a verified
+endpoint cheat sheet) - live in
+[`src/plugins/lol_store/README.md`](src/plugins/lol_store/README.md).
+
+Deployment note: the League client only listens on the machine's own
+loopback, so the watcher requires the bot to run **on the same Windows
+instance as the client** (natively, or in a container with host-level
+networking plus a read-only mount of the lockfile's *directory* - the
+file itself is rewritten on every client start).
 
 ### LLM chat bot (`llm` plugin)
 
@@ -697,7 +757,7 @@ src/
 │   │   ├── plugin_ports/   # plugin contracts (PluginPort, commands, bus)
 │   │   └── services/       # KernelService (pipeline runner, lifecycle)
 │   └── models/             # event taxonomy, IDs, errors
-├── plugins/           # features: auth, command dispatcher, tracker, audit trail, status rotator, llm chat
+├── plugins/           # features: auth, command dispatcher, tracker, audit trail, status rotator, lol store tracker, llm chat
 ├── infrastructure/    # adapters
 │   ├── inbound_adapters/   # Discord gateway + scoped output factory
 │   ├── outbound_adapters/  # storage (sqlx), Discord command registrar, presence
