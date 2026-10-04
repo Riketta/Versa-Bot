@@ -1145,12 +1145,14 @@ impl CommandHandler for GetLlmHandler {
 
 /// `/llm_dump`: every `/llm_set` key with its effective value at once, in
 /// one copy-pasteable code fence. Read-only sibling of `/llm_get` - same
-/// tier, same value renderer, one document read, no channel lock. Prompts
-/// are never dumped - not even as a preview; the dump only says whether
-/// one is set and how big it is, the text is one argument-free
-/// `/llm_set_prompt kind` away. The fence is FOUR backticks deep: rendered
-/// values are channel-managed text (templates) that may themselves contain
-/// code fences.
+/// tier, same value renderer, one document read, no channel lock. Lines
+/// whose value differs from a fresh `/llm_assign` are marked `*` (one
+/// comparison against a baseline config shared by every key - no per-key
+/// default table to drift). Prompts are never dumped - not even as a
+/// preview; the dump only says whether one is set and how big it is, the
+/// text is one argument-free `/llm_set_prompt kind` away. The fence is
+/// FOUR backticks deep: rendered values are channel-managed text
+/// (templates) that may themselves contain code fences.
 pub(super) struct DumpLlmHandler {
     engine: Arc<ChatEngine>,
 }
@@ -1186,11 +1188,22 @@ impl CommandHandler for DumpLlmHandler {
         let Some(config) = load_assigned_config(event, services).await? else {
             return Ok(());
         };
+        // A fresh assignment is the default baseline. Built with the
+        // channel's own model, so `model` itself never reads as customized -
+        // it IS the assignment.
+        let baseline = ChannelConfig::assigned(config.model.clone());
         let mut lines: Vec<String> = SET_KEYS
             .iter()
             .map(|key| {
                 let value = current_value(&config, key, self.engine.settings())
                     .unwrap_or_else(|| "?".to_owned());
+                let marker = if current_value(&baseline, key, self.engine.settings()).as_deref()
+                    == Some(value.as_str())
+                {
+                    ""
+                } else {
+                    "* "
+                };
                 let value = if value.chars().count() > DUMP_VALUE_PREVIEW {
                     format!(
                         "{}… ({} chars total)",
@@ -1200,14 +1213,15 @@ impl CommandHandler for DumpLlmHandler {
                 } else {
                     value
                 };
-                format!("{key} = {value}")
+                format!("{marker}{key} = {value}")
             })
             .collect();
         // The three prompts are never dumped - set-or-not and size only;
         // the text is one `/llm_set_prompt kind` away.
         for kind in [PromptKind::System, PromptKind::Compaction, PromptKind::Image] {
+            let marker = if kind.field(&config).is_some() { "* " } else { "" };
             lines.push(format!(
-                "{} = {}",
+                "{marker}{} = {}",
                 kind.field_name(),
                 prompt_shape(kind.field(&config).as_ref())
             ));
@@ -1215,7 +1229,7 @@ impl CommandHandler for DumpLlmHandler {
         services
             .chat_output
             .send(command_reply(format!(
-                "Channel settings ({} keys + 3 prompts):\n````\n{}\n````",
+                "Channel settings ({} keys + 3 prompts; `*` differs from the default):\n````\n{}\n````",
                 SET_KEYS.len(),
                 lines.join("\n")
             )))

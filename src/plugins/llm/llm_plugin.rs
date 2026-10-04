@@ -842,10 +842,12 @@ mod tests {
     }
 
     /// `/llm_dump`: every key at once, `key = value` inside a four-backtick
-    /// fence, effective values. Prompts never enter the dump - not even as
-    /// a preview: only set-or-not and size, the text is one `/llm_get key`
-    /// away. Long non-prompt values (templates) degrade to head previews so
-    /// the whole dump stays one Discord message.
+    /// fence, effective values; keys that differ from a fresh assignment
+    /// carry a `*` marker, defaults do not. Prompts never enter the dump -
+    /// not even as a preview: only set-or-not and size, the text is one
+    /// argument-free `/llm_set_prompt kind` away. Long non-prompt values
+    /// (templates) degrade to head previews so the whole dump stays one
+    /// Discord message.
     #[tokio::test]
     async fn dump_lists_every_setting_in_a_fence() {
         let (plugin, fixture) = fixture();
@@ -858,6 +860,17 @@ mod tests {
             )
             .await
             .expect("assign expected to succeed");
+        SetLlmHandler::new(ChannelLocks::new(), Arc::clone(&fixture.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![
+                    ("key".to_owned(), "temperature".to_owned()),
+                    ("value".to_owned(), "0.7".to_owned()),
+                ]),
+                &fixture.services,
+            )
+            .await
+            .expect("set expected to succeed");
         let long_prompt = "ário ".repeat(400); // 2400 chars, multibyte-safe
         prompt_handler(&fixture)
             .invoke(
@@ -878,15 +891,22 @@ mod tests {
 
         let reply = fixture.output.messages().last().expect("reply expected").clone();
         assert!(reply.contains("````"), "four-backtick fence expected: {reply}");
+        assert!(reply.contains("`*` differs from the default"), "marker hint expected: {reply}");
         for key in SET_KEYS {
             assert!(reply.contains(&format!("{key} = ")), "key {key} missing: {reply}");
         }
-        assert!(reply.contains("model = local/gemma"), "unexpected: {reply}");
-        assert!(reply.contains("react = off"), "unexpected: {reply}");
+        // Customized keys carry the marker ...
+        assert!(reply.contains("* temperature = 0.7"), "unexpected: {reply}");
+        assert!(reply.contains("* compaction_prompt = <set,"), "unexpected: {reply}");
+        // ... the assignment baseline and untouched defaults do not.
+        assert!(reply.contains("\nmodel = local/gemma"), "unexpected: {reply}");
+        assert!(reply.contains("\nreact = off"), "unexpected: {reply}");
+        assert!(reply.contains("\nstreaming = off"), "unexpected: {reply}");
+        assert!(reply.contains("image_prompt = <plugin default>"), "unexpected: {reply}");
+        assert!(!reply.contains("* depth ="), "untouched default must not be marked");
         // Prompts: shape only - set-or-not and size, never the text.
         let expected = format!("compaction_prompt = <set, {} chars>", long_prompt.chars().count());
         assert!(reply.contains(&expected), "unexpected: {reply}");
-        assert!(reply.contains("image_prompt = <plugin default>"), "unexpected: {reply}");
         assert!(!reply.contains("ário"), "prompt content leaked: {reply}");
         // One Discord message.
         assert!(reply.chars().count() <= 2000, "dump exceeds Discord's cap");
