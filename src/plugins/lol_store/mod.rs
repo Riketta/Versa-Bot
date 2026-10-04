@@ -265,14 +265,6 @@ impl<B: EventBusPort> PluginPort for LolStorePlugin<B> {
     }
 }
 
-impl AnnounceFlags {
-    /// Every tracker announcing (the config default).
-    #[must_use]
-    pub fn all_on() -> Self {
-        Self { sales: true, new_skins: true, mythic_rotation: true, yourshop: true }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +344,24 @@ mod tests {
             assert!(descriptor.guild_only, "{} must be guild-only", descriptor.name);
             assert!(descriptor.required_tier.is_some());
         }
+        // Exact tiers: a regression demoting enable to User (or watches to
+        // Moderator) must fail here, not in production.
+        let tier_of =
+            |name: &str| descriptors.iter().find(|d| d.name == name).and_then(|d| d.required_tier);
+        assert_eq!(tier_of("lol_store_enable"), Some(AccessTier::Admin));
+        assert_eq!(tier_of("lol_store_disable"), Some(AccessTier::Admin));
+        for moderator in [
+            "lol_client_status",
+            "lol_store_assign",
+            "lol_store_unassign",
+            "lol_store_role",
+            "lol_store_dump",
+        ] {
+            assert_eq!(tier_of(moderator), Some(AccessTier::Moderator), "{moderator}");
+        }
+        for user in ["lol_store_watch", "lol_store_unwatch", "lol_store_watchlist"] {
+            assert_eq!(tier_of(user), Some(AccessTier::User), "{user}");
+        }
     }
 
     fn disabled_engine() -> Arc<StoreEngine<RecordingBus>> {
@@ -418,6 +428,23 @@ mod tests {
         assert_eq!(scheduler.jobs.lock().expect("jobs lock").len(), 1, "stop never re-schedules");
     }
 
+    /// A zero poll interval keeps the watcher off: `start()` must not
+    /// schedule anything (the scheduler's zero-interval path is never
+    /// reached).
+    #[test]
+    fn start_with_zero_poll_schedules_nothing() {
+        let scheduler = Arc::new(RecordingScheduler::default());
+        let plugin = LolStorePlugin::new(
+            Arc::new(CapturingRegistry::default()) as Arc<dyn CommandRegistryPort>,
+            Arc::clone(&scheduler) as Arc<dyn SchedulerPort>,
+            disabled_engine(), // poll: Duration::ZERO
+        );
+        plugin.init().expect("init expected");
+        plugin.start().expect("start expected");
+        assert!(scheduler.jobs.lock().expect("jobs lock").is_empty());
+        plugin.stop().expect("stop expected");
+    }
+
     /// Bus double accepting publications without subscribers.
     #[derive(Default)]
     struct RecordingBus;
@@ -438,8 +465,32 @@ mod tests {
 
     /// LCU double that is always online with two Ahri skins in the catalog
     /// (champion 103) - enough for exact-match and ambiguous candidate
-    /// flows in the watch commands.
-    struct OnlineLcu;
+    /// flows in the watch commands. The sales list is mutable so tests can
+    /// seed "currently on sale" snapshots for status-line assertions.
+    struct OnlineLcu {
+        sales: parking_lot::Mutex<Vec<lcu::Sale>>,
+    }
+
+    impl OnlineLcu {
+        fn new() -> Self {
+            Self { sales: parking_lot::Mutex::new(Vec::new()) }
+        }
+
+        fn skin_sale(item_id: u64) -> lcu::Sale {
+            lcu::Sale {
+                id: 1,
+                item: lcu::ItemRef {
+                    inventory_type: Some("CHAMPION_SKIN".to_owned()),
+                    item_id: Some(item_id),
+                },
+                sale: lcu::SaleInfo {
+                    start_date: None,
+                    end_date: None,
+                    prices: vec![lcu::Price { cost: Some(607), currency: Some("RP".to_owned()) }],
+                },
+            }
+        }
+    }
 
     #[async_trait]
     impl lcu::LcuPort for OnlineLcu {
@@ -461,7 +512,7 @@ mod tests {
         }
 
         async fn sales(&self) -> Result<Vec<lcu::Sale>, lcu::LcuError> {
-            Ok(Vec::new())
+            Ok(self.sales.lock().clone())
         }
 
         async fn rotations(&self) -> Result<Vec<lcu::RotationStore>, lcu::LcuError> {
@@ -568,7 +619,7 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new());
         let f = command_fixture_with(true, Arc::clone(&storage)).await;
         let engine = Arc::new(StoreEngine::new(
-            Arc::new(OnlineLcu),
+            Arc::new(OnlineLcu::new()),
             Arc::clone(&storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecordingBus::default(),
@@ -779,7 +830,13 @@ mod tests {
             .expect("invoke");
         let reply = f3.output.messages().first().expect("reply expected").clone();
         assert!(reply.contains("guild reached its watch limit"), "reply: {reply}");
-        let _ = f2; // user 2's successful watch covers the non-cap path
+        // The non-cap path: a different user still subscribes, and the doc
+        // gains a second watch (the guild-cap fixture runs user 1 with cap
+        // 1, so this insert is the first for its user).
+        let reply2 = f2.output.messages().first().expect("reply expected").clone();
+        assert!(reply2.contains("Watch #1 added"), "reply: {reply2}");
+        let doc2 = stored_watch_doc(&f2).await.expect("doc expected");
+        assert_eq!(doc2.get("subs").and_then(|subs| subs.as_array()).map(Vec::len), Some(1));
     }
 
     #[tokio::test]
@@ -840,6 +897,77 @@ mod tests {
         let messages = f.output.messages();
         assert_eq!(messages.len(), 3, "every watch command replied");
         assert!(messages.iter().all(|m| m.contains("only works inside a server")));
+    }
+
+    /// Every guild-only command self-guards outside a guild - not just the
+    /// ones that happened to get their own DM test.
+    #[tokio::test]
+    async fn all_guild_only_commands_reject_outside_a_guild() {
+        let f = command_fixture(false).await;
+        DisableHandler.invoke(&f.event, &Default::default(), &f.services).await.expect("invoke");
+        UnassignHandler.invoke(&f.event, &Default::default(), &f.services).await.expect("invoke");
+        RoleHandler.invoke(&f.event, &Default::default(), &f.services).await.expect("invoke");
+        UnwatchHandler.invoke(&f.event, &Default::default(), &f.services).await.expect("invoke");
+        WatchlistHandler.invoke(&f.event, &Default::default(), &f.services).await.expect("invoke");
+        let messages = f.output.messages();
+        assert_eq!(messages.len(), 5, "every command replied: {messages:?}");
+        assert!(messages.iter().all(|m| m.contains("only works inside a server")));
+    }
+
+    /// Invalid arguments are rejected before the store snapshot is touched,
+    /// and nothing is stored.
+    #[tokio::test]
+    async fn watch_rejects_invalid_arguments_before_searching() {
+        let (f, engine) = watch_fixture(20, 300).await;
+        for (args, _expected) in [
+            (watch_args("tree", "Ahri", None), "target must be"),
+            (watch_args("skin", "Ahri", Some("banana")), "kinds must be one of"),
+            (watch_args("skin", "   ", None), "Give a name to watch"),
+        ] {
+            WatchHandler { engine: Arc::clone(&engine) }
+                .invoke(&f.event, &args, &f.services)
+                .await
+                .expect("invoke");
+        }
+        let messages = f.output.messages();
+        assert_eq!(messages.len(), 3);
+        assert!(messages.iter().any(|m| m.contains("target must be")));
+        assert!(messages.iter().any(|m| m.contains("kinds must be one of")));
+        assert!(messages.iter().any(|m| m.contains("Give a name to watch")));
+        assert!(stored_watch_doc(&f).await.is_none(), "nothing stored on rejection");
+    }
+
+    /// The subscribe confirmation reports current activity from the last
+    /// snapshot ("currently on sale"), so a watcher knows the immediate
+    /// situation - the watched skin's active sale shows up even though it
+    /// will never fire an edge (it is already on sale).
+    #[tokio::test]
+    async fn watch_confirmation_reports_current_activity() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let f = command_fixture_with(true, Arc::clone(&storage)).await;
+        let lcu = OnlineLcu::new();
+        *lcu.sales.lock() = vec![OnlineLcu::skin_sale(1031)];
+        let engine = Arc::new(StoreEngine::new(
+            Arc::new(lcu),
+            Arc::clone(&storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
+            RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
+            RecordingBus::default(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: DEFAULT_USER_CAP,
+                watch_guild_cap: DEFAULT_GUILD_CAP,
+            },
+        ));
+        engine.tick().await; // baseline captures the active sale
+
+        WatchHandler { engine }
+            .invoke(&f.event, &watch_args("skin", "Foxfire Ahri", None), &f.services)
+            .await
+            .expect("invoke");
+        let reply = f.output.messages().first().expect("reply expected").clone();
+        assert!(reply.contains("Watch #1 added"), "reply: {reply}");
+        assert!(reply.contains("- currently on sale"), "reply: {reply}");
     }
 
     #[tokio::test]

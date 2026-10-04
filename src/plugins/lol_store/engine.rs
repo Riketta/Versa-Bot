@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -46,6 +46,14 @@ pub struct AnnounceFlags {
     pub new_skins: bool,
     pub mythic_rotation: bool,
     pub yourshop: bool,
+}
+
+impl AnnounceFlags {
+    /// Every tracker announcing (the config default).
+    #[must_use]
+    pub fn all_on() -> Self {
+        Self { sales: true, new_skins: true, mythic_rotation: true, yourshop: true }
+    }
 }
 
 /// Engine construction settings (`[lol_store]` config section, startup-only).
@@ -91,6 +99,13 @@ pub struct StoreEngine<B: EventBusPort> {
     /// permanent record) and subscribe-time watch status. In-memory only -
     /// the compacted `LastSeen` is the persisted catch-up state.
     last_snapshot: Mutex<Option<Snapshot>>,
+    /// Bumped whenever the retention block above writes; keys the cached
+    /// name index (see [`StoreEngine::cached_index`]).
+    snapshot_generation: AtomicU64,
+    /// Cached joins over the last retained snapshot, keyed by generation:
+    /// watch commands reuse it instead of re-cloning the catalog per
+    /// invocation.
+    name_index_cache: Mutex<Option<(u64, Arc<NameIndex>)>>,
     online: AtomicBool,
     last_poll: Mutex<Option<Instant>>,
     last_announcement: Mutex<Option<(Instant, String)>>,
@@ -114,6 +129,8 @@ impl<B: EventBusPort> StoreEngine<B> {
             state: Mutex::new(None),
             champions: Mutex::new(None),
             last_snapshot: Mutex::new(None),
+            snapshot_generation: AtomicU64::new(0),
+            name_index_cache: Mutex::new(None),
             online: AtomicBool::new(false),
             last_poll: Mutex::new(None),
             last_announcement: Mutex::new(None),
@@ -184,7 +201,8 @@ impl<B: EventBusPort> StoreEngine<B> {
         // Retain the raw snapshot per successful source (name-join fallback
         // and subscribe-time watch status); failed sections keep their
         // previous data. Cached at fetch time: the fallback must exist even
-        // for cycles where a source failed and nothing announces.
+        // for cycles where a source failed and nothing announces. The
+        // generation bump invalidates the cached name index.
         {
             let mut retained = self.last_snapshot.lock();
             let slot = retained.get_or_insert_with(Snapshot::default);
@@ -200,6 +218,7 @@ impl<B: EventBusPort> StoreEngine<B> {
             if snapshot.yourshop.is_some() {
                 slot.yourshop = snapshot.yourshop.clone();
             }
+            self.snapshot_generation.fetch_add(1, Ordering::Release);
         }
 
         let current = match &previous {
@@ -248,7 +267,7 @@ impl<B: EventBusPort> StoreEngine<B> {
             }
             self.notify_subscriptions(delta, &index).await;
         }
-        let announces = full.is_some();
+        let delta_found = full.is_some();
 
         if changed {
             *self.state.lock() = Some(current.clone());
@@ -259,7 +278,7 @@ impl<B: EventBusPort> StoreEngine<B> {
             sales = current.sales.len(),
             skins = current.skins.len(),
             rotations = current.rotations.len(),
-            announced = announces,
+            delta_found,
             "store poll complete"
         );
     }
@@ -355,16 +374,23 @@ impl<B: EventBusPort> StoreEngine<B> {
     async fn name_index(&self, snapshot: &Snapshot) -> NameIndex {
         // Load-once champion table; the guard never crosses an await.
         if self.champions.lock().is_none() {
-            match self.lcu.champion_names().await {
-                Ok(entries) => {
+            // Shared by announcing ticks and watch commands; a hung client
+            // must not stall an ephemeral command for the full request
+            // timeout, so this fetch gets a short budget of its own. A miss
+            // degrades to fallback names exactly like an error.
+            match tokio::time::timeout(Duration::from_secs(3), self.lcu.champion_names()).await {
+                Ok(Ok(entries)) => {
                     let map = champion_map(entries.into_iter().map(|entry| (entry.id, entry.name)));
                     let mut cache = self.champions.lock();
                     if cache.is_none() {
                         *cache = Some(Arc::new(map.into_iter().collect()));
                     }
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     tracing::warn!(%err, "champion name table unavailable - using fallback names");
+                }
+                Err(_) => {
+                    tracing::warn!("champion name fetch timed out - using fallback names");
                 }
             }
         }
@@ -470,8 +496,7 @@ impl<B: EventBusPort> StoreEngine<B> {
     /// backend of `/lol_store_watch`. `None` = no store data captured yet
     /// (the client has not polled successfully since boot).
     pub async fn search_store(&self, query: &str) -> Option<StoreSearch> {
-        let snapshot = self.last_snapshot.lock().clone()?;
-        let index = self.name_index(&snapshot).await;
+        let index = self.cached_index().await?;
         Some(StoreSearch {
             skins: watch::search_skins(query, &index),
             champions: watch::search_champions(query, index.champions.iter()),
@@ -482,8 +507,8 @@ impl<B: EventBusPort> StoreEngine<B> {
     /// sale", "currently in the mythic rotation") against the last good
     /// snapshot. `None` = no store data captured yet.
     pub async fn watch_status(&self, target: &WatchTarget) -> Option<Vec<String>> {
+        let index = self.cached_index().await?;
         let snapshot = self.last_snapshot.lock().clone()?;
-        let index = self.name_index(&snapshot).await;
         let mut lines = Vec::new();
         let on_sale = snapshot.sales.as_ref().is_some_and(|sales| {
             sales.iter().any(|sale| {
@@ -538,12 +563,15 @@ impl<B: EventBusPort> StoreEngine<B> {
             }
             let Some(channel) = config.channel_id.as_deref().and_then(|id| id.parse::<u64>().ok())
             else {
-                tracing::warn!(guild = guild_id.get(), "store tracker enabled but channel missing");
+                tracing::debug!(
+                    guild = guild_id.get(),
+                    "store tracker enabled but channel missing"
+                );
                 continue;
             };
             if let Some(role) = &config.role_id {
                 if role.parse::<u64>().is_err() {
-                    tracing::warn!(
+                    tracing::debug!(
                         guild = guild_id.get(),
                         "store tracker announce role is not a role id - pings disabled for this guild"
                     );
@@ -554,8 +582,32 @@ impl<B: EventBusPort> StoreEngine<B> {
         targets
     }
 
+    /// Cached `NameIndex` over the last retained snapshot, keyed by the
+    /// snapshot generation: repeated watch commands between polls reuse one
+    /// build instead of re-cloning the catalog per invocation. A stale
+    /// generation rebuilds once (two concurrent builders just race the
+    /// store - harmless). `None` = nothing retained yet.
+    async fn cached_index(&self) -> Option<Arc<NameIndex>> {
+        let generation = self.snapshot_generation.load(Ordering::Acquire);
+        {
+            let cache = self.name_index_cache.lock();
+            if let Some((cached_gen, index)) = cache.as_ref() {
+                if *cached_gen == generation {
+                    return Some(Arc::clone(index));
+                }
+            }
+        }
+        let snapshot = self.last_snapshot.lock().clone()?;
+        let index = Arc::new(self.name_index(&snapshot).await);
+        *self.name_index_cache.lock() = Some((generation, Arc::clone(&index)));
+        Some(index)
+    }
+
     /// Boot catch-up source: the first persisted `last_seen` among known
-    /// guilds (the copies are identical by construction).
+    /// guilds (the copies are identical by construction; a guild whose
+    /// persist failed keeps a stale copy, and the first readable one wins
+    /// - bounded by at-most-once delivery, so the skew costs at most one
+    /// replayed or missed delta after a restart).
     async fn load_persisted_state(&self) -> Option<LastSeen> {
         let guilds = self.storage.list_guilds().await.ok()?;
         for (platform, guild_id) in guilds {
@@ -624,9 +676,9 @@ impl<B: EventBusPort> StoreEngine<B> {
         });
         match *self.last_announcement.lock() {
             Some((at, _)) => {
-                lines.push(format!("Last announcement: {}s ago", at.elapsed().as_secs()));
+                lines.push(format!("Last update rendered: {}s ago", at.elapsed().as_secs()));
             }
-            None => lines.push("Last announcement: none yet".to_owned()),
+            None => lines.push("Last update rendered: none yet".to_owned()),
         }
         match state.as_ref() {
             Some(state) => {
@@ -700,7 +752,10 @@ mod tests {
         CatalogItem, ChampionEntry, ItemRef, LcuError, LocalizedText, Price, RotationStore, Sale,
         SaleInfo, StoreEntry, YourShopStatus,
     };
-    use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
+    use crate::test_support::{
+        ChannelRecordingFactory, FailingChatOutputFactory, InMemoryStorage, RecordingChatOutput,
+        RecordingChatOutputFactory,
+    };
     use parking_lot::Mutex as PLMutex;
     use std::collections::BTreeMap;
 
@@ -1290,6 +1345,226 @@ mod tests {
         assert_eq!(messages.len(), 2, "announcement + mythic watch ping expected");
         let ping = messages.last().expect("ping expected");
         assert!(ping.contains("<@111>"), "rotation entry id must join: {messages:?}");
+        assert!(ping.contains("entry"), "the rendered mythic line expected: {messages:?}");
+    }
+
+    /// The engine routes to the ASSIGNED channel, not the origin channel:
+    /// announcements and watch pings must land on the configured channel
+    /// and nowhere else.
+    #[tokio::test]
+    async fn announcements_and_pings_land_on_the_assigned_channel() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let factory = Arc::new(ChannelRecordingFactory::new());
+        let lcu = FakeLcu::online();
+        *lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        let engine = Arc::new(StoreEngine::new(
+            lcu.clone(),
+            Arc::clone(&storage) as Arc<dyn StoragePort>,
+            Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
+            RecorderBus::default(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: watch::DEFAULT_USER_CAP,
+                watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+            },
+        ));
+        enable_guild(&storage, GUILD, Some("55")).await;
+        seed_watch(&storage, GUILD, skin_target_value(1031), "sale").await;
+        engine.tick().await; // baseline
+
+        *lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        engine.tick().await;
+
+        let targeted = factory.targeted();
+        assert_eq!(targeted.len(), 2, "announcement + watch ping: {targeted:?}");
+        assert!(
+            targeted.iter().all(|send| send.guild == GUILD && send.channel == 55),
+            "both sends land on the assigned channel: {targeted:?}"
+        );
+        assert!(targeted.last().expect("ping").text.contains("<@111>"));
+    }
+
+    /// A failed announcement send is a log line: no record, no bus event -
+    /// but the state still advances, so nothing replays next tick.
+    #[tokio::test]
+    async fn failed_announcement_delivery_does_not_record_or_replay() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let lcu = FakeLcu::online();
+        *lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        let bus = RecorderBus::default();
+        let engine = Arc::new(StoreEngine::new(
+            lcu.clone(),
+            Arc::clone(&storage) as Arc<dyn StoragePort>,
+            Arc::new(FailingChatOutputFactory) as Arc<dyn ChatOutputFactoryPort>,
+            bus.clone(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: watch::DEFAULT_USER_CAP,
+                watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+            },
+        ));
+        enable_guild(&storage, GUILD, Some("55")).await;
+        engine.tick().await; // baseline
+
+        *lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        engine.tick().await; // delivery fails
+
+        let scoped = storage.guild_scoped(Platform::Discord, GuildId(GUILD));
+        let records = scoped.list_last(NAMESPACE, 10).await.expect("records read expected");
+        assert!(records.is_empty(), "no record on failed delivery: {records:?}");
+        assert!(bus.log().is_empty(), "no bus event on failed delivery");
+
+        // The state advanced: replaying the same store is silent.
+        engine.tick().await;
+        assert!(bus.log().is_empty(), "no replay after the failed send");
+    }
+
+    /// Same contract for watch pings: a failed notification send records
+    /// nothing and never replays (the announcement side fails with it here,
+    /// which the assertions cover just the same).
+    #[tokio::test]
+    async fn failed_watch_delivery_is_also_at_most_once() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let lcu = FakeLcu::online();
+        *lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        let bus = RecorderBus::default();
+        let engine = Arc::new(StoreEngine::new(
+            lcu.clone(),
+            Arc::clone(&storage) as Arc<dyn StoragePort>,
+            Arc::new(FailingChatOutputFactory) as Arc<dyn ChatOutputFactoryPort>,
+            bus.clone(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: watch::DEFAULT_USER_CAP,
+                watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+            },
+        ));
+        enable_guild(&storage, GUILD, Some("55")).await;
+        seed_watch(&storage, GUILD, skin_target_value(1031), "sale").await;
+        engine.tick().await; // baseline
+
+        *lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        engine.tick().await; // both sends fail
+
+        let scoped = storage.guild_scoped(Platform::Discord, GuildId(GUILD));
+        let records = scoped.list_last(NAMESPACE, 10).await.expect("records read expected");
+        assert!(records.is_empty(), "neither announcement nor watch recorded");
+        assert!(bus.log().is_empty());
+
+        engine.tick().await;
+        assert!(bus.log().is_empty(), "no replay after the failed sends");
+    }
+
+    /// Two guilds track the same store: each gets its own announcement in
+    /// its own channel, and only its own watches fire - a watch in one
+    /// guild never pings in another (isolation at the engine level).
+    #[tokio::test]
+    async fn two_guilds_receive_only_their_own_feed_and_pings() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let factory = Arc::new(ChannelRecordingFactory::new());
+        let lcu = FakeLcu::online();
+        *lcu.catalog.lock() =
+            Some(vec![skin_item(1031, 975), skin_item_named(1032, 975, "Dynastry Ahri")]);
+        let engine = Arc::new(StoreEngine::new(
+            lcu.clone(),
+            Arc::clone(&storage) as Arc<dyn StoragePort>,
+            Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
+            RecorderBus::default(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: watch::DEFAULT_USER_CAP,
+                watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+            },
+        ));
+        enable_guild(&storage, 700, Some("55")).await;
+        enable_guild(&storage, 701, Some("66")).await;
+        seed_watch(&storage, 700, skin_target_value(1031), "sale").await;
+        seed_watch(&storage, 701, skin_target_value(1032), "sale").await;
+        engine.tick().await; // baseline
+
+        *lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        engine.tick().await;
+
+        let targeted = factory.targeted();
+        // 2 announcements + one ping (guild 700's watch; 701 watches a
+        // different skin).
+        assert_eq!(targeted.len(), 3, "targeted sends: {targeted:?}");
+        let ping = targeted.last().expect("ping expected");
+        assert_eq!(ping.guild, 700);
+        assert_eq!(ping.channel, 55);
+        assert!(ping.text.contains("<@111>"));
+        assert!(
+            targeted.iter().all(|send| send.guild != 701 || !send.text.contains("<@")),
+            "guild 701's feed never carries another guild's pings: {targeted:?}"
+        );
+
+        // Records stay guild-scoped: 700 has announcement + watch record,
+        // 701 only the announcement.
+        let records = |guild: u64| {
+            let storage = Arc::clone(&storage);
+            async move {
+                storage
+                    .guild_scoped(Platform::Discord, GuildId(guild))
+                    .list_last(NAMESPACE, 10)
+                    .await
+                    .expect("records read expected")
+            }
+        };
+        let kinds_700: Vec<String> = records(700)
+            .await
+            .iter()
+            .filter_map(|record| {
+                record.payload.get("kind").and_then(|kind| kind.as_str()).map(str::to_owned)
+            })
+            .collect();
+        let kinds_701: Vec<String> = records(701)
+            .await
+            .iter()
+            .filter_map(|record| {
+                record.payload.get("kind").and_then(|kind| kind.as_str()).map(str::to_owned)
+            })
+            .collect();
+        assert!(kinds_700.contains(&"watch_notification".to_owned()), "{kinds_700:?}");
+        assert_eq!(kinds_701, vec!["announcement".to_owned()], "{kinds_701:?}");
+    }
+
+    /// `watch_status` reads current activity straight from the retained
+    /// snapshot: the watched skin on sale reports it, for both the skin and
+    /// the champion target shape; an unrelated skin reports idle.
+    #[tokio::test]
+    async fn watch_status_reports_current_activity_from_the_snapshot() {
+        let f = fixture(FakeLcu::online()).await;
+        let target = WatchTarget::Skin {
+            item_id: 1031,
+            champion: "Ahri".to_owned(),
+            skin: "Foxfire Ahri".to_owned(),
+        };
+        // No snapshot yet.
+        assert_eq!(f.engine.watch_status(&target).await, None);
+
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        f.engine.tick().await; // baseline captures the active sale
+
+        assert_eq!(
+            f.engine.watch_status(&target).await,
+            Some(vec!["currently on sale".to_owned()])
+        );
+        let champion = WatchTarget::Champion { champion_id: 103, champion: "Ahri".to_owned() };
+        assert_eq!(
+            f.engine.watch_status(&champion).await,
+            Some(vec!["currently on sale".to_owned()])
+        );
+        let other = WatchTarget::Skin {
+            item_id: 999_031,
+            champion: "Ahri".to_owned(),
+            skin: "Some Other Skin".to_owned(),
+        };
+        assert_eq!(f.engine.watch_status(&other).await, Some(Vec::new()));
     }
 
     #[tokio::test]

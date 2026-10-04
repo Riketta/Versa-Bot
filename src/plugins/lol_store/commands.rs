@@ -240,11 +240,9 @@ static WATCH_WRITE: AsyncMutex<()> = AsyncMutex::const_new(());
 /// Loads the guild's watch document; an unreadable doc is logged and treated
 /// as empty (ids may restart - mutations only ever save on real change, so
 /// a reset is never persisted by a read-only command path).
-async fn load_watch_doc(services: &KernelServices) -> anyhow::Result<WatchDoc> {
-    let storage = services
-        .guild_storage
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("guild storage unavailable outside a guild"))?;
+async fn load_watch_doc(
+    storage: &dyn crate::kernel::spi_ports::GuildStorage,
+) -> anyhow::Result<WatchDoc> {
     match storage.get(NAMESPACE, WATCH_KEY).await? {
         Some(raw) => match serde_json::from_value::<WatchDoc>(raw) {
             Ok(doc) => Ok(doc),
@@ -262,6 +260,12 @@ enum Resolved {
     Hit(WatchTarget),
     Nothing,
     Candidates(Vec<String>),
+}
+
+/// The validated `target` dropdown value.
+enum TargetKind {
+    Skin,
+    Champion,
 }
 
 fn resolve_skin(query: &str, hits: &[SkinHit]) -> Resolved {
@@ -327,11 +331,13 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for WatchHandl
         args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
-        if services.guild_storage.is_none() {
+        let Some(storage) = services.guild_storage.as_ref() else {
             return reply_guild_only(services).await;
-        }
+        };
         let user_id = event.origin.user_id.get().to_string();
 
+        // Validate all arguments before touching the store snapshot - an
+        // invalid target must not pay for the name search.
         let kinds = match args.get("kinds") {
             Some(raw) => match WatchKind::parse(raw) {
                 Some(kinds) => kinds,
@@ -344,6 +350,17 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for WatchHandl
                 }
             },
             None => WatchKind::All,
+        };
+        let target_kind = match args.get("target") {
+            Some("skin") => TargetKind::Skin,
+            Some("champion") => TargetKind::Champion,
+            _ => {
+                services
+                    .chat_output
+                    .send(command_reply("target must be `skin` or `champion`."))
+                    .await?;
+                return Ok(());
+            }
         };
         let Some(query) = args.get("name").map(str::trim).filter(|name| !name.is_empty()) else {
             services
@@ -364,18 +381,11 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for WatchHandl
                 .await?;
             return Ok(());
         };
-        let target = match args.get("target") {
-            Some("skin") => resolve_skin(query, &search.skins),
-            Some("champion") => resolve_champion(query, &search.champions),
-            _ => {
-                services
-                    .chat_output
-                    .send(command_reply("target must be `skin` or `champion`."))
-                    .await?;
-                return Ok(());
-            }
+        let resolved = match target_kind {
+            TargetKind::Skin => resolve_skin(query, &search.skins),
+            TargetKind::Champion => resolve_champion(query, &search.champions),
         };
-        let target = match target {
+        let target = match resolved {
             Resolved::Hit(target) => target,
             Resolved::Nothing => {
                 services
@@ -401,11 +411,7 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for WatchHandl
 
         // Read-modify-write: caps are enforced between load and save.
         let _guard = WATCH_WRITE.lock().await;
-        let storage = services
-            .guild_storage
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("guild storage unavailable outside a guild"))?;
-        let mut doc = load_watch_doc(services).await?;
+        let mut doc = load_watch_doc(storage.as_ref()).await?;
         let settings = self.engine.settings();
         let user_cap = usize::try_from(settings.watch_user_cap).unwrap_or(usize::MAX);
         let guild_cap = usize::try_from(settings.watch_guild_cap).unwrap_or(usize::MAX);
@@ -459,9 +465,9 @@ impl CommandHandler for UnwatchHandler {
         args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
-        if services.guild_storage.is_none() {
+        let Some(storage) = services.guild_storage.as_ref() else {
             return reply_guild_only(services).await;
-        }
+        };
         let user_id = event.origin.user_id.get().to_string();
         let Some(what) = args.get("what").map(str::trim).filter(|what| !what.is_empty()) else {
             services
@@ -474,7 +480,7 @@ impl CommandHandler for UnwatchHandler {
         };
 
         let _guard = WATCH_WRITE.lock().await;
-        let mut doc = load_watch_doc(services).await?;
+        let mut doc = load_watch_doc(storage.as_ref()).await?;
         let (changed, reply_text) = if what.eq_ignore_ascii_case("all") {
             let removed = doc.remove_all_of(&user_id);
             let text = if removed == 0 {
@@ -493,10 +499,6 @@ impl CommandHandler for UnwatchHandler {
             }
         };
         if changed {
-            let storage = services
-                .guild_storage
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("guild storage unavailable outside a guild"))?;
             storage.set(NAMESPACE, WATCH_KEY, serde_json::to_value(&doc)?).await?;
         }
         drop(_guard);
@@ -517,11 +519,11 @@ impl CommandHandler for WatchlistHandler {
         _args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
-        if services.guild_storage.is_none() {
+        let Some(storage) = services.guild_storage.as_ref() else {
             return reply_guild_only(services).await;
-        }
+        };
         let user_id = event.origin.user_id.get().to_string();
-        let mut mine: Vec<_> = load_watch_doc(services)
+        let mut mine: Vec<_> = load_watch_doc(storage.as_ref())
             .await?
             .subs
             .into_iter()

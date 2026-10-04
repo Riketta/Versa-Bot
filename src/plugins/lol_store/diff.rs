@@ -124,9 +124,9 @@ pub fn rotation_stores(stores: &[RotationStore]) -> Vec<&RotationStore> {
 pub fn merge(previous: &LastSeen, snapshot: &Snapshot) -> LastSeen {
     let mut merged = previous.clone();
 
-    if let Some(sales) = &snapshot.sales {
-        merged.sales = sales.iter().map(|sale| sale.id).collect();
-    }
+    // Skins and rotations first: their collapse guards feed the sales rule
+    // below (correlated-glitch detection).
+    let mut skins_collapsed = false;
     if let Some(catalog) = &snapshot.catalog {
         let skins: BTreeSet<u64> = catalog
             .iter()
@@ -138,6 +138,7 @@ pub fn merge(previous: &LastSeen, snapshot: &Snapshot) -> LastSeen {
         // the store losing every skin at once - adopting it would mass
         // false-announce the whole catalog next poll. Keep the previous set.
         if !previous.skins.is_empty() && skins.is_empty() {
+            skins_collapsed = true;
             tracing::warn!(
                 kept = previous.skins.len(),
                 "store catalog answered Ok but listed no skins - keeping the previous set"
@@ -146,6 +147,7 @@ pub fn merge(previous: &LastSeen, snapshot: &Snapshot) -> LastSeen {
             merged.skins = skins;
         }
     }
+    let mut rotations_collapsed = false;
     if let Some(stores) = &snapshot.rotations {
         // Per-store merge over the previous map: a store absent from the
         // payload simply ends its rotation, but a present store whose entry
@@ -155,6 +157,10 @@ pub fn merge(previous: &LastSeen, snapshot: &Snapshot) -> LastSeen {
         for store in rotation_stores(stores) {
             let Some(name) = store.name.clone() else { continue };
             let Some(meta) = store.rotating_store_metadata.as_ref() else { continue };
+            // Entries without ids all collapse to "": an id-less rotation
+            // compares as one slot, so a wholesale swap of id-less entries
+            // stays silent (acceptable - those entries are synthetic-price
+            // junk with no stable identity).
             let entry_ids: BTreeSet<String> = store
                 .catalog_entries
                 .iter()
@@ -163,6 +169,7 @@ pub fn merge(previous: &LastSeen, snapshot: &Snapshot) -> LastSeen {
             if entry_ids.is_empty()
                 && previous.rotations.get(&name).is_some_and(|state| !state.entry_ids.is_empty())
             {
+                rotations_collapsed = true;
                 tracing::warn!(
                     rotation = %name,
                     "rotation answered Ok but empty - keeping the previous entry set"
@@ -185,6 +192,26 @@ pub fn merge(previous: &LastSeen, snapshot: &Snapshot) -> LastSeen {
             rotation_stores(stores).iter().filter_map(|store| store.name.clone()).collect();
         rotations.retain(|name, _| present.contains(name));
         merged.rotations = rotations;
+    }
+
+    // Sales last: an Ok-but-empty payload is ambiguous - "no active sales"
+    // is a legitimate steady state (sale cycles end), but the same shape is
+    // what a mid-login cold start produces across sources at once. Adopt
+    // empty only when no other source collapsed this cycle; otherwise keep
+    // the previous set so the next good poll does not re-announce every
+    // active sale (the correlated-glitch rule).
+    if let Some(sales) = &snapshot.sales {
+        if sales.is_empty()
+            && !previous.sales.is_empty()
+            && (skins_collapsed || rotations_collapsed)
+        {
+            tracing::warn!(
+                kept = previous.sales.len(),
+                "store sales answered Ok but empty while other sources collapsed - keeping the previous set"
+            );
+        } else {
+            merged.sales = sales.iter().map(|sale| sale.id).collect();
+        }
     }
     if let Some(status) = &snapshot.yourshop {
         merged.yourshop = Some(YourShopState {
@@ -221,14 +248,20 @@ pub fn compute(previous: &LastSeen, snapshot: &Snapshot) -> StoreDelta {
         for store in rotation_stores(stores) {
             let Some(name) = &store.name else { continue };
             let previous_state = previous.rotations.get(name);
-            let changed = previous_state.is_none_or(|state| {
-                state.entry_ids
-                    != store
-                        .catalog_entries
-                        .iter()
-                        .map(|entry| entry.id.clone().unwrap_or_default())
-                        .collect::<BTreeSet<_>>()
-            });
+            let payload_ids: BTreeSet<String> = store
+                .catalog_entries
+                .iter()
+                .map(|entry| entry.id.clone().unwrap_or_default())
+                .collect();
+            // Mirror merge's collapse guard: an Ok-but-empty payload never
+            // announces - merge keeps the previous set, so announcing it
+            // would emit a phantom empty rotation (and a bogus
+            // MythicRotation bus kind) on every tick until the glitch
+            // clears, because the state never advances.
+            if payload_ids.is_empty() {
+                continue;
+            }
+            let changed = previous_state.is_none_or(|state| state.entry_ids != payload_ids);
             if !changed {
                 continue;
             }
@@ -441,6 +474,106 @@ mod tests {
             &Snapshot { catalog: Some(vec![catalog_skin(999)]), ..Default::default() },
         );
         assert_eq!(merged.skins, BTreeSet::from([999]));
+    }
+
+    /// An Ok-but-empty sales payload is ambiguous: alone it adopts (sale
+    /// cycles legitimately end), but when another source collapses in the
+    /// same cycle it is treated as the correlated mid-login glitch and the
+    /// previous set is kept - otherwise the next good poll would re-announce
+    /// every active sale.
+    #[test]
+    fn sales_collapse_is_guarded_only_when_correlated() {
+        let previous = LastSeen { sales: BTreeSet::from([1, 2]), ..Default::default() };
+
+        // Single-source empty: adopted - sales legitimately end.
+        let merged = merge(&previous, &Snapshot { sales: Some(Vec::new()), ..Default::default() });
+        assert!(merged.sales.is_empty());
+
+        // Correlated glitch (catalog collapses too): previous sales kept.
+        // The catalog's collapse only registers against a non-empty skin
+        // set - a previous with no skins has nothing to collapse.
+        let previous_with_skins = LastSeen {
+            sales: BTreeSet::from([1, 2]),
+            skins: BTreeSet::from([100]),
+            ..Default::default()
+        };
+        let merged = merge(
+            &previous_with_skins,
+            &Snapshot { sales: Some(Vec::new()), catalog: Some(Vec::new()), ..Default::default() },
+        );
+        assert_eq!(merged.sales, BTreeSet::from([1, 2]));
+
+        // Rotation collapse also counts as the correlated signature (the
+        // previous rotation state must be non-empty for the collapse to
+        // register).
+        let previous_with_rotation = LastSeen {
+            sales: BTreeSet::from([1, 2]),
+            rotations: BTreeMap::from([(
+                "WEEKLY_ROTATION".to_owned(),
+                RotationState { entry_ids: BTreeSet::from(["a".to_owned()]), ..Default::default() },
+            )]),
+            ..Default::default()
+        };
+        let glitched_rotation = rotation_store("WEEKLY_ROTATION", &[]);
+        let merged = merge(
+            &previous_with_rotation,
+            &Snapshot {
+                sales: Some(Vec::new()),
+                rotations: Some(vec![glitched_rotation]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(merged.sales, BTreeSet::from([1, 2]));
+
+        // Non-empty sales adopt normally even amid unrelated collapses.
+        let merged = merge(
+            &previous,
+            &Snapshot {
+                sales: Some(vec![sale(3)]),
+                catalog: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(merged.sales, BTreeSet::from([3]));
+    }
+
+    /// A collapsed rotation payload never announces: merge keeps the
+    /// previous entry set, so an empty RotationDelta would recur on every
+    /// tick (a phantom delta with a bogus MythicRotation bus kind).
+    #[test]
+    fn compute_skips_a_collapsed_rotation_payload() {
+        let previous = LastSeen {
+            rotations: BTreeMap::from([(
+                "WEEKLY_ROTATION".to_owned(),
+                RotationState {
+                    entry_ids: BTreeSet::from(["a".to_owned(), "b".to_owned()]),
+                    rotation_start: None,
+                    next_rotation: None,
+                },
+            )]),
+            ..Default::default()
+        };
+        let snapshot = Snapshot {
+            rotations: Some(vec![rotation_store("WEEKLY_ROTATION", &[])]),
+            ..Default::default()
+        };
+        let delta = compute(&previous, &snapshot);
+        assert!(delta.rotations.is_empty(), "collapsed payload must not announce");
+        assert!(delta.is_empty());
+
+        // And the state keeps the previous set, so a restored rotation
+        // announces as a normal change.
+        let current = merge(&previous, &snapshot);
+        assert_eq!(current.rotations.get("WEEKLY_ROTATION").expect("state").entry_ids.len(), 2);
+        let restored = compute(&current, &compute_snapshot());
+        assert_eq!(restored.rotations.len(), 1);
+    }
+
+    fn compute_snapshot() -> Snapshot {
+        Snapshot {
+            rotations: Some(vec![rotation_store("WEEKLY_ROTATION", &["x"])]),
+            ..Default::default()
+        }
     }
 
     /// Only rotating MYTHIC_SHOP stores are tracked: a non-rotating shelf

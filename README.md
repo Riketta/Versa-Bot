@@ -370,7 +370,7 @@ zero `poll_secs` keep the watcher off):
 | `poll_secs` | integer | `300` | poll cadence in seconds; `0` disables |
 | `announce_sales` | bool | `true` | announce new sales (name, % off, RP price, end date) |
 | `announce_new_skins` | bool | `true` | announce newly listed skins (champion, skin, RP price) |
-| `announce_mythic_rotation` | bool | `true` | announce Mythic Shop rotation changes (skin, Mythic Essence price) |
+| `announce_mythic_rotation` | bool | `true` | announce Mythic Shop rotation changes (skin, Mythic Essence price, rotation end) |
 | `announce_yourshop` | bool | `true` | announce Your Shop starts (start and end times) |
 | `watch_user_cap` | integer | `20` | maximum `/lol_store_watch` subscriptions per member per guild |
 | `watch_guild_cap` | integer | `300` | maximum `/lol_store_watch` subscriptions per guild |

@@ -361,6 +361,161 @@ impl StoragePort for FailingStorage {
     }
 }
 
+/// One send routed through [`ChannelRecordingFactory`]: the guild the
+/// output was bound to, the channel it was addressed to, and the flat text
+/// projection of the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetedSend {
+    pub guild: u64,
+    pub channel: u64,
+    pub text: String,
+}
+
+/// [`ChatOutputFactoryPort`] that records WHICH guild/channel each send
+/// targeted - fixture for pinning "delivered to the assigned channel, and
+/// nowhere else".
+pub struct ChannelRecordingFactory {
+    sent: Arc<Mutex<Vec<TargetedSend>>>,
+}
+
+impl ChannelRecordingFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { sent: Arc::new(Mutex::new(Vec::new())) }
+    }
+
+    /// Every targeted send, in dispatch order.
+    #[must_use]
+    pub fn targeted(&self) -> Vec<TargetedSend> {
+        self.sent.lock().clone()
+    }
+
+    #[must_use]
+    pub fn boxed(self) -> Arc<dyn ChatOutputFactoryPort> {
+        Arc::new(self)
+    }
+
+    fn output_for(
+        &self,
+        guild: Option<GuildId>,
+        channel: crate::kernel::models::ChannelId,
+    ) -> ChannelRecordingOutput {
+        ChannelRecordingOutput {
+            sent: Arc::clone(&self.sent),
+            guild: guild.map_or(0, GuildId::get),
+            channel: channel.get(),
+        }
+    }
+}
+
+impl Default for ChannelRecordingFactory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct ChannelRecordingOutput {
+    sent: Arc<Mutex<Vec<TargetedSend>>>,
+    guild: u64,
+    channel: u64,
+}
+
+#[async_trait]
+impl ChatOutputPort for ChannelRecordingOutput {
+    async fn send(&self, message: OutboundMessage) -> Result<(), OutboundError> {
+        self.sent.lock().push(TargetedSend {
+            guild: self.guild,
+            channel: self.channel,
+            text: text_of(&message),
+        });
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ChatOutputFactoryPort for ChannelRecordingFactory {
+    fn chat_output(&self, origin: &crate::kernel::models::Origin) -> Arc<dyn ChatOutputPort> {
+        Arc::new(self.output_for(origin.guild_id, origin.channel_id))
+    }
+
+    fn start_typing(&self, _origin: &crate::kernel::models::Origin) -> ChatTypingGuard {
+        ChatTypingGuard::dead()
+    }
+
+    fn channel_output(
+        &self,
+        origin: &crate::kernel::models::Origin,
+        channel_id: crate::kernel::models::ChannelId,
+    ) -> Arc<dyn ChatOutputPort> {
+        Arc::new(self.output_for(origin.guild_id, channel_id))
+    }
+
+    fn stream_output(
+        &self,
+        _origin: &crate::kernel::models::Origin,
+    ) -> Arc<dyn crate::kernel::spi_ports::ChatStreamPort> {
+        Arc::new(NoopChatStream) as Arc<dyn crate::kernel::spi_ports::ChatStreamPort>
+    }
+
+    fn message_link(
+        &self,
+        _origin: &crate::kernel::models::Origin,
+        _channel_id: crate::kernel::models::ChannelId,
+        _message_id: crate::kernel::models::MessageId,
+    ) -> Option<String> {
+        None
+    }
+}
+
+/// [`ChatOutputFactoryPort`] whose sends always fail - fixture for the
+/// at-most-once delivery contract (failed send => no record, no bus event,
+/// state still advances).
+pub struct FailingChatOutputFactory;
+
+struct FailingChatOutput;
+
+#[async_trait]
+impl ChatOutputPort for FailingChatOutput {
+    async fn send(&self, _message: OutboundMessage) -> Result<(), OutboundError> {
+        Err(OutboundError::Send("simulated delivery failure".to_owned()))
+    }
+}
+
+#[async_trait]
+impl ChatOutputFactoryPort for FailingChatOutputFactory {
+    fn chat_output(&self, _origin: &crate::kernel::models::Origin) -> Arc<dyn ChatOutputPort> {
+        Arc::new(FailingChatOutput)
+    }
+
+    fn start_typing(&self, _origin: &crate::kernel::models::Origin) -> ChatTypingGuard {
+        ChatTypingGuard::dead()
+    }
+
+    fn channel_output(
+        &self,
+        _origin: &crate::kernel::models::Origin,
+        _channel_id: crate::kernel::models::ChannelId,
+    ) -> Arc<dyn ChatOutputPort> {
+        Arc::new(FailingChatOutput)
+    }
+
+    fn stream_output(
+        &self,
+        _origin: &crate::kernel::models::Origin,
+    ) -> Arc<dyn crate::kernel::spi_ports::ChatStreamPort> {
+        Arc::new(NoopChatStream) as Arc<dyn crate::kernel::spi_ports::ChatStreamPort>
+    }
+
+    fn message_link(
+        &self,
+        _origin: &crate::kernel::models::Origin,
+        _channel_id: crate::kernel::models::ChannelId,
+        _message_id: crate::kernel::models::MessageId,
+    ) -> Option<String> {
+        None
+    }
+}
+
 /// [`ChatOutputFactoryPort`] handing out the same [`RecordingChatOutput`] for
 /// every origin and channel - channel-agnostic, so assertions can stay flat.
 pub struct RecordingChatOutputFactory {

@@ -16,7 +16,10 @@ pub struct LolStoreConfig {
     /// = watcher disabled.
     pub lockfile_path: String,
     /// Host the client's API listens on. The port always comes from the
-    /// lockfile.
+    /// lockfile. Trust note: the adapter accepts the client's self-signed
+    /// certificate and authenticates with the lockfile token - keep this on
+    /// a trusted segment only (the default loopback for a same-machine
+    /// client, or the WSL/host bridge address when the bot runs in WSL).
     pub address: String,
     /// Poll cadence in seconds. The four sources are cheap local HTTP
     /// calls; rotations change daily at most.

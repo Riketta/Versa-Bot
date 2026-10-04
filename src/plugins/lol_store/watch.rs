@@ -126,6 +126,8 @@ pub struct Watch {
 /// watch commands until manual storage surgery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchDoc {
+    /// Forward-compat scaffolding: no reader or migration exists yet - a
+    /// bump signals a future shape migration.
     #[serde(default = "default_version")]
     pub version: u32,
     #[serde(default = "default_next_id")]
@@ -181,13 +183,13 @@ pub(crate) enum Subject {
 }
 
 /// Resolves one mythic entry onto a matchable subject. Id first (verified
-/// against the catalog), normalized display name as the fallback - the
-/// name path only ever matches skin watches (see [`target_matches`]).
+/// against the catalog), raw display name as the fallback - the name path
+/// only ever matches skin watches (see [`target_matches`]).
 #[must_use]
 pub(crate) fn entry_subject(entry: &super::diff::MythicEntry, index: &NameIndex) -> Subject {
     match entry.entry_id.as_deref().and_then(|id| id.parse::<u64>().ok()) {
         Some(id) if index.catalog.contains_key(&id) => Subject::Item(id),
-        _ => Subject::Name(normalize_name(entry.name.as_deref().unwrap_or_default())),
+        _ => Subject::Name(entry.name.clone().unwrap_or_default()),
     }
 }
 
@@ -196,13 +198,37 @@ pub(crate) fn entry_subject(entry: &super::diff::MythicEntry, index: &NameIndex)
 pub(crate) fn target_matches(target: &WatchTarget, subject: &Subject, index: &NameIndex) -> bool {
     match (target, subject) {
         (WatchTarget::Skin { item_id, .. }, Subject::Item(id)) => item_id == id,
-        (WatchTarget::Skin { skin, .. }, Subject::Name(name)) => normalize_name(skin) == *name,
+        (WatchTarget::Skin { skin, .. }, Subject::Name(name)) => {
+            let want = normalize_name(skin);
+            let have = normalize_name(name);
+            // Second chance on the "loose key": Riot's shoppefront names
+            // append decorative parenthesized suffixes the catalog name
+            // lacks ("K/DA ALL OUT Akali (BADDEST)").
+            want == have || loose_name(skin) == loose_name(name)
+        }
         (WatchTarget::Champion { champion_id, .. }, Subject::Item(id)) => {
             index.champion_id_of_item(*id) == Some(*champion_id)
         }
         // A bare display name carries no champion information.
         (WatchTarget::Champion { .. }, Subject::Name(_)) => false,
     }
+}
+
+/// Normalized name with parenthesized segments stripped - the second-
+/// chance comparison key for name-based watch matching.
+#[must_use]
+fn loose_name(name: &str) -> String {
+    let mut stripped = String::with_capacity(name.len());
+    let mut depth = 0u32;
+    for ch in name.chars() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => stripped.push(ch),
+            _ => {}
+        }
+    }
+    normalize_name(&stripped)
 }
 
 /// Lowercases, replaces every non-alphanumeric with a space, collapses
@@ -365,7 +391,10 @@ pub(crate) fn build_notification(
 }
 
 /// Users whose watches match this subject on this edge - `None` when no
-/// one watches it (the common case; early-outs the rendering).
+/// one watches it (the common case; early-outs the rendering). Watches
+/// with non-numeric user ids never participate: storage is trusted, but a
+/// hand-tampered doc must not be able to inject mention syntax (e.g.
+/// `<@everyone>`) into the ping content.
 fn matching_users(
     doc: &WatchDoc,
     edge: Edge,
@@ -375,7 +404,11 @@ fn matching_users(
     let matched: Vec<String> = doc
         .subs
         .iter()
-        .filter(|watch| watch.kinds.covers(edge) && target_matches(&watch.target, subject, index))
+        .filter(|watch| {
+            watch.user_id.parse::<u64>().is_ok()
+                && watch.kinds.covers(edge)
+                && target_matches(&watch.target, subject, index)
+        })
         .map(|watch| watch.user_id.clone())
         .collect();
     if matched.is_empty() { None } else { Some(matched) }
@@ -520,18 +553,18 @@ mod tests {
         assert!(!target_matches(&skin_target(1031, "Foxfire Ahri"), &Subject::Item(1032), &index));
         assert!(target_matches(
             &skin_target(1031, "foxfire  ahri!"),
-            &Subject::Name(normalize_name("Foxfire Ahri")),
+            &Subject::Name("Foxfire Ahri".to_owned()),
             &index
         ));
         let champion = WatchTarget::Champion { champion_id: 103, champion: "Ahri".to_owned() };
         assert!(target_matches(&champion, &Subject::Item(1032), &index));
         // Base-champion items (or unknown items) join to nothing.
         assert!(!target_matches(&champion, &Subject::Item(103), &index));
-        assert!(!target_matches(&champion, &Subject::Name(normalize_name("Foxfire Ahri")), &index));
+        assert!(!target_matches(&champion, &Subject::Name("Foxfire Ahri".to_owned()), &index));
     }
 
     #[test]
-    fn entry_subject_prefers_catalog_joined_ids() {
+    fn entry_subject_keeps_the_raw_display_name() {
         let index = index();
         let joined = MythicEntry {
             entry_id: Some("1031".to_owned()),
@@ -539,15 +572,37 @@ mod tests {
             mythic_price: Some(100),
         };
         assert_eq!(entry_subject(&joined, &index), Subject::Item(1031));
-        // Unresolvable ids fall back to the normalized name.
+        // Unresolvable ids fall back to the RAW display name - normalization
+        // and the loose-key comparison happen in `target_matches`.
         let foreign = MythicEntry {
             entry_id: Some("999999".to_owned()),
             name: Some("Foxfire Ahri".to_owned()),
             mythic_price: None,
         };
-        assert_eq!(entry_subject(&foreign, &index), Subject::Name(normalize_name("Foxfire Ahri")));
+        assert_eq!(entry_subject(&foreign, &index), Subject::Name("Foxfire Ahri".to_owned()));
         let nameless = MythicEntry { entry_id: None, name: None, mythic_price: None };
         assert_eq!(entry_subject(&nameless, &index), Subject::Name(String::new()));
+    }
+
+    /// The live shoppefront shape: GUID entry ids and fulfillment names
+    /// with decorative parenthesized suffixes ("... (BADDEST)"). The name
+    /// fallback must still match the catalog name the user subscribed by -
+    /// and must not match the synthetic price-entry name.
+    #[test]
+    fn name_fallback_survives_parenthesized_shoppefront_suffixes() {
+        let index = index();
+        let watch = skin_target(1031, "K/DA ALL OUT Akali");
+        let baddest = Subject::Name("K/DA ALL OUT Akali (BADDEST)".to_owned());
+        assert!(target_matches(&watch, &baddest, &index), "loose key must match");
+        let exact = Subject::Name("K/DA ALL OUT Akali".to_owned());
+        assert!(target_matches(&watch, &exact, &index));
+        // The StoreEntry.name fallback ("Script generated price - ME: 35")
+        // is decorative junk and must never match a real skin watch.
+        let junk = Subject::Name("Script generated price - ME: 35".to_owned());
+        assert!(!target_matches(&watch, &junk, &index));
+        // A different skin with a suffix must not cross-match.
+        let other = Subject::Name("Dynastry Ahri (SPECIAL)".to_owned());
+        assert!(!target_matches(&watch, &other, &index));
     }
 
     #[test]
@@ -566,6 +621,49 @@ mod tests {
         let hits = search_champions("aHRi", champions.iter());
         assert_eq!(hits.first().expect("hit").champion_id, 103);
         assert!(search_champions("zzz", champions.iter()).is_empty());
+    }
+
+    /// The candidate list is capped: a broad query over a big catalog
+    /// replies with a bounded list, exact matches still sorted first.
+    #[test]
+    fn search_results_are_capped_for_huge_catalogs() {
+        let mut catalog: Vec<CatalogItem> = (0..25)
+            .map(|n| CatalogItem {
+                item_id: 5000 + n,
+                inventory_type: Some("CHAMPION_SKIN".to_owned()),
+                prices: Vec::new(),
+                localizations: BTreeMap::from([(
+                    "en_US".to_owned(),
+                    LocalizedText { name: Some(format!("Testee Skin {n:02}")) },
+                )]),
+                item_requirements: vec![ItemRef {
+                    inventory_type: Some("CHAMPION".to_owned()),
+                    item_id: Some(500),
+                }],
+            })
+            .collect();
+        // An exact match buried among the partials must surface first.
+        catalog.push(CatalogItem {
+            item_id: 4999,
+            inventory_type: Some("CHAMPION_SKIN".to_owned()),
+            prices: Vec::new(),
+            localizations: BTreeMap::from([(
+                "en_US".to_owned(),
+                LocalizedText { name: Some("Testee".to_owned()) },
+            )]),
+            item_requirements: vec![ItemRef {
+                inventory_type: Some("CHAMPION".to_owned()),
+                item_id: Some(500),
+            }],
+        });
+        let index = NameIndex::new(catalog, champion_map([(500, Some("Testee".to_owned()))]));
+        let hits = search_skins("testee", &index);
+        assert_eq!(hits.len(), super::SEARCH_RESULT_CAP, "capped at the limit");
+        assert_eq!(
+            hits.first().expect("hit").skin,
+            "Testee",
+            "the exact match sorts first despite the suffix numbering"
+        );
     }
 
     #[test]
@@ -613,5 +711,56 @@ mod tests {
         };
         assert!(build_notification(&doc, &sale_delta, &index()).is_none());
         assert!(build_notification(&WatchDoc::default(), &sale_delta, &index()).is_none());
+    }
+
+    /// A tampered watch doc (non-numeric user id) must never inject mention
+    /// syntax into the ping content; valid watches keep working.
+    #[test]
+    fn non_numeric_user_ids_never_reach_the_tag_content() {
+        let doc = doc_of(vec![
+            Watch {
+                id: 1,
+                user_id: "everyone".to_owned(),
+                target: skin_target(1031, "Foxfire Ahri"),
+                kinds: WatchKind::All,
+            },
+            Watch {
+                id: 2,
+                user_id: "222".to_owned(),
+                target: skin_target(1031, "Foxfire Ahri"),
+                kinds: WatchKind::All,
+            },
+        ]);
+        let delta = sale_delta_for(1031);
+        let notification = build_notification(&doc, &delta, &index()).expect("valid watch fires");
+        assert!(notification.tags.contains("<@222>"));
+        assert!(!notification.tags.contains("everyone"), "tags: {}", notification.tags);
+        assert_eq!(notification.watchers, 1);
+    }
+
+    /// The "+N more" budget path: many watchers must keep the content under
+    /// the Discord limit and record what was cut.
+    #[test]
+    fn tag_content_stays_within_the_budget() {
+        let users: Vec<String> = (0..300).map(|n| format!("1{n:017}")).collect();
+        let tags = super::tag_content(&users);
+        assert!(tags.len() <= super::TAG_BUDGET_CHARS + 32, "content over budget: {}", tags.len());
+        assert!(tags.contains('+'), "hidden count expected: {tags}");
+        assert!(tags.ends_with("more"));
+        assert!(tags.starts_with("<@1"), "rendered tags are well-formed mentions");
+    }
+
+    fn sale_delta_for(item_id: u64) -> StoreDelta {
+        StoreDelta {
+            sales: vec![super::super::lcu::Sale {
+                id: 7,
+                item: ItemRef {
+                    inventory_type: Some("CHAMPION_SKIN".to_owned()),
+                    item_id: Some(item_id),
+                },
+                sale: Default::default(),
+            }],
+            ..StoreDelta::default()
+        }
     }
 }

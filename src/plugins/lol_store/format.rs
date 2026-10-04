@@ -85,7 +85,7 @@ impl NameIndex {
     }
 
     fn original_price(&self, item_id: u64) -> Option<u64> {
-        self.catalog.get(&item_id)?.prices.first().and_then(|price| price.cost)
+        self.catalog.get(&item_id).and_then(|item| rp_price(&item.prices))
     }
 }
 
@@ -105,9 +105,14 @@ pub fn announce_text(delta: &StoreDelta, index: &NameIndex) -> Option<String> {
     }
     for rotation in &delta.rotations {
         let lines: Vec<String> = rotation.entries.iter().map(mythic_line).collect();
-        if !lines.is_empty() {
-            push_section(&mut sections, &format!("Mythic rotation ({})", rotation.label), &lines);
+        if lines.is_empty() {
+            continue;
         }
+        let mut title = format!("Mythic rotation ({})", rotation.label);
+        if let Some(ends) = &rotation.next_rotation {
+            title.push_str(&format!(" \u{b7} ends {}", timestamp(ends)));
+        }
+        push_section(&mut sections, &title, &lines);
     }
     if let Some(start) = &delta.yourshop {
         let mut line = String::from("**Your Shop started**");
@@ -126,7 +131,11 @@ pub fn announce_text(delta: &StoreDelta, index: &NameIndex) -> Option<String> {
 /// Fits the built sections into the embed budget: whole sections are
 /// dropped from the tail (lowest build priority) until the join fits, a
 /// hidden-count footer records what was cut, and a single pathological
-/// section (absurd item names) is hard-cut char-safely.
+/// section (absurd item names) is hard-cut char-safely. The join budget
+/// counts BYTES while the hard cut counts CHARS - deliberately
+/// conservative: multibyte locales drop sections a little earlier than
+/// strictly needed, but the char cut always stays under Discord's
+/// code-point-based embed limit.
 pub(crate) fn fit(mut sections: Vec<String>) -> Option<String> {
     let join_len = |sections: &[String]| {
         sections.iter().map(String::len).sum::<usize>() + sections.len().saturating_sub(1) * 2
@@ -201,7 +210,7 @@ pub(crate) fn sale_line(sale: &super::lcu::Sale, index: &NameIndex) -> String {
     };
 
     let mut line = format!("- {subject}");
-    let sale_price = sale.sale.prices.first().and_then(|price| price.cost);
+    let sale_price = rp_price(&sale.sale.prices);
     // Percentage off, computed against the catalog's original price (the
     // payload's own `discount` field is dead - always 0.0).
     if let (Some(original), Some(cost)) = (index.original_price(item_id), sale_price) {
@@ -228,10 +237,16 @@ pub(crate) fn skin_line(item: &CatalogItem, index: &NameIndex) -> String {
         None => localized_name(item),
     };
     let mut line = format!("- {subject}");
-    if let Some(price) = item.prices.first().and_then(|price| price.cost) {
+    if let Some(price) = rp_price(&item.prices) {
         line.push_str(&format!(" · {price} RP"));
     }
     line
+}
+
+/// The RP cost of a price list - Riot payloads can carry other currencies
+/// alongside RP, and announcements only ever quote RP.
+fn rp_price(prices: &[super::lcu::Price]) -> Option<u64> {
+    prices.iter().find(|price| price.currency.as_deref() == Some("RP")).and_then(|price| price.cost)
 }
 
 /// One Mythic Shop slot line - shared by announcements and watch pings.
@@ -249,21 +264,30 @@ fn date(iso: &str) -> String {
     iso.split('T').next().unwrap_or(iso).to_owned()
 }
 
-/// `2026-10-01T09:00:00Z` -> `2026-10-01 09:00 UTC`; a zero offset renders
-/// the same, a non-zero offset is rendered as-is instead of mislabeled as
-/// UTC. Falls back to the raw string on any deviation.
+/// `2026-10-01T09:00:00Z` -> `2026-10-01 09:00 UTC`; a non-zero offset is
+/// rendered as-is WITH its sign (dropping it would misread `-05:30` as
+/// `+05:30`). Falls back to the raw string on any deviation.
 #[must_use]
 pub(crate) fn timestamp(iso: &str) -> String {
     let mut parts = iso.split('T');
     let day = parts.next().unwrap_or(iso);
     let Some(time) = parts.next() else { return iso.to_owned() };
     let hhmm: String = time.chars().take(5).collect();
+    // Locate the sign char itself (split_once would strip it): everything
+    // after it is the offset body.
     let offset = time
-        .split_once(['+', '-'])
-        .map(|(_, offset)| offset)
-        .filter(|offset| !offset.is_empty())
-        .unwrap_or("Z");
-    let label = if offset == "Z" || offset == "00:00" { "UTC" } else { offset };
+        .char_indices()
+        .find(|(_, ch)| *ch == '+' || *ch == '-')
+        .and_then(|(idx, sign)| {
+            let rest = time.get(idx + 1..)?;
+            (!rest.is_empty()).then(|| format!("{sign}{rest}"))
+        })
+        .unwrap_or_else(|| "Z".to_owned());
+    let label = if offset == "Z" || offset == "+00:00" || offset == "-00:00" {
+        "UTC"
+    } else {
+        offset.as_str()
+    };
     format!("{day} {hhmm} {label}")
 }
 
@@ -420,12 +444,37 @@ mod tests {
         assert_eq!(timestamp("weird"), "weird");
     }
 
-    /// A non-zero offset is rendered as given, never mislabeled as UTC.
+    /// A non-zero offset is rendered as given, WITH its sign - dropping it
+    /// would misread `-05:30` as `+05:30`.
     #[test]
     fn timestamp_keeps_nonzero_offsets() {
         assert_eq!(timestamp("2026-10-01T09:07:33.000+00:00"), "2026-10-01 09:07 UTC");
-        assert_eq!(timestamp("2026-10-01T09:07:33.000+02:00"), "2026-10-01 09:07 02:00");
-        assert_eq!(timestamp("2026-10-01T09:07:33-05:30"), "2026-10-01 09:07 05:30");
+        assert_eq!(timestamp("2026-10-01T09:07:33.000+02:00"), "2026-10-01 09:07 +02:00");
+        assert_eq!(timestamp("2026-10-01T09:07:33-05:30"), "2026-10-01 09:07 -05:30");
+    }
+
+    /// The rotation section title carries the next-rotation time when the
+    /// payload provides it.
+    #[test]
+    fn rotation_section_title_shows_when_it_ends() {
+        let delta = StoreDelta {
+            rotations: vec![super::super::diff::RotationDelta {
+                label: "weekly".to_owned(),
+                rotation_start: None,
+                next_rotation: Some("2026-10-08T00:00:00.000Z".to_owned()),
+                entries: vec![super::super::diff::MythicEntry {
+                    entry_id: None,
+                    name: Some("Prestige Ocean Song Seraphine".to_owned()),
+                    mythic_price: Some(35),
+                }],
+            }],
+            ..StoreDelta::default()
+        };
+        let text = announce_text(&delta, &NameIndex::empty()).expect("announcement expected");
+        assert!(
+            text.contains("**Mythic rotation (weekly) · ends 2026-10-08 00:00 UTC**"),
+            "text: {text}"
+        );
     }
 
     /// A discounted non-skin item (chest, orb, bundle) gets no champion
