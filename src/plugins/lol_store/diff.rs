@@ -118,6 +118,36 @@ pub fn rotation_stores(stores: &[RotationStore]) -> Vec<&RotationStore> {
         .collect()
 }
 
+/// Projects one rotating mythic store onto a renderable rotation delta.
+/// `None` for stores without a name or with an Ok-but-empty payload - the
+/// same collapse guard `merge` applies when keeping the previous entry set
+/// (announcing the empty shape would emit a phantom rotation on every tick
+/// until the glitch clears, because the state never advances). Shared by
+/// the live diff (which adds the changed-check) and the first-launch
+/// `/lol_store_dump` (which renders every rotation currently present).
+pub(crate) fn rotation_delta(store: &RotationStore) -> Option<RotationDelta> {
+    if store.name.is_none() {
+        return None;
+    }
+    let payload_ids: BTreeSet<String> =
+        store.catalog_entries.iter().map(|entry| entry.id.clone().unwrap_or_default()).collect();
+    if payload_ids.is_empty() {
+        return None;
+    }
+    Some(RotationDelta {
+        label: store.category_label().unwrap_or_else(|| "rotation".to_owned()),
+        rotation_start: store
+            .rotating_store_metadata
+            .as_ref()
+            .and_then(|meta| meta.curr_rotation_start_time.clone()),
+        next_rotation: store
+            .rotating_store_metadata
+            .as_ref()
+            .and_then(|meta| meta.next_rotation_start_time.clone()),
+        entries: store.catalog_entries.iter().map(mythic_entry).collect(),
+    })
+}
+
 /// Builds the last-seen state from a snapshot, overwriting only the sources
 /// that actually arrived (failed sources keep their previous state).
 #[must_use]
@@ -253,30 +283,16 @@ pub fn compute(previous: &LastSeen, snapshot: &Snapshot) -> StoreDelta {
                 .iter()
                 .map(|entry| entry.id.clone().unwrap_or_default())
                 .collect();
-            // Mirror merge's collapse guard: an Ok-but-empty payload never
-            // announces - merge keeps the previous set, so announcing it
-            // would emit a phantom empty rotation (and a bogus
-            // MythicRotation bus kind) on every tick until the glitch
-            // clears, because the state never advances.
-            if payload_ids.is_empty() {
-                continue;
-            }
             let changed = previous_state.is_none_or(|state| state.entry_ids != payload_ids);
             if !changed {
                 continue;
             }
-            delta.rotations.push(RotationDelta {
-                label: store.category_label().unwrap_or_else(|| "rotation".to_owned()),
-                rotation_start: store
-                    .rotating_store_metadata
-                    .as_ref()
-                    .and_then(|meta| meta.curr_rotation_start_time.clone()),
-                next_rotation: store
-                    .rotating_store_metadata
-                    .as_ref()
-                    .and_then(|meta| meta.next_rotation_start_time.clone()),
-                entries: store.catalog_entries.iter().map(mythic_entry).collect(),
-            });
+            // The empty-payload guard lives in `rotation_delta`: a
+            // changed-but-empty shape (merge kept the previous set) must
+            // stay silent, mirroring the state merge.
+            if let Some(rotation) = rotation_delta(store) {
+                delta.rotations.push(rotation);
+            }
         }
     }
     if let Some(status) = &snapshot.yourshop {

@@ -547,7 +547,9 @@ impl CommandHandler for WatchlistHandler {
 }
 
 /// `/lol_store_dump`: force-post the latest store update summary into the
-/// invoking channel (moderator, public - a dump is meant to be seen).
+/// invoking channel (moderator, public - a dump is meant to be seen). With
+/// no update announced yet (fresh launch), the current store is dumped
+/// instead; with no snapshot either, an ephemeral placeholder explains it.
 pub struct DumpHandler<B: crate::kernel::plugin_ports::EventBusPort> {
     pub engine: Arc<StoreEngine<B>>,
 }
@@ -560,12 +562,23 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for DumpHandle
         _args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
-        let message = match self.engine.last_announcement_text() {
-            Some(text) if !text.is_empty() => OutboundMessage::embed(Embed {
+        let message = if let Some(text) =
+            self.engine.last_announcement_text().filter(|text| !text.is_empty())
+        {
+            OutboundMessage::embed(Embed {
                 title: "LoL Store - latest update".to_owned(),
                 description: text,
-            }),
-            _ => command_reply("No store update has been announced yet."),
+            })
+        } else if let Some(text) = self.engine.current_store_text().await {
+            OutboundMessage::embed(Embed {
+                title: "LoL Store - current state".to_owned(),
+                description: text,
+            })
+        } else {
+            command_reply(
+                "No store update has been announced yet, and no store snapshot is \
+                     available yet (the client may not have been polled).",
+            )
         };
         services.chat_output.send(message).await?;
         Ok(())

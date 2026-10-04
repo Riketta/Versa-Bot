@@ -308,7 +308,9 @@ whose send fails gets a log line, not a replay - the poll state still
 advances so nothing is announced twice. `/lol_store_dump` and
 `/lol_client_status` show the bot-global watcher state (there is one
 League client per bot), which may differ from what an individual guild
-received.
+received. A dump before the first announced update renders the current
+store (sales, Mythic rotations, Your Shop) instead - "new skins" needs
+history, so that section only appears once updates have been announced.
 
 | Command | Tier | Effect |
 |---|---|---|
@@ -318,7 +320,7 @@ received.
 | `/lol_store_assign` | moderator | post store events in this channel (run it in the target channel) |
 | `/lol_store_unassign` | moderator | stop posting store events in this guild |
 | `/lol_store_role` | moderator | tag this role on store announcements - the subscription role (run without the argument to clear) |
-| `/lol_store_dump` | moderator | force-post the latest store update summary in the current channel (public, no role tag) |
+| `/lol_store_dump` | moderator | force-post the latest store update summary in the current channel; on a fresh launch (nothing announced yet), the current store instead (public, no role tag) |
 | `/lol_store_watch` | user | watch a skin or a champion for sales, Mythic Shop rotations, new releases (ephemeral) |
 | `/lol_store_unwatch` | user | remove one own watch by its list id, or every own watch with `all` (ephemeral) |
 | `/lol_store_watchlist` | user | list your own watches (private, ephemeral) |

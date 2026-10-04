@@ -25,7 +25,9 @@ use crate::kernel::models::{ChannelId, Embed, GuildId, Origin, OutboundMessage, 
 use crate::kernel::plugin_ports::{EventBusPort, Job};
 use crate::kernel::spi_ports::{ChatOutputFactoryPort, StoragePort};
 
-use super::diff::{self, LastSeen, Snapshot, StoreDelta};
+use super::diff::{
+    self, LastSeen, Snapshot, StoreDelta, YourShopStart, rotation_delta, rotation_stores,
+};
 use super::events::{LolStoreAnnounced, StoreEventKind};
 use super::format::{NameIndex, announce_text, champion_map};
 use super::lcu::LcuPort;
@@ -720,11 +722,48 @@ impl<B: EventBusPort> StoreEngine<B> {
         lines.join("\n")
     }
 
-    /// The last delivered announcement text, for `/lol_store_dump`.
+    /// The last delivered announcement text (first `/lol_store_dump`
+    /// choice; the command falls back to [`Self::current_store_text`]).
     #[must_use]
     pub fn last_announcement_text(&self) -> Option<String> {
         let last = self.last_announcement.lock();
         last.as_ref().map(|(_, text)| text.clone())
+    }
+
+    /// Renders the retained raw snapshot as a full "current store" dump -
+    /// the `/lol_store_dump` fallback for a fresh launch, before any delta
+    /// has been announced. Sales, mythic rotations and an active Your Shop
+    /// show their current contents; skins are omitted because "new in
+    /// store" is a diff concept a lone snapshot cannot provide (the
+    /// alternative would print the whole catalog). `None` while nothing
+    /// renderable has been fetched (no poll yet, client offline, or all
+    /// sections empty).
+    pub async fn current_store_text(&self) -> Option<String> {
+        let snapshot = self.last_snapshot.lock().clone()?;
+        if snapshot.sales.is_none() && snapshot.rotations.is_none() && snapshot.yourshop.is_none() {
+            return None;
+        }
+        let index = self.name_index(&snapshot).await;
+        let mut delta = StoreDelta::default();
+        if let Some(sales) = &snapshot.sales {
+            delta.sales = sales.clone();
+        }
+        if let Some(stores) = &snapshot.rotations {
+            for store in rotation_stores(stores) {
+                if let Some(rotation) = rotation_delta(store) {
+                    delta.rotations.push(rotation);
+                }
+            }
+        }
+        if let Some(status) = &snapshot.yourshop {
+            if status.hub_enabled.unwrap_or(false) {
+                delta.yourshop = Some(YourShopStart {
+                    start: status.start_time.clone(),
+                    end: status.end_time.clone(),
+                });
+            }
+        }
+        announce_text(&delta, &index)
     }
 }
 
@@ -1002,6 +1041,28 @@ mod tests {
         let scoped = f.storage.guild_scoped(Platform::Discord, GuildId(GUILD));
         let persisted = scoped.get(NAMESPACE, LAST_SEEN_KEY).await.expect("read expected");
         assert!(persisted.is_some(), "last_seen must be persisted for boot catch-up");
+    }
+
+    /// A fresh launch has no announcement to dump - the dump falls back to
+    /// the current snapshot: sales and rotations as they stand, but no
+    /// skins section ("new in store" needs history; a lone snapshot would
+    /// otherwise print the whole catalog).
+    #[tokio::test]
+    async fn fresh_launch_dump_renders_the_current_store_without_skins() {
+        let f = fixture(FakeLcu::online()).await;
+        enable_guild(&f.storage, GUILD, Some("55")).await;
+        assert!(f.engine.current_store_text().await.is_none(), "no poll yet");
+
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        *f.lcu.rotations.lock() = Some(vec![rotation_store("WEEKLY", &["e1", "e2"])]);
+        f.engine.tick().await; // silent baseline
+        assert!(f.engine.last_announcement_text().is_none());
+
+        let text = f.engine.current_store_text().await.expect("snapshot dump expected");
+        assert!(text.contains("New sales"), "current sales show: {text}");
+        assert!(text.contains("Mythic rotation"), "current rotation shows: {text}");
+        assert!(!text.contains("New in store"), "skins need history: {text}");
     }
 
     #[tokio::test]

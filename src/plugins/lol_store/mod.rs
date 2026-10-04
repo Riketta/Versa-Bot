@@ -156,7 +156,9 @@ impl<B: EventBusPort> PluginPort for LolStorePlugin<B> {
             CommandDescriptor {
                 plugin_id: self.name().to_owned(),
                 name: "lol_store_dump".to_owned(),
-                description: "Post the latest LoL store update summary in this channel".to_owned(),
+                description:
+                    "Post the latest store update, or the current store state, in this channel"
+                        .to_owned(),
                 arguments: Vec::new(),
                 required_permission: None,
                 required_tier: Some(AccessTier::Moderator),
@@ -971,7 +973,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dump_without_announcements_replies_the_placeholder() {
+    async fn dump_without_a_snapshot_replies_the_placeholder() {
         let f = command_fixture(true).await;
         let engine = disabled_engine();
         DumpHandler { engine }
@@ -983,8 +985,39 @@ mod tests {
                 .messages()
                 .first()
                 .expect("reply expected")
-                .contains("No store update has been announced yet.")
+                .contains("no store snapshot is available")
         );
+    }
+
+    /// A fresh launch has announced nothing yet - the dump falls back to
+    /// the current store snapshot instead of the placeholder.
+    #[tokio::test]
+    async fn dump_on_a_fresh_launch_posts_the_current_store() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let f = command_fixture_with(true, Arc::clone(&storage)).await;
+        let lcu = OnlineLcu::new();
+        *lcu.sales.lock() = vec![OnlineLcu::skin_sale(1031)];
+        let engine = Arc::new(StoreEngine::new(
+            Arc::new(lcu),
+            Arc::clone(&storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
+            RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
+            RecordingBus::default(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: DEFAULT_USER_CAP,
+                watch_guild_cap: DEFAULT_GUILD_CAP,
+            },
+        ));
+        engine.tick().await; // silent baseline
+
+        DumpHandler { engine }
+            .invoke(&f.event, &Default::default(), &f.services)
+            .await
+            .expect("invoke");
+        let reply = f.output.messages().first().expect("reply expected").clone();
+        assert!(reply.contains("LoL Store - current state"), "reply: {reply}");
+        assert!(reply.contains("New sales"), "reply: {reply}");
     }
 
     #[tokio::test]
