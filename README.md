@@ -644,9 +644,11 @@ channel system prompt itself is `/llm_prompt`'s, visible via
 | `max_length` | 1-2000 characters | `max_message_length` (2000) | per-channel reply-splitting limit |
 | `turn_template` | template containing `{sender}` and `{message}` | `[{sender}](<@{user_id}>): {message}` | how user turns render into the model context; fields: `{sender}`, `{user_id}`, `{guild_name}`, `{time}` (unix), `{message}` |
 
-**Delivery.** While an answer generates and delivers, the bot holds the
-channel's typing indicator - users see it composing, not frozen. The
-answer posts as a native Discord reply to the message that triggered it
+**Delivery.** The bot holds the channel's typing indicator from the
+moment a triggered run is accepted - through any wait for a previous
+answer on the same channel to finish - across generation and delivery;
+users see it composing, not frozen. The answer posts as a native Discord
+reply to the message that triggered it
 (the mention/reply target, or the message a chime-in fired on); only the
 first message of a split answer carries the reply header, the rest
 continue plainly. Long answers split on line boundaries - a line that

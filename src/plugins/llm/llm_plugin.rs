@@ -10,7 +10,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common::panic_message;
 use crate::kernel::{
-    models::{EventKind, EventPayload, GuildId, Origin, PluginError, RequestContext},
+    models::{
+        EventKind, EventPayload, GuildId, MessagePayload, Origin, PluginError, RequestContext,
+    },
     plugin_ports::{
         AccessTier, ArgDescriptor, ArgKind, CommandDescriptor, CommandRegistryPort,
         MiddlewarePluginPort, Next, PluginPort,
@@ -193,6 +195,34 @@ impl LlmPlugin {
                 tracing::warn!(channel = channel_id, %err, "reply-trigger check failed after engine panic");
                 false
             }
+        }
+    }
+
+    /// Whether the engine would answer this message, decided WITHOUT the
+    /// channel lock - the mirror the plugin needs for paths outside the
+    /// engine frame: typing starts before the lock (the queue wait must
+    /// read as "composing") and panic recovery re-checks after the frame
+    /// unwound. A mention is decidable from the payload; a reply trigger
+    /// matches Assistant records through `reply_targets_bot` - the same
+    /// bounded post-cutoff window `should_trigger` reads under the lock.
+    async fn payload_triggers(
+        services: &KernelServices,
+        payload: &MessagePayload,
+        channel_id: u64,
+        depth: u32,
+        keep_tail: u32,
+    ) -> bool {
+        if payload.mentions_bot {
+            return true;
+        }
+        let Some(storage) = &services.guild_storage else {
+            return false;
+        };
+        match payload.reply_to {
+            Some(reply_to) => {
+                Self::reply_targets_bot(storage, channel_id, reply_to.get(), depth, keep_tail).await
+            }
+            None => false,
         }
     }
 
@@ -496,6 +526,26 @@ impl MiddlewarePluginPort for LlmPlugin {
             if shutdown.is_cancelled() {
                 return;
             }
+            // Typing must cover the queue, not just the generation: a
+            // triggered run first waits here for an in-flight answer to
+            // release the channel lock, and users should see "composing"
+            // from the moment the run was accepted. Chime-ins have not
+            // rolled yet, so unaddressed messages stay quiet; a rare
+            // disagreement with the engine's post-lock decision only means
+            // a brief typing flicker - the guard drops with the task.
+            let typing = if Self::payload_triggers(
+                &services,
+                &payload,
+                origin.channel_id.get(),
+                config.history_depth,
+                engine.settings().compaction_keep_tail,
+            )
+            .await
+            {
+                Some(services.chat_output_factory.start_typing(&origin))
+            } else {
+                None
+            };
             let _guard = lock.lock().await;
             // Last-resort panic isolation: the pipeline catches panics in
             // every hook, but the engine runs here, off-pipeline - an
@@ -503,7 +553,7 @@ impl MiddlewarePluginPort for LlmPlugin {
             // channel lock and the admission permit drop with the unwound
             // task, so the channel stays usable.
             let run = std::panic::AssertUnwindSafe(
-                engine.handle_message(&origin, &payload, &config, &services),
+                engine.handle_message(&origin, &payload, &config, &services, typing),
             )
             .catch_unwind()
             .await;
@@ -518,27 +568,15 @@ impl MiddlewarePluginPort for LlmPlugin {
                 // (the engine's state is intact - only the call frame
                 // unwound). The rare panic after content was already
                 // revealed may place the notice after a partial answer -
-                // acceptable noise for an internal bug. A mention is
-                // decidable from the payload; a reply trigger is re-checked
-                // against the record log, since the in-flight window is
-                // gone.
-                let triggered = payload.mentions_bot
-                    || match payload.reply_to {
-                        Some(reply_to) => match &services.guild_storage {
-                            Some(storage) => {
-                                Self::reply_targets_bot(
-                                    storage,
-                                    origin.channel_id.get(),
-                                    reply_to.get(),
-                                    config.history_depth,
-                                    engine.settings().compaction_keep_tail,
-                                )
-                                .await
-                            }
-                            None => false,
-                        },
-                        None => false,
-                    };
+                // acceptable noise for an internal bug.
+                let triggered = Self::payload_triggers(
+                    &services,
+                    &payload,
+                    origin.channel_id.get(),
+                    config.history_depth,
+                    engine.settings().compaction_keep_tail,
+                )
+                .await;
                 if triggered {
                     engine.send_fallback(&origin, &services).await;
                 }

@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use crate::kernel::{
     models::{ChannelId, Embed, GuildId, MessageId, MessagePayload, Origin, OutboundMessage},
     services::KernelServices,
-    spi_ports::{ChatStreamPort, GuildStorage},
+    spi_ports::{ChatStreamPort, ChatTypingGuard, GuildStorage},
 };
 
 use super::completion_port::{
@@ -258,13 +258,18 @@ impl ChatEngine {
     }
 
     /// Processes one inbound message of an assigned channel. Always
-    /// returns normally - failures are logged, never propagated.
+    /// returns normally - failures are logged, never propagated. A caller
+    /// that decided the trigger before the channel lock (and started the
+    /// typing indicator there, so the queue wait reads as "composing")
+    /// passes its guard in `pre_typing`; `None` lets the engine type itself
+    /// when an answer is due (the chime path, which rolls under the lock).
     pub async fn handle_message(
         &self,
         origin: &Origin,
         payload: &MessagePayload,
         config: &ChannelConfig,
         services: &KernelServices,
+        pre_typing: Option<ChatTypingGuard>,
     ) {
         let Some(storage) = &services.guild_storage else {
             return; // DMs cannot have channel config; unreachable via `pre`.
@@ -344,7 +349,7 @@ impl ChatEngine {
         if conversation::should_trigger(payload.mentions_bot, reply_to, &live_records) {
             if capture_failed {
                 self.send_fallback(origin, services).await;
-            } else if !self.answer(origin, request, services).await {
+            } else if !self.answer(origin, request, services, pre_typing).await {
                 // The generated answer is impossible - the triggered message
                 // still gets a visible response.
                 self.send_fallback(origin, services).await;
@@ -526,13 +531,16 @@ impl ChatEngine {
         origin: &Origin,
         request: AnswerRequest<'_>,
         services: &KernelServices,
+        typing: Option<ChatTypingGuard>,
     ) -> bool {
         let AnswerRequest { config, state, live, usage_stats, trigger } = request;
         // The answer may take tens of seconds: hold the platform typing
-        // indicator across generation and delivery. The guard drops on every
-        // return path - failure included, the caller's fallback follows
-        // right after.
-        let _typing = services.chat_output_factory.start_typing(origin);
+        // indicator across generation and delivery. A triggered run arrives
+        // with the guard its caller started before the channel lock (the
+        // queue wait must read as "composing" too); a chime run types here,
+        // after its roll fired. The guard drops on every return path -
+        // failure included, the caller's fallback follows right after.
+        let _typing = typing.unwrap_or_else(|| services.chat_output_factory.start_typing(origin));
         let channel_id = origin.channel_id.get();
         let (request, context_chars, budget, window_used) =
             self.assemble_prompt(config, state, live, usage_stats);
@@ -950,7 +958,7 @@ impl ChatEngine {
                 self.note_react_chime(origin);
             }
             request.trigger = "chime";
-            self.answer(origin, request, services).await;
+            self.answer(origin, request, services, None).await;
         } else if react_fire {
             self.note_react_chime(origin);
             self.react_chime(origin, request, services).await;
@@ -2142,7 +2150,7 @@ mod tests {
         seed_config(&ctx.storage, &assigned_config());
 
         ctx.engine
-            .handle_message(&origin(), &payload(true, None), &assigned_config(), &services)
+            .handle_message(&origin(), &payload(true, None), &assigned_config(), &services, None)
             .await;
 
         // Nothing was delivered - and exactly two sends were attempted:
@@ -2165,7 +2173,9 @@ mod tests {
             append_record(&ctx.storage, &user_record(seq, "alice", &format!("m{seq}"))).await;
         }
 
-        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
 
         let request = ctx.fake.requests().first().expect("one request expected").clone();
         let rendered: Vec<&str> =
@@ -2298,7 +2308,13 @@ mod tests {
         seed_config(&ctx.storage, &assigned_config());
 
         ctx.engine
-            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .handle_message(
+                &origin(),
+                &payload(true, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
             .await;
 
         // Context sent to the provider: system, placeholder, the user turn.
@@ -2349,7 +2365,9 @@ mod tests {
         let mut payload = payload(true, None);
         payload.guild_name = Some("Crafters".to_owned());
 
-        ctx.engine.handle_message(&origin(), &payload, &assigned_config(), &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload, &assigned_config(), &ctx.services, None)
+            .await;
 
         let records = stored_records(&ctx).await;
         let user = records.first().expect("user record expected");
@@ -2367,16 +2385,50 @@ mod tests {
         seed_config(&ctx.storage, &assigned_config());
 
         ctx.engine
-            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .handle_message(
+                &origin(),
+                &payload(true, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
             .await;
 
         assert_eq!(ctx.factory.typing_starts(), 1);
 
         // The next answer starts it again - one guard per answer.
         ctx.engine
-            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .handle_message(
+                &origin(),
+                &payload(true, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
             .await;
         assert_eq!(ctx.factory.typing_starts(), 2);
+    }
+
+    /// A guard the caller started before the channel lock is reused by the
+    /// triggered answer - one typing start covers the queue wait and the
+    /// generation, no second indicator fires.
+    #[tokio::test]
+    async fn triggered_answer_reuses_the_caller_started_typing_guard() {
+        let ctx = ctx(vec![Ok("hi alice".to_owned())]);
+        seed_config(&ctx.storage, &assigned_config());
+        let pre_typing = ctx.factory.start_typing(&origin());
+
+        ctx.engine
+            .handle_message(
+                &origin(),
+                &payload(true, None),
+                &assigned_config(),
+                &ctx.services,
+                Some(pre_typing),
+            )
+            .await;
+
+        assert_eq!(ctx.factory.typing_starts(), 1);
     }
 
     #[tokio::test]
@@ -2385,7 +2437,13 @@ mod tests {
         seed_config(&ctx.storage, &assigned_config());
 
         ctx.engine
-            .handle_message(&origin(), &payload(false, None), &assigned_config(), &ctx.services)
+            .handle_message(
+                &origin(),
+                &payload(false, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
             .await;
 
         assert!(ctx.fake.requests().is_empty());
@@ -2399,7 +2457,9 @@ mod tests {
         let config = ChannelConfig { capture_mode: CaptureMode::AllMessages, ..assigned_config() };
         seed_config(&ctx.storage, &config);
 
-        ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(false, None), &config, &ctx.services, None)
+            .await;
 
         let records = stored_records(&ctx).await;
         assert_eq!(records.len(), 1);
@@ -2432,6 +2492,7 @@ mod tests {
                 &payload_with_images(&["https://cdn.example/1.png"]),
                 &config,
                 &ctx.services,
+                None,
             )
             .await;
 
@@ -2474,6 +2535,7 @@ mod tests {
                 &payload_with_images(&["https://cdn.example/1.png"]),
                 &config,
                 &ctx.services,
+                None,
             )
             .await;
 
@@ -2494,6 +2556,7 @@ mod tests {
                 &payload_with_images(&["https://cdn.example/1.png"]),
                 &config,
                 &ctx.services,
+                None,
             )
             .await;
 
@@ -2521,6 +2584,7 @@ mod tests {
                 &payload_with_images(&["https://cdn.example/1.png"]),
                 &config,
                 &ctx.services,
+                None,
             )
             .await;
 
@@ -2552,6 +2616,7 @@ mod tests {
                 &payload_with_images(&["https://cdn.example/1.png", "/2.png", "/3.png"]),
                 &config,
                 &ctx.services,
+                None,
             )
             .await;
 
@@ -2589,6 +2654,7 @@ mod tests {
                 &payload_with_images(&["https://cdn.example/1.png"]),
                 &config,
                 &ctx.services,
+                None,
             )
             .await;
 
@@ -2621,7 +2687,13 @@ mod tests {
 
         // Bob replies to the bot's message (id 11): no mention, still triggers.
         ctx.engine
-            .handle_message(&origin(), &payload(false, Some(11)), &assigned_config(), &ctx.services)
+            .handle_message(
+                &origin(),
+                &payload(false, Some(11)),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
             .await;
 
         assert_eq!(ctx.fake.requests().len(), 1);
@@ -2640,7 +2712,13 @@ mod tests {
         seed_config(&ctx.storage, &assigned_config());
 
         ctx.engine
-            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .handle_message(
+                &origin(),
+                &payload(true, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
             .await;
 
         // The generated answer is gone, but the triggered message gets the
@@ -2659,7 +2737,9 @@ mod tests {
         let config = ChannelConfig { max_length: Some(5), ..assigned_config() };
         seed_config(&ctx.storage, &config);
 
-        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
 
         // First chunk via begin (as a native reply to the trigger),
         // remainder via plain sends.
@@ -2688,7 +2768,13 @@ mod tests {
         );
 
         ctx.engine
-            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .handle_message(
+                &origin(),
+                &payload(true, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
             .await;
 
         let request = ctx.fake.requests().first().expect("one request expected").clone();
@@ -2717,7 +2803,13 @@ mod tests {
         append_record(&ctx.storage, &user_record(4, "new2", "m4")).await;
 
         ctx.engine
-            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .handle_message(
+                &origin(),
+                &payload(true, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
             .await;
 
         // The context holds only post-cutoff turns plus the triggering one.
@@ -2740,7 +2832,9 @@ mod tests {
         append_record(&ctx.storage, &user_record(2, "a2", "m2")).await;
         append_record(&ctx.storage, &user_record(3, "a3", "m3")).await;
 
-        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
 
         let request = ctx.fake.requests().first().expect("one request expected").clone();
         // Fixed slots (system + summary) plus the newest 2 turns only.
@@ -2778,7 +2872,9 @@ mod tests {
             ),
         };
 
-        engine.handle_message(&origin(), &payload(true, None), &assigned_config(), &services).await;
+        engine
+            .handle_message(&origin(), &payload(true, None), &assigned_config(), &services, None)
+            .await;
 
         assert!(fake.requests().is_empty());
         // A mention is decidable without the state doc - the guarantee holds.
@@ -2796,7 +2892,9 @@ mod tests {
         append_record(&ctx.storage, &user_record(2, "a2", "m2")).await;
         append_record(&ctx.storage, &user_record(3, "a3", "m3")).await;
 
-        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
 
         // Chat completion first, compaction second; the chunk holds only the
         // oldest two records (keep_tail = 2 keeps the newest pair).
@@ -2859,7 +2957,9 @@ mod tests {
         append_record(&ctx.storage, &user_record(2, "a2", "m2")).await;
         append_record(&ctx.storage, &user_record(3, "a3", "m3")).await;
 
-        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
 
         // Both completions ran (chat + compaction), but the stored "last
         // request" stays the CHAT call's usage - the summarizer never writes.
@@ -2890,7 +2990,9 @@ mod tests {
         append_record(&ctx.storage, &user_record(2, "a2", "m2")).await;
         append_record(&ctx.storage, &user_record(3, "a3", "m3")).await;
 
-        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
 
         // The reply went out; the compaction failure left the state intact.
         assert_eq!(begin_texts(&ctx.begins), vec!["the answer".to_owned()]);
@@ -2918,7 +3020,13 @@ mod tests {
         seed_config(&ctx.storage, &assigned_config());
 
         ctx.engine
-            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .handle_message(
+                &origin(),
+                &payload(true, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
             .await;
 
         assert!(ctx.fake.requests().is_empty());
@@ -2939,7 +3047,13 @@ mod tests {
         seed_config(&ctx.storage, &assigned_config());
 
         ctx.engine
-            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .handle_message(
+                &origin(),
+                &payload(true, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
             .await;
 
         assert!(ctx.fake.requests().is_empty());
@@ -2958,7 +3072,13 @@ mod tests {
         seed_service_channel(&ctx);
 
         ctx.engine
-            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .handle_message(
+                &origin(),
+                &payload(true, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
             .await;
 
         let text = ctx
@@ -2981,7 +3101,13 @@ mod tests {
 
         for _ in 0..3 {
             ctx.engine
-                .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+                .handle_message(
+                    &origin(),
+                    &payload(true, None),
+                    &assigned_config(),
+                    &ctx.services,
+                    None,
+                )
                 .await;
         }
 
@@ -3009,6 +3135,7 @@ mod tests {
                     &payload(true, None),
                     &assigned_config(),
                     &ctx.services,
+                    None,
                 )
                 .await;
         }
@@ -3031,7 +3158,9 @@ mod tests {
         seed_config(&ctx.storage, &config);
         append_record(&ctx.storage, &user_record(1, "a1", "m1")).await;
 
-        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
 
         // Only the chat completion ran; no state was ever written.
         assert_eq!(ctx.fake.requests().len(), 1);
@@ -3060,7 +3189,9 @@ mod tests {
         };
         seed_config(&ctx.storage, &config);
 
-        ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(false, None), &config, &ctx.services, None)
+            .await;
 
         assert_eq!(ctx.fake.requests().len(), 1);
         assert_eq!(begin_texts(&ctx.begins), vec!["random thought".to_owned()]);
@@ -3088,7 +3219,9 @@ mod tests {
         };
         seed_config(&ctx.storage, &config);
 
-        ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(false, None), &config, &ctx.services, None)
+            .await;
 
         // The capture stays, no answer is delivered, nothing is said.
         assert_eq!(ctx.fake.requests().len(), 1);
@@ -3107,7 +3240,9 @@ mod tests {
         };
         seed_config(&ctx.storage, &config);
 
-        ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(false, None), &config, &ctx.services, None)
+            .await;
 
         assert!(ctx.fake.requests().is_empty());
         assert_eq!(stored_records(&ctx).await.len(), 1);
@@ -3121,7 +3256,13 @@ mod tests {
         seed_config(&ctx.storage, &assigned_config());
 
         ctx.engine
-            .handle_message(&origin(), &payload(false, None), &assigned_config(), &ctx.services)
+            .handle_message(
+                &origin(),
+                &payload(false, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
             .await;
 
         assert!(ctx.fake.requests().is_empty());
@@ -3147,7 +3288,7 @@ mod tests {
 
         for _ in 0..2 {
             ctx.engine
-                .handle_message(&origin(), &payload(false, None), &config, &ctx.services)
+                .handle_message(&origin(), &payload(false, None), &config, &ctx.services, None)
                 .await;
         }
 
@@ -3178,7 +3319,7 @@ mod tests {
 
         for _ in 0..2 {
             ctx.engine
-                .handle_message(&origin(), &payload(false, None), &config, &ctx.services)
+                .handle_message(&origin(), &payload(false, None), &config, &ctx.services, None)
                 .await;
         }
 
@@ -3239,7 +3380,9 @@ mod tests {
         let config = ChannelConfig { streaming: true, ..assigned_config() };
         seed_config(&ctx.storage, &config);
 
-        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
 
         assert_eq!(begin_texts(&ctx.begins), vec!["Answer".to_owned()]);
         // The live message opened as a native reply to the trigger.
@@ -3272,7 +3415,9 @@ mod tests {
         let config = ChannelConfig { streaming: true, ..assigned_config() };
         seed_config(&ctx.storage, &config);
 
-        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
 
         assert_eq!(ctx.output.messages(), vec![FALLBACK_MESSAGE.to_owned()]);
         assert!(ctx.begins.lock().is_empty());
@@ -3300,7 +3445,9 @@ mod tests {
         let config = ChannelConfig { streaming: true, ..assigned_config() };
         seed_config(&ctx.storage, &config);
 
-        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
 
         // No fallback: partial text is already on screen.
         assert!(ctx.output.messages().is_empty());
@@ -3329,7 +3476,9 @@ mod tests {
         let config = react_config();
         seed_config(&ctx.storage, &config);
 
-        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
 
         // The channel sees only the cleaned answer.
         assert_eq!(begin_texts(&ctx.begins), vec!["nice!".to_owned()]);
@@ -3354,7 +3503,9 @@ mod tests {
         let config = react_config();
         seed_config(&ctx.storage, &config);
 
-        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
 
         assert!(ctx.begins.lock().is_empty());
         assert!(ctx.output.messages().is_empty(), "no fallback: the emoji was the answer");
@@ -3379,7 +3530,7 @@ mod tests {
             guild_storage: Some(ctx.storage.guild_scoped(Platform::Discord, GuildId(1))),
         };
 
-        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &services).await;
+        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &services, None).await;
 
         // Delivered = recorded: the assistant turn with the cleaned text
         // proves the answer went out despite the reaction failure.
@@ -3397,7 +3548,9 @@ mod tests {
         let config = assigned_config();
         seed_config(&ctx.storage, &config);
 
-        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
 
         assert_eq!(begin_texts(&ctx.begins), vec!["text".to_owned()]);
         assert!(reactions_log(&ctx.factory).is_empty());
@@ -3420,7 +3573,9 @@ mod tests {
         let config = ChannelConfig { streaming: true, ..react_config() };
         seed_config(&ctx.storage, &config);
 
-        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
 
         assert!(ctx.output.messages().is_empty());
         assert_eq!(ctx.updates.lock().last().map(String::as_str), Some("partial"));
@@ -3445,7 +3600,9 @@ mod tests {
         };
         seed_config(&ctx.storage, &config);
 
-        ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(false, None), &config, &ctx.services, None)
+            .await;
 
         assert_eq!(ctx.fake.requests().len(), 1);
         assert!(ctx.begins.lock().is_empty(), "no reply is delivered");
@@ -3483,7 +3640,9 @@ mod tests {
         };
         seed_config(&ctx.storage, &config);
 
-        ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(false, None), &config, &ctx.services, None)
+            .await;
 
         let requests = ctx.fake.requests();
         assert_eq!(requests.len(), 1);
@@ -3519,7 +3678,9 @@ mod tests {
         };
         seed_config(&ctx.storage, &config);
 
-        ctx.engine.handle_message(&origin(), &payload(false, None), &config, &ctx.services).await;
+        ctx.engine
+            .handle_message(&origin(), &payload(false, None), &config, &ctx.services, None)
+            .await;
 
         assert_eq!(ctx.fake.requests().len(), 1);
         assert!(ctx.begins.lock().is_empty());
@@ -3541,7 +3702,13 @@ mod tests {
         seed_config(&ctx.storage, &assigned_config());
 
         ctx.engine
-            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .handle_message(
+                &origin(),
+                &payload(true, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
             .await;
 
         let stats_raw = ctx
@@ -3568,7 +3735,13 @@ mod tests {
         seed_config(&ctx.storage, &assigned_config());
 
         ctx.engine
-            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .handle_message(
+                &origin(),
+                &payload(true, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
             .await;
 
         let stats_raw = ctx
@@ -3607,7 +3780,13 @@ mod tests {
 
         for _ in 0..2 {
             ctx.engine
-                .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+                .handle_message(
+                    &origin(),
+                    &payload(true, None),
+                    &assigned_config(),
+                    &ctx.services,
+                    None,
+                )
                 .await;
         }
 
@@ -3667,7 +3846,13 @@ mod tests {
         );
 
         ctx.engine
-            .handle_message(&origin(), &payload(true, None), &assigned_config(), &ctx.services)
+            .handle_message(
+                &origin(),
+                &payload(true, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
             .await;
 
         // The answer went out (the channel is not bricked) - answers deliver
