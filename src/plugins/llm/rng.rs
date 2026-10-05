@@ -54,17 +54,35 @@ impl RandomPort for RandRandom {
 }
 
 /// Deck-style adapter ("fake random"): per scope, draws come WITHOUT
-/// replacement from a bag holding the rounded percent as hits - a 2% chance
-/// fires exactly 2 times per 100 draws, instead of statistically clumping.
-/// The bag rebuilds when exhausted or when the percent changes.
+/// replacement from a bag holding the promised hits, so fires balance out
+/// over a cycle instead of statistically clumping. Low chances normalize
+/// to a single hit - 2% decks as 1 hit per 50 cards, not 2 per 100 - so
+/// hits cannot pair up mid-cycle and the spacing stays even (and
+/// sub-percent chances become exact instead of rounding up to a 1-hit
+/// floor). The single-hit size is `round(100/percent)`, so the delivered
+/// rate drifts by at most half a card of rounding (imperceptible for
+/// chime rolls); sizes cap at [`MAX_DECK_CARDS`], clamping chances below
+/// 0.01% to it. Higher chances keep the exact rounded percent as hits per
+/// 100 cards - a one-hit deck would distort the rate there (50% would
+/// alternate strictly, 90% would always fire). The bag rebuilds when
+/// exhausted or when the shape changes.
 pub struct DeckRandom {
     decks: Mutex<HashMap<RandomScope, Deck>>,
 }
 
+/// Single-hit normalization applies while `round(100/percent)` reaches
+/// this many cards; below it (percent above ~28%), a one-hit deck would
+/// distort the rate past perception, so the exact hits-per-100 shape wins.
+const MIN_SINGLE_HIT_DECK: u32 = 4;
+
+/// Deck-size cap: chances below `100/MAX` percent clamp to it (one hit
+/// per 10,000 cards), bounding the bag's memory.
+const MAX_DECK_CARDS: u32 = 10_000;
+
 #[derive(Debug)]
 struct Deck {
-    /// Rounded percent the bag was built for; rebuilds on change.
-    built_for: u32,
+    /// (hits, cards) the bag was built for; rebuilds on change.
+    built_for: (u32, u32),
     remaining: Vec<bool>,
 }
 
@@ -90,23 +108,25 @@ impl RandomPort for DeckRandom {
             return true;
         }
 
-        // Guards above clamp percent into (0, 100); rounding is exact.
+        // Guards above clamp percent into (0, 100); both casts are exact:
+        // the kept size sits in [MIN_SINGLE_HIT_DECK, MAX_DECK_CARDS], and
+        // the fallback percent rounds into [29, 100].
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let rounded = percent.round() as u32;
+        let shape = if (100.0 / percent).round() >= f64::from(MIN_SINGLE_HIT_DECK) {
+            (1, (100.0 / percent).round().min(f64::from(MAX_DECK_CARDS)) as u32)
+        } else {
+            (percent.round() as u32, 100)
+        };
+
         let mut decks = self.decks.lock();
-        let deck =
-            decks.entry(scope).or_insert(Deck { built_for: u32::MAX, remaining: Vec::new() });
-        if deck.built_for != rounded || deck.remaining.is_empty() {
-            // Sub-0.5% chances round to zero hits: without the floor the bag
-            // would hold only misses, never empty, and never rebuild - the
-            // channel would stay silent forever. Any nonzero chance fires at
-            // least once per cycle (a 0.4% setting behaves as ~1%).
-            let hits = usize::from(u16::try_from(rounded).unwrap_or(u16::MAX).min(100)).max(1);
-            let mut bag: Vec<bool> = std::iter::repeat_n(true, hits)
-                .chain(std::iter::repeat_n(false, 100 - hits))
+        let deck = decks.entry(scope).or_insert(Deck { built_for: (0, 0), remaining: Vec::new() });
+        if deck.built_for != shape || deck.remaining.is_empty() {
+            let (hits, cards) = shape;
+            let mut bag: Vec<bool> = std::iter::repeat_n(true, hits as usize)
+                .chain(std::iter::repeat_n(false, cards as usize - hits as usize))
                 .collect();
             bag.shuffle(&mut rand::rng());
-            deck.built_for = rounded;
+            deck.built_for = shape;
             deck.remaining = bag;
         }
         deck.remaining.pop().unwrap_or(true)
@@ -152,8 +172,25 @@ mod tests {
                 hits += 1;
             }
         }
-        // One full deck cycle: exactly 2 hits, regardless of shuffle order.
+        // Two normalized single-hit cycles of 50: exactly 2 hits, regardless
+        // of shuffle order.
         assert_eq!(hits, 2);
+    }
+
+    /// The normalization pins the cycle SIZE, not just the average: 2% is
+    /// one hit per 50 draws, not two hits per 100 that might pair up.
+    #[test]
+    fn single_hit_deck_cycle_is_the_normalized_size() {
+        let deck = DeckRandom::new();
+        let scope = scope("discord", 1);
+
+        let mut hits = 0;
+        for _ in 0..50 {
+            if deck.chance_percent(scope, 2.0) {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 1);
     }
 
     #[test]
@@ -244,16 +281,16 @@ mod tests {
         assert_eq!(hits, 50);
     }
 
-    /// Sub-0.5% chances round to zero hits: without a floor the bag would
-    /// hold only misses, never empty, and never rebuild - the channel would
-    /// stay silent forever. Any nonzero chance fires at least once per cycle.
+    /// Sub-percent chances resolve to exact single-hit decks (0.4% = 1 hit
+    /// per 250 cards) - the old rounded-hits shape had to round them up to
+    /// a 1-hit-per-100 floor, tripling the rate.
     #[test]
-    fn sub_half_percent_chance_still_fires_once_per_cycle() {
+    fn sub_percent_chances_are_exact_one_hit_decks() {
         let deck = DeckRandom::new();
         let scope = scope("discord", 1);
 
         let mut hits = 0;
-        for _ in 0..100 {
+        for _ in 0..250 {
             if deck.chance_percent(scope, 0.4) {
                 hits += 1;
             }
@@ -261,18 +298,52 @@ mod tests {
         assert_eq!(hits, 1);
     }
 
-    /// Non-integer percents round half away from zero: 2.5% decks as 3 hits.
+    /// Fractional percents normalize by scaling the deck: 2.5% is 1 hit per
+    /// 40 cards - exact, no rounding to whole hits per 100.
     #[test]
-    fn non_integer_percent_rounds_to_nearest_whole_hits() {
+    fn fractional_percent_normalizes_to_one_hit() {
+        let deck = DeckRandom::new();
+        let scope = scope("discord", 1);
+
+        let mut hits = 0;
+        for _ in 0..40 {
+            if deck.chance_percent(scope, 2.5) {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 1);
+    }
+
+    /// Above the single-hit threshold the exact rounded percent rides as
+    /// hits per 100 cards - a one-hit deck would distort the rate (90%
+    /// would always fire).
+    #[test]
+    fn high_chance_keeps_the_exact_hits_per_100_deck() {
         let deck = DeckRandom::new();
         let scope = scope("discord", 1);
 
         let mut hits = 0;
         for _ in 0..100 {
-            if deck.chance_percent(scope, 2.5) {
+            if deck.chance_percent(scope, 90.0) {
                 hits += 1;
             }
         }
-        assert_eq!(hits, 3);
+        assert_eq!(hits, 90);
+    }
+
+    /// The deck-size cap bounds the bag: chances below 0.01% clamp to one
+    /// hit per 10,000 cards.
+    #[test]
+    fn tiny_chances_clamp_to_the_deck_cap() {
+        let deck = DeckRandom::new();
+        let scope = scope("discord", 1);
+
+        let mut hits = 0;
+        for _ in 0..10_000 {
+            if deck.chance_percent(scope, 0.001) {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 1);
     }
 }

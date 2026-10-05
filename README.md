@@ -848,8 +848,11 @@ degrade gracefully: the answer then arrives as one piece (and a
 non-streaming channel always does). Chime-ins are cooldown-guarded
 (default 5 seconds between them, per-channel `random_cooldown`) and
 only fire on messages the bot actually captured; the chance draws from a
-per-channel deck, so hits balance out over each 100-draw cycle instead
-of clumping. With `react` on, a second independent roll
+per-channel deck, so hits balance out per cycle instead of clumping -
+chances up to ~28% normalize to a single hit (2% is one guaranteed hit
+per 50 draws, not two per 100 that might pair up; sub-percent chances
+stay exact), higher chances keep the exact percent as hits per 100
+draws. With `react` on, a second independent roll
 (`random_react_chance`, default 10%) can silently react to a captured
 message without replying: one single-shot call carrying a dedicated
 reaction-only instruction (the model must choose a reaction, not write
