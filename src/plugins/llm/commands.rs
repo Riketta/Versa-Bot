@@ -429,8 +429,12 @@ fn set_float(config: &mut ChannelConfig, key: &str, value: Option<f64>) {
 
 /// `/llm_assign`: assigns the chat bot to the channel the command is run in,
 /// with the given provider/model reference. Re-assigning retunes in place.
-/// Discord caps one option's `choices` at 25 entries.
-pub(super) const MAX_DISCORD_CHOICES: usize = 25;
+/// Cap on one command argument's `choices` dropdown. The name is
+/// platform-neutral because the cap is a platform fact, not plugin logic -
+/// but the value is Discord's (25 entries per option) on purpose: every
+/// deployment serves a single chat provider, and plugins may focus that
+/// provider until a second adapter ever exists.
+pub(super) const MAX_CHOICES: usize = 25;
 
 /// Declared model refs for the `/llm_assign` dropdown: registry order
 /// (sorted), truncated to Discord's choice cap. The dropdown is discovery
@@ -438,14 +442,14 @@ pub(super) const MAX_DISCORD_CHOICES: usize = 25;
 /// truncation.
 pub(super) fn model_choices(settings: &LlmSettings) -> Vec<String> {
     let mut refs: Vec<String> = settings.models.keys().cloned().collect();
-    if refs.len() > MAX_DISCORD_CHOICES {
+    if refs.len() > MAX_CHOICES {
         tracing::warn!(
             total = refs.len(),
-            cap = MAX_DISCORD_CHOICES,
+            cap = MAX_CHOICES,
             "declared models exceed Discord's choice cap - dropdown truncated; \
              runtime validation still accepts every declared ref"
         );
-        refs.truncate(MAX_DISCORD_CHOICES);
+        refs.truncate(MAX_CHOICES);
     }
     refs
 }
@@ -2083,7 +2087,7 @@ mod tests {
         }
 
         let choices = model_choices(&settings);
-        assert_eq!(choices.len(), MAX_DISCORD_CHOICES);
+        assert_eq!(choices.len(), MAX_CHOICES);
         assert_eq!(choices.first().expect("choice expected"), "p/m0");
     }
 

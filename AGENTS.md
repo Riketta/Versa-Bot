@@ -46,6 +46,11 @@ concept. Platform-specific features live in adapters or platform-scoped
 plugins. Platform types never enter the kernel or core plugins - because
 of economics, not purity: platform branching inside every plugin scales
 with (plugins x platforms); new-adapter integration scales with 1.
+Platform-FACT exceptions (caps, host names, naming) in core-plugin
+constants, comments, and user-facing text are tolerated while each
+deployment serves exactly one chat provider - keep them behind a
+platform-neutral name where one exists, and scrub them only when a
+second adapter actually lands.
 
 ## README maintenance
 
