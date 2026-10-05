@@ -30,8 +30,9 @@ use super::completion_port::{
 };
 use super::conversation::{self, ConversationRecord, RecordRole};
 use super::model::{
-    ChannelConfig, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats,
-    blend_ratio, channel_state_key, channel_stats_key, records_namespace, unix_now,
+    ChannelConfig, ChannelKey, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY,
+    UsageStats, blend_ratio, channel_key, channel_state_key, channel_stats_key, records_namespace,
+    unix_now,
 };
 use super::prompts::{PromptVars, render_prompt};
 use super::providers::LlmSettings;
@@ -45,10 +46,6 @@ use crate::kernel::spi_ports::PlatformInfoPort;
 fn undescribed(count: usize) -> Vec<conversation::RecordImage> {
     std::iter::repeat_n(conversation::RecordImage { description: None }, count).collect()
 }
-
-/// Identifies one channel for service-notice cooldowns: platform, guild,
-/// channel.
-type ChannelKey = (String, u64, u64);
 
 /// Minimum interval between error notices for the same channel: a down
 /// provider must not turn every triggering message into an admin ping.
@@ -1428,11 +1425,7 @@ impl ChatEngine {
     }
 
     fn error_notice_allowed(&self, origin: &Origin, service_channel: u64) -> bool {
-        let key: ChannelKey = (
-            self.platform_info.slug().to_owned(),
-            origin.guild_id.map_or(0, GuildId::get),
-            service_channel,
-        );
+        let key = channel_key(self.platform_info.slug(), origin.guild_id, service_channel);
         let mut notices = self.notices.lock();
         match notices.get(&key) {
             Some(last) if last.elapsed() < NOTICE_COOLDOWN => false,
@@ -1444,42 +1437,26 @@ impl ChatEngine {
     }
 
     fn chime_allowed(&self, origin: &Origin, cooldown_secs: u64) -> bool {
-        let key: ChannelKey = (
-            self.platform_info.slug().to_owned(),
-            origin.guild_id.map_or(0, GuildId::get),
-            origin.channel_id.get(),
-        );
+        let key = channel_key(self.platform_info.slug(), origin.guild_id, origin.channel_id.get());
         let cooldown = Duration::from_secs(cooldown_secs);
         !matches!(self.chimes.lock().get(&key), Some(last) if last.elapsed() < cooldown)
     }
 
     fn note_chime(&self, origin: &Origin) {
-        let key: ChannelKey = (
-            self.platform_info.slug().to_owned(),
-            origin.guild_id.map_or(0, GuildId::get),
-            origin.channel_id.get(),
-        );
+        let key = channel_key(self.platform_info.slug(), origin.guild_id, origin.channel_id.get());
         self.chimes.lock().insert(key, Instant::now());
     }
 
     /// Silent-react chime cooldown - the same `random_cooldown_secs`
     /// duration as the reply chime, but an independent tracker.
     fn react_chime_allowed(&self, origin: &Origin, cooldown_secs: u64) -> bool {
-        let key: ChannelKey = (
-            self.platform_info.slug().to_owned(),
-            origin.guild_id.map_or(0, GuildId::get),
-            origin.channel_id.get(),
-        );
+        let key = channel_key(self.platform_info.slug(), origin.guild_id, origin.channel_id.get());
         let cooldown = Duration::from_secs(cooldown_secs);
         !matches!(self.react_chimes.lock().get(&key), Some(last) if last.elapsed() < cooldown)
     }
 
     fn note_react_chime(&self, origin: &Origin) {
-        let key: ChannelKey = (
-            self.platform_info.slug().to_owned(),
-            origin.guild_id.map_or(0, GuildId::get),
-            origin.channel_id.get(),
-        );
+        let key = channel_key(self.platform_info.slug(), origin.guild_id, origin.channel_id.get());
         self.react_chimes.lock().insert(key, Instant::now());
     }
 

@@ -10,9 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common::panic_message;
 use crate::kernel::{
-    models::{
-        EventKind, EventPayload, GuildId, MessagePayload, Origin, PluginError, RequestContext,
-    },
+    models::{EventKind, EventPayload, MessagePayload, Origin, PluginError, RequestContext},
     plugin_ports::{
         AccessTier, ArgDescriptor, ArgKind, CommandDescriptor, CommandRegistryPort,
         MiddlewarePluginPort, Next, PluginPort,
@@ -31,6 +29,7 @@ use super::model::{
     ChannelConfig, ConversationState, NAMESPACE, channel_config_key, channel_state_key,
     records_namespace,
 };
+use super::model::{ChannelKey, channel_key};
 
 /// Whole-request timeout for prompt-file downloads from the Discord CDN -
 /// deliberately shorter than provider timeouts: the fetch is interactive
@@ -43,9 +42,6 @@ const PROMPT_FETCH_TIMEOUT_SECS: u64 = 30;
 /// skip, not captured) instead of accumulating tasks and memory without
 /// bound.
 const MAX_PENDING_RUNS_PER_CHANNEL: usize = 64;
-
-/// Identifies one channel's processing lock: platform, guild, channel.
-type ChannelKey = (String, u64, u64);
 
 /// Per-channel processing locks, shared by the engine intake and the
 /// state-mutating admin commands: everything that reads or writes one
@@ -64,8 +60,7 @@ impl ChannelLocks {
     }
 
     pub(super) fn lock_for(&self, slug: &'static str, origin: &Origin) -> Arc<AsyncMutex<()>> {
-        let key: ChannelKey =
-            (slug.to_owned(), origin.guild_id.map_or(0, GuildId::get), origin.channel_id.get());
+        let key = channel_key(slug, origin.guild_id, origin.channel_id.get());
         Arc::clone(self.locks.lock().entry(key).or_default())
     }
 }
@@ -86,8 +81,7 @@ impl ChannelPermits {
     }
 
     fn permit_for(&self, slug: &'static str, origin: &Origin) -> Arc<Semaphore> {
-        let key: ChannelKey =
-            (slug.to_owned(), origin.guild_id.map_or(0, GuildId::get), origin.channel_id.get());
+        let key = channel_key(slug, origin.guild_id, origin.channel_id.get());
         Arc::clone(
             self.permits
                 .lock()
@@ -116,7 +110,9 @@ pub struct LlmPlugin {
     channel_permits: Arc<ChannelPermits>,
     /// Cancelled in `stop`: afterwards no new engine runs are admitted (the
     /// kernel stops plugins during shutdown). In-flight runs finish
-    /// naturally - they are bounded by the permits.
+    /// naturally while the process lives - they are bounded by the permits;
+    /// at process exit the runtime drops and abandons whatever is still in
+    /// flight (an accepted message can lose its answer at shutdown).
     shutdown: CancellationToken,
     /// Keyless client for prompt-file downloads - Discord CDN only (host
     /// pinned in the handler), never a provider endpoint.
@@ -338,7 +334,7 @@ impl LlmPlugin {
                 Vec::new(),
                 AccessTier::Moderator,
             ),
-            Arc::new(UnassignLlmHandler),
+            Arc::new(UnassignLlmHandler::new(Arc::clone(&self.channel_locks))),
         );
     }
 }
@@ -348,6 +344,9 @@ impl PluginPort for LlmPlugin {
         "llm"
     }
 
+    /// Registers the admin and model commands. The plugin is NOT re-bootable
+    /// after `stop()` - the admission gate is never re-armed (unreachable
+    /// under the kernel's one-shot lifecycle).
     fn init(&self) -> Result<(), PluginError> {
         self.register_model_commands();
         self.registry.register(
@@ -1114,7 +1113,7 @@ mod tests {
             )
             .await
             .expect("assign expected to succeed");
-        UnassignLlmHandler
+        UnassignLlmHandler::new(ChannelLocks::new())
             .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
             .await
             .expect("unassign expected to succeed");
@@ -1126,7 +1125,7 @@ mod tests {
                 .expect("keys readable"),
             Vec::<String>::new()
         );
-        UnassignLlmHandler
+        UnassignLlmHandler::new(ChannelLocks::new())
             .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
             .await
             .expect("second unassign expected to succeed (idempotent)");

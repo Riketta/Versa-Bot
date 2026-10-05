@@ -106,10 +106,13 @@ impl SqlxStorage {
 #[async_trait]
 impl StoragePort for SqlxStorage {
     fn guild_scoped(&self, platform: &str, guild_id: GuildId) -> Arc<dyn GuildStorage> {
+        // Discord snowflakes are epoch-based and far below 2^63, so the
+        // cast cannot wrap for any id the platform issues; the assert
+        // documents the invariant the storage schema relies on.
+        debug_assert!(guild_id.get() < (1 << 63), "guild id exceeds the i64 storage range");
         Arc::new(ScopedGuildStorage {
             db: Arc::clone(&self.db),
             platform: platform.to_owned(),
-            // Discord snowflakes fit i64; engines store integers natively.
             guild_id: guild_id.get() as i64,
         })
     }
@@ -835,5 +838,52 @@ mod tests {
                 "sequence numbers must stay unique and contiguous: {seqs:?}"
             );
         }
+    }
+
+    /// The poll-driven plugins' discovery primitive: distinct (platform,
+    /// guild) scopes in stable order, corrupted rows filtered.
+    #[tokio::test]
+    async fn list_guilds_returns_distinct_scopes_in_stable_order() {
+        let storage = sqlite_storage().await;
+        storage
+            .guild_scoped("discord", GuildId(2))
+            .set("ns", "k", Value::Bool(true))
+            .await
+            .unwrap();
+        storage
+            .guild_scoped("discord", GuildId(1))
+            .set("ns", "k", Value::Bool(true))
+            .await
+            .unwrap();
+        // The same scope twice must collapse into one row (DISTINCT).
+        storage
+            .guild_scoped("discord", GuildId(1))
+            .set("ns", "k2", Value::Bool(true))
+            .await
+            .unwrap();
+        storage.guild_scoped("test", GuildId(3)).set("ns", "k", Value::Bool(true)).await.unwrap();
+        // A negative guild id cannot be produced through the port; seed one
+        // directly to pin the corruption filter.
+        match &*storage.db {
+            Db::Sqlite(pool) => {
+                sqlx::query(
+                    "INSERT INTO guild_documents (platform, guild_id, namespace, key, value) \
+                     VALUES ('discord', -5, 'ns', 'ghost', 'null')",
+                )
+                .execute(pool)
+                .await
+                .expect("raw row expected to insert");
+            }
+            Db::Postgres(_) => unreachable!("the fixture is sqlite"),
+        }
+
+        assert_eq!(
+            storage.list_guilds().await.expect("list expected to succeed"),
+            [
+                ("discord".to_owned(), GuildId(1)),
+                ("discord".to_owned(), GuildId(2)),
+                ("test".to_owned(), GuildId(3)),
+            ]
+        );
     }
 }

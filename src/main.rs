@@ -135,8 +135,8 @@ async fn main() -> ExitCode {
                 // discovery from the platform is the fallback per part.
                 llm_settings_from(
                     config,
-                    config.bot_name.clone().or_else(|| Some(bot_user.name.clone())),
-                    config.bot_id.clone().or_else(|| Some(bot_user.id.get().to_string())),
+                    Some(config.bot_name.clone().unwrap_or_else(|| bot_user.name.clone())),
+                    Some(config.bot_id.clone().unwrap_or_else(|| bot_user.id.get().to_string())),
                     platform_info.message_limit(),
                 )
             })
@@ -223,14 +223,11 @@ async fn main() -> ExitCode {
     let leaderboard_engine_settings =
         leaderboard_settings(config.lol_leaderboard.as_ref(), &leaderboard_source).unwrap_or_else(
             || {
-                LeaderboardEngineSettings::new(
-                    &leaderboard_source,
-                    &[],
-                    1000,
-                    Duration::from_secs(18 * 60 * 60),
-                    Duration::from_secs(1),
-                    LeaderboardView::resolve(1000, &[300, 1000], 1000, 5),
-                )
+                // Section absent or degraded: the engine still boots in
+                // "not configured" mode, derived from the config's own
+                // defaults so the two can never drift.
+                leaderboard_settings(Some(&LolLeaderboardConfig::default()), &leaderboard_source)
+                    .expect("the default leaderboard config is enabled")
             },
         );
     let leaderboard_engine = Arc::new(LeaderboardEngine::new(
@@ -651,4 +648,122 @@ fn build_http(token: &str, proxy: Option<String>, application_id: Option<u64>) -
         http_builder = http_builder.client(reqwest_client);
     }
     http_builder.build()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use versa_bot::infrastructure::{LolLeaderboardConfig, LolStoreConfig};
+    use versa_bot::plugins::lol_leaderboard::{RegionLeaderboard, SourceError};
+
+    /// The boot-time clamp matrix of `llm_settings_from`: the platform cap,
+    /// the absence of one, and the zero-value rescues all announce
+    /// themselves - here only the resulting values are pinned.
+    #[test]
+    fn max_message_length_clamps_to_the_platform_cap() {
+        let mut config = LlmConfig::default();
+        config.max_message_length = 5000;
+
+        let settings = llm_settings_from(&config, None, None, Some(2000));
+        assert_eq!(settings.max_message_length, 2000);
+
+        // No platform cap: the configured value passes through.
+        let settings = llm_settings_from(&config, None, None, None);
+        assert_eq!(settings.max_message_length, 5000);
+    }
+
+    #[test]
+    fn llm_zero_values_clamp_to_safe_floors() {
+        let mut config = LlmConfig::default();
+        config.max_message_length = 0;
+        config.stream_interval_ms = 10;
+        config.compaction_keep_tail = 0;
+        config.image_max_side = 0;
+
+        let settings = llm_settings_from(&config, None, None, Some(2000));
+        assert_eq!(settings.max_message_length, 1);
+        assert_eq!(settings.stream_interval_ms, 250);
+        assert_eq!(settings.compaction_keep_tail, 1);
+        assert_eq!(settings.image_max_side, 1);
+    }
+
+    #[test]
+    fn time_offset_clamps_to_a_full_day_either_way() {
+        let mut config = LlmConfig::default();
+        config.time_offset_minutes = 5000;
+        let settings = llm_settings_from(&config, None, None, None);
+        assert_eq!(settings.time_offset_minutes, 1439);
+
+        config.time_offset_minutes = -5000;
+        let settings = llm_settings_from(&config, None, None, None);
+        assert_eq!(settings.time_offset_minutes, -1439);
+    }
+
+    /// The store watcher's disable matrix: absent section, empty lockfile
+    /// path, and zero poll all map to the disabled state (dead handle).
+    #[test]
+    fn store_watcher_disabled_states() {
+        assert_eq!(lol_store_engine_settings(None).poll, Duration::ZERO);
+
+        let mut config = LolStoreConfig::default();
+        config.lockfile_path = String::new();
+        assert_eq!(lol_store_engine_settings(Some(&config)).poll, Duration::ZERO);
+
+        config.lockfile_path = "lockfile".to_owned();
+        config.poll_secs = 0;
+        assert_eq!(lol_store_engine_settings(Some(&config)).poll, Duration::ZERO);
+
+        config.poll_secs = 30;
+        assert_eq!(lol_store_engine_settings(Some(&config)).poll, Duration::from_secs(30));
+    }
+
+    struct StubSource;
+
+    #[async_trait]
+    impl LeaderboardSourcePort for StubSource {
+        fn known_regions(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        async fn leaderboard(
+            &self,
+            _region: &str,
+            _depth: u32,
+        ) -> Result<RegionLeaderboard, SourceError> {
+            unreachable!("the settings mapping never touches the source");
+        }
+
+        async fn champion_names(&self) -> Result<HashMap<String, String>, SourceError> {
+            unreachable!("the settings mapping never touches the source");
+        }
+    }
+
+    /// The leaderboard's degrade matrix: absent section and every zeroed
+    /// knob map to "not configured"; a valid section enables.
+    #[test]
+    fn leaderboard_settings_disable_matrix() {
+        let source = StubSource;
+        let source: &dyn LeaderboardSourcePort = &source;
+
+        assert!(leaderboard_settings(None, source).is_none());
+
+        let mut config = LolLeaderboardConfig::default();
+        config.request_interval_secs = 0;
+        assert!(leaderboard_settings(Some(&config), source).is_none());
+
+        config.request_interval_secs = 1;
+        config.parse_depth = 0;
+        assert!(leaderboard_settings(Some(&config), source).is_none());
+
+        config.parse_depth = 1000;
+        config.cache_ttl_secs = 0;
+        assert!(leaderboard_settings(Some(&config), source).is_none());
+
+        config.cache_ttl_secs = 3600;
+        assert!(leaderboard_settings(Some(&config), source).is_some());
+    }
 }

@@ -89,11 +89,13 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
         // Discord-admin clamp holds everywhere.
         let author_permissions = resolve_author_permissions(&ctx, &message);
         // Same best-effort display naming: channel nick when present, else
-        // the platform username, frozen at capture time for history renders.
+        // the platform display name (global name), else the username -
+        // frozen at capture time for history renders.
         let author_name = message
             .member
             .as_ref()
             .and_then(|member| member.nick.clone())
+            .or_else(|| message.author.global_name.clone())
             .unwrap_or_else(|| message.author.name.clone());
         // The reply reference survives even when the referenced message is
         // not cached (or was deleted) - unlike `referenced_message`.
@@ -372,11 +374,22 @@ fn resolve_author_permissions(ctx: &Context, message: &Message) -> u64 {
     }
     let Some(guild_id) = message.guild_id else { return 0 };
     let Some(guild) = ctx.cache.guild(guild_id) else { return 0 };
+    cached_author_permissions(message.author.id, &guild)
+}
+
+/// The cache half of [`resolve_author_permissions`]: the owner gets
+/// everything, anyone else the union of the @everyone role and their member
+/// roles. Pure over the cached guild so the fallback rules stay testable
+/// without a live gateway cache.
+fn cached_author_permissions(
+    message_author_id: SerenityUserId,
+    guild: &serenity::all::Guild,
+) -> u64 {
     let everyone =
         guild.roles.get(&SerenityRoleId::new(guild.id.get())).map(|role| role.permissions.bits());
     let member_roles: Vec<u64> = guild
         .members
-        .get(&message.author.id)
+        .get(&message_author_id)
         .map(|member| {
             member
                 .roles
@@ -388,7 +401,7 @@ fn resolve_author_permissions(ctx: &Context, message: &Message) -> u64 {
         .unwrap_or_default();
     unioned_member_permissions(
         guild.owner_id.get(),
-        message.author.id.get(),
+        message_author_id.get(),
         everyone,
         &member_roles,
     )
@@ -665,6 +678,49 @@ mod tests {
                 "file".to_owned(),
                 "https://cdn.discordapp.com/attachments/1/2/prompt.md".to_owned()
             )]
+        );
+    }
+
+    /// The cache fallback rules: owner shortcut, everyone+roles union,
+    /// unknown-member default.
+    #[test]
+    fn cached_permissions_resolve_owner_and_role_union() {
+        fn role(id: SerenityRoleId, permissions: Permissions) -> serenity::all::Role {
+            let mut role = serenity::all::Role::default();
+            role.id = id;
+            role.permissions = permissions;
+            role
+        }
+
+        let mut guild = serenity::all::Guild::default();
+        guild.id = SerenityGuildId::new(7);
+        guild.owner_id = SerenityUserId::new(1);
+        guild.roles.insert(
+            SerenityRoleId::new(7),
+            role(SerenityRoleId::new(7), Permissions::SEND_MESSAGES),
+        );
+        guild.roles.insert(
+            SerenityRoleId::new(8),
+            role(SerenityRoleId::new(8), Permissions::ADMINISTRATOR),
+        );
+
+        let mut member = serenity::all::Member::default();
+        member.roles = vec![SerenityRoleId::new(8)];
+        guild.members.insert(SerenityUserId::new(2), member);
+
+        // The owner shortcut.
+        assert_eq!(
+            cached_author_permissions(SerenityUserId::new(1), &guild),
+            Permissions::all().bits()
+        );
+        // A member: union of @everyone and their own roles.
+        let bits = cached_author_permissions(SerenityUserId::new(2), &guild);
+        assert_ne!(bits & Permissions::SEND_MESSAGES.bits(), 0);
+        assert_ne!(bits & Permissions::ADMINISTRATOR.bits(), 0);
+        // An unknown member: @everyone only.
+        assert_eq!(
+            cached_author_permissions(SerenityUserId::new(3), &guild),
+            Permissions::SEND_MESSAGES.bits()
         );
     }
 }

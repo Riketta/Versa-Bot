@@ -35,6 +35,6 @@ impl ReactionPort for UndeliverableReactionPort {
         _message_id: MessageId,
         _emoji: &str,
     ) -> Result<(), OutboundError> {
-        Err(OutboundError::Reaction("this origin has no reactable Discord message".to_owned()))
+        Err(OutboundError::Reaction("this origin has no reactable message".to_owned()))
     }
 }

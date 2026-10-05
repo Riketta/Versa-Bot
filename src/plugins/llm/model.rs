@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::kernel::models::GuildId;
 use crate::plugins::llm::completion_port::{ResponseTiming, TokenUsage};
 
 /// Guild storage namespace owned by this plugin (the plugin's slug).
@@ -36,6 +37,21 @@ pub fn channel_state_key(channel_id: u64) -> String {
 pub fn channel_stats_key(channel_id: u64) -> String {
     format!("channel:{channel_id}:stats")
 }
+
+/// Builds the [`ChannelKey`] for one origin under the deployment's slug.
+#[must_use]
+pub(super) fn channel_key(
+    slug: &'static str,
+    guild_id: Option<GuildId>,
+    channel_id: u64,
+) -> ChannelKey {
+    (slug.to_owned(), guild_id.map_or(0, GuildId::get), channel_id)
+}
+
+/// Identity of one chat channel across the plugin's state maps (locks,
+/// permits, cooldown trackers, error notices): platform slug, guild id
+/// (0 for DMs), channel id.
+pub(super) type ChannelKey = (String, u64, u64);
 
 /// Record namespace of one channel's conversation log: the plugin slug,
 /// sub-partitioned per channel. Guild isolation comes from the storage

@@ -75,7 +75,7 @@ url = "sqlite://versabot.db"
 # (`streaming` on); the final edit always carries the exact full text.
 # Floored at 250 ms - faster cadences would hammer Discord's edit limit.
 # stream_interval_ms = 2000
-# Cap for /llm_prompt_file attachment downloads, in bytes.
+# Cap for /llm_set_prompt file attachment downloads, in bytes.
 # max_prompt_file_bytes = 131072
 # Collapse runs of consecutive newlines in completions down to this many
 # (e.g. 2 = at most one blank line between paragraphs). Absent = responses

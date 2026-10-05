@@ -123,13 +123,15 @@ async fn set_tier(
     services: &KernelServices,
     args: &CommandArgs,
 ) -> anyhow::Result<()> {
-    // One write at a time: set is a document read-modify-write, and two
-    // concurrent invocations must not lose one update.
-    let _write = policy_writes.lock().await;
+    // Argument validation runs before the write lock: a malformed
+    // invocation must not queue behind another admin's write.
     let target = match target_of(args) {
         Ok(target) => target,
         Err(message) => return reply(services, message).await,
     };
+    // One write at a time: set is a document read-modify-write, and two
+    // concurrent invocations must not lose one update.
+    let _write = policy_writes.lock().await;
     let Ok(tier) = tier_of(services, args).await else {
         return Ok(());
     };
@@ -179,11 +181,15 @@ async fn clear_target(
     services: &KernelServices,
     args: &CommandArgs,
 ) -> anyhow::Result<()> {
-    let _write = policy_writes.lock().await;
+    // Argument validation runs before the write lock: a malformed
+    // invocation must not queue behind another admin's write.
     let target = match target_of(args) {
         Ok(target) => target,
         Err(message) => return reply(services, message).await,
     };
+    // One write at a time: clear is a document read-modify-write, and two
+    // concurrent invocations must not lose one update.
+    let _write = policy_writes.lock().await;
 
     let mut policy = match read_policy(storage).await {
         Ok(policy) => policy,

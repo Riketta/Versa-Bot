@@ -133,7 +133,6 @@ fn pack(blocks: Vec<String>, limit: usize) -> Vec<String> {
                     part.push_str(line);
                 } else {
                     flush(&mut messages, &mut part);
-                    part.clear();
                     part.push_str(line);
                 }
             }

@@ -188,15 +188,28 @@ impl<E: EventBusPort> KernelService<E> {
     }
 
     /// Boot rollback: stops already-started plugins in reverse order. Stop
-    /// failures are logged and skipped - a broken `stop` must not strand the
-    /// other plugins' cleanup nor mask the original boot error.
+    /// failures and panics are logged and skipped - a broken `stop` must
+    /// not strand the other plugins' cleanup nor mask the original boot
+    /// error.
     fn rollback_started(started: &[Arc<dyn PluginPort>]) {
         for plugin in started.iter().rev() {
-            if let Err(err) = plugin.stop() {
+            Self::stop_quietly(plugin);
+        }
+    }
+
+    /// Stops one plugin, absorbing both `Err` and panics: a broken `stop`
+    /// must never strand the other plugins' cleanup - the same isolation
+    /// contract the pipeline hooks, bus handlers, jobs, and config
+    /// subscribers honor.
+    fn stop_quietly(plugin: &Arc<dyn PluginPort>) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| plugin.stop())) {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::error!(plugin = plugin.name(), %err, "plugin stop failed"),
+            Err(panic) => {
                 tracing::error!(
                     plugin = plugin.name(),
-                    %err,
-                    "plugin stop failed during boot rollback"
+                    panic = panic_message(&panic),
+                    "plugin stop panicked"
                 );
             }
         }
@@ -213,10 +226,12 @@ impl<E: EventBusPort> KernelService<E> {
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
         }
-        for plugin in self.started.lock().drain(..).rev() {
-            if let Err(err) = plugin.stop() {
-                tracing::error!(plugin = plugin.name(), %err, "plugin stop failed");
-            }
+        // Collected before stopping: the reverse-order walk must survive
+        // whatever a stopping plugin does - every stop is isolated in
+        // [`Self::stop_quietly`].
+        let started: Vec<_> = self.started.lock().drain(..).collect();
+        for plugin in started.iter().rev() {
+            Self::stop_quietly(plugin);
         }
     }
 
@@ -473,6 +488,42 @@ mod tests {
         }
     }
 
+    /// Plugin whose `stop` panics - the fixture for the shutdown isolation
+    /// tests. Records the call before panicking, like `RecorderPlugin`.
+    struct PanickingStopPlugin {
+        name: &'static str,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PluginPort for PanickingStopPlugin {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn stop(&self) -> Result<(), PluginError> {
+            self.log.lock().push(format!("stop:{}", self.name));
+            panic!("stop boom");
+        }
+    }
+
+    /// Plugin whose `stop` returns `Err` - the fixture for the shutdown
+    /// isolation tests. Records the call, same as `RecorderPlugin`.
+    struct FailingStopPlugin {
+        name: &'static str,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PluginPort for FailingStopPlugin {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn stop(&self) -> Result<(), PluginError> {
+            self.log.lock().push(format!("stop:{}", self.name));
+            Err(PluginError::Stop(format!("stop failed: {}", self.name)))
+        }
+    }
+
     /// Plugin whose `start` fails only on the first attempt - the fixture
     /// for the boot-retry test.
     struct OnceFailingStartPlugin {
@@ -656,6 +707,62 @@ mod tests {
 
         assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(kernel.started.lock().len(), 1, "started set must survive the second boot");
+    }
+
+    /// A panicking `stop` must not strand the remaining plugins' cleanup -
+    /// the same isolation contract every other plugin boundary honors.
+    #[tokio::test]
+    async fn panicking_stop_does_not_strand_the_remaining_plugins() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let healthy = Arc::new(RecorderPlugin {
+            name: "healthy",
+            log: Arc::clone(&log),
+            panic_in_pre: false,
+            panic_in_post: false,
+        });
+        let boomer = Arc::new(PanickingStopPlugin { name: "boomer", log: Arc::clone(&log) });
+
+        let (kernel, _output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![
+                Arc::clone(&healthy) as Arc<dyn PluginPort>,
+                Arc::clone(&boomer) as Arc<dyn PluginPort>,
+            ],
+            vec![],
+        );
+        kernel.boot().expect("boot should succeed");
+        kernel.shutdown();
+
+        // Reverse stop order: boomer (started last) panics first - healthy
+        // must still be stopped, and the Drop fallback must not re-stop.
+        assert_eq!(*log.lock(), ["stop:boomer".to_owned(), "stop:healthy".to_owned()]);
+    }
+
+    /// A `stop` returning `Err` is logged and skipped; the remaining
+    /// plugins still stop.
+    #[tokio::test]
+    async fn failing_stop_still_stops_the_remaining_plugins() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let healthy = Arc::new(RecorderPlugin {
+            name: "healthy",
+            log: Arc::clone(&log),
+            panic_in_pre: false,
+            panic_in_post: false,
+        });
+        let failing = Arc::new(FailingStopPlugin { name: "failing", log: Arc::clone(&log) });
+
+        let (kernel, _output) = test_kernel(
+            Arc::new(InMemoryStorage::new()),
+            vec![
+                Arc::clone(&healthy) as Arc<dyn PluginPort>,
+                Arc::clone(&failing) as Arc<dyn PluginPort>,
+            ],
+            vec![],
+        );
+        kernel.boot().expect("boot should succeed");
+        kernel.shutdown();
+
+        assert_eq!(*log.lock(), ["stop:failing".to_owned(), "stop:healthy".to_owned()]);
     }
 
     /// Registration validation: a middleware step that is not registered as

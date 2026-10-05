@@ -167,9 +167,13 @@ absent/empty DSN disables reporting; Sentry SaaS or self-hosted
 GlitchTip). Level contract: `debug` = stdout-only breadcrumbs
 (pipeline traversal, provider traces, job ticks, roll decisions); `info`
 = audit grade, also shipped to Sentry as log items (command dispatch,
-command registration trail, per-completion LLM record). Privacy rule at
-every level: shapes and counters, never contents - no message text, no
-prompts, no endpoint bodies in logs or guild-visible embeds. The single
+command registration trail, per-completion LLM record). command registration trail, per-completion LLM record). Privacy rule:
+guild data must never cross guild boundaries and never reach
+guild-visible surfaces - no message text, no prompts, no endpoint bodies
+in embeds or channel text. Operator-side telemetry (stdout, log files,
+Sentry) is trusted like storage: it may carry bounded short context
+(ids, settings keys, short admin-set values), never message-sized
+payloads. The single
 explicit exception is the LLM plugin's `[llm] log_raw_traffic` operator
 diagnostic (off by default, stdout only via the dedicated
 `llm_raw_traffic` target, never the Sentry layer, captured to files only

@@ -19,9 +19,9 @@ pub struct LolLeaderboardConfig {
     /// Requests are strictly sequential; this is rate-limit politeness.
     pub request_interval_secs: u64,
     /// How many top-ranked players to parse per region (rounded up to
-    /// whole source pages; the source may return fewer).
-    /// Top players parsed per region. Must be > 0 (0 disables the plugin);
-    /// values beyond 10 000 are capped at startup with a warning.
+    /// whole source pages; the source may return fewer). Must be > 0
+    /// (0 disables the plugin); values beyond 10 000 are capped at startup
+    /// with a warning.
     pub parse_depth: u32,
     /// Player-count rows for the role-distribution tables (e.g. a
     /// "TOP 300" row). Values beyond `parse_depth` are clamped to it.

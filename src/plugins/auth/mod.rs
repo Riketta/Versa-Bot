@@ -172,7 +172,16 @@ impl MiddlewarePluginPort for AuthPlugin {
             // failure must never widen access, for any guild.
             Err(err) => {
                 tracing::error!(namespace = NAMESPACE, %err, "auth config unreadable - failing closed");
-                self.answer_denial(services, event, Self::policy_unavailable_embed(event)).await;
+                self.answer_denial(
+                    services,
+                    event,
+                    Self::policy_unavailable_embed(
+                        event,
+                        "temporarily unavailable (storage error)",
+                        "Try again in a moment.",
+                    ),
+                )
+                .await;
                 return Next::Stop;
             }
         };
@@ -181,7 +190,16 @@ impl MiddlewarePluginPort for AuthPlugin {
             Some(Ok(config)) => config,
             Some(Err(_)) => {
                 tracing::warn!(namespace = NAMESPACE, "auth config is malformed - failing closed");
-                self.answer_denial(services, event, Self::policy_unavailable_embed(event)).await;
+                self.answer_denial(
+                    services,
+                    event,
+                    Self::policy_unavailable_embed(
+                        event,
+                        "unreadable (malformed)",
+                        "Ask a guild admin to fix the bot configuration.",
+                    ),
+                )
+                .await;
                 return Next::Stop;
             }
             None => AuthConfig::default(),
@@ -266,9 +284,10 @@ impl AuthPlugin {
         }
     }
 
-    /// Denial when the policy itself is unreadable: no tiers to quote,
-    /// point at the broken configuration instead.
-    fn policy_unavailable_embed(event: &RequestContext) -> Embed {
+    /// Denial when the policy itself could not be read: no tiers to quote,
+    /// point at the cause instead. A storage outage and a malformed policy
+    /// both deny - the wording must not confuse one with the other.
+    fn policy_unavailable_embed(event: &RequestContext, cause: &str, advice: &str) -> Embed {
         let what = match &event.payload {
             EventPayload::Command(command) => {
                 format!("Command `/{}` could not be authorized.", command.name)
@@ -278,7 +297,7 @@ impl AuthPlugin {
         Embed {
             title: "⛔ Not authorized".to_owned(),
             description: format!(
-                "{what}\nThis guild's access policy is unreadable (malformed), so the request was denied.\nAsk a guild admin to fix the bot configuration."
+                "{what}\nThis guild's access policy is {cause}, so the request was denied.\n{advice}"
             ),
         }
     }
@@ -724,7 +743,7 @@ mod tests {
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
         let messages = output.messages();
         assert_eq!(messages.len(), 1, "denial embed expected");
-        assert!(messages.first().is_some_and(|m| m.contains("unreadable")));
+        assert!(messages.first().is_some_and(|m| m.contains("temporarily unavailable")));
         assert!(output.sent().first().is_some_and(|m| m.ephemeral));
     }
 }

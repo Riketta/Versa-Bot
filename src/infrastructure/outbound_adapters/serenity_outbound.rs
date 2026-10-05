@@ -121,11 +121,7 @@ impl SerenityChatOutputFactory {
 impl ChatOutputFactoryPort for SerenityChatOutputFactory {
     fn chat_output(&self, origin: &Origin) -> Arc<dyn ChatOutputPort> {
         if let Some(token) = &origin.reply_token {
-            return Arc::new(InteractionFollowupOutput {
-                http: Arc::clone(&self.http),
-                token: token.clone(),
-                first_followup_used: AtomicBool::new(false),
-            });
+            return Arc::new(InteractionFollowupOutput::new(Arc::clone(&self.http), token.clone()));
         }
 
         // Member lifecycle origins carry no channel (`ChannelId(0)`); a
@@ -395,8 +391,9 @@ fn parse_reaction_token(token: &str) -> ParsedReaction {
 }
 
 fn custom_reaction(animated: bool, name: &str, id: &str) -> ReactionType {
-    // Digit-validated by the parsers; a failed parse cannot be reached.
-    let id = id.parse::<u64>().map(EmojiId::new).unwrap_or_else(|_| EmojiId::new(0));
+    // Both parsers validate digits before handing the id here - a parse
+    // failure would be an invariant breach, not a runtime condition.
+    let id = EmojiId::new(id.parse::<u64>().expect("reaction token id is digit-validated"));
     ReactionType::Custom { animated, id, name: Some(name.to_owned()) }
 }
 
@@ -458,8 +455,42 @@ impl ChatStreamPort for UndeliverableChatStream {
     }
 }
 
-struct InteractionFollowupOutput {
-    http: Arc<Http>,
+/// The two followup operations the interaction reply path needs, split
+/// from serenity's `Http` so the slot dance is testable against a scripted
+/// transport (same pattern as the LCU adapter's `Transport`).
+#[async_trait]
+trait InteractionApi: Send + Sync {
+    /// Posts one followup message; returns its id.
+    async fn create_followup(
+        &self,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> Result<SerenityMessageId, String>;
+
+    /// Deletes one followup message.
+    async fn delete_followup(&self, token: &str, id: SerenityMessageId) -> Result<(), String>;
+}
+
+#[async_trait]
+impl InteractionApi for Http {
+    async fn create_followup(
+        &self,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> Result<SerenityMessageId, String> {
+        self.create_followup_message(token, body, Vec::new())
+            .await
+            .map(|message| message.id)
+            .map_err(|err| err.to_string())
+    }
+
+    async fn delete_followup(&self, token: &str, id: SerenityMessageId) -> Result<(), String> {
+        self.delete_followup_message(token, id).await.map_err(|err| err.to_string())
+    }
+}
+
+struct InteractionFollowupOutput<T: InteractionApi> {
+    api: Arc<T>,
     token: String,
     /// Whether the first-followup slot has been consumed. The first followup
     /// of an interaction edits the deferred ephemeral original response and
@@ -470,7 +501,7 @@ struct InteractionFollowupOutput {
 }
 
 #[async_trait]
-impl ChatOutputPort for InteractionFollowupOutput {
+impl<T: InteractionApi> ChatOutputPort for InteractionFollowupOutput<T> {
     async fn send(&self, message: OutboundMessage) -> Result<(), OutboundError> {
         if message.is_empty() {
             tracing::warn!("dropping empty interaction followup (no content, no embeds)");
@@ -492,15 +523,9 @@ impl ChatOutputPort for InteractionFollowupOutput {
         // itself fails, the content post degrades to the inheritance
         // behavior (invoker-only) - the same shape the pre-dance adapter had.
         if !self.first_followup_used.swap(true, Ordering::Relaxed) {
-            match self
-                .http
-                .create_followup_message(&self.token, &placeholder_body(), Vec::new())
-                .await
-            {
+            match self.api.create_followup(&self.token, &placeholder_body()).await {
                 Ok(placeholder) => {
-                    if let Err(err) =
-                        self.http.delete_followup_message(&self.token, placeholder.id).await
-                    {
+                    if let Err(err) = self.api.delete_followup(&self.token, placeholder).await {
                         tracing::warn!(
                             %err,
                             "failed to delete the public-reply placeholder (invoker-only, harmless)"
@@ -522,14 +547,18 @@ impl ChatOutputPort for InteractionFollowupOutput {
     }
 }
 
-impl InteractionFollowupOutput {
+impl<T: InteractionApi> InteractionFollowupOutput<T> {
+    fn new(api: Arc<T>, token: String) -> Self {
+        Self { api, token, first_followup_used: AtomicBool::new(false) }
+    }
+
     /// Posts one followup body for this interaction.
     async fn post(&self, body: &serde_json::Value) -> Result<(), OutboundError> {
-        self.http
-            .create_followup_message(&self.token, body, Vec::new())
+        self.api
+            .create_followup(&self.token, body)
             .await
-            .map(|_: serenity::all::Message| ())
-            .map_err(|err| OutboundError::Send(err.to_string()))
+            .map(|_: SerenityMessageId| ())
+            .map_err(OutboundError::Send)
     }
 }
 
@@ -724,5 +753,110 @@ mod tests {
             Some("ping <@77>")
         );
         assert!(body.get("message_reference").is_none());
+    }
+
+    /// Scripted [`InteractionApi`] recording the call sequence. The
+    /// placeholder is distinguished from real content by its ephemeral
+    /// flags (only it and ephemeral replies carry them).
+    struct ScriptedApi {
+        calls: std::sync::Mutex<Vec<String>>,
+        placeholder_fails: bool,
+        delete_fails: bool,
+    }
+
+    impl ScriptedApi {
+        fn new(placeholder_fails: bool, delete_fails: bool) -> Self {
+            Self { calls: std::sync::Mutex::new(Vec::new()), placeholder_fails, delete_fails }
+        }
+
+        fn log(&self) -> Vec<String> {
+            self.calls.lock().expect("call log expected").clone()
+        }
+    }
+
+    #[async_trait]
+    impl InteractionApi for ScriptedApi {
+        async fn create_followup(
+            &self,
+            _token: &str,
+            body: &serde_json::Value,
+        ) -> Result<SerenityMessageId, String> {
+            let label = if body.get("flags").is_some() { "create:flags" } else { "create:public" };
+            self.calls.lock().expect("call log expected").push(label.to_owned());
+            if self.placeholder_fails && body.get("flags").is_some() {
+                return Err("placeholder rejected".to_owned());
+            }
+            Ok(SerenityMessageId::new(1))
+        }
+
+        async fn delete_followup(
+            &self,
+            _token: &str,
+            _id: SerenityMessageId,
+        ) -> Result<(), String> {
+            self.calls.lock().expect("call log expected").push("delete:placeholder".to_owned());
+            if self.delete_fails {
+                return Err("delete rejected".to_owned());
+            }
+            Ok(())
+        }
+    }
+
+    fn scripted_output(api: Arc<ScriptedApi>) -> InteractionFollowupOutput<ScriptedApi> {
+        InteractionFollowupOutput::new(api, "token".to_owned())
+    }
+
+    /// The first public reply must route around the deferred ephemeral
+    /// original: placeholder consumes the slot, real content posts as a
+    /// second followup, the placeholder is cleaned up.
+    #[tokio::test]
+    async fn first_public_reply_consumes_the_slot_with_a_placeholder() {
+        let api = Arc::new(ScriptedApi::new(false, false));
+        let output = scripted_output(Arc::clone(&api));
+
+        output.send(OutboundMessage::text("hello")).await.expect("first reply delivers");
+        output.send(OutboundMessage::text("again")).await.expect("second reply delivers");
+
+        assert_eq!(
+            api.log(),
+            ["create:flags", "delete:placeholder", "create:public", "create:public"]
+        );
+    }
+
+    /// Ephemeral replies inherit the deferred ephemeral state - they post
+    /// directly, no slot dance.
+    #[tokio::test]
+    async fn ephemeral_replies_skip_the_slot() {
+        let api = Arc::new(ScriptedApi::new(false, false));
+        let output = scripted_output(Arc::clone(&api));
+
+        output.send(OutboundMessage::text("hi").ephemeral()).await.expect("ephemeral delivers");
+
+        assert_eq!(api.log(), ["create:flags"]);
+    }
+
+    /// If the placeholder itself fails, the content still posts (degraded
+    /// to invoker-only) and the slot stays consumed - the second public
+    /// reply must not retry the dance.
+    #[tokio::test]
+    async fn failed_placeholder_still_posts_content_and_keeps_the_slot() {
+        let api = Arc::new(ScriptedApi::new(true, false));
+        let output = scripted_output(Arc::clone(&api));
+
+        output.send(OutboundMessage::text("hello")).await.expect("degraded delivery expected");
+        output.send(OutboundMessage::text("again")).await.expect("second reply delivers");
+
+        assert_eq!(api.log(), ["create:flags", "create:public", "create:public"]);
+    }
+
+    /// A failing placeholder cleanup never blocks the content post.
+    #[tokio::test]
+    async fn failed_placeholder_delete_does_not_block_the_content() {
+        let api = Arc::new(ScriptedApi::new(false, true));
+        let output = scripted_output(Arc::clone(&api));
+
+        output.send(OutboundMessage::text("hello")).await.expect("delivery expected");
+
+        assert_eq!(api.log(), ["create:flags", "delete:placeholder", "create:public"]);
     }
 }

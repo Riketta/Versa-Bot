@@ -543,7 +543,15 @@ impl CommandHandler for AssignLlmHandler {
 
 /// `/llm_unassign`: removes the channel's chat configuration (idempotent -
 /// conversation records and state are kept, only the assignment goes).
-pub(super) struct UnassignLlmHandler;
+pub(super) struct UnassignLlmHandler {
+    locks: Arc<ChannelLocks>,
+}
+
+impl UnassignLlmHandler {
+    pub(super) fn new(locks: Arc<ChannelLocks>) -> Self {
+        Self { locks }
+    }
+}
 
 #[async_trait]
 impl CommandHandler for UnassignLlmHandler {
@@ -553,6 +561,11 @@ impl CommandHandler for UnassignLlmHandler {
         _args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
+        // The delete joins the same per-channel serialization as the other
+        // state-mutating commands: an in-flight engine run must not answer
+        // once the unassignment has landed.
+        let channel = self.locks.lock_for(services.platform_info.slug(), &event.origin);
+        let _channel = channel.lock().await;
         let Some(storage) = &services.guild_storage else {
             services
                 .chat_output

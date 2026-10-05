@@ -53,7 +53,11 @@ impl<C: PartialEq + Send + Sync + 'static> PollingConfigWatcher<C> {
         tracing::info!("configuration changed");
         *self.state.write() = Some(Arc::clone(&snapshot));
 
-        for handler in self.subscribers.read().iter() {
+        // Snapshot the handlers out of the lock: a handler that subscribes
+        // (or unsubscribes) from inside `on_change` must not deadlock on a
+        // still-held read guard - same pattern as the event bus.
+        let handlers: Vec<_> = self.subscribers.read().clone();
+        for handler in &handlers {
             // Panic isolation: same contract as the event bus - a broken
             // subscriber must not block the others.
             let delivery = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -175,5 +179,27 @@ mod tests {
         fixture.watcher.poll(); // reloads 2 - both handlers run, one panics
 
         assert_eq!(*fixture.received.lock(), vec![2]);
+    }
+
+    /// A subscriber that subscribes again from inside `on_change`: holding
+    /// the subscriber read guard across dispatch would deadlock here - the
+    /// snapshot-before-dispatch contract keeps re-entrant subscribers safe.
+    #[test]
+    fn subscribing_from_inside_a_handler_does_not_deadlock() {
+        let watcher = Arc::new(PollingConfigWatcher::new(|| Ok(TestConfig { value: 2 })));
+        watcher.seed(TestConfig { value: 1 });
+
+        struct ReentrantHandler(Arc<PollingConfigWatcher<TestConfig>>);
+
+        impl ConfigChangeHandler<TestConfig> for ReentrantHandler {
+            fn on_change(&self, _config: Arc<TestConfig>) {
+                self.0.subscribe(Arc::new(Recorder(Arc::new(Mutex::new(Vec::new())))));
+            }
+        }
+
+        watcher.subscribe(Arc::new(ReentrantHandler(Arc::clone(&watcher))));
+        watcher.poll();
+
+        assert_eq!(watcher.subscribers.read().len(), 2, "re-entrant subscribe must land");
     }
 }

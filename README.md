@@ -464,7 +464,11 @@ sequentially and rate-limited; the champion tables pool each region's
 highest-ranked `champ_pool_depth` players. Results are cached
 process-lifetime for `cache_ttl` - a fresh cache answers instantly, a
 stale one triggers a re-parse first (the typing indicator shows during
-the parse; a cold multi-region parse takes tens of seconds). The output
+the parse; a cold multi-region parse takes tens of seconds). Mind the
+ceiling: a cold parse walks `parse_depth` / 100 source pages per region
+at the configured request pace - keep the worst case comfortably inside
+the platform's interaction window (about 15 minutes on Discord), or the
+invocation's "thinking" state expires before the answer lands. The output
 leads with a coverage line (`Parsed 2941/3000 players from 3 regions ·
 data age 2h`), renders a bucket row only when the parses actually cover
 it, degrades holes (a player without role/champion data leaves that
@@ -972,7 +976,7 @@ src/
 │   │   ├── plugin_ports/   # plugin contracts (PluginPort, commands, bus)
 │   │   └── services/       # KernelService (pipeline runner, lifecycle)
 │   └── models/             # event taxonomy, IDs, errors
-├── plugins/           # features: auth, command dispatcher, tracker, audit trail, status rotator, lol store tracker, llm chat
+├── plugins/           # features: auth, command dispatcher, tracker, audit trail, status rotator, nickname, lol store tracker, lol leaderboard, llm chat
 ├── infrastructure/    # adapters
 │   ├── inbound_adapters/   # Discord gateway + scoped output factory
 │   ├── outbound_adapters/  # storage (sqlx), Discord command registrar, presence
