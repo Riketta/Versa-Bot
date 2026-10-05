@@ -26,9 +26,21 @@ pub const DEFAULT_GUILD_CAP: u32 = 300;
 /// Candidates shown before an ambiguous name search is cut off.
 const SEARCH_RESULT_CAP: usize = 10;
 
-/// Tag budget inside the 2000-char Discord content limit (embeds never
-/// notify; the tags must ride the content).
-const TAG_BUDGET_CHARS: usize = 1800;
+/// Byte margin between the platform's message cap and the mention-tag
+/// budget: covers the "+N more" suffix and byte slack.
+pub(crate) const TAG_BUDGET_MARGIN: usize = 200;
+
+/// Floor for a derived tag budget, so at least a tag or two always fits.
+const MIN_TAG_BUDGET: usize = 64;
+
+/// Byte budget for the mention tags riding the message content (embeds
+/// never notify; the tags must ride the content), derived from the
+/// platform's message cap. A platform declaring no cap renders unbounded.
+#[must_use]
+pub(crate) fn tag_budget(message_limit: Option<usize>) -> usize {
+    message_limit
+        .map_or(usize::MAX, |cap| cap.saturating_sub(TAG_BUDGET_MARGIN).max(MIN_TAG_BUDGET))
+}
 
 /// One watch kind as chosen in `/lol_store_watch`. `All` covers the three
 /// concrete kinds; narrower subsets (sale + mythic without release) are
@@ -380,6 +392,8 @@ pub(crate) fn build_notification(
     doc: &WatchDoc,
     delta: &StoreDelta,
     index: &NameIndex,
+    embed_budget: usize,
+    tag_budget: usize,
 ) -> Option<WatchNotification> {
     if doc.subs.is_empty() {
         return None;
@@ -422,8 +436,8 @@ pub(crate) fn build_notification(
     }
     push_section(&mut sections, "New in store", &lines);
 
-    let text = fit(sections)?;
-    Some(WatchNotification { tags: tag_content(&users), text, watchers: users.len() })
+    let text = fit(sections, embed_budget)?;
+    Some(WatchNotification { tags: tag_content(&users, tag_budget), text, watchers: users.len() })
 }
 
 /// Users whose watches match this subject on this edge - `None` when no
@@ -460,12 +474,12 @@ fn collect_users(users: &mut Vec<String>, matched: Vec<String>) {
 
 /// Renders the user tags that must ride the message content, guarded
 /// against the content limit (an absurd watch match crowd gets "+N more").
-fn tag_content(users: &[String]) -> String {
+fn tag_content(users: &[String], tag_budget: usize) -> String {
     let mut content = String::new();
     let mut shown = 0usize;
     for user in users {
         let tag = format!("<@{user}> ");
-        if content.len() + tag.len() > TAG_BUDGET_CHARS {
+        if content.len() + tag.len() > tag_budget {
             break;
         }
         content.push_str(&tag);
@@ -481,6 +495,11 @@ fn tag_content(users: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+
+    /// Realistic budgets for the notification tests (what the wired
+    /// platform's caps derive to, give or take margin).
+    const EMBED: usize = 3800;
+    const TAG_BUDGET: usize = 1800;
 
     use super::super::diff::MythicEntry;
     use super::super::format::champion_map;
@@ -735,7 +754,8 @@ mod tests {
             }],
             ..StoreDelta::default()
         };
-        let notification = build_notification(&doc, &delta, &index()).expect("should notify");
+        let notification =
+            build_notification(&doc, &delta, &index(), EMBED, TAG_BUDGET).expect("should notify");
         assert_eq!(notification.watchers, 2);
         assert!(notification.tags.contains("<@111>"));
         assert!(notification.tags.contains("<@222>"));
@@ -756,8 +776,11 @@ mod tests {
             }],
             ..StoreDelta::default()
         };
-        assert!(build_notification(&doc, &sale_delta, &index()).is_none());
-        assert!(build_notification(&WatchDoc::default(), &sale_delta, &index()).is_none());
+        assert!(build_notification(&doc, &sale_delta, &index(), EMBED, TAG_BUDGET).is_none());
+        assert!(
+            build_notification(&WatchDoc::default(), &sale_delta, &index(), EMBED, TAG_BUDGET)
+                .is_none()
+        );
     }
 
     /// A tampered watch doc (non-numeric user id) must never inject mention
@@ -779,7 +802,8 @@ mod tests {
             },
         ]);
         let delta = sale_delta_for(1031);
-        let notification = build_notification(&doc, &delta, &index()).expect("valid watch fires");
+        let notification = build_notification(&doc, &delta, &index(), EMBED, TAG_BUDGET)
+            .expect("valid watch fires");
         assert!(notification.tags.contains("<@222>"));
         assert!(!notification.tags.contains("everyone"), "tags: {}", notification.tags);
         assert_eq!(notification.watchers, 1);
@@ -790,8 +814,8 @@ mod tests {
     #[test]
     fn tag_content_stays_within_the_budget() {
         let users: Vec<String> = (0..300).map(|n| format!("1{n:017}")).collect();
-        let tags = super::tag_content(&users);
-        assert!(tags.len() <= super::TAG_BUDGET_CHARS + 32, "content over budget: {}", tags.len());
+        let tags = super::tag_content(&users, TAG_BUDGET);
+        assert!(tags.len() <= TAG_BUDGET + 32, "content over budget: {}", tags.len());
         assert!(tags.contains('+'), "hidden count expected: {tags}");
         assert!(tags.ends_with("more"));
         assert!(tags.starts_with("<@1"), "rendered tags are well-formed mentions");

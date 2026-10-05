@@ -9,10 +9,6 @@ use std::time::Duration;
 
 use super::stats::{ChampBlock, LeaderboardStats, RoleSection};
 
-/// Discord's hard content limit; byte-based packing is conservative for
-/// non-ASCII content, which only ever shortens a message.
-pub const MESSAGE_LIMIT: usize = 2000;
-
 /// Humanized data age for the coverage line.
 fn age_label(age: Duration) -> String {
     let seconds = age.as_secs();
@@ -98,11 +94,12 @@ fn champ_block(blocks: &[ChampBlock]) -> String {
     lines.join("\n")
 }
 
-/// Packs blocks into messages: blocks stay whole across boundaries unless
-/// one alone exceeds the limit, and an oversized block falls back to
-/// line-boundary splitting (an absurd single line is hard-cut on char
-/// boundaries as the last resort).
-fn pack(blocks: Vec<String>) -> Vec<String> {
+/// Packs blocks into messages under `limit` bytes (byte-based packing is
+/// conservative for non-ASCII content, which only ever shortens a message):
+/// blocks stay whole across boundaries unless one alone exceeds the limit,
+/// and an oversized block falls back to line-boundary splitting (an absurd
+/// single line is hard-cut on char boundaries as the last resort).
+fn pack(blocks: Vec<String>, limit: usize) -> Vec<String> {
     let mut messages: Vec<String> = Vec::new();
     let mut current = String::new();
     let flush = |messages: &mut Vec<String>, current: &mut String| {
@@ -112,16 +109,16 @@ fn pack(blocks: Vec<String>) -> Vec<String> {
     };
 
     for block in blocks {
-        if block.len() > MESSAGE_LIMIT {
+        if block.len() > limit {
             flush(&mut messages, &mut current);
             let mut part = String::new();
             for line in block.lines() {
-                if line.len() > MESSAGE_LIMIT {
+                if line.len() > limit {
                     // Hard-cut an oversized single line on chars.
                     flush(&mut messages, &mut part);
                     let mut chunk = String::new();
                     for character in line.chars() {
-                        if chunk.len() + character.len_utf8() > MESSAGE_LIMIT {
+                        if chunk.len() + character.len_utf8() > limit {
                             messages.push(std::mem::take(&mut chunk));
                         }
                         chunk.push(character);
@@ -131,7 +128,7 @@ fn pack(blocks: Vec<String>) -> Vec<String> {
                 }
                 if part.is_empty() {
                     part.push_str(line);
-                } else if part.len() + 1 + line.len() <= MESSAGE_LIMIT {
+                } else if part.len() + 1 + line.len() <= limit {
                     part.push('\n');
                     part.push_str(line);
                 } else {
@@ -145,7 +142,7 @@ fn pack(blocks: Vec<String>) -> Vec<String> {
         }
         if current.is_empty() {
             current = block;
-        } else if current.len() + 1 + block.len() <= MESSAGE_LIMIT {
+        } else if current.len() + 1 + block.len() <= limit {
             current.push('\n');
             current.push_str(&block);
         } else {
@@ -158,8 +155,10 @@ fn pack(blocks: Vec<String>) -> Vec<String> {
 }
 
 /// Renders the full output as one message per packed block group.
+/// `message_limit` is the platform's per-message byte budget; a platform
+/// declaring no cap passes `usize::MAX` and renders as a single message.
 #[must_use]
-pub fn render(stats: &LeaderboardStats) -> Vec<String> {
+pub fn render(stats: &LeaderboardStats, message_limit: usize) -> Vec<String> {
     let mut blocks = vec![header_block(stats)];
     for section in &stats.role_sections {
         blocks.push(role_block(section));
@@ -167,7 +166,7 @@ pub fn render(stats: &LeaderboardStats) -> Vec<String> {
     if !stats.champ_blocks.is_empty() {
         blocks.push(champ_block(&stats.champ_blocks));
     }
-    pack(blocks)
+    pack(blocks, message_limit)
 }
 
 #[cfg(test)]
@@ -175,6 +174,10 @@ mod tests {
     use super::super::port::Role;
     use super::super::stats::{ChampEntry, RoleRow};
     use super::*;
+
+    /// The per-message budget tests pack under: what the test platform's
+    /// port serves, mirroring the wired adapter.
+    const LIMIT: usize = 2000;
 
     fn section_of(scope: &str, row: &RoleRow, lines: usize) -> RoleSection {
         RoleSection { scope: scope.to_owned(), rows: vec![row.clone(); lines] }
@@ -208,7 +211,7 @@ mod tests {
     fn header_line_carries_coverage_age_and_failures() {
         let mut stats = stats_with_lines(1);
         stats.failures = vec!["na".to_owned()];
-        let rendered = render(&stats);
+        let rendered = render(&stats, LIMIT);
         let header = rendered.first().expect("header message");
         assert!(header.starts_with("# LoL Leaderboard Statistics"));
         assert!(header.contains("Parsed 3000/3000 players from 3 regions"));
@@ -221,14 +224,14 @@ mod tests {
         let mut stats = stats_with_lines(1);
         stats.region_count = 1;
         stats.age_seconds = 30;
-        let header = render(&stats).remove(0);
+        let header = render(&stats, LIMIT).remove(0);
         assert!(header.contains("from 1 region ·"));
         assert!(header.contains("data age just now"));
     }
 
     #[test]
     fn full_render_contains_demo_layout_pieces() {
-        let rendered = render(&stats_with_lines(1));
+        let rendered = render(&stats_with_lines(1), LIMIT);
         let whole = rendered.join("\n");
         assert!(whole.contains("## Role distribution in average"));
         assert!(whole.contains("## Role distribution in KR"));
@@ -264,10 +267,10 @@ mod tests {
         // Many role rows per section: several messages; a section too big
         // for one message line-splits, so a message may start with a row -
         // but every line anywhere stays complete.
-        let rendered = render(&stats_with_lines(30));
+        let rendered = render(&stats_with_lines(30), LIMIT);
         assert!(rendered.len() > 1);
         for message in &rendered {
-            assert!(message.len() <= MESSAGE_LIMIT);
+            assert!(message.len() <= LIMIT);
             complete_lines_only(message);
         }
     }
@@ -275,10 +278,10 @@ mod tests {
     #[test]
     fn oversized_section_falls_back_to_line_splitting() {
         // One section whose rows alone exceed the limit.
-        let rendered = render(&stats_with_lines(200));
+        let rendered = render(&stats_with_lines(200), LIMIT);
         assert!(rendered.len() > 1);
         for message in &rendered {
-            assert!(message.len() <= MESSAGE_LIMIT);
+            assert!(message.len() <= LIMIT);
             complete_lines_only(message);
         }
     }
@@ -288,13 +291,13 @@ mod tests {
         // 2010 Cyrillic chars = 4020 bytes; byte-based chunks cut at 2000
         // bytes = 1000 chars per message - on char boundaries by
         // construction (no panics, no replacement characters).
-        let long_line = "ж".repeat(MESSAGE_LIMIT + 10);
-        let rendered = pack(vec![long_line]);
+        let long_line = "ж".repeat(LIMIT + 10);
+        let rendered = pack(vec![long_line], LIMIT);
         assert_eq!(rendered.len(), 3);
         assert_eq!(rendered.first().expect("3 parts").chars().count(), 1000);
         assert_eq!(rendered.get(1).expect("3 parts").chars().count(), 1000);
         assert_eq!(rendered.get(2).expect("3 parts").chars().count(), 10);
         let total: usize = rendered.iter().map(|m| m.chars().count()).sum();
-        assert_eq!(total, MESSAGE_LIMIT + 10);
+        assert_eq!(total, LIMIT + 10);
     }
 }

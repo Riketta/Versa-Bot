@@ -62,7 +62,10 @@ impl CommandHandler for LeaderboardHandler {
             }
         };
 
-        let messages = format::render(&stats::build(&snapshot));
+        let messages = format::render(
+            &stats::build(&snapshot),
+            services.platform_info.message_limit().unwrap_or(usize::MAX),
+        );
         for message in messages {
             // Plain public sends: the dump is a channel-visible artifact.
             services.chat_output.send(OutboundMessage::text(message)).await?;

@@ -23,4 +23,10 @@ pub trait PlatformInfoPort: Send + Sync + 'static {
     /// Reply-splitting callers clamp their output to it - chunks beyond the
     /// cap would be rejected outright.
     fn message_limit(&self) -> Option<usize>;
+
+    /// Hard cap on one embed's text payload (the description), as enforced
+    /// by the platform (`Some(4096)` on Discord); `None` when the platform
+    /// declares no cap. Embed-rendering callers clamp their bodies to it -
+    /// an oversized embed is rejected outright.
+    fn embed_limit(&self) -> Option<usize>;
 }

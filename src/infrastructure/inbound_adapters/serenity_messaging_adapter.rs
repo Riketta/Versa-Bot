@@ -48,6 +48,11 @@ impl PlatformInfoPort for DiscordPlatform {
         // extensions do not apply to bots.
         Some(2000)
     }
+
+    fn embed_limit(&self) -> Option<usize> {
+        // The embed description cap.
+        Some(4096)
+    }
 }
 
 /// Kernel driving adapter: normalizes Discord gateway events onto the

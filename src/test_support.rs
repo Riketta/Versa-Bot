@@ -38,10 +38,14 @@ impl PlatformInfoPort for TestPlatformInfo {
         "Test"
     }
 
-    /// Same cap as the wired adapter, so tests pin the limits production
+    /// Same caps as the wired adapter, so tests pin the limits production
     /// exercises.
     fn message_limit(&self) -> Option<usize> {
         Some(2000)
+    }
+
+    fn embed_limit(&self) -> Option<usize> {
+        Some(4096)
     }
 }
 

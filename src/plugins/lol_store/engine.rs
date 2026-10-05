@@ -333,7 +333,7 @@ impl<B: EventBusPort> StoreEngine<B> {
                  (check the 'some store sources failed' warnings)"
             );
         }
-        let pages = announce_pages(delta, index);
+        let pages = announce_pages(delta, index, self.embed_budget());
         if pages.is_empty() {
             return Vec::new();
         }
@@ -506,6 +506,8 @@ impl<B: EventBusPort> StoreEngine<B> {
         if targets.is_empty() {
             return;
         }
+        let embed_budget = self.embed_budget();
+        let tag_budget = watch::tag_budget(self.platform.message_limit());
         for &(guild_id, channel_id, _) in targets {
             let storage = self.storage.guild_scoped(self.platform.slug(), guild_id);
             let doc = match storage.get(NAMESPACE, watch::WATCH_KEY).await {
@@ -522,7 +524,9 @@ impl<B: EventBusPort> StoreEngine<B> {
                     continue;
                 }
             };
-            let Some(notification) = watch::build_notification(&doc, delta, index) else {
+            let Some(notification) =
+                watch::build_notification(&doc, delta, index, embed_budget, tag_budget)
+            else {
                 continue;
             };
             let origin = Origin {
@@ -873,7 +877,13 @@ impl<B: EventBusPort> StoreEngine<B> {
                 });
             }
         }
-        announce_pages(&delta, &index)
+        announce_pages(&delta, &index, self.embed_budget())
+    }
+
+    /// Byte budget for one announcement embed, derived from the
+    /// deployment's platform embed cap.
+    fn embed_budget(&self) -> usize {
+        super::format::embed_budget(self.platform.embed_limit())
     }
 }
 

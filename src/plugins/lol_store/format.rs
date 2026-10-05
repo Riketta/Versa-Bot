@@ -10,11 +10,23 @@ use super::lcu::CatalogItem;
 /// Lines shown per section before the "+N more" cut.
 const MAX_LINES_PER_SECTION: usize = 15;
 
-/// Hard cap for the joined announcement. The embed-description limit is
-/// 4096 chars and the send path truncates nothing - an oversized embed is
-/// rejected and silently loses the update for every guild. Stay under it
-/// with margin (the bytes count BYTES, Discord counts code points).
-const MAX_ANNOUNCEMENT_CHARS: usize = 3800;
+/// Byte margin between the platform's embed cap and one announcement page:
+/// the budget counts BYTES while the platform counts code points, and the
+/// difference plus rendering headroom lives here.
+pub(crate) const EMBED_BUDGET_MARGIN: usize = 300;
+
+/// Floor for a derived page budget, so the budget arithmetic downstream
+/// (title halves, continuation suffixes) can never underflow.
+const MIN_PAGE_BUDGET: usize = 256;
+
+/// Byte budget for one announcement page (an embed body), derived from the
+/// platform's embed cap. A platform declaring no cap renders unbounded -
+/// one page, sections unsplit.
+#[must_use]
+pub(crate) fn embed_budget(embed_limit: Option<usize>) -> usize {
+    embed_limit
+        .map_or(usize::MAX, |cap| cap.saturating_sub(EMBED_BUDGET_MARGIN).max(MIN_PAGE_BUDGET))
+}
 
 /// Clamp for payload strings interpolated into section TITLES (dates,
 /// timestamps, rotation labels). The lines of a section are cut per page
@@ -217,7 +229,7 @@ fn sales_sections(sales: &[super::lcu::Sale], index: &NameIndex) -> Vec<Section>
 /// last). Nothing is dropped or cut (a page pack that would overflow
 /// starts a new page instead). Empty when nothing renders.
 #[must_use]
-pub fn announce_pages(delta: &StoreDelta, index: &NameIndex) -> Vec<String> {
+pub fn announce_pages(delta: &StoreDelta, index: &NameIndex, page_budget: usize) -> Vec<String> {
     let mut sections: Vec<Section> = Vec::new();
     if !delta.sales.is_empty() {
         sections.extend(sales_sections(&delta.sales, index));
@@ -251,7 +263,7 @@ pub fn announce_pages(delta: &StoreDelta, index: &NameIndex) -> Vec<String> {
         }
         sections.push(Section::bare(line));
     }
-    paginate(sections)
+    paginate(sections, page_budget)
 }
 
 /// Rendered byte length of `**{title}**\n{lines joined by newline}` (or
@@ -268,23 +280,23 @@ fn chunk_len(title: &str, lines: &[String]) -> usize {
 /// its lines - the title returns with " (cont.)" on every continuation -
 /// and char-safely hard-cuts a single line too long for even a fresh
 /// chunk. A section that fits passes through untouched.
-fn explode(section: &Section) -> Vec<Section> {
-    if section.byte_len() <= MAX_ANNOUNCEMENT_CHARS {
+fn explode(section: &Section, page_budget: usize) -> Vec<Section> {
+    if section.byte_len() <= page_budget {
         return vec![Section::new(section.title.clone(), section.lines.clone())];
     }
     // A title longer than half a page cannot share a page with anything -
     // cut it once, up front, so the budget subtraction below can never
     // underflow. (Title text is clamped at its sources already; this is
     // the belt to those braces.)
-    let base_title = cut_to_budget(&section.title, MAX_ANNOUNCEMENT_CHARS / 2);
-    let fresh_budget = MAX_ANNOUNCEMENT_CHARS - base_title.len() - " (cont.)".len() - 5;
+    let base_title = cut_to_budget(&section.title, page_budget / 2);
+    let fresh_budget = page_budget - base_title.len() - " (cont.)".len() - 5;
     let mut chunks: Vec<Section> = Vec::new();
     let mut current: Vec<String> = Vec::new();
     let mut title = base_title.clone();
     let mut used = chunk_len(&title, &current);
     for line in &section.lines {
         let line = cut_to_budget(line, fresh_budget);
-        if used + 1 + line.len() > MAX_ANNOUNCEMENT_CHARS {
+        if used + 1 + line.len() > page_budget {
             chunks.push(Section::new(std::mem::take(&mut title), std::mem::take(&mut current)));
             title = format!("{base_title} (cont.)");
             used = chunk_len(&title, &current);
@@ -299,8 +311,8 @@ fn explode(section: &Section) -> Vec<Section> {
 }
 
 /// Char-safe AND byte-bounded truncation for a pathological single line:
-/// the budget counts bytes (Discord counts code points, so staying under
-/// in bytes always stays under in chars too), and the ellipsis itself is
+/// the budget counts bytes (the platform counts code points, so staying
+/// under in bytes always stays under in chars too), and the ellipsis itself is
 /// 3 bytes - reserved up front.
 fn cut_to_budget(line: &str, budget: usize) -> String {
     if line.len() <= budget {
@@ -323,14 +335,14 @@ fn cut_to_budget(line: &str, budget: usize) -> String {
 /// Packs sections into embed-sized pages. Nothing is dropped: whole
 /// sections fill a page greedily and a taller-than-page section arrives
 /// pre-split by [`explode`]. Empty input renders no pages.
-pub(crate) fn paginate(sections: Vec<Section>) -> Vec<String> {
+pub(crate) fn paginate(sections: Vec<Section>, page_budget: usize) -> Vec<String> {
     let mut pages: Vec<String> = Vec::new();
     let mut current: Vec<String> = Vec::new();
     let mut used = 0usize;
     for section in &sections {
-        for chunk in explode(section) {
+        for chunk in explode(section, page_budget) {
             let text = chunk.render();
-            if !current.is_empty() && used + 2 + text.len() > MAX_ANNOUNCEMENT_CHARS {
+            if !current.is_empty() && used + 2 + text.len() > page_budget {
                 pages.push(current.join("\n\n"));
                 current = Vec::new();
                 used = 0;
@@ -351,23 +363,20 @@ pub(crate) fn paginate(sections: Vec<Section>) -> Vec<String> {
 /// section (absurd item names) is hard-cut char-safely. The join budget
 /// counts BYTES while the hard cut counts CHARS - deliberately
 /// conservative: multibyte locales drop sections a little earlier than
-/// strictly needed, but the char cut always stays under Discord's
+/// strictly needed, but the char cut always stays under the platform's
 /// code-point-based embed limit.
-pub(crate) fn fit(mut sections: Vec<String>) -> Option<String> {
+pub(crate) fn fit(mut sections: Vec<String>, page_budget: usize) -> Option<String> {
     let join_len = |sections: &[String]| {
         sections.iter().map(String::len).sum::<usize>() + sections.len().saturating_sub(1) * 2
     };
     let mut hidden = 0usize;
-    while sections.len() > 1 && join_len(&sections) > MAX_ANNOUNCEMENT_CHARS {
+    while sections.len() > 1 && join_len(&sections) > page_budget {
         sections.pop();
         hidden += 1;
     }
-    if join_len(&sections) > MAX_ANNOUNCEMENT_CHARS {
+    if join_len(&sections) > page_budget {
         if let Some(first) = sections.first_mut() {
-            *first = format!(
-                "{}\u{2026}",
-                first.chars().take(MAX_ANNOUNCEMENT_CHARS).collect::<String>()
-            );
+            *first = format!("{}\u{2026}", first.chars().take(page_budget).collect::<String>());
         }
     }
     if sections.is_empty() {
@@ -497,6 +506,10 @@ mod tests {
     use super::*;
     use crate::plugins::lol_store::lcu::{ItemRef, LocalizedText, Price, SaleInfo};
 
+    /// A realistic page budget for the pagination tests (what the wired
+    /// platform's caps derive to, give or take margin).
+    const BUDGET: usize = 3800;
+
     fn index() -> NameIndex {
         NameIndex::new(
             vec![CatalogItem {
@@ -605,7 +618,7 @@ mod tests {
         };
         let mut index = index();
         index.champions.insert(10, "Kayle".to_owned());
-        let pages = announce_pages(&delta, &index);
+        let pages = announce_pages(&delta, &index, BUDGET);
         assert_eq!(pages.len(), 1, "small delta: one page, {pages:?}");
         let text = pages.first().expect("page expected");
         assert!(text.contains("**New sales**"));
@@ -619,7 +632,7 @@ mod tests {
 
     #[test]
     fn empty_delta_renders_no_pages() {
-        assert!(announce_pages(&StoreDelta::default(), &NameIndex::empty()).is_empty());
+        assert!(announce_pages(&StoreDelta::default(), &NameIndex::empty(), BUDGET).is_empty());
     }
 
     /// The point of pagination: every sale prints, none is cut. The old
@@ -629,7 +642,7 @@ mod tests {
         let sales: Vec<super::super::lcu::Sale> =
             (0..20).map(|id| skin_sale_named(id, 10_000 + id, 975, None)).collect();
         let delta = StoreDelta { sales, ..Default::default() };
-        let pages = announce_pages(&delta, &NameIndex::empty());
+        let pages = announce_pages(&delta, &NameIndex::empty(), BUDGET);
         assert_eq!(pages.len(), 1);
         let text = pages.join("\n\n");
         for id in 0..20u64 {
@@ -652,7 +665,7 @@ mod tests {
             skin_sale_named(3, 30_001, 500, None),
         ];
         let delta = StoreDelta { sales, ..Default::default() };
-        let text = announce_pages(&delta, &NameIndex::empty()).join("\n\n");
+        let text = announce_pages(&delta, &NameIndex::empty(), BUDGET).join("\n\n");
         let position = |needle: &str| text.find(needle).expect(needle);
         assert!(position("**New sales · until 2026-10-05**") < position("- Skin 10001"));
         assert!(position("**New sales · until 2026-10-12**") < position("- Skin 20001"));
@@ -688,7 +701,7 @@ mod tests {
             skin_sale_named(3, 40_001, 800, None),
         ];
         let delta = StoreDelta { sales, ..Default::default() };
-        let text = announce_pages(&delta, &NameIndex::empty()).join("\n\n");
+        let text = announce_pages(&delta, &NameIndex::empty(), BUDGET).join("\n\n");
         let position = |needle: &str| text.find(needle).expect(needle);
         // Grouped by day, cheapest first, priceless sinks to the group's end.
         assert!(position("- Skin 10001 \u{b7} 607 RP") < position("- Skin 20001 \u{b7} 700 RP"));
@@ -730,7 +743,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let text = announce_pages(&delta, &NameIndex::empty()).join("\n\n");
+        let text = announce_pages(&delta, &NameIndex::empty(), BUDGET).join("\n\n");
         let position = |needle: &str| text.find(needle).expect(needle);
         assert!(
             position("- Champion 10 — Skin 10002 · 520 RP")
@@ -768,10 +781,10 @@ mod tests {
         // Many lines force `explode` to run with the clamped title.
         let sales: Vec<super::super::lcu::Sale> = (0..300u64).map(sale).collect();
         let delta = StoreDelta { sales, ..Default::default() };
-        let pages = announce_pages(&delta, &NameIndex::empty());
+        let pages = announce_pages(&delta, &NameIndex::empty(), BUDGET);
         assert!(!pages.is_empty(), "the pathological delta still renders");
         for page in &pages {
-            assert!(page.len() <= MAX_ANNOUNCEMENT_CHARS, "page budget: {}", page.len());
+            assert!(page.len() <= BUDGET, "page budget: {}", page.len());
         }
     }
 
@@ -804,7 +817,7 @@ mod tests {
             }],
             ..StoreDelta::default()
         };
-        let text = announce_pages(&delta, &NameIndex::empty()).join("\n\n");
+        let text = announce_pages(&delta, &NameIndex::empty(), BUDGET).join("\n\n");
         assert!(text.contains("**Mythic rotation (weekly) · ends 2026-10-08**"), "text: {text}");
     }
 
@@ -825,7 +838,7 @@ mod tests {
             }],
             ..StoreDelta::default()
         };
-        let text = announce_pages(&delta, &NameIndex::empty()).join("\n\n");
+        let text = announce_pages(&delta, &NameIndex::empty(), BUDGET).join("\n\n");
         assert!(text.contains("**Mythic rotation (featured)**"), "text: {text}");
         assert!(!text.contains("ends"), "no dangling ends: {text}");
     }
@@ -895,7 +908,7 @@ mod tests {
     }
 
     /// Oversized announcements SPLIT into pages - nothing is dropped from
-    /// the tail anymore, and every page stays inside Discord's embed limit.
+    /// the tail anymore, and every page stays inside the embed budget.
     #[test]
     fn oversized_announcements_split_into_pages() {
         let fat_rotation = |label: &str| super::super::diff::RotationDelta {
@@ -920,7 +933,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let pages = announce_pages(&delta, &index());
+        let pages = announce_pages(&delta, &index(), BUDGET);
         assert!(pages.len() > 1, "a full store must span pages: {}", pages.len());
         let text = pages.join("\n\n");
         for label in ["daily", "weekly", "biweekly", "monthly"] {
@@ -961,7 +974,7 @@ mod tests {
             item_requirements: Vec::new(),
         });
         let delta = StoreDelta { skins, ..Default::default() };
-        let pages = announce_pages(&delta, &NameIndex::empty());
+        let pages = announce_pages(&delta, &NameIndex::empty(), BUDGET);
         assert!(pages.len() > 1, "30 fat skins must span pages");
         for page in &pages {
             assert!(page.len() <= 3800, "page inside the budget: {}", page.len());
