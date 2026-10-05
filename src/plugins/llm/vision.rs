@@ -40,11 +40,14 @@ pub(crate) const DISCORD_CDN_PREFIX: &str = "https://cdn.discordapp.com/";
 const MAX_DECODE_DIMENSION: u32 = 8192;
 
 /// One image awaiting description, filtered by the engine from a message's
-/// attachments.
+/// attachments. `ext` rides along so records keep the capture-baked
+/// placeholder extension even when recognition is off or the per-message
+/// cap overflows (see `conversation::placeholder_ext`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageSource {
     pub url: String,
     pub content_type: Option<String>,
+    pub ext: Option<String>,
 }
 
 /// One description job: the recognition call's parameters, resolved by the
@@ -247,6 +250,7 @@ mod tests {
         ImageSource {
             url: "https://cdn.example.test/a.png".to_owned(),
             content_type: mime.map(str::to_owned),
+            ext: None,
         }
     }
 
@@ -322,6 +326,7 @@ mod tests {
                 vec![ImageSource {
                     url: "https://evil.test/a.png".to_owned(),
                     content_type: Some("image/png".to_owned()),
+                    ext: None,
                 }],
             )
             .await;

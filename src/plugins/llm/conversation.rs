@@ -26,24 +26,31 @@ pub const NO_EARLIER_CONTEXT: &str = "(no earlier context)";
 /// unix seconds), `{message}`.
 pub const DEFAULT_TURN_TEMPLATE: &str = "[{sender}](<@{user_id}>): {message}";
 
-/// The file name is a fake placeholder: the model only needs the "this was
-/// an image" hint - the description lives in the markdown alt-text slot.
+/// Placeholder file-name base: the model only needs the "this was an
+/// image" hint - the description lives in the markdown alt-text slot.
+/// The extension is the capture-baked [`RecordImage::ext`], falling back
+/// to [`DEFAULT_IMAGE_EXT`] for legacy records and unknown types.
 /// Multi-image messages number the placeholders so the model can refer to
 /// them separately.
-const IMAGE_PLACEHOLDER: &str = "image.png";
+const IMAGE_PLACEHOLDER_BASE: &str = "image";
+
+/// Extension of last resort for image placeholders.
+const DEFAULT_IMAGE_EXT: &str = "png";
 
 /// Renders a record's images as markdown image references, one per line:
 /// `![description](image.png)`, undescribed ones as
-/// `![image without description](image.png)`.
+/// `![image without description](image.png)` - the extension follows the
+/// capture-baked `ext` when present.
 #[must_use]
 pub fn render_images(images: &[RecordImage]) -> String {
     let mut rendered = String::new();
     for (index, image) in images.iter().enumerate() {
         rendered.push('\n');
+        let ext = image.ext.as_deref().unwrap_or(DEFAULT_IMAGE_EXT);
         let name = if index == 0 {
-            IMAGE_PLACEHOLDER.to_owned()
+            format!("{IMAGE_PLACEHOLDER_BASE}.{ext}")
         } else {
-            format!("image_{}.png", index + 1)
+            format!("{IMAGE_PLACEHOLDER_BASE}_{}.{ext}", index + 1)
         };
         let alt = image.description.as_deref().unwrap_or("image without description");
         let _ = write!(rendered, "![{alt}]({name})");
@@ -119,6 +126,42 @@ pub fn render_user_turn(template: &str, record: &ConversationRecord) -> String {
 pub struct RecordImage {
     #[serde(default)]
     pub description: Option<String>,
+    /// Placeholder extension baked at capture (lowercase, no dot - see
+    /// [`placeholder_ext`]); `None` on legacy records and unknown types
+    /// renders as `png`.
+    #[serde(default)]
+    pub ext: Option<String>,
+}
+
+/// Resolves a captured attachment's placeholder extension: the platform's
+/// content type is authoritative (`image/gif` -> `gif`, parameters and
+/// structural suffixes like `+xml` stripped), the upload's own file
+/// extension is the fallback hint, and `None` renders as
+/// [`DEFAULT_IMAGE_EXT`]. The value is baked into the record at capture,
+/// so it is normalized here: lowercase, alphanumeric, at most five
+/// characters - anything else is rejected rather than trusted.
+#[must_use]
+pub fn placeholder_ext(content_type: Option<&str>, file_name: Option<&str>) -> Option<String> {
+    let from_mime = content_type
+        .and_then(|mime| mime.split(';').next())
+        .map(str::trim)
+        .and_then(|mime| mime.strip_prefix("image/"))
+        .and_then(|sub| sub.split('+').next())
+        .filter(|ext| is_sane_ext(ext))
+        .map(str::to_ascii_lowercase);
+    from_mime.or_else(|| {
+        file_name
+            .and_then(|name| name.rsplit_once('.'))
+            .map(|(_, ext)| ext)
+            .filter(|ext| is_sane_ext(ext))
+            .map(str::to_ascii_lowercase)
+    })
+}
+
+/// Placeholder-extension sanity gate: a render-time fake name must never
+/// smuggle whitespace, dots or long junk into the prompt.
+fn is_sane_ext(ext: &str) -> bool {
+    !ext.is_empty() && ext.len() <= 5 && ext.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// One captured conversation entry - the payload of a `guild_records` row.
@@ -753,8 +796,8 @@ mod tests {
         let state = ConversationState::default();
         let mut record = user_record(10, "alice", "look at this");
         record.images = vec![
-            RecordImage { description: Some("a tabby cat on a keyboard".to_owned()) },
-            RecordImage { description: None },
+            RecordImage { description: Some("a tabby cat on a keyboard".to_owned()), ext: None },
+            RecordImage { description: None, ext: None },
         ];
 
         let messages =
@@ -776,7 +819,7 @@ mod tests {
         let settings = LlmSettings::default();
         let state = ConversationState::default();
         let mut padded = user_record(10, "alice", "old");
-        padded.images = vec![RecordImage { description: Some("x".repeat(4000)) }];
+        padded.images = vec![RecordImage { description: Some("x".repeat(4000)), ext: None }];
         let records = vec![padded, user_record(11, "bob", "newest")];
 
         // A tight budget drops the image-padded record first - descriptions
@@ -791,7 +834,7 @@ mod tests {
     #[test]
     fn compaction_transcript_renders_images_like_the_context() {
         let mut record = user_record(10, "alice", "look");
-        record.images = vec![RecordImage { description: Some("a dog".to_owned()) }];
+        record.images = vec![RecordImage { description: Some("a dog".to_owned()), ext: None }];
 
         let messages = compaction_input("summarize", None, &[record]);
 
@@ -799,6 +842,53 @@ mod tests {
             messages.get(1).map(|m| m.content.as_str()),
             Some("New messages:\nalice: look\n![a dog](image.png)\n")
         );
+    }
+
+    /// The placeholder name follows the capture-baked extension, per image;
+    /// legacy records (no ext) keep the png fallback.
+    #[test]
+    fn baked_extensions_render_into_the_placeholder_name() {
+        let mut record = user_record(10, "alice", "look");
+        record.images = vec![
+            RecordImage {
+                description: Some("a tabby cat".to_owned()),
+                ext: Some("gif".to_owned()),
+            },
+            RecordImage { description: None, ext: Some("webp".to_owned()) },
+            RecordImage { description: None, ext: None },
+        ];
+
+        assert_eq!(
+            record_content(&record),
+            concat!(
+                "look\n",
+                "![a tabby cat](image.gif)\n",
+                "![image without description](image_2.webp)\n",
+                "![image without description](image_3.png)"
+            )
+        );
+    }
+
+    /// Extension resolution: content type wins over the file name; MIME
+    /// parameters and structural suffixes are stripped; junk is rejected
+    /// down to the png fallback at render time.
+    #[test]
+    fn placeholder_ext_resolves_and_sanitizes() {
+        // Content type is authoritative - even against the file name.
+        assert_eq!(placeholder_ext(Some("image/gif"), Some("cat.png")).as_deref(), Some("gif"));
+        // Parameters and structural suffixes are stripped.
+        assert_eq!(
+            placeholder_ext(Some("image/svg+xml; charset=binary"), None).as_deref(),
+            Some("svg")
+        );
+        // File-name fallback, normalized to lowercase.
+        assert_eq!(placeholder_ext(None, Some("cat.GIF")).as_deref(), Some("gif"));
+        // Non-image MIME falls through to the file name.
+        assert_eq!(placeholder_ext(Some("text/html"), Some("cat.gif")).as_deref(), Some("gif"));
+        // Junk everywhere -> None (png fallback at render time).
+        assert_eq!(placeholder_ext(Some("application/octet-stream"), Some("noext")), None);
+        // Oversized junk extensions are rejected too.
+        assert_eq!(placeholder_ext(None, Some("cat.superlong")), None);
     }
 
     #[test]

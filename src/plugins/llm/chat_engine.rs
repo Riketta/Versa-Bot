@@ -42,9 +42,13 @@ use super::vision::{self, DEFAULT_IMAGE_PROMPT, ImageDescriber, ImageJob, ImageS
 use crate::kernel::spi_ports::PlatformInfoPort;
 
 /// One undescribed placeholder entry per image (feature off, cap overflow,
-/// or recognition failure - the record still shows THAT an image existed).
-fn undescribed(count: usize) -> Vec<conversation::RecordImage> {
-    std::iter::repeat_n(conversation::RecordImage { description: None }, count).collect()
+/// or recognition failure - the record still shows THAT an image existed,
+/// with its real extension baked at capture).
+fn undescribed(sources: &[ImageSource]) -> Vec<conversation::RecordImage> {
+    sources
+        .iter()
+        .map(|source| conversation::RecordImage { description: None, ext: source.ext.clone() })
+        .collect()
 }
 
 /// Minimum interval between error notices for the same channel: a down
@@ -448,6 +452,10 @@ impl ChatEngine {
             .map(|attachment| ImageSource {
                 url: attachment.url.clone(),
                 content_type: attachment.content_type.clone(),
+                ext: conversation::placeholder_ext(
+                    attachment.content_type.as_deref(),
+                    attachment.file_name.as_deref(),
+                ),
             })
             .filter(vision::is_image_source)
             .collect();
@@ -455,14 +463,14 @@ impl ChatEngine {
             return Vec::new();
         }
         if !config.images {
-            return undescribed(sources.len());
+            return undescribed(&sources);
         }
         let Some(model) = config.image_model.clone().or_else(|| self.settings.image_model.clone())
         else {
             tracing::debug!(
                 "channel image recognition enabled but no image model is configured - storing undescribed"
             );
-            return undescribed(sources.len());
+            return undescribed(&sources);
         };
         let cap = usize::try_from(self.settings.max_images_per_message).unwrap_or(usize::MAX);
         let (described, overflow) = if sources.len() > cap {
@@ -493,9 +501,16 @@ impl ChatEngine {
         );
         let mut images: Vec<_> = results
             .into_iter()
-            .map(|description| conversation::RecordImage { description })
+            .zip(described)
+            .map(|(description, source)| conversation::RecordImage {
+                description,
+                ext: source.ext.clone(),
+            })
             .collect();
-        images.extend(overflow.iter().map(|_| conversation::RecordImage { description: None }));
+        images.extend(overflow.iter().map(|source| conversation::RecordImage {
+            description: None,
+            ext: source.ext.clone(),
+        }));
         images
     }
 
@@ -2591,6 +2606,35 @@ mod tests {
         let images = records.first().map(|r| r.images.clone()).unwrap_or_default();
         assert_eq!(images.len(), 1);
         assert_eq!(images.first().and_then(|image| image.description.clone()), None);
+    }
+
+    /// The placeholder carries the attachment's real extension, resolved at
+    /// capture from the content type - here even undescribed (feature off),
+    /// so the model sees the animated-image hint.
+    #[tokio::test]
+    async fn gif_attachment_bakes_its_extension_into_the_placeholder() {
+        let ctx = ctx(vec![Ok("ok".to_owned())]);
+        let config = assigned_config(); // images: false (the default)
+        seed_config(&ctx.storage, &config);
+        let mut payload = payload(true, None);
+        payload.attachments = vec![AttachmentPayload {
+            url: "https://cdn.example/1.gif".to_owned(),
+            content_type: Some("image/gif".to_owned()),
+            file_name: Some("cat.gif".to_owned()),
+            size_bytes: 100,
+            width: Some(10),
+            height: Some(10),
+        }];
+
+        ctx.engine.handle_message(&origin(), &payload, &config, &ctx.services, None).await;
+
+        let records = stored_records(&ctx).await;
+        let images = records.first().map(|r| r.images.clone()).unwrap_or_default();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images.first().and_then(|image| image.ext.clone()), Some("gif".to_owned()));
+        let context = ctx.fake.requests().first().expect("chat request expected").clone();
+        let turn = context.messages.iter().find(|m| m.role == ChatRole::User).expect("user turn");
+        assert!(turn.content.contains("![image without description](image.gif)"));
     }
 
     #[tokio::test]

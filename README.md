@@ -690,7 +690,11 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   captured messages are described by a vision-capable model at capture
   time, and the description is stored with the message. The context
   renders it as a markdown image reference - `![description](image.png)`
-  (multi-image messages number the placeholders) - so the chat model
+  (multi-image messages number the placeholders; the placeholder carries
+  the attachment's real extension, resolved from the platform's content
+  type with the file name as fallback and `png` last, so an animated
+  `image.gif` hints at motion even though recognition only saw the first
+  frame) - so the chat model
   reads what an image showed without ever receiving pixels: any declared
   model works, and costs stay bounded (each image is described once,
   rescaled to `image_max_side`, at most `max_images_per_message` per
