@@ -326,7 +326,18 @@ fn resolve_skin(query: &str, hits: &[SkinHit]) -> Resolved {
     let needle = normalize_name(query);
     let exacts: Vec<&SkinHit> =
         hits.iter().filter(|hit| normalize_name(&hit.skin) == needle).collect();
-    match collapse(exacts, skin_pair, |hit| hit.item_id).as_slice() {
+    let collapsed = collapse(exacts.clone(), skin_pair, |hit| hit.item_id);
+    if exacts.len() > collapsed.len() {
+        tracing::debug!(
+            item_ids = %exacts
+                .iter()
+                .map(|hit| hit.item_id.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            "skin name spans several catalog item ids - watch bound to the lowest"
+        );
+    }
+    match collapsed.as_slice() {
         [hit] => Resolved::Hit(WatchTarget::Skin {
             item_id: hit.item_id,
             champion: hit.champion.clone(),
@@ -349,14 +360,25 @@ fn resolve_skin(query: &str, hits: &[SkinHit]) -> Resolved {
 
 fn resolve_champion(query: &str, hits: &[ChampionHit]) -> Resolved {
     let needle = normalize_name(query);
+    let exacts: Vec<&ChampionHit> =
+        hits.iter().filter(|hit| normalize_name(&hit.champion) == needle).collect();
     // Every exact hit shares the query's name by construction - several
     // rows under one name collapse to the lowest champion id instead of
-    // asking for an exact name that cannot disambiguate anything.
-    if let Some(hit) = hits
-        .iter()
-        .filter(|hit| normalize_name(&hit.champion) == needle)
-        .min_by_key(|hit| hit.champion_id)
-    {
+    // asking for an exact name that cannot disambiguate anything. The
+    // breadcrumb keeps the id set observable: if the rows ever turn out
+    // to be genuinely different targets (not duplicates), this is where
+    // it shows.
+    if let Some(hit) = exacts.iter().min_by_key(|hit| hit.champion_id) {
+        if exacts.len() > 1 {
+            tracing::debug!(
+                champion_ids = %exacts
+                    .iter()
+                    .map(|hit| hit.champion_id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                "champion name spans several table ids - watch bound to the lowest"
+            );
+        }
         return Resolved::Hit(WatchTarget::Champion {
             champion_id: hit.champion_id,
             champion: hit.champion.clone(),
