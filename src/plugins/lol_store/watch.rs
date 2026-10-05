@@ -160,18 +160,19 @@ impl WatchDoc {
         id
     }
 
-    /// Removes one watch owned by `user_id`; true when it existed.
-    pub fn remove(&mut self, user_id: &str, id: u64) -> bool {
-        let before = self.subs.len();
-        self.subs.retain(|watch| !(watch.id == id && watch.user_id == user_id));
-        self.subs.len() != before
+    /// Removes one watch owned by `user_id` and returns it.
+    pub fn remove(&mut self, user_id: &str, id: u64) -> Option<Watch> {
+        let index =
+            self.subs.iter().position(|watch| watch.id == id && watch.user_id == user_id)?;
+        Some(self.subs.remove(index))
     }
 
-    /// Removes every watch of `user_id`; returns how many went away.
-    pub fn remove_all_of(&mut self, user_id: &str) -> usize {
-        let before = self.subs.len();
-        self.subs.retain(|watch| watch.user_id != user_id);
-        before - self.subs.len()
+    /// Removes every watch of `user_id` and returns them.
+    pub fn remove_all_of(&mut self, user_id: &str) -> Vec<Watch> {
+        let (kept, removed): (Vec<_>, Vec<_>) =
+            self.subs.drain(..).partition(|watch| watch.user_id != user_id);
+        self.subs = kept;
+        removed
     }
 }
 
@@ -583,11 +584,11 @@ mod tests {
             target: skin_target(1032, "Dynasty Ahri"),
             kinds: WatchKind::All,
         });
-        assert!(!doc.remove("111", 99), "unknown id");
-        assert!(!doc.remove("111", 2), "another user's watch is not removable");
-        assert!(doc.remove("222", 2), "a user removes their own watch");
-        assert_eq!(doc.remove_all_of("222"), 0, "already gone");
-        assert!(doc.remove("111", 1));
+        assert!(doc.remove("111", 99).is_none(), "unknown id");
+        assert!(doc.remove("111", 2).is_none(), "another user's watch is not removable");
+        assert!(doc.remove("222", 2).is_some(), "a user removes their own watch");
+        assert!(doc.remove_all_of("222").is_empty(), "already gone");
+        assert!(doc.remove("111", 1).is_some());
         assert!(doc.subs.is_empty());
     }
 

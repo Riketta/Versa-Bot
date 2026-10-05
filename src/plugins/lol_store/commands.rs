@@ -657,16 +657,26 @@ impl CommandHandler for UnwatchHandler {
         let (mut doc, unreadable) = load_watch_doc(storage.as_ref()).await?;
         let (changed, reply_text) = if what.eq_ignore_ascii_case("all") {
             let removed = doc.remove_all_of(&user_id);
-            let text = if removed == 0 {
+            let text = if removed.is_empty() {
                 "You have no watches to remove.".to_owned()
             } else {
-                format!("Removed {removed} watch(es).")
+                let mut lines: Vec<String> = vec![format!("Removed {} watch(es):", removed.len())];
+                lines.extend(removed.iter().map(|watch| {
+                    format!("- #{} {} ({})", watch.id, watch.target.label(), watch.kinds.label())
+                }));
+                lines.join("\n")
             };
-            (removed > 0, text)
+            (!removed.is_empty(), text)
         } else {
             match what.parse::<u64>() {
-                Ok(id) if doc.remove(&user_id, id) => (true, format!("Watch #{id} removed.")),
-                Ok(id) => (false, format!("No watch #{id} of yours - see `/lol_store_watchlist`.")),
+                Ok(id) => match doc.remove(&user_id, id) {
+                    Some(watch) => {
+                        (true, format!("Watch #{id} removed: {}.", watch.target.label()))
+                    }
+                    None => {
+                        (false, format!("No watch #{id} of yours - see `/lol_store_watchlist`."))
+                    }
+                },
                 Err(_) => {
                     (false, "Give a watch id from `/lol_store_watchlist`, or `all`.".to_owned())
                 }

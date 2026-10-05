@@ -876,11 +876,18 @@ mod tests {
         assert!(list.contains("#2 Ahri (all)"));
         assert!(!list.contains("#3"));
 
-        // `all` clears only the invoker's watches.
+        // A removal names what went away.
+        let args = CommandArgs(vec![("what".to_owned(), "1".to_owned())]);
+        UnwatchHandler.invoke(&f.event, &args, &f.services).await.expect("invoke");
+        let reply = f.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("Watch #1 removed: Ahri - Foxfire Ahri."), "reply: {reply}");
+
+        // `all` clears only the invoker's watches, naming each one.
         let args = CommandArgs(vec![("what".to_owned(), "all".to_owned())]);
         UnwatchHandler.invoke(&f.event, &args, &f.services).await.expect("invoke");
         let reply = f.output.messages().last().expect("reply expected").clone();
-        assert!(reply.contains("Removed 2 watch(es)"), "reply: {reply}");
+        assert!(reply.contains("Removed 1 watch(es):"), "reply: {reply}");
+        assert!(reply.contains("- #2 Ahri (all)"), "reply: {reply}");
         let doc = stored_watch_doc(&f).await.expect("doc expected");
         let subs = doc.get("subs").and_then(|subs| subs.as_array()).expect("subs array");
         assert_eq!(subs.len(), 1, "only user 2's watch survives");
