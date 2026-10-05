@@ -135,8 +135,9 @@ jobs:
               | head -1 \
               | cut -d'"' -f4)
             if [ -n "$resolved" ] && [ "$resolved" != "$GITHUB_SHA" ]; then
-              echo "ref $FORGEJO_REF_NAME is at $resolved, but the image would be tagged \
-  sha-$(echo "$GITHUB_SHA" | cut -c1-8) - refusing to publish a mislabeled image" >&2
+              echo "ref $FORGEJO_REF_NAME is at $resolved," \
+                "but the image would be tagged sha-$(echo "$GITHUB_SHA" | cut -c1-8)" \
+                "- refusing to publish a mislabeled image" >&2
               exit 1
             fi
             if [ -z "$resolved" ]; then
