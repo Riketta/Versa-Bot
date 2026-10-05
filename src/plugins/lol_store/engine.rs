@@ -170,22 +170,22 @@ impl<B: EventBusPort> StoreEngine<B> {
             self.lcu.yourshop_status(),
         );
         let mut snapshot = Snapshot::default();
-        let mut failures: Vec<&str> = Vec::new();
+        let mut failures: Vec<(&'static str, String)> = Vec::new();
         match sales {
             Ok(data) => snapshot.sales = Some(data),
-            Err(_) => failures.push("sales"),
+            Err(err) => failures.push(("sales", err.to_string())),
         }
         match catalog {
             Ok(data) => snapshot.catalog = Some(data),
-            Err(_) => failures.push("catalog"),
+            Err(err) => failures.push(("catalog", err.to_string())),
         }
         match rotations {
             Ok(data) => snapshot.rotations = Some(data),
-            Err(_) => failures.push("rotations"),
+            Err(err) => failures.push(("rotations", err.to_string())),
         }
         match yourshop {
             Ok(data) => snapshot.yourshop = Some(data),
-            Err(_) => failures.push("yourshop"),
+            Err(err) => failures.push(("yourshop", err.to_string())),
         }
 
         // The tracker is about skins: the champion ITSELF going on sale is
@@ -199,7 +199,10 @@ impl<B: EventBusPort> StoreEngine<B> {
         if failures.len() == 4 {
             // Client closed (or restarting): the normal quiet path.
             self.online.store(false, Ordering::Release);
-            tracing::debug!(?failures, "store poll skipped - league client unreachable");
+            tracing::debug!(
+                sources = ?failures.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+                "store poll skipped - league client unreachable"
+            );
             return;
         }
         self.online.store(true, Ordering::Release);
@@ -439,9 +442,18 @@ impl<B: EventBusPort> StoreEngine<B> {
             match tokio::time::timeout(Duration::from_secs(3), self.lcu.champion_names()).await {
                 Ok(Ok(entries)) => {
                     let map = champion_map(entries.into_iter().map(|entry| (entry.id, entry.name)));
-                    let mut cache = self.champions.lock();
-                    if cache.is_none() {
-                        *cache = Some(Arc::new(map.into_iter().collect()));
+                    if map.is_empty() {
+                        // Never cache an empty table: a degenerate payload
+                        // must retry next cycle, not pin fallback names for
+                        // the process lifetime.
+                        tracing::warn!(
+                            "champion name table came back empty - using fallback names"
+                        );
+                    } else {
+                        let mut cache = self.champions.lock();
+                        if cache.is_none() {
+                            *cache = Some(Arc::new(map.into_iter().collect()));
+                        }
                     }
                 }
                 Ok(Err(err)) => {

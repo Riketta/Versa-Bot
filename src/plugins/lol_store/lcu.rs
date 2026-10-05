@@ -317,7 +317,11 @@ impl Transport for ReqwestTransport {
         if !response.status().is_success() {
             return Ok(RawAnswer { status, body: Err(format!("HTTP {status}")) });
         }
-        let body = response.json::<serde_json::Value>().await.map_err(|err| err.to_string());
+        // Explicit parse from raw bytes: a decode failure then carries
+        // serde's real message in `LcuError::Parse` instead of reqwest's
+        // opaque "error decoding response body".
+        let bytes = response.bytes().await.map_err(|err| err.to_string())?;
+        let body = serde_json::from_slice(&bytes).map_err(|err| err.to_string());
         Ok(RawAnswer { status, body })
     }
 }
@@ -460,7 +464,20 @@ impl LcuPort for LcuClient {
     }
 
     async fn champion_names(&self) -> Result<Vec<ChampionEntry>, LcuError> {
-        self.get_json_typed("/lol-game-data/assets/v1/champion-summary.json").await
+        let path = "/lol-game-data/assets/v1/champion-summary.json";
+        let value = self.get_json(path).await?;
+        let serde_json::Value::Array(entries) = value else {
+            return Err(LcuError::Parse(format!("{path}: expected a JSON array")));
+        };
+        // The table opens with a bare `-1` sentinel element, not an object,
+        // and one degenerate entry must not blank the whole table - non-
+        // object elements and entries without a usable name are skipped.
+        let champions = entries
+            .into_iter()
+            .filter_map(|entry| serde_json::from_value::<ChampionEntry>(entry).ok())
+            .filter(|entry| entry.name.as_deref().is_some_and(|name| !name.is_empty()))
+            .collect();
+        Ok(champions)
     }
 }
 
@@ -774,5 +791,28 @@ mod tests {
 
         let err = client.catalog().await.expect_err("bad body expected to fail");
         assert!(matches!(err, LcuError::Parse(_)), "{err}");
+    }
+
+    /// The champion table opens with a bare `-1` sentinel element; it and
+    /// degenerate entries are skipped, not fatal to the whole table.
+    #[tokio::test]
+    async fn champion_summary_sentinel_and_degenerate_entries_are_skipped() {
+        let lockfile = lockfile_path("champions");
+        write_lockfile(&lockfile, "token");
+        let body = serde_json::json!([
+            -1,
+            {"id": 266, "name": "Aatrox"},
+            {"id": 103, "name": ""},
+            "not-an-object"
+        ]);
+        let transport = Arc::new(ScriptedTransport {
+            answers: Mutex::new(vec![ScriptedTransport::ok(200, body)]),
+            seen: Mutex::new(Vec::new()),
+            rewrite: None,
+        });
+        let client = client_at(transport, lockfile);
+
+        let champions = client.champion_names().await.expect("champion names expected to parse");
+        assert_eq!(champions, vec![ChampionEntry { id: 266, name: Some("Aatrox".to_owned()) }]);
     }
 }

@@ -112,12 +112,26 @@ The error text is the fastest way to a correct request shape.
 Live-probed on patch ~26.x (EUW, 2026-10). Resolve anything that moved
 via `/help?target=`.
 
+Transport gotchas (both bit us in production):
+
+- **Some bodies arrive gzip-compressed** - the client's HTTP server
+  compresses large payloads (`/lol-store/v1/catalog`, `/lol-shoppefront/
+  v1/stores`) and static assets (`champion-summary.json`) even when the
+  request advertises no `Accept-Encoding`. An HTTP client that does not
+  transparently decompress (e.g. reqwest without the `gzip` feature)
+  sees binary garbage and fails JSON decoding with an opaque error, while
+  small bodies (sales, yourshop) work - a confusing half-broken state.
+- **`champion-summary.json` opens with the bare number `-1`** - a
+  sentinel array element, not a champion object. Strict `Vec<struct>`
+  deserialization fails on it; skip non-object elements (and entries
+  with empty names) instead of parsing the array in one shot.
+
 Identity & assets:
 
 | Path | Notes |
 |---|---|
 | `/lol-summoner/v1/current-summoner` | `gameName`, `tagLine`, `puuid`, level |
-| `/lol-game-data/assets/v1/champion-summary.json` | id -> name map (no skins) |
+| `/lol-game-data/assets/v1/champion-summary.json` | id -> name map (no skins); leading `-1` sentinel element, see transport gotchas |
 | `/lol-game-data/assets/v1/champions/{championId}.json` | full data incl. `skins: [{id, name}]`; `championId = skinId / 1000` |
 | `/lol-champions/v1/owned-champions-minimal` | ownership + `purchased` timestamps |
 

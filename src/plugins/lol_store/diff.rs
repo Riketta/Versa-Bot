@@ -287,14 +287,22 @@ pub fn compute(previous: &LastSeen, snapshot: &Snapshot) -> StoreDelta {
             sales.iter().filter(|sale| !previous.sales.contains(&sale.id)).cloned().collect();
     }
     if let Some(catalog) = &snapshot.catalog {
-        delta.skins = catalog
-            .iter()
-            .filter(|item| {
-                item.inventory_type.as_deref() == Some("CHAMPION_SKIN")
-                    && !previous.skins.contains(&item.item_id)
-            })
-            .cloned()
-            .collect();
+        // A never-observed catalog (empty previous set) is a silent
+        // baseline, not an event: diffing it would announce the whole
+        // skin catalog - thousands of items - as "new" and fire every
+        // release watch. Mirrors the engine's first-poll baseline.
+        delta.skins = if previous.skins.is_empty() {
+            Vec::new()
+        } else {
+            catalog
+                .iter()
+                .filter(|item| {
+                    item.inventory_type.as_deref() == Some("CHAMPION_SKIN")
+                        && !previous.skins.contains(&item.item_id)
+                })
+                .cloned()
+                .collect()
+        };
     }
     if let Some(stores) = &snapshot.rotations {
         for store in rotation_stores(stores) {
@@ -427,6 +435,30 @@ mod tests {
         assert_eq!(delta.skins.iter().map(|item| item.item_id).collect::<Vec<_>>(), vec![200]);
         assert!(delta.rotations.is_empty());
         assert!(delta.yourshop.is_none());
+    }
+
+    #[test]
+    fn compute_treats_a_never_seen_catalog_as_a_silent_baseline() {
+        // State persisted while the catalog source was down (only sales
+        // ever observed): the first successful catalog must not flood the
+        // feed - and every release watch - with the whole skin catalog.
+        let previous = LastSeen { sales: BTreeSet::from([1]), ..Default::default() };
+        let snapshot = Snapshot {
+            catalog: Some(vec![catalog_skin(100), catalog_skin(200)]),
+            ..Default::default()
+        };
+        let delta = compute(&previous, &snapshot);
+        assert!(delta.skins.is_empty(), "baseline must not announce: {:?}", delta.skins);
+
+        // Once observed, normal diffing resumes.
+        let merged = merge(&previous, &snapshot);
+        assert!(compute(&merged, &snapshot).skins.is_empty());
+        let grown = Snapshot {
+            catalog: Some(vec![catalog_skin(100), catalog_skin(200), catalog_skin(300)]),
+            ..Default::default()
+        };
+        let delta = compute(&merged, &grown);
+        assert_eq!(delta.skins.iter().map(|item| item.item_id).collect::<Vec<_>>(), vec![300]);
     }
 
     #[test]
