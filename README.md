@@ -352,10 +352,10 @@ mention-everyone permission.
 
 **Per-user watches.** Beyond the guild-wide role, any member can
 subscribe personally with `/lol_store_watch`: either a specific skin
-(`target: skin`, e.g. *Blood Moon Evelynn*) or a champion's whole skin
+line (`target: skin`, e.g. *Blood Moon Evelynn*) or a champion's whole skin
 line (`target: champion`, e.g. *Evelynn* - future skins are caught by
 construction). The `kinds` argument selects what fires: `sale`,
-`mythic`, `release`, or `all` (default). Matching runs on the same
+`mythic`, `release`, or `all` (default - all three categories). Matching runs on the same
 store deltas the announcements use, so catch-up after a restart covers
 watches too, and the per-guild announce flags (`announce_sales`, ...)
 never suppress personal watches. When something fires, the assigned

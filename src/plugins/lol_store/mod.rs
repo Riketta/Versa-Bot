@@ -191,7 +191,8 @@ impl<B: EventBusPort> PluginPort for LolStorePlugin<B> {
                     },
                     ArgDescriptor {
                         name: "kinds".to_owned(),
-                        description: "Notify on sale, mythic, release - or all (default)"
+                        description: "What fires: sale, mythic, release, or all (default; all = \
+                                     sale + mythic + release)"
                             .to_owned(),
                         required: false,
                         kind: ArgKind::String,
@@ -771,7 +772,7 @@ mod tests {
             .await
             .expect("invoke");
         let first = f.output.messages().first().expect("reply expected").clone();
-        assert!(first.contains("Watch #1 added: Ahri (all)"), "reply: {first}");
+        assert!(first.contains("Watch #1 added: Ahri (all categories)"), "reply: {first}");
     }
 
     #[tokio::test]

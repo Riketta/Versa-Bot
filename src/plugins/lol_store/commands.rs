@@ -616,7 +616,13 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for WatchHandl
         storage.set(NAMESPACE, WATCH_KEY, serde_json::to_value(&doc)?).await?;
         drop(_guard);
 
-        let mut reply_text = format!("Watch #{id} added: {} ({}).", target.label(), kinds.label());
+        // "all" is a category bundle - say so; the watchlist keeps the
+        // short form.
+        let kinds_text = match kinds {
+            WatchKind::All => "all categories".to_owned(),
+            _ => kinds.label().to_owned(),
+        };
+        let mut reply_text = format!("Watch #{id} added: {} ({}).", target.label(), kinds_text);
         if let Some(status) = self.engine.watch_status(&target).await {
             for line in status {
                 reply_text.push_str(&format!("\n- {line}"));
@@ -803,12 +809,12 @@ mod tests {
 
     #[test]
     fn duplicate_champion_rows_resolve_instead_of_dead_ending() {
-        let ascending = vec![champion(57, "Evelynn"), champion(9057, "Evelynn")];
+        let ascending = vec![champion(28, "Evelynn"), champion(60028, "Evelynn")];
         let descending: Vec<_> = ascending.iter().rev().cloned().collect();
         for hits in [ascending, descending] {
             match resolve_champion("Evelynn", &hits, &HashSet::new()) {
                 Resolved::Hit(WatchTarget::Champion { champion_id, champion }) => {
-                    assert_eq!(champion_id, 57);
+                    assert_eq!(champion_id, 28);
                     assert_eq!(champion, "Evelynn");
                 }
                 _ => panic!("one name under several unbacked ids must resolve, not ask again"),
@@ -818,11 +824,11 @@ mod tests {
 
     #[test]
     fn store_backed_id_wins_over_the_lowest() {
-        let hits = vec![champion(57, "Evelynn"), champion(9057, "Evelynn")];
-        let backed = HashSet::from([9057]);
+        let hits = vec![champion(28, "Evelynn"), champion(60028, "Evelynn")];
+        let backed = HashSet::from([60028]);
         match resolve_champion("Evelynn", &hits, &backed) {
             Resolved::Hit(WatchTarget::Champion { champion_id, champion }) => {
-                assert_eq!(champion_id, 9057);
+                assert_eq!(champion_id, 60028);
                 assert_eq!(champion, "Evelynn");
             }
             _ => panic!("the store-backed id must win over the id-order assumption"),
@@ -831,12 +837,12 @@ mod tests {
 
     #[test]
     fn several_store_backed_ids_stay_candidates_with_labels() {
-        let hits = vec![champion(57, "Evelynn"), champion(9057, "Evelynn")];
-        let backed = HashSet::from([57, 9057]);
+        let hits = vec![champion(28, "Evelynn"), champion(60028, "Evelynn")];
+        let backed = HashSet::from([28, 60028]);
         match resolve_champion("Evelynn", &hits, &backed) {
             Resolved::Candidates { lines, by_id } => {
                 assert!(by_id);
-                assert_eq!(lines, vec!["`Evelynn (id 57)`", "`Evelynn (id 9057)`"]);
+                assert_eq!(lines, vec!["`Evelynn (id 28)`", "`Evelynn (id 60028)`"]);
             }
             _ => panic!("several store-backed ids are genuinely different targets"),
         }
@@ -844,10 +850,10 @@ mod tests {
 
     #[test]
     fn a_numeric_name_selects_by_id() {
-        let hits = vec![champion(57, "Evelynn"), champion(9057, "Evelynn")];
-        match resolve_champion("9057", &hits, &HashSet::new()) {
+        let hits = vec![champion(28, "Evelynn"), champion(60028, "Evelynn")];
+        match resolve_champion("60028", &hits, &HashSet::new()) {
             Resolved::Hit(WatchTarget::Champion { champion_id, .. }) => {
-                assert_eq!(champion_id, 9057);
+                assert_eq!(champion_id, 60028);
             }
             _ => panic!("a listed id must be selectable by typing it"),
         }
@@ -855,7 +861,7 @@ mod tests {
 
     #[test]
     fn partial_champion_duplicates_list_one_candidate_per_name() {
-        let hits = vec![champion(9057, "Evelynn"), champion(57, "Evelynn"), champion(120, "Kayn")];
+        let hits = vec![champion(60028, "Evelynn"), champion(28, "Evelynn"), champion(120, "Kayn")];
         match resolve_champion("yn", &hits, &HashSet::new()) {
             Resolved::Candidates { lines, by_id } => {
                 assert!(!by_id);
@@ -884,8 +890,8 @@ mod tests {
     #[test]
     fn variant_skins_with_one_name_stay_labeled_candidates() {
         let hits = vec![
-            skin(57, 103_001, "Evelynn", "Blood Moon Evelynn"),
-            skin(60041, 60_041_001, "Evelynn", "Blood Moon Evelynn"),
+            skin(28, 103_001, "Evelynn", "Blood Moon Evelynn"),
+            skin(60028, 60_028_001, "Evelynn", "Blood Moon Evelynn"),
         ];
         match resolve_skin("Blood Moon Evelynn", &hits) {
             Resolved::Candidates { lines, by_id } => {
@@ -894,7 +900,7 @@ mod tests {
                     lines,
                     vec![
                         "`Evelynn - Blood Moon Evelynn (item 103001)`",
-                        "`Evelynn - Blood Moon Evelynn (item 60041001)`"
+                        "`Evelynn - Blood Moon Evelynn (item 60028001)`"
                     ]
                 );
             }
@@ -905,12 +911,12 @@ mod tests {
     #[test]
     fn a_numeric_name_selects_a_skin_by_item_id() {
         let hits = vec![
-            skin(57, 103_001, "Evelynn", "Blood Moon Evelynn"),
-            skin(60041, 60_041_001, "Evelynn", "Blood Moon Evelynn"),
+            skin(28, 103_001, "Evelynn", "Blood Moon Evelynn"),
+            skin(60028, 60_028_001, "Evelynn", "Blood Moon Evelynn"),
         ];
-        match resolve_skin("60041001", &hits) {
+        match resolve_skin("60028001", &hits) {
             Resolved::Hit(WatchTarget::Skin { item_id, .. }) => {
-                assert_eq!(item_id, 60_041_001);
+                assert_eq!(item_id, 60_028_001);
             }
             _ => panic!("a listed item id must be selectable by typing it"),
         }
