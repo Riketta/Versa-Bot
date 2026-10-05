@@ -1177,8 +1177,11 @@ impl CommandHandler for GetLlmHandler {
 /// default table to drift). Prompts are never dumped - not even as a
 /// preview; the dump only says whether one is set and how big it is, the
 /// text is one argument-free `/llm_set_prompt kind` away. The fence is
-/// FOUR backticks deep: rendered values are channel-managed text
-/// (templates) that may themselves contain code fences.
+/// plain three backticks - Discord renders deeper fences with a literal
+/// tick at each end - so rendered values (channel-managed text,
+/// templates) that may themselves contain code fences are sanitized
+/// first: any backtick run of three or more degrades to a doubled tick
+/// and can never close the block early.
 pub(super) struct DumpLlmHandler {
     engine: Arc<ChatEngine>,
 }
@@ -1203,6 +1206,26 @@ fn prompt_shape(value: Option<&String>) -> String {
     )
 }
 
+/// Collapse backtick runs of three or more down to a doubled tick so a
+/// rendered value can never close the dump's three-backtick fence early.
+/// Single and doubled ticks are literal inside a fence and pass through.
+fn fence_safe(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut ticks = 0usize;
+    for ch in value.chars() {
+        if ch == '`' {
+            if ticks < 2 {
+                out.push('`');
+            }
+            ticks += 1;
+        } else {
+            ticks = 0;
+            out.push(ch);
+        }
+    }
+    out
+}
+
 #[async_trait]
 impl CommandHandler for DumpLlmHandler {
     async fn invoke(
@@ -1222,8 +1245,11 @@ impl CommandHandler for DumpLlmHandler {
             .iter()
             .map(|key| {
                 let value = current_value(&config, key, self.engine.settings())
+                    .map(|value| fence_safe(&value))
                     .unwrap_or_else(|| "?".to_owned());
-                let marker = if current_value(&baseline, key, self.engine.settings()).as_deref()
+                let marker = if current_value(&baseline, key, self.engine.settings())
+                    .map(|value| fence_safe(&value))
+                    .as_deref()
                     == Some(value.as_str())
                 {
                     ""
@@ -1255,7 +1281,7 @@ impl CommandHandler for DumpLlmHandler {
         services
             .chat_output
             .send(command_reply(format!(
-                "Channel settings ({} keys + 3 prompts; `*` differs from the default):\n````\n{}\n````",
+                "Channel settings ({} keys + 3 prompts; `*` differs from the default):\n```\n{}\n```",
                 SET_KEYS.len(),
                 lines.join("\n")
             )))

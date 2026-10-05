@@ -839,13 +839,15 @@ mod tests {
         assert!(reply.contains("plugin default"), "unexpected: {reply}");
     }
 
-    /// `/llm_dump`: every key at once, `key = value` inside a four-backtick
-    /// fence, effective values; keys that differ from a fresh assignment
-    /// carry a `*` marker, defaults do not. Prompts never enter the dump -
-    /// not even as a preview: only set-or-not and size, the text is one
-    /// argument-free `/llm_set_prompt kind` away. Long non-prompt values
-    /// (templates) degrade to head previews so the whole dump stays one
-    /// Discord message.
+    /// `/llm_dump`: every key at once, `key = value` inside a three-backtick
+    /// fence, effective values; backtick runs of 3+ inside values degrade
+    /// to 2 so a fenced template can never close the block early. Keys
+    /// that differ from a fresh assignment carry a `*` marker, defaults
+    /// do not. Prompts never enter the dump - not even as a preview: only
+    /// set-or-not and size, the text is one argument-free
+    /// `/llm_set_prompt kind` away. Long non-prompt values (templates)
+    /// degrade to head previews so the whole dump stays one Discord
+    /// message.
     #[tokio::test]
     async fn dump_lists_every_setting_in_a_fence() {
         let (plugin, fixture) = fixture();
@@ -888,7 +890,8 @@ mod tests {
             .expect("dump expected to succeed");
 
         let reply = fixture.output.messages().last().expect("reply expected").clone();
-        assert!(reply.contains("````"), "four-backtick fence expected: {reply}");
+        assert!(reply.contains("\n```\n"), "three-backtick fence expected: {reply}");
+        assert!(!reply.contains("````"), "fence deeper than Discord renders: {reply}");
         assert!(reply.contains("`*` differs from the default"), "marker hint expected: {reply}");
         for key in SET_KEYS {
             assert!(reply.contains(&format!("{key} = ")), "key {key} missing: {reply}");
@@ -908,6 +911,47 @@ mod tests {
         assert!(!reply.contains("ário"), "prompt content leaked: {reply}");
         // One Discord message.
         assert!(reply.chars().count() <= 2000, "dump exceeds Discord's cap");
+    }
+
+    /// A channel-managed template may itself contain code fences; the dump
+    /// collapses such runs so the block's three-backtick fence stays
+    /// intact - exactly two fence runs in the whole reply (open + close).
+    #[tokio::test]
+    async fn dump_sanitizes_fenced_templates_inside_the_block() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        AssignLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("model".to_owned(), "local/gemma".to_owned())]),
+                &fixture.services,
+            )
+            .await
+            .expect("assign expected to succeed");
+        SetLlmHandler::new(ChannelLocks::new(), Arc::clone(&fixture.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![
+                    ("key".to_owned(), "turn_template".to_owned()),
+                    ("value".to_owned(), "```{sender}: {message}```".to_owned()),
+                ]),
+                &fixture.services,
+            )
+            .await
+            .expect("set expected to succeed");
+
+        DumpLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("dump expected to succeed");
+
+        let reply = fixture.output.messages().last().expect("reply expected").clone();
+        assert_eq!(reply.matches("```").count(), 2, "fence must stay intact: {reply}");
+        assert!(!reply.contains("````"), "no four-tick runs expected: {reply}");
+        assert!(
+            reply.contains("turn_template = ``{sender}: {message}``"),
+            "sanitized value expected: {reply}"
+        );
     }
 
     #[tokio::test]
