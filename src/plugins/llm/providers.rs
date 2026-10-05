@@ -66,7 +66,9 @@ pub struct LlmSettings {
     /// are deduplicated first, then capped). Discord's own hard cap is 20.
     pub react_max_per_message: usize,
     /// Diagnostic dump: log the raw request and response bodies of every
-    /// completion at DEBUG level (stdout only, never shipped to Sentry).
+    /// completion at DEBUG level, under the dedicated `llm_raw_traffic`
+    /// target (stdout only, never shipped to Sentry; captured to
+    /// `[logging]` files only when the file filter names that target).
     /// Off by default - the bodies carry full conversation content.
     pub log_raw_traffic: bool,
     /// Declared providers (`[llm.providers.<name]`).
@@ -335,11 +337,14 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
             "LLM request dispatched"
         );
         // Operator opt-in dump: what exactly went on the wire (proves which
-        // reasoning/sampling parameters were actually sent). DEBUG stays on
-        // stdout and never reaches Sentry; the body carries the full
-        // conversation, hence the config gate.
+        // reasoning/sampling parameters were actually sent). Emitted under
+        // the dedicated `llm_raw_traffic` target - stdout only, never
+        // Sentry; a `[logging]` file layer captures it only when its filter
+        // names the target. The body carries the full conversation, hence
+        // the config gate.
         if self.settings.log_raw_traffic {
             tracing::debug!(
+                target: "llm_raw_traffic",
                 provider = provider_name,
                 model = model_name,
                 body = %body,
@@ -355,6 +360,7 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
         // gives (and the only place reasoning_content is ever visible).
         if self.settings.log_raw_traffic {
             tracing::debug!(
+                target: "llm_raw_traffic",
                 provider = provider_name,
                 model = model_name,
                 status = %status,
@@ -418,6 +424,7 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
         );
         if self.settings.log_raw_traffic {
             tracing::debug!(
+                target: "llm_raw_traffic",
                 provider = provider_name,
                 model = model_name,
                 body = %body,
@@ -431,6 +438,7 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
             let text = response.text().await.map_err(|err| LlmError::Request(err.to_string()))?;
             if self.settings.log_raw_traffic {
                 tracing::debug!(
+                    target: "llm_raw_traffic",
                     provider = provider_name,
                     model = model_name,
                     status = %status,
@@ -447,6 +455,7 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
         let read = read_sse_stream(response, &deltas, self.settings.log_raw_traffic).await?;
         if self.settings.log_raw_traffic {
             tracing::debug!(
+                target: "llm_raw_traffic",
                 provider = provider_name,
                 model = model_name,
                 body = %read.raw,

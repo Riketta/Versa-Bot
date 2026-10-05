@@ -49,8 +49,10 @@ pub struct LlmConfig {
     pub max_consecutive_newlines: Option<usize>,
     /// Cap on emoji reactions applied per answer (the LLM react tool).
     pub react_max_per_message: usize,
-    /// Diagnostic dump of raw LLM request/response bodies at DEBUG level
-    /// (stdout only, never Sentry). Off by default: the bodies carry full
+    /// Diagnostic dump of raw LLM request/response bodies at DEBUG level,
+    /// under the dedicated `llm_raw_traffic` target (stdout only, never
+    /// Sentry; captured to `[logging]` files only when the file filter
+    /// names that target). Off by default: the bodies carry full
     /// conversation content.
     pub log_raw_traffic: bool,
     /// Declared providers (`[llm.providers.<name>`).

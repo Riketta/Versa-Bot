@@ -47,9 +47,11 @@ async fn main() -> ExitCode {
     let config = load_config().expect("config expected to exist and be valid");
 
     // Sentry/GlitchTip endpoint is DSN-driven; absent DSN means stdout only.
-    // The guard must outlive the whole run - bound at `main`'s top level.
-    let _sentry_guard = observability::init(
+    // Optional `[logging]` adds a file layer. Both need guards that outlive
+    // the whole run - bound at `main`'s top level.
+    let _guards = observability::init(
         config.debug,
+        config.logging.as_ref(),
         config.sentry.as_ref().map(|s| s.dsn.as_str()),
         config.sentry.as_ref().and_then(|s| s.environment.as_deref()),
         config.sentry.as_ref().and_then(|s| s.traces_sample_rate),

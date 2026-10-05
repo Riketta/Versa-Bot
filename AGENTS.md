@@ -154,17 +154,21 @@ deleted - cutoffs move.
 **Observability:** `tracing` IS the observability port - a facade, not
 infrastructure (same exception category as `serde`); there is
 deliberately no `TelemetryPort`. The composition root installs the
-subscribers: stdout fmt layer plus an optional `sentry-tracing` layer
-(DSN-driven config; absent/empty DSN disables reporting; Sentry SaaS or
-self-hosted GlitchTip). Level contract: `debug` = stdout-only breadcrumbs
+subscribers: stdout fmt layer, optional file layer (`tracing-appender`,
+`[logging]` config; startup-only, independent filter, fail-fast on dir
+errors), plus an optional `sentry-tracing` layer (DSN-driven config;
+absent/empty DSN disables reporting; Sentry SaaS or self-hosted
+GlitchTip). Level contract: `debug` = stdout-only breadcrumbs
 (pipeline traversal, provider traces, job ticks, roll decisions); `info`
 = audit grade, also shipped to Sentry as log items (command dispatch,
 command registration trail, per-completion LLM record). Privacy rule at
 every level: shapes and counters, never contents - no message text, no
 prompts, no endpoint bodies in logs or guild-visible embeds. The single
 explicit exception is the LLM plugin's `[llm] log_raw_traffic` operator
-diagnostic (off by default, stdout only, never the Sentry layer). Real
-metrics would use the `metrics` crate facade directly - still no port.
+diagnostic (off by default, stdout only via the dedicated
+`llm_raw_traffic` target, never the Sentry layer, captured to files only
+when the `[logging]` filter names that target). Real metrics would use
+the `metrics` crate facade directly - still no port.
 
 **Inbound events:** `RequestContext` is a chat-agnostic EVENT, not just a
 message: kinds (`MessageReceived`, `MemberJoined`, `CommandInvoked`, ...)

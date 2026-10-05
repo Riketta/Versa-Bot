@@ -103,6 +103,13 @@ compiler CI and the Docker image use.
    # environment = "development"
    # traces_sample_rate = 0.01  # performance sampling; omit for error-only
 
+   # Optional: persistent file log (independent filter, startup-only -
+   # see "File logging" below).
+   # [logging]
+   # dir = "logs"
+   # rotation = "daily"  # or "never": one file, rotate externally
+   # level = "info,versa_bot=debug,llm_raw_traffic=debug"  # default: breadcrumbs at debug, raw traffic excluded
+
    # Optional: status rotator - cycles the bot's activity.
    # [status]
    # interval_seconds = 300
@@ -144,6 +151,32 @@ and **Message Content Intent**.
 Environment variables override the file:
 `VERSABOT__DISCORD__TOKEN`, `VERSABOT__STORAGE__URL`,
 `VERSABOT__SENTRY__DSN`, ...
+
+### File logging
+
+Without a `[logging]` section the bot logs to stdout (and Sentry, when
+configured). With one, it also writes `versa-bot.log.<date>` files into
+`dir` - daily rotation by default, `rotation = "never"` for a single
+append-only file to pair with an external rotator.
+
+The file layer has its own filter and is startup-only (changes require a
+restart). By default it records the bot's breadcrumbs at debug - a flight
+recorder that survives stdout running at info - and pins the third-party
+HTTP stack to warn; `RUST_LOG` never affects the file. The directory must
+be creatable and writable; a failure aborts startup. Full LLM
+request/response bodies (`log_raw_traffic`) never reach the file unless
+the filter names their target:
+
+```toml
+[logging]
+dir = "logs"
+level = "info,versa_bot=debug,llm_raw_traffic=debug"
+```
+
+In containers, mount a volume for the log directory
+(`-v ./logs:/app/logs`) or prefer the Docker logging driver
+(`--log-opt max-size=10m`); files are never pruned automatically - clean
+or archive them externally.
 
 ## Plugins
 

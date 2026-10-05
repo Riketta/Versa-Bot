@@ -30,6 +30,24 @@ url = "sqlite://versabot.db"
 # reporting. Low rates like 0.01 keep the data volume down.
 # traces_sample_rate = 0.01
 
+# Optional: persistent file logging. Startup-only: the subscriber is
+# installed once at boot, changes require a restart. Remove the section
+# to log to stdout only (containers usually prefer the Docker logging
+# driver; otherwise mount a volume to keep the files).
+# [logging]
+# Log directory - created at boot; failure to create it aborts startup.
+# dir = "logs"
+# "daily" writes one file per day (versa-bot.log.2026-10-05); "never"
+# appends to a single versa-bot.log (pair with an external rotator).
+# Files are never pruned automatically.
+# rotation = "daily"
+# Independent filter for the file layer (RUST_LOG never affects it).
+# Default: flight recorder - the bot's breadcrumbs at debug even when
+# stdout runs quieter, third-party HTTP stack at warn. Add
+# "llm_raw_traffic=debug" to also capture full LLM request/response
+# bodies to the file (see the [llm] log_raw_traffic note below).
+# level = "info,versa_bot=debug,reqwest=warn,hyper=warn,hyper_util=warn"
+
 # Optional: LLM chat runtime. This section is the bot operator's domain -
 # guild moderators only pick among the declared models via /llm_assign
 # and /llm_set, never configure endpoints. Startup-only: changes require
@@ -78,8 +96,10 @@ url = "sqlite://versabot.db"
 # recorded undescribed.
 # max_images_per_message = 2
 #
-# Diagnostic: dump every LLM request and response body at DEBUG level
-# (stdout only, never Sentry). The bodies carry full conversation
+# Diagnostic: dump every LLM request and response body at DEBUG level,
+# under the dedicated `llm_raw_traffic` target - stdout only, never
+# Sentry, and captured to `[logging]` files only when that target is
+# named in `[logging].level`. The bodies carry full conversation
 # content - enable only while debugging a provider.
 # log_raw_traffic = false
 
