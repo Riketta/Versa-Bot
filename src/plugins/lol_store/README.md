@@ -112,7 +112,7 @@ The error text is the fastest way to a correct request shape.
 Live-probed on patch ~26.x (EUW, 2026-10). Resolve anything that moved
 via `/help?target=`.
 
-Transport gotchas (both bit us in production):
+Transport gotchas (each one bit us in production):
 
 - **Some bodies arrive gzip-compressed** - the client's HTTP server
   compresses large payloads (`/lol-store/v1/catalog`, `/lol-shoppefront/
@@ -125,6 +125,14 @@ Transport gotchas (both bit us in production):
   sentinel array element, not a champion object. Strict `Vec<struct>`
   deserialization fails on it; skip non-object elements (and entries
   with empty names) instead of parsing the array in one shot.
+- **The store session is lazy** - `/lol-store/v1/catalog` answers `200`
+  with a bare `null` body until the store backend initializes for the
+  client session (opening the store tab once warms it); a poller just
+  retries and self-heals. Treat `null` as "not ready", never as an
+  empty catalog.
+- **`/lol-shoppefront/v1/stores` is a paged envelope** - the stores
+  array lives under `data`, beside `notes`, `paging`, `stats`. The bare
+  array captured from older swagger-era notes no longer exists.
 
 Identity & assets:
 
@@ -139,10 +147,10 @@ Store (what this plugin uses):
 
 | Path | Notes |
 |---|---|
-| `/lol-store/v1/catalog` | bare = full catalog (~9.5k items): `localizations.<locale>.name`, `prices[]`, `itemRequirements[]` (skin -> champion), `releaseDate` |
+| `/lol-store/v1/catalog` | bare = full catalog (~9.5k items): `localizations.<locale>.name`, `prices[]`, `itemRequirements[]` (skin -> champion), `releaseDate`; answers bare `null` while the store session is cold |
 | `/lol-store/v1/catalog/{inventoryType}` | trap: the path variant requires an `itemIds` **vector**; prefer the bare form |
 | `/lol-store/v1/catalog/sales` | active sales; the `sale.prices[].discount` field is dead (always `0.0`) - compute % off against the catalog's original price |
-| `/lol-shoppefront/v1/stores` | the new store frontend's shelves; rotation stores carry `rotatingStoreMetadata` (`rotationCadence`, `currRotationStartTime`, `nextRotationStartTime`); Mythic Shop = `displayMetadata.shoppefront.id == "MYTHIC_SHOP"` with DAILY/WEEKLY/BIWEEKLY rotations |
+| `/lol-shoppefront/v1/stores` | paged envelope: stores live under `data` (beside `notes`, `paging`, `stats`); rotation stores carry `rotatingStoreMetadata` (`rotationCadence`, `currRotationStartTime`, `nextRotationStartTime`); Mythic Shop = `displayMetadata.shoppefront.id == "MYTHIC_SHOP"` with DAILY/WEEKLY/BIWEEKLY rotations; non-mythic shelves (incl. `*_TEST` stores) are ignored by the tracker |
 | `/lol-shoppefront/v1/store-digests` | compact shelf summaries |
 | `/lol-yourshop/v1/status` | Your Shop event: `hubEnabled`, `startTime`, `endTime` (placeholder dates while deactivated) |
 | `/lol-yourshop/v1/offers` | the 6 personal offers (`skinName`, `discountPrice`, `expirationDate`); 404s unless the event is live |

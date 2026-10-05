@@ -448,7 +448,31 @@ impl LcuClient {
 #[async_trait]
 impl LcuPort for LcuClient {
     async fn catalog(&self) -> Result<Vec<CatalogItem>, LcuError> {
-        self.get_json_typed("/lol-store/v1/catalog").await
+        let path = "/lol-store/v1/catalog";
+        let value = self.get_json(path).await?;
+        // A cold store session answers 200 with a bare `null` until the
+        // store backend initializes (opening the store tab once warms it);
+        // surface that explicitly instead of serde's "invalid type: null,
+        // expected a sequence".
+        let serde_json::Value::Array(entries) = value else {
+            return Err(LcuError::Parse(format!(
+                "{path}: store catalog not initialized yet - open the store \
+                 tab once in the client; the poll retries and self-heals"
+            )));
+        };
+        // One unparsable item must not void a ~9.5k-entry catalog.
+        let mut items = Vec::with_capacity(entries.len());
+        let mut skipped = 0usize;
+        for entry in entries {
+            match serde_json::from_value::<CatalogItem>(entry) {
+                Ok(item) => items.push(item),
+                Err(_) => skipped += 1,
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(path = %path, skipped, "unparsable catalog items skipped");
+        }
+        Ok(items)
     }
 
     async fn sales(&self) -> Result<Vec<Sale>, LcuError> {
@@ -456,7 +480,38 @@ impl LcuPort for LcuClient {
     }
 
     async fn rotations(&self) -> Result<Vec<RotationStore>, LcuError> {
-        self.get_json_typed("/lol-shoppefront/v1/stores").await
+        let path = "/lol-shoppefront/v1/stores";
+        let value = self.get_json(path).await?;
+        // Live shape: a paged envelope - {data: [...], notes, paging,
+        // stats}; a bare array stays accepted (earlier captures).
+        let entries = match value {
+            serde_json::Value::Array(entries) => entries,
+            serde_json::Value::Object(map) => match map.get("data") {
+                Some(serde_json::Value::Array(entries)) => entries.clone(),
+                _ => {
+                    return Err(LcuError::Parse(format!(
+                        "{path}: paged envelope without a 'data' array"
+                    )));
+                }
+            },
+            _ => {
+                return Err(LcuError::Parse(format!(
+                    "{path}: expected a store array or a paged envelope"
+                )));
+            }
+        };
+        let mut stores = Vec::with_capacity(entries.len());
+        let mut skipped = 0usize;
+        for entry in entries {
+            match serde_json::from_value::<RotationStore>(entry) {
+                Ok(store) => stores.push(store),
+                Err(_) => skipped += 1,
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(path = %path, skipped, "unparsable rotation stores skipped");
+        }
+        Ok(stores)
     }
 
     async fn yourshop_status(&self) -> Result<YourShopStatus, LcuError> {
@@ -814,5 +869,80 @@ mod tests {
 
         let champions = client.champion_names().await.expect("champion names expected to parse");
         assert_eq!(champions, vec![ChampionEntry { id: 266, name: Some("Aatrox".to_owned()) }]);
+    }
+
+    /// Live shoppefront shape: a paged envelope whose `data` array holds
+    /// the stores (verified against a warm client, patch ~26.x).
+    #[tokio::test]
+    async fn rotations_unwrap_the_paged_envelope() {
+        let lockfile = lockfile_path("rotations");
+        write_lockfile(&lockfile, "token");
+        let store = serde_json::json!({
+            "name": "MYTHIC_SHOPPE_WEEKLY_ROTATION_V6",
+            "displayMetadata": {"shoppefront": {"id": "MYTHIC_SHOP", "categories": ["WEEKLY"]}},
+            "rotatingStoreMetadata": {"rotationCadence": "PT168H",
+                                      "currRotationStartTime": "2026-10-01T00:00:00.000Z",
+                                      "nextRotationStartTime": "2026-10-08T00:00:00.000Z"},
+            "catalogEntries": []
+        });
+        let envelope = serde_json::json!({"data": [store], "notes": [], "paging": {}, "stats": {}});
+        let transport = Arc::new(ScriptedTransport {
+            answers: Mutex::new(vec![ScriptedTransport::ok(200, envelope)]),
+            seen: Mutex::new(Vec::new()),
+            rewrite: None,
+        });
+        let client = client_at(transport, lockfile);
+
+        let stores = client.rotations().await.expect("envelope expected to parse");
+        assert_eq!(stores.len(), 1);
+        assert_eq!(
+            stores.first().and_then(|store| store.category_label()).as_deref(),
+            Some("weekly")
+        );
+    }
+
+    /// A cold store session: catalog answers 200 with a bare `null` body.
+    /// That must surface as an explicit, actionable parse error - not
+    /// serde's raw "invalid type: null".
+    #[tokio::test]
+    async fn cold_catalog_null_is_an_explicit_parse_error() {
+        let lockfile = lockfile_path("cold-catalog");
+        write_lockfile(&lockfile, "token");
+        let transport = Arc::new(ScriptedTransport {
+            answers: Mutex::new(vec![ScriptedTransport::ok(200, serde_json::Value::Null)]),
+            seen: Mutex::new(Vec::new()),
+            rewrite: None,
+        });
+        let client = client_at(transport, lockfile);
+
+        let err = client.catalog().await.expect_err("null catalog expected to fail");
+        assert!(matches!(err, LcuError::Parse(_)), "{err}");
+        assert!(err.to_string().contains("not initialized"), "{err}");
+    }
+
+    /// A single unparsable element degrades to a skip instead of voiding
+    /// the whole source.
+    #[tokio::test]
+    async fn catalog_and_rotations_skip_unparsable_elements() {
+        let lockfile = lockfile_path("skip");
+        write_lockfile(&lockfile, "token");
+        let item = serde_json::json!({
+            "inventoryType": "CHAMPION_SKIN", "itemId": 10002,
+            "prices": [{"cost": 520, "currency": "RP"}]
+        });
+        let transport = Arc::new(ScriptedTransport {
+            answers: Mutex::new(vec![
+                ScriptedTransport::ok(200, serde_json::json!([item, null, "junk"])),
+                ScriptedTransport::ok(200, serde_json::json!({"data": [item, 7], "notes": []})),
+            ]),
+            seen: Mutex::new(Vec::new()),
+            rewrite: None,
+        });
+        let client = client_at(transport, lockfile);
+
+        let items = client.catalog().await.expect("catalog expected to parse");
+        assert_eq!(items.len(), 1, "only the valid item survives");
+        let stores = client.rotations().await.expect("rotations expected to parse");
+        assert_eq!(stores.len(), 1, "only the valid store survives");
     }
 }
