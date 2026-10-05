@@ -2,7 +2,7 @@
 //! name tables to produce the announcement text. Every line degrades
 //! gracefully - a missing join yields a synthetic name, never an error.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::diff::StoreDelta;
 use super::lcu::CatalogItem;
@@ -40,15 +40,25 @@ pub struct NameIndex {
     pub catalog: HashMap<u64, CatalogItem>,
     pub champions: HashMap<u64, String>,
     pub(crate) skins: Vec<SkinEntry>,
+    /// Champion ids the store catalog can actually reach - the ids its
+    /// items resolve to. Matching is purely catalog-driven, so a
+    /// champion-table row without one can never fire a watch (the live
+    /// table lists some champions twice: live + Classic variants).
+    pub(crate) store_backed: HashSet<u64>,
 }
 
 impl NameIndex {
     #[must_use]
     pub fn new(catalog: Vec<CatalogItem>, champions: BTreeMap<u64, String>) -> Self {
+        let catalog: HashMap<u64, CatalogItem> =
+            catalog.into_iter().map(|item| (item.item_id, item)).collect();
+        let store_backed: HashSet<u64> =
+            catalog.values().filter_map(Self::item_champion_id).collect();
         let mut index = Self {
-            catalog: catalog.into_iter().map(|item| (item.item_id, item)).collect(),
+            catalog,
             champions: champions.into_iter().collect(),
             skins: Vec::new(),
+            store_backed,
         };
         let mut skins: Vec<SkinEntry> = index
             .catalog
@@ -70,7 +80,12 @@ impl NameIndex {
     #[cfg(test)]
     #[must_use]
     pub fn empty() -> Self {
-        Self { catalog: HashMap::new(), champions: HashMap::new(), skins: Vec::new() }
+        Self {
+            catalog: HashMap::new(),
+            champions: HashMap::new(),
+            skins: Vec::new(),
+            store_backed: HashSet::new(),
+        }
     }
 
     fn champion_name(&self, champion_id: u64) -> String {
@@ -86,12 +101,12 @@ impl NameIndex {
     /// orbs, bundles) get no champion prefix: their ids mean nothing by
     /// that convention.
     pub(crate) fn skin_champion(&self, item: &CatalogItem) -> Option<String> {
-        let champion_id = self.champion_id(item)?;
+        let champion_id = Self::item_champion_id(item)?;
         Some(self.champion_name(champion_id))
     }
 
     /// The champion id behind a catalog item (see [`NameIndex::skin_champion`]).
-    fn champion_id(&self, item: &CatalogItem) -> Option<u64> {
+    fn item_champion_id(item: &CatalogItem) -> Option<u64> {
         let from_requirements = item
             .item_requirements
             .iter()
@@ -114,7 +129,7 @@ impl NameIndex {
     /// joins on this - base champions and non-skin items join to nothing.
     pub(crate) fn champion_id_of_item(&self, item_id: u64) -> Option<u64> {
         let item = self.catalog.get(&item_id)?;
-        self.champion_id(item)
+        Self::item_champion_id(item)
     }
 
     fn original_price(&self, item_id: u64) -> Option<u64> {

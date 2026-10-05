@@ -2,6 +2,7 @@
 //! use the event-scoped guild storage; status/dump commands read the
 //! engine's in-memory state, which is why they hold an `Arc` to it.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -282,7 +283,12 @@ async fn quarantine_unreadable(
 enum Resolved {
     Hit(WatchTarget),
     Nothing,
-    Candidates(Vec<String>),
+    /// Suggestion lines; `by_id` marks lists whose rows carry an
+    /// `(id N)` suffix - the reply then offers picking one with it.
+    Candidates {
+        lines: Vec<String>,
+        by_id: bool,
+    },
 }
 
 /// The validated `target` dropdown value.
@@ -350,55 +356,110 @@ fn resolve_skin(query: &str, hits: &[SkinHit]) -> Resolved {
                 champion: hit.champion.clone(),
                 skin: hit.skin.clone(),
             }),
-            many => {
-                candidate_lines(many.iter().map(|hit| format!("{} - {}", hit.champion, hit.skin)))
-            }
+            many => candidate_lines(
+                many.iter().map(|hit| format!("{} - {}", hit.champion, hit.skin)).collect(),
+                false,
+            ),
         },
-        many => candidate_lines(many.iter().map(|hit| format!("{} - {}", hit.champion, hit.skin))),
+        many => candidate_lines(
+            many.iter().map(|hit| format!("{} - {}", hit.champion, hit.skin)).collect(),
+            false,
+        ),
     }
 }
 
-fn resolve_champion(query: &str, hits: &[ChampionHit]) -> Resolved {
+/// Breadcrumb payload: the competing ids, joined - shapes, not contents.
+fn ids_of<'a>(hits: impl IntoIterator<Item = &'a ChampionHit>) -> String {
+    hits.into_iter().map(|hit| hit.champion_id.to_string()).collect::<Vec<_>>().join(",")
+}
+
+fn resolve_champion(query: &str, hits: &[ChampionHit], store_backed: &HashSet<u64>) -> Resolved {
+    // A bare number selects by champion id directly - the only way to
+    // pick between same-named rows that are both real (live + Classic
+    // variants share the display name).
+    if let Ok(id) = query.parse::<u64>() {
+        if let Some(hit) = hits.iter().find(|hit| hit.champion_id == id) {
+            return Resolved::Hit(WatchTarget::Champion {
+                champion_id: hit.champion_id,
+                champion: hit.champion.clone(),
+            });
+        }
+    }
     let needle = normalize_name(query);
     let exacts: Vec<&ChampionHit> =
         hits.iter().filter(|hit| normalize_name(&hit.champion) == needle).collect();
-    // Every exact hit shares the query's name by construction - several
-    // rows under one name collapse to the lowest champion id instead of
-    // asking for an exact name that cannot disambiguate anything. The
-    // breadcrumb keeps the id set observable: if the rows ever turn out
-    // to be genuinely different targets (not duplicates), this is where
-    // it shows.
-    if let Some(hit) = exacts.iter().min_by_key(|hit| hit.champion_id) {
-        if exacts.len() > 1 {
-            tracing::debug!(
-                champion_ids = %exacts
-                    .iter()
-                    .map(|hit| hit.champion_id.to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                "champion name spans several table ids - watch bound to the lowest"
-            );
+    // The table lists some champions under several ids (live + Classic
+    // variants share one display name). Only ids the store catalog can
+    // reach can ever fire, so bind to a backed id when exactly one
+    // exists; several backed ids are genuinely different targets and
+    // stay a disambiguation list.
+    let backed: Vec<&ChampionHit> =
+        exacts.iter().filter(|hit| store_backed.contains(&hit.champion_id)).copied().collect();
+    match backed.as_slice() {
+        [hit] => {
+            if exacts.len() > 1 {
+                tracing::debug!(
+                    champion_ids = %ids_of(exacts.iter().copied()),
+                    bound = hit.champion_id,
+                    "champion name spans several table ids - watch bound to the store-backed id"
+                );
+            }
+            Resolved::Hit(WatchTarget::Champion {
+                champion_id: hit.champion_id,
+                champion: hit.champion.clone(),
+            })
         }
-        return Resolved::Hit(WatchTarget::Champion {
-            champion_id: hit.champion_id,
-            champion: hit.champion.clone(),
-        });
-    }
-    let by_name = |hit: &ChampionHit| normalize_name(&hit.champion);
-    match collapse(hits.iter(), by_name, |hit| hit.champion_id).as_slice() {
-        [] => Resolved::Nothing,
-        [hit] => Resolved::Hit(WatchTarget::Champion {
-            champion_id: hit.champion_id,
-            champion: hit.champion.clone(),
-        }),
-        many => candidate_lines(many.iter().map(|hit| hit.champion.clone())),
+        // No store-backed id (catalog empty or not yet polled): lowest
+        // id is the release-ordered canonical row.
+        [] => {
+            if let Some(hit) = exacts.iter().min_by_key(|hit| hit.champion_id) {
+                if exacts.len() > 1 {
+                    tracing::debug!(
+                        champion_ids = %ids_of(exacts.iter().copied()),
+                        bound = hit.champion_id,
+                        "champion name spans several table ids, none store-backed - \
+                         watch bound to the lowest"
+                    );
+                }
+                return Resolved::Hit(WatchTarget::Champion {
+                    champion_id: hit.champion_id,
+                    champion: hit.champion.clone(),
+                });
+            }
+            let by_name = |hit: &ChampionHit| normalize_name(&hit.champion);
+            match collapse(hits.iter(), by_name, |hit| hit.champion_id).as_slice() {
+                [] => Resolved::Nothing,
+                [hit] => Resolved::Hit(WatchTarget::Champion {
+                    champion_id: hit.champion_id,
+                    champion: hit.champion.clone(),
+                }),
+                many => {
+                    candidate_lines(many.iter().map(|hit| hit.champion.clone()).collect(), false)
+                }
+            }
+        }
+        // Reachable only with two or more backed ids: genuinely different
+        // targets sharing one display name.
+        many => {
+            tracing::debug!(
+                champion_ids = %ids_of(exacts.iter().copied()),
+                "champion name spans several store-backed ids - asking the user"
+            );
+            candidate_lines(
+                many.iter()
+                    .map(|hit| format!("{} (id {})", hit.champion, hit.champion_id))
+                    .collect(),
+                true,
+            )
+        }
     }
 }
 
 /// Suggestion lines are backticked: the reply renders as markdown, and the
 /// quotes keep stray whitespace in live names visible instead of silent.
-fn candidate_lines(lines: impl Iterator<Item = String>) -> Resolved {
-    Resolved::Candidates(lines.map(|line| format!("`{line}`")).collect())
+fn candidate_lines(lines: Vec<String>, by_id: bool) -> Resolved {
+    let lines = lines.into_iter().map(|line| format!("`{line}`")).collect();
+    Resolved::Candidates { lines, by_id }
 }
 
 /// `/lol_store_watch`: subscribe to a skin or a champion's whole skin line
@@ -468,7 +529,9 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for WatchHandl
         };
         let resolved = match target_kind {
             TargetKind::Skin => resolve_skin(query, &search.skins),
-            TargetKind::Champion => resolve_champion(query, &search.champions),
+            TargetKind::Champion => {
+                resolve_champion(query, &search.champions, &search.store_backed)
+            }
         };
         let target = match resolved {
             Resolved::Hit(target) => target,
@@ -482,11 +545,12 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for WatchHandl
                     .await?;
                 return Ok(());
             }
-            Resolved::Candidates(lines) => {
+            Resolved::Candidates { lines, by_id } => {
+                let hint = if by_id { "the exact name or a listed id" } else { "the exact name" };
                 services
                     .chat_output
                     .send(command_reply(format!(
-                        "Several matches - run `/lol_store_watch` again with the exact name:\n{}",
+                        "Several matches - run `/lol_store_watch` again with {hint}:\n{}",
                         lines.join("\n")
                     )))
                     .await?;
@@ -692,6 +756,8 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for DumpHandle
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::super::watch::{ChampionHit, SkinHit};
     use super::{Resolved, WatchTarget, resolve_champion, resolve_skin};
 
@@ -708,21 +774,59 @@ mod tests {
         let ascending = vec![champion(57, "Evelynn"), champion(9057, "Evelynn")];
         let descending: Vec<_> = ascending.iter().rev().cloned().collect();
         for hits in [ascending, descending] {
-            match resolve_champion("Evelynn", &hits) {
+            match resolve_champion("Evelynn", &hits, &HashSet::new()) {
                 Resolved::Hit(WatchTarget::Champion { champion_id, champion }) => {
                     assert_eq!(champion_id, 57);
                     assert_eq!(champion, "Evelynn");
                 }
-                _ => panic!("one name under several ids must resolve, not ask again"),
+                _ => panic!("one name under several unbacked ids must resolve, not ask again"),
             }
+        }
+    }
+
+    #[test]
+    fn store_backed_id_wins_over_the_lowest() {
+        let hits = vec![champion(57, "Evelynn"), champion(9057, "Evelynn")];
+        let backed = HashSet::from([9057]);
+        match resolve_champion("Evelynn", &hits, &backed) {
+            Resolved::Hit(WatchTarget::Champion { champion_id, champion }) => {
+                assert_eq!(champion_id, 9057);
+                assert_eq!(champion, "Evelynn");
+            }
+            _ => panic!("the store-backed id must win over the id-order assumption"),
+        }
+    }
+
+    #[test]
+    fn several_store_backed_ids_stay_candidates_with_labels() {
+        let hits = vec![champion(57, "Evelynn"), champion(9057, "Evelynn")];
+        let backed = HashSet::from([57, 9057]);
+        match resolve_champion("Evelynn", &hits, &backed) {
+            Resolved::Candidates { lines, by_id } => {
+                assert!(by_id);
+                assert_eq!(lines, vec!["`Evelynn (id 57)`", "`Evelynn (id 9057)`"]);
+            }
+            _ => panic!("several store-backed ids are genuinely different targets"),
+        }
+    }
+
+    #[test]
+    fn a_numeric_name_selects_by_id() {
+        let hits = vec![champion(57, "Evelynn"), champion(9057, "Evelynn")];
+        match resolve_champion("9057", &hits, &HashSet::new()) {
+            Resolved::Hit(WatchTarget::Champion { champion_id, .. }) => {
+                assert_eq!(champion_id, 9057);
+            }
+            _ => panic!("a listed id must be selectable by typing it"),
         }
     }
 
     #[test]
     fn partial_champion_duplicates_list_one_candidate_per_name() {
         let hits = vec![champion(9057, "Evelynn"), champion(57, "Evelynn"), champion(120, "Kayn")];
-        match resolve_champion("yn", &hits) {
-            Resolved::Candidates(lines) => {
+        match resolve_champion("yn", &hits, &HashSet::new()) {
+            Resolved::Candidates { lines, by_id } => {
+                assert!(!by_id);
                 assert_eq!(lines, vec!["`Evelynn`", "`Kayn`"]);
             }
             _ => panic!("several distinct names must stay candidates"),
@@ -747,7 +851,8 @@ mod tests {
     fn same_skin_name_across_champions_stays_a_candidate_list() {
         let hits = vec![skin(1, "Ahri", "Fire"), skin(2, "Annie", "Fire")];
         match resolve_skin("fire", &hits) {
-            Resolved::Candidates(lines) => {
+            Resolved::Candidates { lines, by_id } => {
+                assert!(!by_id);
                 assert_eq!(lines, vec!["`Ahri - Fire`", "`Annie - Fire`"]);
             }
             _ => panic!("skins of different champions must stay candidates"),
@@ -756,7 +861,7 @@ mod tests {
 
     #[test]
     fn nothing_matches_without_any_hit() {
-        assert!(matches!(resolve_champion("missing", &[]), Resolved::Nothing));
+        assert!(matches!(resolve_champion("missing", &[], &HashSet::new()), Resolved::Nothing));
         assert!(matches!(resolve_skin("missing", &[]), Resolved::Nothing));
     }
 }

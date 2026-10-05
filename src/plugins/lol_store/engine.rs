@@ -574,6 +574,7 @@ impl<B: EventBusPort> StoreEngine<B> {
         Some(StoreSearch {
             skins: watch::search_skins(query, &index),
             champions: watch::search_champions(query, index.champions.iter()),
+            store_backed: index.store_backed.clone(),
         })
     }
 

@@ -10,6 +10,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashSet;
+
 use super::diff::StoreDelta;
 use super::format::{NameIndex, fit, mythic_line, push_section, sale_line, skin_line};
 
@@ -269,6 +271,9 @@ pub struct ChampionHit {
 pub struct StoreSearch {
     pub skins: Vec<SkinHit>,
     pub champions: Vec<ChampionHit>,
+    /// Champion-table ids the current catalog can actually reach (watch
+    /// matching is catalog-driven; an unreached id can never fire).
+    pub store_backed: HashSet<u64>,
 }
 
 /// Name search over catalog skins: exact (normalized) matches first, then
