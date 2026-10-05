@@ -1539,8 +1539,7 @@ impl ChatEngine {
 mod tests {
     use super::*;
     use crate::kernel::models::{
-        AttachmentPayload, ChannelId, GuildId, MessageId, OutboundError, StorageError,
-        UserId,
+        AttachmentPayload, ChannelId, GuildId, MessageId, OutboundError, StorageError, UserId,
     };
     use crate::kernel::spi_ports::{
         ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard, GuildStorage,
@@ -1873,7 +1872,7 @@ mod tests {
             completion,
             Arc::new(FixedRandom(false)),
             Arc::new(FakeDescriber::default()),
-        crate::test_support::test_platform_info(),
+            crate::test_support::test_platform_info(),
         );
         let storage = Arc::new(InMemoryStorage::new());
         let output = RecordingChatOutput::new();
@@ -2096,7 +2095,7 @@ mod tests {
             Arc::clone(&fake) as Arc<dyn LlmCompletionPort>,
             rng,
             Arc::clone(&describer) as Arc<dyn ImageDescriber>,
-        crate::test_support::test_platform_info(),
+            crate::test_support::test_platform_info(),
         );
         let storage = Arc::new(InMemoryStorage::new());
         let output = RecordingChatOutput::new();
@@ -2113,7 +2112,7 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
             guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
-        platform_info: crate::test_support::test_platform_info(),
+            platform_info: crate::test_support::test_platform_info(),
         };
         TestCtx { engine, fake, storage, output, begins, factory, services, describer }
     }
@@ -2196,7 +2195,7 @@ mod tests {
             chat_output_factory: Arc::new(FailingDeliveryFactory { output: Arc::clone(&output) })
                 as Arc<dyn ChatOutputFactoryPort>,
             guild_storage: Some(ctx.storage.guild_scoped("test", GuildId(1))),
-        platform_info: crate::test_support::test_platform_info(),
+            platform_info: crate::test_support::test_platform_info(),
         };
         seed_config(&ctx.storage, &assigned_config());
 
@@ -2910,7 +2909,7 @@ mod tests {
             Arc::clone(&fake) as Arc<dyn LlmCompletionPort>,
             Arc::new(RandRandom) as Arc<dyn RandomPort>,
             Arc::new(FakeDescriber::default()) as Arc<dyn ImageDescriber>,
-        crate::test_support::test_platform_info(),
+            crate::test_support::test_platform_info(),
         );
         let output = RecordingChatOutput::new();
         let services = KernelServices {
@@ -2921,7 +2920,7 @@ mod tests {
             guild_storage: Some(
                 crate::test_support::FailingStorage.guild_scoped("test", GuildId(1)),
             ),
-        platform_info: crate::test_support::test_platform_info(),
+            platform_info: crate::test_support::test_platform_info(),
         };
 
         engine
@@ -3580,7 +3579,7 @@ mod tests {
             chat_output_factory: Arc::new(FailingReactionFactory { output: Arc::clone(&output) })
                 as Arc<dyn ChatOutputFactoryPort>,
             guild_storage: Some(ctx.storage.guild_scoped("test", GuildId(1))),
-        platform_info: crate::test_support::test_platform_info(),
+            platform_info: crate::test_support::test_platform_info(),
         };
 
         ctx.engine.handle_message(&origin(), &payload(true, None), &config, &services, None).await;

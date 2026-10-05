@@ -176,8 +176,9 @@ message: kinds (`MessageReceived`, `MemberJoined`, `CommandInvoked`, ...)
 plus origin context (guild, channel, optional transactional
 `reply_token`, optional `locale`). The deployment serves exactly one chat
 platform per process: platform identity is deployment metadata via the
-driven `PlatformInfoPort` (adapter-owned stable slug for storage keys +
-presentation display name) - the kernel carries no platform vocabulary,
+driven `PlatformInfoPort` (adapter-owned stable slug for storage keys,
+presentation display name, and platform facts such as the outbound
+message limit) - the kernel carries no platform vocabulary,
 only the concept. The driving adapter normalizes ALL
 platform events onto this taxonomy, including mention-tag rewriting
 (`<@id>` -> `[Name]<@id>` inbound, so models see name + id; outbound

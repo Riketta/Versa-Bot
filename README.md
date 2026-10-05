@@ -549,7 +549,7 @@ history.
 # (both template-rendered per request - see "Prompt templates" below),
 # bot_name / bot_id (template identity overrides; discovered from the
 # platform at boot), compaction_model, compaction_keep_tail,
-# max_message_length (capped at Discord's 2000), stream_interval_ms,
+# max_message_length (clamped to the platform's message limit at boot), stream_interval_ms,
 # time_offset_minutes (0 = UTC), max_consecutive_newlines (collapse
 # blank-line runs in answers down to N; absent = untouched). `log_raw_traffic = true`
 # dumps every LLM request and response body at DEBUG level (stdout only)
@@ -771,7 +771,7 @@ uploaded files for long texts.
 | `random_chance` | 0-100 (clamped) | 2 | percent chance to chime in on a captured non-trigger message; 0 = off |
 | `random_cooldown` | whole seconds | 5 | minimum seconds between chime-ins - the reply and silent-react rolls each keep their own tracker behind it; 0 = none |
 | `random_react_chance` | 0-100 (clamped) | 10 | percent chance for a silent react (emoji only, no reply) on a captured non-trigger message; independent of `random_chance`; needs `react` on |
-| `max_length` | 1-2000 characters | `max_message_length` (2000) | per-channel reply-splitting limit |
+| `max_length` | 1 up to the platform's message limit | `max_message_length` | per-channel reply-splitting limit |
 | `turn_template` | template containing `{sender}` and `{message}` | `[{sender}](<@{user_id}>): {message}` | how user turns render into the model context; fields: `{sender}`, `{user_id}`, `{guild_name}`, `{time}` (unix), `{message}` |
 
 **Delivery.** The bot holds the channel's typing indicator from the

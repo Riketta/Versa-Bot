@@ -17,4 +17,10 @@ pub trait PlatformInfoPort: Send + Sync + 'static {
 
     /// Presentation name ("Discord") for user-facing text.
     fn display_name(&self) -> &'static str;
+
+    /// Hard cap on one outbound text message as enforced by the platform
+    /// (`Some(2000)` on Discord); `None` when the platform declares no cap.
+    /// Reply-splitting callers clamp their output to it - chunks beyond the
+    /// cap would be rejected outright.
+    fn message_limit(&self) -> Option<usize>;
 }

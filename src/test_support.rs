@@ -37,6 +37,12 @@ impl PlatformInfoPort for TestPlatformInfo {
     fn display_name(&self) -> &'static str {
         "Test"
     }
+
+    /// Same cap as the wired adapter, so tests pin the limits production
+    /// exercises.
+    fn message_limit(&self) -> Option<usize> {
+        Some(2000)
+    }
 }
 
 /// Arc'd [`TestPlatformInfo`] for `KernelServices` fixtures.

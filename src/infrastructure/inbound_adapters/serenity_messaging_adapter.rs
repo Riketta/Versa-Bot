@@ -42,6 +42,12 @@ impl PlatformInfoPort for DiscordPlatform {
     fn display_name(&self) -> &'static str {
         "Discord"
     }
+
+    fn message_limit(&self) -> Option<usize> {
+        // Bot accounts: the documented hard content limit. User-side Nitro
+        // extensions do not apply to bots.
+        Some(2000)
+    }
 }
 
 /// Kernel driving adapter: normalizes Discord gateway events onto the

@@ -27,10 +27,6 @@ use super::prompts;
 use super::providers::{LlmSettings, ModelSettings};
 use super::vision::DEFAULT_IMAGE_PROMPT;
 
-/// Discord's hard cap for one text message - the reply splitter must never
-/// produce chunks beyond it (the platform rejects them outright).
-pub const DISCORD_MESSAGE_LIMIT: usize = 2000;
-
 /// Recognized `/llm_set` keys, in display order. Doubles as the Discord
 /// choices dropdown for the `key` argument. Channel prompts are NOT keys -
 /// they have their own command (`/llm_set_prompt`), which also keeps this
@@ -115,12 +111,17 @@ fn parse_bool(value: &str) -> Option<bool> {
 /// Applies one `/llm_set` mutation. Pure so the key grammar stays unit-
 /// testable: `Ok(message)` describes the change, `Err(usage)` is the reply
 /// for an unknown key or malformed value.
-fn apply_set(config: &mut ChannelConfig, key: &str, value: &str) -> Result<String, String> {
+fn apply_set(
+    config: &mut ChannelConfig,
+    key: &str,
+    value: &str,
+    message_limit: Option<usize>,
+) -> Result<String, String> {
     let cleared = matches!(value, "clear" | "none" | "default");
     if let Some(result) = apply_numeric(config, key, value, cleared) {
         return result;
     }
-    if let Some(result) = apply_optional_field(config, key, value, cleared) {
+    if let Some(result) = apply_optional_field(config, key, value, cleared, message_limit) {
         return result;
     }
     if let Some(result) = apply_flag(config, key, value) {
@@ -348,6 +349,7 @@ fn apply_optional_field(
     key: &str,
     value: &str,
     cleared: bool,
+    message_limit: Option<usize>,
 ) -> Option<Result<String, String>> {
     match key {
         // Model refs sharing the set/clear shape. The text prompts left the
@@ -380,12 +382,18 @@ fn apply_optional_field(
             }
             match value.parse::<usize>() {
                 Ok(0) => Some(Err(format!("`{key}` must be at least 1."))),
-                // Discord rejects longer text messages outright - a bigger
-                // limit would only turn split replies into undelivered
-                // chunks.
-                Ok(n) if n > DISCORD_MESSAGE_LIMIT => Some(Err(format!(
-                    "`{key}` cannot exceed {DISCORD_MESSAGE_LIMIT} (Discord's message limit)."
-                ))),
+                // The platform rejects longer text messages outright - a
+                // bigger limit would only turn split replies into
+                // undelivered chunks. Platforms declaring no cap accept
+                // anything.
+                Ok(n)
+                    if let Some(cap) = message_limit
+                        && n > cap =>
+                {
+                    Some(Err(format!(
+                        "`{key}` cannot exceed {cap} (the platform's message limit)."
+                    )))
+                }
                 Ok(characters) => {
                     config.max_length = Some(characters);
                     Some(Ok(format!("`{key}` set to {characters} characters.")))
@@ -1069,7 +1077,7 @@ impl CommandHandler for SetLlmHandler {
             return Ok(());
         }
 
-        match apply_set(&mut config, key, value) {
+        match apply_set(&mut config, key, value, services.platform_info.message_limit()) {
             Ok(message) => {
                 save_config(event, services, config).await?;
                 services.chat_output.send(command_reply(message)).await?;
@@ -1660,6 +1668,10 @@ mod tests {
     use crate::plugins::llm::completion_port::{ResponseTiming, TokenUsage};
     use crate::test_support::InMemoryStorage;
 
+    /// The cap tests exercise: what [`TestPlatformInfo`] serves, mirroring
+    /// the wired adapter.
+    const PLATFORM_LIMIT: Option<usize> = Some(2000);
+
     /// The attachment argument must name Discord's CDN - https and the exact
     /// pinned host. Anything else (other hosts, other schemes, lookalike
     /// domains) is rejected before any network I/O: no arbitrary URL fetches.
@@ -1772,38 +1784,39 @@ mod tests {
     fn float_params_set_and_clear() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        let message = apply_set(&mut config, "temperature", "0.7").expect("set expected");
+        let message =
+            apply_set(&mut config, "temperature", "0.7", PLATFORM_LIMIT).expect("set expected");
         assert!(message.contains("0.7"));
         assert_eq!(config.params.temperature, Some(0.7));
 
-        apply_set(&mut config, "top_k", "40").expect("set expected");
+        apply_set(&mut config, "top_k", "40", PLATFORM_LIMIT).expect("set expected");
         assert_eq!(config.params.top_k, Some(40.0));
 
-        apply_set(&mut config, "temperature", "clear").expect("clear expected");
+        apply_set(&mut config, "temperature", "clear", PLATFORM_LIMIT).expect("clear expected");
         assert_eq!(config.params.temperature, None);
 
-        assert!(apply_set(&mut config, "top_p", "abc").is_err());
+        assert!(apply_set(&mut config, "top_p", "abc", PLATFORM_LIMIT).is_err());
     }
 
     #[test]
     fn bool_keys_accept_on_off_words() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "streaming", "on").expect("on expected");
+        apply_set(&mut config, "streaming", "on", PLATFORM_LIMIT).expect("on expected");
         assert!(config.streaming);
-        apply_set(&mut config, "streaming", "off").expect("off expected");
+        apply_set(&mut config, "streaming", "off", PLATFORM_LIMIT).expect("off expected");
         assert!(!config.streaming);
-        apply_set(&mut config, "compaction", "false").expect("false expected");
+        apply_set(&mut config, "compaction", "false", PLATFORM_LIMIT).expect("false expected");
         assert!(!config.compaction_enabled);
-        apply_set(&mut config, "images", "on").expect("on expected");
+        apply_set(&mut config, "images", "on", PLATFORM_LIMIT).expect("on expected");
         assert!(config.images);
-        apply_set(&mut config, "images", "off").expect("off expected");
+        apply_set(&mut config, "images", "off", PLATFORM_LIMIT).expect("off expected");
         assert!(!config.images);
-        apply_set(&mut config, "react", "on").expect("on expected");
+        apply_set(&mut config, "react", "on", PLATFORM_LIMIT).expect("on expected");
         assert!(config.react);
-        apply_set(&mut config, "react", "off").expect("off expected");
+        apply_set(&mut config, "react", "off", PLATFORM_LIMIT).expect("off expected");
         assert!(!config.react);
-        assert!(apply_set(&mut config, "streaming", "maybe").is_err());
+        assert!(apply_set(&mut config, "streaming", "maybe", PLATFORM_LIMIT).is_err());
     }
 
     /// Image settings follow the same set/clear grammar as their compaction
@@ -1814,14 +1827,17 @@ mod tests {
     fn image_keys_set_and_clear() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "image_model", "local/vision").expect("set expected");
+        apply_set(&mut config, "image_model", "local/vision", PLATFORM_LIMIT)
+            .expect("set expected");
         assert_eq!(config.image_model.as_deref(), Some("local/vision"));
 
-        apply_set(&mut config, "image_model", "clear").expect("clear expected");
+        apply_set(&mut config, "image_model", "clear", PLATFORM_LIMIT).expect("clear expected");
         assert_eq!(config.image_model, None);
 
-        assert!(apply_set(&mut config, "image_prompt", "Describe in Russian.").is_err());
-        assert!(apply_set(&mut config, "compaction_prompt", "Summarize.").is_err());
+        assert!(
+            apply_set(&mut config, "image_prompt", "Describe in Russian.", PLATFORM_LIMIT).is_err()
+        );
+        assert!(apply_set(&mut config, "compaction_prompt", "Summarize.", PLATFORM_LIMIT).is_err());
     }
 
     /// `off` is an explicit choice with its own acknowledgment and its own
@@ -1832,16 +1848,19 @@ mod tests {
     fn reasoning_effort_distinguishes_off_from_reset() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        let set = apply_set(&mut config, "reasoning_effort", "low").expect("set expected");
+        let set = apply_set(&mut config, "reasoning_effort", "low", PLATFORM_LIMIT)
+            .expect("set expected");
         assert!(set.contains("set to `low`"));
         assert_eq!(config.params.reasoning_effort.as_deref(), Some("low"));
 
-        let off = apply_set(&mut config, "reasoning_effort", "off").expect("off expected");
+        let off = apply_set(&mut config, "reasoning_effort", "off", PLATFORM_LIMIT)
+            .expect("off expected");
         assert!(off.contains("`reasoning_effort` off"));
         assert!(off.contains("explicit disable"));
         assert_eq!(config.params.reasoning_effort.as_deref(), Some("off"));
 
-        let cleared = apply_set(&mut config, "reasoning_effort", "clear").expect("clear expected");
+        let cleared = apply_set(&mut config, "reasoning_effort", "clear", PLATFORM_LIMIT)
+            .expect("clear expected");
         assert!(cleared.contains("cleared"));
         assert_eq!(config.params.reasoning_effort, None);
     }
@@ -1850,32 +1869,35 @@ mod tests {
     fn numeric_keys_validate_ranges() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "depth", "0").unwrap_err();
-        apply_set(&mut config, "depth", "50").expect("depth expected");
+        apply_set(&mut config, "depth", "0", PLATFORM_LIMIT).unwrap_err();
+        apply_set(&mut config, "depth", "50", PLATFORM_LIMIT).expect("depth expected");
         assert_eq!(config.history_depth, 50);
 
-        apply_set(&mut config, "random_chance", "250").expect("clamp expected");
+        apply_set(&mut config, "random_chance", "250", PLATFORM_LIMIT).expect("clamp expected");
         assert!((config.random_chance_percent - 100.0).abs() < f64::EPSILON);
-        apply_set(&mut config, "random_chance", "clear").expect("clear expected");
+        apply_set(&mut config, "random_chance", "clear", PLATFORM_LIMIT).expect("clear expected");
         assert!((config.random_chance_percent).abs() < f64::EPSILON);
 
-        apply_set(&mut config, "random_react_chance", "250").expect("clamp expected");
+        apply_set(&mut config, "random_react_chance", "250", PLATFORM_LIMIT)
+            .expect("clamp expected");
         assert!((config.random_react_chance_percent - 100.0).abs() < f64::EPSILON);
-        apply_set(&mut config, "random_react_chance", "clear").expect("clear expected");
+        apply_set(&mut config, "random_react_chance", "clear", PLATFORM_LIMIT)
+            .expect("clear expected");
         assert!((config.random_react_chance_percent).abs() < f64::EPSILON);
 
-        apply_set(&mut config, "random_cooldown", "30").expect("cooldown expected");
+        apply_set(&mut config, "random_cooldown", "30", PLATFORM_LIMIT).expect("cooldown expected");
         assert_eq!(config.random_cooldown_secs, 30);
-        apply_set(&mut config, "random_cooldown", "clear").expect("cooldown clear expected");
+        apply_set(&mut config, "random_cooldown", "clear", PLATFORM_LIMIT)
+            .expect("cooldown clear expected");
         assert_eq!(config.random_cooldown_secs, 5);
-        apply_set(&mut config, "random_cooldown", "not-a-number").unwrap_err();
+        apply_set(&mut config, "random_cooldown", "not-a-number", PLATFORM_LIMIT).unwrap_err();
 
-        apply_set(&mut config, "max_tokens", "not-a-number").unwrap_err();
+        apply_set(&mut config, "max_tokens", "not-a-number", PLATFORM_LIMIT).unwrap_err();
 
         // A zero budget would keep only the newest turn - rejected like
         // `depth` 0, not accepted as "no budget".
-        apply_set(&mut config, "context_budget", "0").unwrap_err();
-        apply_set(&mut config, "context_budget", "4096").expect("budget expected");
+        apply_set(&mut config, "context_budget", "0", PLATFORM_LIMIT).unwrap_err();
+        apply_set(&mut config, "context_budget", "4096", PLATFORM_LIMIT).expect("budget expected");
         assert_eq!(config.context_budget_tokens, Some(4096));
     }
 
@@ -1883,26 +1905,38 @@ mod tests {
     fn max_length_cannot_exceed_the_platform_limit() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "max_length", "2000").expect("limit value expected");
+        apply_set(&mut config, "max_length", "2000", Some(2000)).expect("limit value expected");
         assert_eq!(config.max_length, Some(2000));
-        // Beyond Discord's cap the platform rejects the chunks outright -
-        // rejected here so replies never turn into undelivered garbage.
-        apply_set(&mut config, "max_length", "2001").unwrap_err();
+        // Beyond the cap the platform rejects the chunks outright - rejected
+        // here so replies never turn into undelivered garbage.
+        apply_set(&mut config, "max_length", "2001", Some(2000)).unwrap_err();
         assert_eq!(config.max_length, Some(2000));
+    }
+
+    #[test]
+    fn max_length_ignores_the_cap_when_the_platform_declares_none() {
+        let mut config = ChannelConfig::assigned("m".to_owned());
+
+        apply_set(&mut config, "max_length", "5000", None).expect("no cap expected");
+        assert_eq!(config.max_length, Some(5000));
+        apply_set(&mut config, "max_length", "clear", None).expect("clear expected");
+        assert_eq!(config.max_length, None);
     }
 
     #[test]
     fn capture_mode_and_template_validate() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "capture_mode", "all_messages").expect("mode expected");
+        apply_set(&mut config, "capture_mode", "all_messages", PLATFORM_LIMIT)
+            .expect("mode expected");
         assert_eq!(config.capture_mode, CaptureMode::AllMessages);
-        apply_set(&mut config, "capture_mode", "chaos").unwrap_err();
+        apply_set(&mut config, "capture_mode", "chaos", PLATFORM_LIMIT).unwrap_err();
 
-        apply_set(&mut config, "turn_template", "<{sender}> {message}").expect("template expected");
+        apply_set(&mut config, "turn_template", "<{sender}> {message}", PLATFORM_LIMIT)
+            .expect("template expected");
         assert_eq!(config.turn_template.as_deref(), Some("<{sender}> {message}"));
-        apply_set(&mut config, "turn_template", "no placeholders").unwrap_err();
-        apply_set(&mut config, "turn_template", "clear").expect("clear expected");
+        apply_set(&mut config, "turn_template", "no placeholders", PLATFORM_LIMIT).unwrap_err();
+        apply_set(&mut config, "turn_template", "clear", PLATFORM_LIMIT).expect("clear expected");
         assert_eq!(config.turn_template, None);
     }
 
@@ -1910,11 +1944,12 @@ mod tests {
     fn unknown_keys_and_required_fields_are_rejected() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        let unknown = apply_set(&mut config, "vibes", "maximum").unwrap_err();
+        let unknown = apply_set(&mut config, "vibes", "maximum", PLATFORM_LIMIT).unwrap_err();
         assert!(unknown.contains("Unknown key"));
-        assert!(apply_set(&mut config, "model", "clear").is_err());
-        assert!(apply_set(&mut config, "depth", "clear").is_err());
-        apply_set(&mut config, "model", "zai/glm-5.3-flash").expect("model expected");
+        assert!(apply_set(&mut config, "model", "clear", PLATFORM_LIMIT).is_err());
+        assert!(apply_set(&mut config, "depth", "clear", PLATFORM_LIMIT).is_err());
+        apply_set(&mut config, "model", "zai/glm-5.3-flash", PLATFORM_LIMIT)
+            .expect("model expected");
         assert_eq!(config.model, "zai/glm-5.3-flash");
     }
 
@@ -1924,7 +1959,7 @@ mod tests {
     fn flag_with_invalid_value_reports_usage_not_unknown_key() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        let err = apply_set(&mut config, "streaming", "maybe").unwrap_err();
+        let err = apply_set(&mut config, "streaming", "maybe", PLATFORM_LIMIT).unwrap_err();
         assert!(err.contains("on or off"), "unexpected reply: {err}");
         assert!(!err.contains("Unknown key"), "unexpected reply: {err}");
         assert!(!config.streaming, "the failed set must not mutate");
@@ -2000,14 +2035,14 @@ mod tests {
     fn float_keys_reject_non_finite_values() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        assert!(apply_set(&mut config, "temperature", "NaN").is_err());
-        assert!(apply_set(&mut config, "top_p", "inf").is_err());
-        assert!(apply_set(&mut config, "min_p", "-inf").is_err());
+        assert!(apply_set(&mut config, "temperature", "NaN", PLATFORM_LIMIT).is_err());
+        assert!(apply_set(&mut config, "top_p", "inf", PLATFORM_LIMIT).is_err());
+        assert!(apply_set(&mut config, "min_p", "-inf", PLATFORM_LIMIT).is_err());
         assert_eq!(config.params.temperature, None, "nothing may be stored");
 
         // NaN would clamp to NaN, not to the range bounds; the default stays.
         let before = config.random_chance_percent;
-        assert!(apply_set(&mut config, "random_chance", "NaN").is_err());
+        assert!(apply_set(&mut config, "random_chance", "NaN", PLATFORM_LIMIT).is_err());
         assert!((config.random_chance_percent - before).abs() < f64::EPSILON);
     }
 

@@ -26,9 +26,9 @@ use versa_bot::plugins::audit::AuditLogPlugin;
 use versa_bot::plugins::auth::AuthPlugin;
 use versa_bot::plugins::command::CommandPlugin;
 use versa_bot::plugins::llm::{
-    ChatEngine, DISCORD_MESSAGE_LIMIT, DeckRandom, ImageDescriber, LlmCompletionPort, LlmPlugin,
-    LlmSettings, ModelSettings, OpenAiCompatibleAdapter, ProviderSettings, RandomPort,
-    ReasoningStyle, SummaryPlacement, VisionService,
+    ChatEngine, DeckRandom, ImageDescriber, LlmCompletionPort, LlmPlugin, LlmSettings,
+    ModelSettings, OpenAiCompatibleAdapter, ProviderSettings, RandomPort, ReasoningStyle,
+    SummaryPlacement, VisionService,
 };
 use versa_bot::plugins::lol_leaderboard::{
     DeepLolSource, EngineSettings as LeaderboardEngineSettings, LeaderboardEngine,
@@ -134,6 +134,7 @@ async fn main() -> ExitCode {
                     config,
                     config.bot_name.clone().or_else(|| Some(bot_user.name.clone())),
                     config.bot_id.clone().or_else(|| Some(bot_user.id.get().to_string())),
+                    platform_info.message_limit(),
                 )
             })
             .unwrap_or_default(),
@@ -357,17 +358,23 @@ fn llm_settings_from(
     config: &LlmConfig,
     bot_name: Option<String>,
     bot_id: Option<String>,
+    message_limit: Option<usize>,
 ) -> LlmSettings {
     // Operator knobs clamped to safe ranges, mirroring the command-layer
     // guards. The clamp is announced - a silent correction hides a typo.
-    let max_message_length = config.max_message_length.clamp(1, DISCORD_MESSAGE_LIMIT);
+    let max_message_length = match message_limit {
+        Some(cap) => config.max_message_length.clamp(1, cap),
+        None => config.max_message_length.max(1),
+    };
     if config.max_message_length == 0 {
         tracing::warn!("[llm] max_message_length is zero - clamped to 1");
-    } else if config.max_message_length > DISCORD_MESSAGE_LIMIT {
+    } else if let Some(cap) = message_limit
+        && config.max_message_length > cap
+    {
         tracing::warn!(
             configured = config.max_message_length,
-            clamped = DISCORD_MESSAGE_LIMIT,
-            "[llm] max_message_length exceeds Discord's message cap - clamped"
+            clamped = max_message_length,
+            "[llm] max_message_length exceeds the platform's message cap - clamped"
         );
     }
     let image_max_side = config.image_max_side.max(1);
