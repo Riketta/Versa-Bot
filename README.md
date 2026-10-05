@@ -371,7 +371,8 @@ Watch notes:
   some champions twice (live + Classic variants share one display name);
   a watch binds to the id the store catalog can actually reach, and when
   several ids qualify the candidates carry their ids - re-run with the
-  id, or type it right away, to pick one.
+  id (pasting the candidate line works) to pick one. Same-named variant
+  skins are listed with their item ids the same way.
 - `/lol_store_watch` reports current activity in its confirmation
   ("currently on sale", "currently in the mythic rotation"). Firing is
   edge-based: a skin already on sale when you subscribe will not notify

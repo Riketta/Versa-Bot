@@ -251,10 +251,41 @@ pub fn normalize_name(name: &str) -> String {
     out.trim().to_owned()
 }
 
+/// A query that names a row by id rather than by name: a bare number
+/// (`41`), a bare `id 41`, or a candidate line pasted back
+/// (`Gangplank (id 41)`). Candidate replies print ids, so every form the
+/// reply suggests must parse back.
+#[must_use]
+pub fn query_id(query: &str) -> Option<u64> {
+    let trimmed = query.trim();
+    if let Ok(id) = trimmed.parse::<u64>() {
+        return Some(id);
+    }
+    let stripped = trimmed.strip_suffix(')').unwrap_or(trimmed).trim_end();
+    let (head, num) = stripped.rsplit_once(' ')?;
+    if num.is_empty() || !num.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    // The head must end with the whole token `id` (possibly parenthesized).
+    let head_lower = head.to_lowercase();
+    let Some(without_marker) = head_lower.strip_suffix("id") else {
+        return None;
+    };
+    match without_marker.chars().next_back() {
+        None | Some('(') => {}
+        Some(c) if c.is_whitespace() => {}
+        _ => return None,
+    }
+    num.parse::<u64>().ok()
+}
+
 /// A skin resolved from the catalog by name search.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkinHit {
     pub item_id: u64,
+    /// Champion table id behind the skin - live and Classic variants
+    /// share display names but not ids.
+    pub champion_id: u64,
     pub champion: String,
     pub skin: String,
 }
@@ -292,6 +323,7 @@ pub fn search_skins(query: &str, index: &NameIndex) -> Vec<SkinHit> {
         let normalized = normalize_name(&entry.skin);
         let hit = SkinHit {
             item_id: entry.item_id,
+            champion_id: entry.champion_id,
             champion: entry.champion.clone(),
             skin: entry.skin.clone(),
         };
@@ -505,6 +537,17 @@ mod tests {
         assert_eq!(normalize_name("  Blood   Moon  Evelynn "), "blood moon evelynn");
         assert_eq!(normalize_name("Nunu & Willump"), "nunu willump");
         assert_eq!(normalize_name("!!!"), "");
+    }
+
+    #[test]
+    fn query_id_parses_bare_and_pasted_forms() {
+        assert_eq!(query_id("41"), Some(41));
+        assert_eq!(query_id(" 41 "), Some(41));
+        assert_eq!(query_id("Gangplank (id 41)"), Some(41));
+        assert_eq!(query_id("id 41"), Some(41));
+        assert_eq!(query_id("Blood Moon Evelynn"), None);
+        assert_eq!(query_id("Gangplank (id x)"), None);
+        assert_eq!(query_id("Gangplank (41"), None);
     }
 
     #[test]

@@ -571,11 +571,29 @@ impl<B: EventBusPort> StoreEngine<B> {
     /// (the client has not polled successfully since boot).
     pub async fn search_store(&self, query: &str) -> Option<StoreSearch> {
         let index = self.cached_index().await?;
-        Some(StoreSearch {
-            skins: watch::search_skins(query, &index),
-            champions: watch::search_champions(query, index.champions.iter()),
-            store_backed: index.store_backed.clone(),
-        })
+        let mut champions = watch::search_champions(query, index.champions.iter());
+        let mut skins = watch::search_skins(query, &index);
+        // A query naming an id (`41`, or a pasted candidate line like
+        // `Gangplank (id 41)`) cannot match any name - fetch the referenced
+        // rows directly so the resolvers can select them.
+        if let Some(id) = watch::query_id(query) {
+            if let Some(name) = index.champions.get(&id) {
+                if !champions.iter().any(|hit| hit.champion_id == id) {
+                    champions.push(watch::ChampionHit { champion_id: id, champion: name.clone() });
+                }
+            }
+            if let Some(entry) = index.skins.iter().find(|entry| entry.item_id == id) {
+                if !skins.iter().any(|hit| hit.item_id == id) {
+                    skins.push(watch::SkinHit {
+                        item_id: entry.item_id,
+                        champion_id: entry.champion_id,
+                        champion: entry.champion.clone(),
+                        skin: entry.skin.clone(),
+                    });
+                }
+            }
+        }
+        Some(StoreSearch { skins, champions, store_backed: index.store_backed.clone() })
     }
 
     /// Current-activity status lines for a watch target ("currently on

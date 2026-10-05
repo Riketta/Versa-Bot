@@ -17,7 +17,7 @@ use crate::kernel::{
 
 use super::engine::{CONFIG_KEY, GuildConfig, NAMESPACE, StoreEngine};
 use super::watch::{
-    ChampionHit, SkinHit, WATCH_KEY, WatchDoc, WatchKind, WatchTarget, normalize_name,
+    ChampionHit, SkinHit, WATCH_KEY, WatchDoc, WatchKind, WatchTarget, normalize_name, query_id,
 };
 
 /// Serializes the guild-config read-modify-write across ALL config commands
@@ -322,17 +322,45 @@ fn collapse<'a, T>(
     best.into_iter().map(|(_, hit)| hit).collect()
 }
 
-/// Normalized (champion, skin) identity: different champions may share a
-/// skin name, so both sides must collide for two rows to be duplicates.
-fn skin_pair(hit: &SkinHit) -> String {
-    format!("{}|{}", normalize_name(&hit.champion), normalize_name(&hit.skin))
+/// Normalized (champion id, skin name) identity: live and Classic
+/// variants share display names but not champion ids - only rows under
+/// ONE champion id are true duplicates.
+fn skin_key(hit: &SkinHit) -> String {
+    format!("{}|{}", hit.champion_id, normalize_name(&hit.skin))
+}
+
+/// Skin candidate lines. Live and Classic variants can render one
+/// identical line - such collisions get item-id suffixes and the reply
+/// offers picking by id.
+fn skin_candidates(hits: &[&SkinHit]) -> Resolved {
+    let line = |hit: &SkinHit| format!("{} - {}", hit.champion, hit.skin);
+    let distinct = hits.iter().map(|hit| line(hit)).collect::<HashSet<_>>().len();
+    if distinct < hits.len() {
+        candidate_lines(
+            hits.iter().map(|hit| format!("{} (item {})", line(hit), hit.item_id)).collect(),
+            true,
+        )
+    } else {
+        candidate_lines(hits.iter().map(|hit| line(hit)).collect(), false)
+    }
 }
 
 fn resolve_skin(query: &str, hits: &[SkinHit]) -> Resolved {
+    // A bare number (or a pasted `... (item N)` line) selects by item id
+    // directly - the only way to pick between same-named variant skins.
+    if let Some(id) = query_id(query) {
+        if let Some(hit) = hits.iter().find(|hit| hit.item_id == id) {
+            return Resolved::Hit(WatchTarget::Skin {
+                item_id: hit.item_id,
+                champion: hit.champion.clone(),
+                skin: hit.skin.clone(),
+            });
+        }
+    }
     let needle = normalize_name(query);
     let exacts: Vec<&SkinHit> =
         hits.iter().filter(|hit| normalize_name(&hit.skin) == needle).collect();
-    let collapsed = collapse(exacts.clone(), skin_pair, |hit| hit.item_id);
+    let collapsed = collapse(exacts.clone(), skin_key, |hit| hit.item_id);
     if exacts.len() > collapsed.len() {
         tracing::debug!(
             item_ids = %exacts
@@ -349,22 +377,16 @@ fn resolve_skin(query: &str, hits: &[SkinHit]) -> Resolved {
             champion: hit.champion.clone(),
             skin: hit.skin.clone(),
         }),
-        [] => match collapse(hits.iter(), skin_pair, |hit| hit.item_id).as_slice() {
+        [] => match collapse(hits.iter(), skin_key, |hit| hit.item_id).as_slice() {
             [] => Resolved::Nothing,
             [hit] => Resolved::Hit(WatchTarget::Skin {
                 item_id: hit.item_id,
                 champion: hit.champion.clone(),
                 skin: hit.skin.clone(),
             }),
-            many => candidate_lines(
-                many.iter().map(|hit| format!("{} - {}", hit.champion, hit.skin)).collect(),
-                false,
-            ),
+            many => skin_candidates(many),
         },
-        many => candidate_lines(
-            many.iter().map(|hit| format!("{} - {}", hit.champion, hit.skin)).collect(),
-            false,
-        ),
+        many => skin_candidates(many),
     }
 }
 
@@ -374,10 +396,10 @@ fn ids_of<'a>(hits: impl IntoIterator<Item = &'a ChampionHit>) -> String {
 }
 
 fn resolve_champion(query: &str, hits: &[ChampionHit], store_backed: &HashSet<u64>) -> Resolved {
-    // A bare number selects by champion id directly - the only way to
-    // pick between same-named rows that are both real (live + Classic
-    // variants share the display name).
-    if let Ok(id) = query.parse::<u64>() {
+    // A bare number (or a pasted `... (id N)` line) selects by champion
+    // id directly - the only way to pick between same-named rows that
+    // are both real (live + Classic variants share one display name).
+    if let Some(id) = query_id(query) {
         if let Some(hit) = hits.iter().find(|hit| hit.champion_id == id) {
             return Resolved::Hit(WatchTarget::Champion {
                 champion_id: hit.champion_id,
@@ -765,8 +787,8 @@ mod tests {
         ChampionHit { champion_id: id, champion: name.to_owned() }
     }
 
-    fn skin(item_id: u64, champion: &str, name: &str) -> SkinHit {
-        SkinHit { item_id, champion: champion.to_owned(), skin: name.to_owned() }
+    fn skin(champion_id: u64, item_id: u64, champion: &str, name: &str) -> SkinHit {
+        SkinHit { champion_id, item_id, champion: champion.to_owned(), skin: name.to_owned() }
     }
 
     #[test]
@@ -835,8 +857,10 @@ mod tests {
 
     #[test]
     fn duplicate_skin_rows_collapse_to_the_lowest_item_id() {
-        let hits =
-            vec![skin(103_002, "Ahri", "Foxfire Ahri"), skin(103_001, "Ahri", "Foxfire Ahri")];
+        let hits = vec![
+            skin(103, 103_002, "Ahri", "Foxfire Ahri"),
+            skin(103, 103_001, "Ahri", "Foxfire Ahri"),
+        ];
         match resolve_skin("Foxfire Ahri", &hits) {
             Resolved::Hit(WatchTarget::Skin { item_id, champion, skin }) => {
                 assert_eq!(item_id, 103_001);
@@ -848,8 +872,58 @@ mod tests {
     }
 
     #[test]
+    fn variant_skins_with_one_name_stay_labeled_candidates() {
+        let hits = vec![
+            skin(57, 103_001, "Evelynn", "Blood Moon Evelynn"),
+            skin(60041, 60_041_001, "Evelynn", "Blood Moon Evelynn"),
+        ];
+        match resolve_skin("Blood Moon Evelynn", &hits) {
+            Resolved::Candidates { lines, by_id } => {
+                assert!(by_id);
+                assert_eq!(
+                    lines,
+                    vec![
+                        "`Evelynn - Blood Moon Evelynn (item 103001)`",
+                        "`Evelynn - Blood Moon Evelynn (item 60041001)`"
+                    ]
+                );
+            }
+            _ => panic!("variants must not collapse into a silent pick"),
+        }
+    }
+
+    #[test]
+    fn a_numeric_name_selects_a_skin_by_item_id() {
+        let hits = vec![
+            skin(57, 103_001, "Evelynn", "Blood Moon Evelynn"),
+            skin(60041, 60_041_001, "Evelynn", "Blood Moon Evelynn"),
+        ];
+        match resolve_skin("60041001", &hits) {
+            Resolved::Hit(WatchTarget::Skin { item_id, .. }) => {
+                assert_eq!(item_id, 60_041_001);
+            }
+            _ => panic!("a listed item id must be selectable by typing it"),
+        }
+    }
+
+    #[test]
+    fn a_pasted_candidate_line_selects_by_id() {
+        let hits = vec![champion(41, "Gangplank"), champion(60041, "Gangplank")];
+        let backed = HashSet::from([41, 60041]);
+        for query in ["Gangplank (id 41)", "id 41", "41"] {
+            match resolve_champion(query, &hits, &backed) {
+                Resolved::Hit(WatchTarget::Champion { champion_id, champion }) => {
+                    assert_eq!(champion_id, 41);
+                    assert_eq!(champion, "Gangplank");
+                }
+                _ => panic!("query {query:?} must select the listed id"),
+            }
+        }
+    }
+
+    #[test]
     fn same_skin_name_across_champions_stays_a_candidate_list() {
-        let hits = vec![skin(1, "Ahri", "Fire"), skin(2, "Annie", "Fire")];
+        let hits = vec![skin(103, 1, "Ahri", "Fire"), skin(1, 2, "Annie", "Fire")];
         match resolve_skin("fire", &hits) {
             Resolved::Candidates { lines, by_id } => {
                 assert!(!by_id);

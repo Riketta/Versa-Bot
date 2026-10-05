@@ -29,6 +29,7 @@ const MAX_TITLE_FIELD_BYTES: usize = 32;
 #[derive(Debug, Clone)]
 pub(crate) struct SkinEntry {
     pub(crate) item_id: u64,
+    pub(crate) champion_id: u64,
     pub(crate) champion: String,
     pub(crate) skin: String,
 }
@@ -65,8 +66,14 @@ impl NameIndex {
             .values()
             .filter(|item| item.inventory_type.as_deref() == Some("CHAMPION_SKIN"))
             .filter_map(|item| {
-                let champion = index.skin_champion(item)?;
-                Some(SkinEntry { item_id: item.item_id, champion, skin: localized_name(item) })
+                let champion_id = Self::item_champion_id(item)?;
+                let champion = index.champion_name(champion_id);
+                Some(SkinEntry {
+                    item_id: item.item_id,
+                    champion_id,
+                    champion,
+                    skin: localized_name(item),
+                })
             })
             .collect();
         // Deterministic order: name, then id - the search's exact-before-
