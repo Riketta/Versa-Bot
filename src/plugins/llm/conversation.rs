@@ -32,7 +32,8 @@ pub const DEFAULT_TURN_TEMPLATE: &str = "[{sender}](<@{user_id}>): {message}";
 const IMAGE_PLACEHOLDER: &str = "image.png";
 
 /// Renders a record's images as markdown image references, one per line:
-/// `![description](image.png)`, undescribed ones as `![image](image.png)`.
+/// `![description](image.png)`, undescribed ones as
+/// `![image without description](image.png)`.
 #[must_use]
 pub fn render_images(images: &[RecordImage]) -> String {
     let mut rendered = String::new();
@@ -43,7 +44,7 @@ pub fn render_images(images: &[RecordImage]) -> String {
         } else {
             format!("image_{}.png", index + 1)
         };
-        let alt = image.description.as_deref().unwrap_or("image");
+        let alt = image.description.as_deref().unwrap_or("image without description");
         let _ = write!(rendered, "![{alt}]({name})");
     }
     rendered
@@ -738,7 +739,7 @@ mod tests {
             Some(concat!(
                 "alice: look at this\n",
                 "![a tabby cat on a keyboard](image.png)\n",
-                "![image](image_2.png)"
+                "![image without description](image_2.png)"
             ))
         );
     }

@@ -677,8 +677,9 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   message). The recognition prompt is customizable per channel
   (`image_prompt`) - useful for pinning the description language.
   Undescribed images (feature off, recognition failure, oversize,
-  over-cap) still render `![image](image.png)`, so the model at least
-  knows an image was posted. Images are fetched from Discord's CDN only;
+  over-cap) still render `![image without description](image.png)`, so
+  the model at least knows an image was posted. Images are fetched from
+  Discord's CDN only;
   recognition usage never mixes into the channel's token stats.
 - **Emoji reactions** (the react tool, opt-in per channel,
   `/llm_set react on`): the model may decorate the message it replies to
