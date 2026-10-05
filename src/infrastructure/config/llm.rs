@@ -14,9 +14,20 @@ use serde_json::Value;
 #[serde(default)]
 pub struct LlmConfig {
     /// System prompt for channels without a per-channel override.
+    /// Template-rendered per request (`{{bot}}` etc.).
     pub default_system_prompt: String,
-    /// Compaction instruction for channels without an override.
+    /// Compaction instruction for channels without an override. Rendered
+    /// like the system prompt.
     pub default_compaction_prompt: String,
+    /// `{{bot_name}}` override for prompt templates; absent = discovered at
+    /// boot from the platform adapter.
+    pub bot_name: Option<String>,
+    /// `{{bot_id}}` override for prompt templates; absent = discovered at
+    /// boot.
+    pub bot_id: Option<String>,
+    /// Minute offset from UTC for the template time tokens (date, weekday,
+    /// hour); 0 = UTC. Clamped to -1439..=1439 at boot.
+    pub time_offset_minutes: i16,
     /// Compaction model fallback (`provider/model`); absent = compact with
     /// the channel's chat model.
     pub compaction_model: Option<String>,
@@ -66,10 +77,13 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            default_system_prompt: "You are a helpful chat assistant.".to_owned(),
-            default_compaction_prompt: "Summarize the conversation above, preserving facts, \
-                 decisions, names and open questions. Be concise."
+            default_system_prompt: "You are {{bot}}, a helpful chat assistant.".to_owned(),
+            default_compaction_prompt: "You are {{bot}}. Summarize the conversation above, \
+                 preserving facts, decisions, names and open questions. Be concise."
                 .to_owned(),
+            bot_name: None,
+            bot_id: None,
+            time_offset_minutes: 0,
             compaction_model: None,
             compaction_keep_tail: 10,
             max_message_length: 2000,
@@ -181,8 +195,10 @@ mod tests {
         let config = serde_json::from_str::<LlmConfig>("{}").expect("empty section deserializes");
         assert_eq!(config.compaction_keep_tail, 10);
         assert_eq!(config.max_message_length, 2000);
+        assert_eq!(config.time_offset_minutes, 0);
+        assert_eq!(config.bot_name, None);
         assert!(config.providers.is_empty());
-        assert!(config.default_system_prompt.contains("chat assistant"));
+        assert!(config.default_system_prompt.contains("{{bot}}"));
     }
 
     #[test]
@@ -190,6 +206,9 @@ mod tests {
         let config = serde_json::from_str::<LlmConfig>(
             r#"{
                 "default_system_prompt": "custom",
+                "bot_name": "Alice",
+                "bot_id": "1234",
+                "time_offset_minutes": 180,
                 "compaction_model": "zai/glm-5.3-flash",
                 "compaction_keep_tail": 5,
                 "max_message_length": 1500,
@@ -220,6 +239,9 @@ mod tests {
         .expect("section expected to deserialize");
 
         assert_eq!(config.default_system_prompt, "custom");
+        assert_eq!(config.bot_name.as_deref(), Some("Alice"));
+        assert_eq!(config.bot_id.as_deref(), Some("1234"));
+        assert_eq!(config.time_offset_minutes, 180);
         assert_eq!(config.compaction_model.as_deref(), Some("zai/glm-5.3-flash"));
         assert_eq!(config.compaction_keep_tail, 5);
         assert_eq!(config.max_prompt_file_bytes, 4096);

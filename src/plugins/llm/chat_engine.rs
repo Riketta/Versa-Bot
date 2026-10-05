@@ -33,6 +33,7 @@ use super::model::{
     ChannelConfig, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats,
     blend_ratio, channel_state_key, channel_stats_key, records_namespace, unix_now,
 };
+use super::prompts::{PromptVars, render_prompt};
 use super::providers::LlmSettings;
 use super::rng::{RandomPort, RandomScope};
 use super::tools;
@@ -62,6 +63,8 @@ struct AnswerRequest<'a> {
     /// Audit label: `"triggered"` (the user addressed the bot) or `"chime"`
     /// (unprompted roll).
     trigger: &'a str,
+    /// Current guild name from the payload - `{{guild_name}}` material.
+    guild_name: Option<&'a str>,
 }
 
 /// Inputs of the per-channel stats write, grouped so
@@ -345,6 +348,7 @@ impl ChatEngine {
             live: &live_records,
             usage_stats: &usage_stats,
             trigger: "triggered",
+            guild_name: payload.guild_name.as_deref(),
         };
         if conversation::should_trigger(payload.mentions_bot, reply_to, &live_records) {
             if capture_failed {
@@ -372,7 +376,16 @@ impl ChatEngine {
         // Compaction runs after the reply (the triggering turn used the
         // pre-compaction context) and after every capture, so all-messages
         // channels compact too - not just chatty ones.
-        self.maybe_compact(origin, config, &state, &seqs, &live_records, services).await;
+        self.maybe_compact(
+            origin,
+            config,
+            &state,
+            &seqs,
+            &live_records,
+            payload.guild_name.as_deref(),
+            services,
+        )
+        .await;
     }
 
     /// Capture half of the intake: `None` when the channel's mode does not
@@ -488,12 +501,33 @@ impl ChatEngine {
     /// resolved token budget, the character count the endpoint's usage
     /// report is measured against, and the window size for the audit row.
     /// Shared by the triggered/chime answer and the silent-react chime.
+    /// Request-scoped prompt template values: bot identity from settings,
+    /// the platform display name from the wired adapter (via services), a
+    /// time snapshot taken now, guild/model from the current request.
+    fn prompt_vars(
+        &self,
+        services: &KernelServices,
+        guild_name: Option<&str>,
+        model: &str,
+    ) -> PromptVars {
+        PromptVars::new(
+            self.settings.bot_name.clone(),
+            self.settings.bot_id.clone(),
+            i64::try_from(unix_now()).unwrap_or(i64::MAX),
+            self.settings.time_offset_minutes,
+            services.chat_output_factory.platform_name(),
+            guild_name,
+            model,
+        )
+    }
+
     fn assemble_prompt(
         &self,
         config: &ChannelConfig,
         state: &ConversationState,
         live: &[ConversationRecord],
         usage_stats: &UsageStats,
+        vars: &PromptVars,
     ) -> (CompletionRequest, u64, Option<u64>, usize) {
         let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
         let skip = live.len().saturating_sub(depth);
@@ -503,6 +537,7 @@ impl ChatEngine {
         let messages = conversation::assemble_context(
             config,
             &self.settings,
+            vars,
             state,
             window,
             usage_stats.tokens_per_char,
@@ -533,7 +568,7 @@ impl ChatEngine {
         services: &KernelServices,
         typing: Option<ChatTypingGuard>,
     ) -> bool {
-        let AnswerRequest { config, state, live, usage_stats, trigger } = request;
+        let AnswerRequest { config, state, live, usage_stats, trigger, guild_name } = request;
         // The answer may take tens of seconds: hold the platform typing
         // indicator across generation and delivery. A triggered run arrives
         // with the guard its caller started before the channel lock (the
@@ -542,8 +577,9 @@ impl ChatEngine {
         // failure included, the caller's fallback follows right after.
         let _typing = typing.unwrap_or_else(|| services.chat_output_factory.start_typing(origin));
         let channel_id = origin.channel_id.get();
+        let vars = self.prompt_vars(services, guild_name, &config.model);
         let (request, context_chars, budget, window_used) =
-            self.assemble_prompt(config, state, live, usage_stats);
+            self.assemble_prompt(config, state, live, usage_stats, &vars);
         let started = Instant::now();
 
         // Streaming channels pull the answer live off the endpoint (SSE
@@ -977,10 +1013,11 @@ impl ChatEngine {
         request: AnswerRequest<'_>,
         services: &KernelServices,
     ) {
-        let AnswerRequest { config, state, live, usage_stats, .. } = request;
+        let AnswerRequest { config, state, live, usage_stats, guild_name, .. } = request;
         let channel_id = origin.channel_id.get();
+        let vars = self.prompt_vars(services, guild_name, &config.model);
         let (mut request, context_chars, budget, _) =
-            self.assemble_prompt(config, state, live, usage_stats);
+            self.assemble_prompt(config, state, live, usage_stats, &vars);
         // This invocation is a reaction decision, not a reply: without a
         // dedicated instruction the model answers conversationally, the
         // prose is discarded, and markers stay rare. Appended last so the
@@ -1180,6 +1217,9 @@ impl ChatEngine {
     /// write: crash mid-way leaves the old state intact. Compaction is
     /// never a sliding window - the prompt prefix stays byte-stable
     /// between compactions, so provider prompt caches stay warm.
+    // The parameter list mirrors the call site's locals one to one; a
+    // grouping struct would just be repacked into the same names.
+    #[allow(clippy::too_many_arguments)]
     async fn maybe_compact(
         &self,
         origin: &Origin,
@@ -1187,6 +1227,7 @@ impl ChatEngine {
         state: &ConversationState,
         seqs: &[u64],
         records: &[ConversationRecord],
+        guild_name: Option<&str>,
         services: &KernelServices,
     ) {
         if !config.compaction_enabled {
@@ -1211,15 +1252,19 @@ impl ChatEngine {
         let split = records.len() - keep_tail;
         let chunk = records.get(..split).unwrap_or(records);
         let chunk_end_seq = seqs.get(split.saturating_sub(1)).copied().unwrap_or(0);
-        let prompt = config
-            .compaction_prompt
-            .clone()
-            .unwrap_or_else(|| self.settings.default_compaction_prompt.clone());
         let model = config
             .compaction_model
             .clone()
             .or_else(|| self.settings.compaction_model.clone())
             .unwrap_or_else(|| config.model.clone());
+        // The summarizer model executes this prompt - `{{model}}` names it,
+        // not the channel's chat model.
+        let vars = self.prompt_vars(services, guild_name, &model);
+        let resolved = config
+            .compaction_prompt
+            .clone()
+            .unwrap_or_else(|| self.settings.default_compaction_prompt.clone());
+        let prompt = render_prompt(&resolved, &vars);
 
         let messages = conversation::compaction_input(&prompt, state.summary.as_deref(), chunk);
         // The summarizer call is deliberately NOT recorded into the channel's
@@ -1581,6 +1626,10 @@ mod tests {
     }
 
     impl ChatOutputFactoryPort for StreamRecordingFactory {
+        fn platform_name(&self) -> &str {
+            "Test"
+        }
+
         fn chat_output(&self, _origin: &Origin) -> Arc<dyn ChatOutputPort> {
             Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
         }
@@ -1659,6 +1708,10 @@ mod tests {
 
     #[async_trait]
     impl ChatOutputFactoryPort for FailingReactionFactory {
+        fn platform_name(&self) -> &str {
+            "Test"
+        }
+
         fn chat_output(&self, _origin: &Origin) -> Arc<dyn ChatOutputPort> {
             Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
         }
@@ -2103,6 +2156,10 @@ mod tests {
 
     #[async_trait]
     impl ChatOutputFactoryPort for FailingDeliveryFactory {
+        fn platform_name(&self) -> &str {
+            "Test"
+        }
+
         fn chat_output(&self, _origin: &Origin) -> Arc<dyn ChatOutputPort> {
             Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
         }

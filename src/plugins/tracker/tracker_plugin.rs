@@ -306,6 +306,10 @@ mod tests {
     }
 
     impl ChatOutputFactoryPort for ChannelRecordingFactory {
+        fn platform_name(&self) -> &str {
+            "Test"
+        }
+
         fn chat_output(&self, origin: &Origin) -> Arc<dyn ChatOutputPort> {
             self.channel_output(origin, origin.channel_id)
         }

@@ -76,6 +76,9 @@ async fn main() -> ExitCode {
         .expect("application info expected to be reachable")
         .id
         .get();
+    // Bot identity for LLM prompt templates (`{{bot_name}}`/`{{bot_id}}`):
+    // resolved once here, config overrides take precedence per part.
+    let bot_user = bootstrap.get_current_user().await.expect("bot user expected to be resolvable");
 
     // One shared REST client for every driven Discord call (factory outputs,
     // command registration): serenity rate limiting is per `Http`, so one
@@ -116,7 +119,22 @@ async fn main() -> ExitCode {
     // replies draw from per-channel decks ("fake random"): hits balance out
     // over each 100-draw cycle instead of statistically clumping; the plain
     // RNG adapter (`RandRandom`) is the drop-in swap.
-    let llm_settings = Arc::new(config.llm.as_ref().map(llm_settings_from).unwrap_or_default());
+    let llm_settings = Arc::new(
+        config
+            .llm
+            .as_ref()
+            .map(|config| {
+                // Bot identity for prompt templates: config overrides win,
+                // discovery from the platform is the fallback per part.
+                llm_settings_from(
+                    config,
+                    config.bot_name.clone().or_else(|| Some(bot_user.name.clone())),
+                    config.bot_id.clone().or_else(|| Some(bot_user.id.get().to_string())),
+                )
+            })
+            .unwrap_or_default(),
+    );
+    versa_bot::plugins::llm::warn_unknown_prompt_tokens(&llm_settings);
     let llm_adapter = OpenAiCompatibleAdapter::from_settings(Arc::clone(&llm_settings))
         .expect("config [llm] section expected to be valid (api_key_env set, proxies parseable)");
     // One completion port, two consumers: the chat engine and the image
@@ -328,7 +346,11 @@ async fn sigterm() {
 /// Maps the infra `[llm]` config onto the plugin-facing settings. Field-by-
 /// field on purpose: the composition root is the only place allowed to know
 /// both sides.
-fn llm_settings_from(config: &LlmConfig) -> LlmSettings {
+fn llm_settings_from(
+    config: &LlmConfig,
+    bot_name: Option<String>,
+    bot_id: Option<String>,
+) -> LlmSettings {
     // Operator knobs clamped to safe ranges, mirroring the command-layer
     // guards. The clamp is announced - a silent correction hides a typo.
     let max_message_length = config.max_message_length.clamp(1, DISCORD_MESSAGE_LIMIT);
@@ -366,6 +388,21 @@ fn llm_settings_from(config: &LlmConfig) -> LlmSettings {
     LlmSettings {
         default_system_prompt: config.default_system_prompt.clone(),
         default_compaction_prompt: config.default_compaction_prompt.clone(),
+        bot_name,
+        bot_id,
+        time_offset_minutes: {
+            // A shifted clock beyond ±24h is a config typo, not a timezone.
+            const MAX_OFFSET_MINUTES: i16 = 1439;
+            let clamped = config.time_offset_minutes.clamp(-MAX_OFFSET_MINUTES, MAX_OFFSET_MINUTES);
+            if clamped != config.time_offset_minutes {
+                tracing::warn!(
+                    configured = config.time_offset_minutes,
+                    clamped,
+                    "[llm] time_offset_minutes outside -1439..=1439 - clamped"
+                );
+            }
+            clamped
+        },
         compaction_model: config.compaction_model.clone(),
         compaction_keep_tail,
         max_message_length,

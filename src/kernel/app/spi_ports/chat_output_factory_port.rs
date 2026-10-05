@@ -39,6 +39,13 @@ pub trait ChatOutputFactoryPort: Send + Sync + 'static {
         message_id: MessageId,
     ) -> Option<String>;
 
+    /// Display name of the platform this factory serves, as the adapter
+    /// wants it rendered in user-facing text ("Discord") - prompt-template
+    /// material, not a kernel concept. Same ownership rule as
+    /// `message_link`: the adapter owns presentation, plugins stay
+    /// platform-blind.
+    fn platform_name(&self) -> &str;
+
     /// Starts the platform typing indicator for the event's origin channel
     /// and keeps refreshing it on the platform's cadence until the returned
     /// guard is dropped - long operations (LLM answer generation) hold it so

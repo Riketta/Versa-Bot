@@ -1666,7 +1666,7 @@ mod tests {
         assert!(messages.iter().any(|m| m.contains("no messages after the cutoff")));
         // No channel override: the report names the effective plugin default.
         assert!(messages.iter().any(|m| m.contains("Prompt: plugin default")));
-        assert!(messages.iter().any(|m| m.contains("You are a helpful chat assistant.")));
+        assert!(messages.iter().any(|m| m.contains("You are {{bot}}, a helpful chat assistant.")));
     }
 
     fn prompt_handler(fixture: &Fixture) -> SetPromptLlmHandler {

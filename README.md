@@ -545,9 +545,12 @@ history.
 
 ```toml
 [llm]
-# Optional defaults: default_system_prompt, default_compaction_prompt,
-# compaction_model, compaction_keep_tail, max_message_length (capped at
-# Discord's 2000), stream_interval_ms, max_consecutive_newlines (collapse
+# Optional defaults: default_system_prompt, default_compaction_prompt
+# (both template-rendered per request - see "Prompt templates" below),
+# bot_name / bot_id (template identity overrides; discovered from the
+# platform at boot), compaction_model, compaction_keep_tail,
+# max_message_length (capped at Discord's 2000), stream_interval_ms,
+# time_offset_minutes (0 = UTC), max_consecutive_newlines (collapse
 # blank-line runs in answers down to N; absent = untouched). `log_raw_traffic = true`
 # dumps every LLM request and response body at DEBUG level (stdout only)
 # while debugging a provider - it carries conversation content, so it
@@ -645,6 +648,19 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   changes retroactively. The window is selected newest-first under the
   token budget and `depth`, whichever bites first - the newest turn is
   always included.
+- **Prompt templates**: the system and compaction prompts (channel
+  overrides and `[llm]` defaults alike) render `{{token}}` per request -
+  `{{bot}}` (the bot's identity as `name (id)`, degrading to whichever
+  part is known), `{{bot_name}}`, `{{bot_id}}`, `{{date}}` (`YYYY-MM-DD`),
+  `{{weekday}}`, `{{hour}}` (`HH:00-HH:59` - minute-free on purpose, so
+  provider prompt caches rebuild at most once an hour; shifted by
+  `[llm] time_offset_minutes`, UTC by default), `{{platform}}`,
+  `{{guild_name}}` (empty when unknown) and `{{model}}` (the model
+  executing the prompt). Identity comes from the platform at boot;
+  `[llm] bot_name`/`bot_id` override it per part. Unknown tokens stay
+  literal - `/llm_set_prompt` rejects them outright with the valid list.
+  The built-in default prompts carry `You are {{bot}}` so the bot can
+  identify itself; custom prompts opt in by using the tokens.
 - **Mentions** in captured messages are normalized to `[Name]<@id>` - the
   model sees both who was named and the raw tag to imitate in replies.
   Replies using the same shape are converted back to bare mentions on

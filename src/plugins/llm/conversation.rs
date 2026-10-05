@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::completion_port::{ChatMessage, ChatRole};
 use super::model::{CaptureMode, ChannelConfig, ConversationState};
+use super::prompts::{PromptVars, render_prompt};
 use super::providers::{LlmSettings, SummaryPlacement};
 
 /// Slot placeholder for the summary placements that keep a dedicated
@@ -255,6 +256,7 @@ fn estimated_tokens(text: &str, tokens_per_char: f64) -> u64 {
 pub fn assemble_context(
     config: &ChannelConfig,
     settings: &LlmSettings,
+    vars: &PromptVars,
     state: &ConversationState,
     records: &[ConversationRecord],
     tokens_per_char: f64,
@@ -267,8 +269,11 @@ pub fn assemble_context(
         .models
         .get(&config.model)
         .map_or(SummaryPlacement::default(), |model| model.summary_placement);
-    let mut system =
+    // The operator's prompt (override or default) is template-rendered per
+    // request; the tool block after it stays constant bytes (cache rule).
+    let resolved =
         config.system_prompt.clone().unwrap_or_else(|| settings.default_system_prompt.clone());
+    let mut system = render_prompt(&resolved, vars);
     // The reactions tool block joins the operator's prompt (constant bytes;
     // appended AFTER the operator text so the prefix before it stays stable,
     // and BEFORE any summary merge so `system_suffix` still appends last).
@@ -412,6 +417,16 @@ mod tests {
     use super::*;
     use crate::plugins::llm::providers::{ModelSettings, SummaryPlacement};
 
+    /// Named identity for assembly tests: the default prompt renders as
+    /// "You are TestBot, ..." without id noise.
+    fn test_vars() -> PromptVars {
+        PromptVars {
+            bot_name: Some("TestBot".to_owned()),
+            bot: "TestBot".to_owned(),
+            ..PromptVars::default()
+        }
+    }
+
     /// `LlmSettings` with model `m` declared at the given placement - so the
     /// assembly resolves it the way a real configuration would.
     fn settings_with_placement(placement: SummaryPlacement) -> LlmSettings {
@@ -503,13 +518,14 @@ mod tests {
         let messages = assemble_context(
             &config,
             &LlmSettings::default(),
+            &test_vars(),
             &ConversationState::default(),
             &[],
             0.25,
             None,
         );
         let system = messages.first().map(|m| m.content.as_str()).unwrap_or_default();
-        assert!(system.starts_with("You are a helpful chat assistant."));
+        assert!(system.starts_with("You are TestBot, a helpful chat assistant."));
         assert!(system.contains(super::super::tools::REACT_TOOL_PROMPT));
 
         // Opted-out channels keep the prompt untouched.
@@ -517,6 +533,7 @@ mod tests {
         let messages = assemble_context(
             &plain,
             &LlmSettings::default(),
+            &test_vars(),
             &ConversationState::default(),
             &[],
             0.25,
@@ -524,7 +541,7 @@ mod tests {
         );
         assert_eq!(
             messages.first().map(|m| m.content.as_str()),
-            Some("You are a helpful chat assistant.")
+            Some("You are TestBot, a helpful chat assistant.")
         );
     }
 
@@ -549,14 +566,15 @@ mod tests {
             },
         ];
 
-        let messages = assemble_context(&config, &settings, &state, &records, 0.25, None);
+        let messages =
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, None);
 
         // Default placement (SystemTurn): system prompt, always-present
         // summary slot (placeholder without a summary), then the turns.
         assert_eq!(messages.len(), 5);
         assert_eq!(
             messages.first().map(|m| (m.role, m.content.as_str())),
-            Some((ChatRole::System, "You are a helpful chat assistant."))
+            Some((ChatRole::System, "You are TestBot, a helpful chat assistant."))
         );
         assert_eq!(
             messages.get(1).map(|m| (m.role, m.content.as_str())),
@@ -590,7 +608,7 @@ mod tests {
             cutoff_at: Some(1_717_000_000),
         };
 
-        let messages = assemble_context(&config, &settings, &state, &[], 0.25, None);
+        let messages = assemble_context(&config, &settings, &test_vars(), &state, &[], 0.25, None);
 
         assert_eq!(messages.first().map(|m| m.content.as_str()), Some("custom prompt"));
         assert_eq!(
@@ -614,7 +632,8 @@ mod tests {
         };
         let records = vec![user_record(10, "alice", "hello")];
 
-        let messages = assemble_context(&config, &settings, &state, &records, 0.25, None);
+        let messages =
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, None);
 
         assert_eq!(messages.len(), 2);
         assert_eq!(
@@ -630,6 +649,7 @@ mod tests {
         let bare = assemble_context(
             &config,
             &settings,
+            &test_vars(),
             &ConversationState::default(),
             &records,
             0.25,
@@ -653,7 +673,8 @@ mod tests {
         };
         let records = vec![user_record(10, "alice", "hello")];
 
-        let with_summary = assemble_context(&config, &settings, &state, &records, 0.25, None);
+        let with_summary =
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, None);
         assert_eq!(
             with_summary.get(1).map(|m| (m.role, m.content.as_str())),
             Some((ChatRole::System, "Earlier conversation summary:\nthe gist"))
@@ -662,6 +683,7 @@ mod tests {
         let without_summary = assemble_context(
             &config,
             &settings,
+            &test_vars(),
             &ConversationState::default(),
             &records,
             0.25,
@@ -686,7 +708,8 @@ mod tests {
         };
         let records = vec![user_record(10, "alice", "hello")];
 
-        let with_summary = assemble_context(&config, &settings, &state, &records, 0.25, None);
+        let with_summary =
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, None);
         assert_eq!(
             with_summary.get(1).map(|m| (m.role, m.content.as_str())),
             Some((ChatRole::Assistant, "Earlier conversation summary:\nthe gist"))
@@ -695,6 +718,7 @@ mod tests {
         let without_summary = assemble_context(
             &config,
             &settings,
+            &test_vars(),
             &ConversationState::default(),
             &records,
             0.25,
@@ -716,7 +740,8 @@ mod tests {
         let state = ConversationState::default();
         let records = vec![user_record(10, "alice", "hello")];
 
-        let messages = assemble_context(&config, &settings, &state, &records, 0.25, None);
+        let messages =
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, None);
 
         assert_eq!(messages.get(2).map(|m| m.content.as_str()), Some("<alice> hello"));
     }
@@ -732,7 +757,8 @@ mod tests {
             RecordImage { description: None },
         ];
 
-        let messages = assemble_context(&config, &settings, &state, &[record], 0.25, None);
+        let messages =
+            assemble_context(&config, &settings, &test_vars(), &state, &[record], 0.25, None);
 
         assert_eq!(
             messages.get(2).map(|m| m.content.as_str()),
@@ -755,7 +781,8 @@ mod tests {
 
         // A tight budget drops the image-padded record first - descriptions
         // are real prompt bytes and must not ride for free.
-        let messages = assemble_context(&config, &settings, &state, &records, 0.25, Some(300));
+        let messages =
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, Some(300));
 
         assert_eq!(messages.len(), 3); // system + placeholder + the newest turn
         assert!(messages.get(2).is_some_and(|m| m.content.ends_with("bob: newest")));
@@ -829,10 +856,19 @@ mod tests {
             assistant_record(5, "second answer"),
         ];
 
-        let mut previous = render(&assemble_context(&config, &settings, &state, &[], 0.0, None));
+        let mut previous =
+            render(&assemble_context(&config, &settings, &test_vars(), &state, &[], 0.0, None));
         for (index, _) in steps.iter().enumerate() {
             let visible = steps.get(..=index).expect("index below steps length");
-            let current = render(&assemble_context(&config, &settings, &state, visible, 0.0, None));
+            let current = render(&assemble_context(
+                &config,
+                &settings,
+                &test_vars(),
+                &state,
+                visible,
+                0.0,
+                None,
+            ));
             assert!(
                 current.starts_with(previous.as_str()),
                 "step {index} rewrote the context prefix:\n\
@@ -874,7 +910,8 @@ mod tests {
             cutoff_at: Some(1_735_600_000),
         };
 
-        let messages = assemble_context(&config, &settings, &state, &records, 0.0, None);
+        let messages =
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.0, None);
         assert_eq!(messages.len(), 4, "two fixed slots + two turns");
         assert!(matches!(messages.first().expect("system expected").role, ChatRole::System));
         assert!(matches!(messages.get(1).expect("summary expected").role, ChatRole::System));
@@ -906,7 +943,8 @@ mod tests {
         user.captured_at = 1_735_689_600;
         let records = vec![user];
 
-        let messages = assemble_context(&config, &settings, &state, &records, 0.0, None);
+        let messages =
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.0, None);
         let rendered = render(&messages);
         assert!(rendered.contains("user:[alice](<@42>): hi there\n"), "{rendered}");
         // Metadata beyond the template's parameters stays bookkeeping.
@@ -948,7 +986,8 @@ mod tests {
         legacy.captured_at = 1_735_689_601;
         let records = vec![user, legacy];
 
-        let messages = assemble_context(&config, &settings, &state, &records, 0.0, None);
+        let messages =
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.0, None);
         let rendered = render(&messages);
         assert!(rendered.contains("Crafters / 1735689600: alice (42): hi\n"), "{rendered}");
         assert!(rendered.contains(" / 1735689601: bob (): hello\n"), "{rendered}");
@@ -959,8 +998,8 @@ mod tests {
         let settings = LlmSettings::default();
         let state = ConversationState::default();
         // Ratio 1.0 -> per-turn costs: aaaa=12, bb=10, cccccc=14. The fixed
-        // slots (system 33 chars + placeholder 20 chars, +8 overhead each)
-        // consume 69 of the budget before any turn.
+        // slots (system 42 chars + placeholder 20 chars, +8 overhead each)
+        // consume 78 of the budget before any turn.
         let records = vec![
             user_record(1, "a1", "aaaa"),
             user_record(2, "a2", "bb"),
@@ -968,14 +1007,15 @@ mod tests {
         ];
         let config = ChannelConfig {
             history_depth: 10,
-            context_budget_tokens: Some(93),
+            context_budget_tokens: Some(102),
             ..flat_turn_config()
         };
 
         let budget = resolve_budget(&config, &settings, true);
-        let messages = assemble_context(&config, &settings, &state, &records, 1.0, budget);
+        let messages =
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 1.0, budget);
 
-        // 69 fixed + 14 (cccccc) + 10 (bb) = 93 exactly; aaaa would exceed.
+        // 78 fixed + 14 (cccccc) + 10 (bb) = 102 exactly; aaaa would exceed.
         assert_eq!(messages.len(), 4);
         assert!(messages.get(2).expect("turn expected").content.contains("a2: bb"));
         assert!(messages.get(3).expect("turn expected").content.contains("a3: cccccc"));
@@ -989,7 +1029,8 @@ mod tests {
         let config = ChannelConfig { context_budget_tokens: Some(1), ..flat_turn_config() };
 
         let budget = resolve_budget(&config, &settings, true);
-        let messages = assemble_context(&config, &settings, &state, &records, 1.0, budget);
+        let messages =
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 1.0, budget);
 
         // A reply must at least see what it answers.
         assert_eq!(messages.len(), 3);
@@ -1025,13 +1066,15 @@ mod tests {
         };
 
         let budget = resolve_budget(&config, &settings, true);
-        let calibrated = assemble_context(&config, &settings, &state, &records, 1.0, budget);
+        let calibrated =
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 1.0, budget);
         assert_eq!(calibrated.len(), 4, "two fixed slots + two budgeted turns");
 
         // Uncalibrated: no usage data, so filling falls back to the message
         // limit - all four turns are present despite the declared window.
         let budget = resolve_budget(&config, &settings, false);
-        let uncalibrated = assemble_context(&config, &settings, &state, &records, 1.0, budget);
+        let uncalibrated =
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 1.0, budget);
         assert_eq!(uncalibrated.len(), 6);
     }
 

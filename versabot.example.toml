@@ -53,8 +53,20 @@ url = "sqlite://versabot.db"
 # and /llm_set, never configure endpoints. Startup-only: changes require
 # a restart. Without the section the chat engine has no providers.
 # [llm]
-# default_system_prompt = "You are a helpful chat assistant."
-# default_compaction_prompt = "Summarize the conversation above, preserving facts, decisions, names and open questions. Be concise."
+# The prompts below are templates: {{bot}} renders the bot's identity as
+# "name (id)" (degrading to whichever part is known), and {{bot_name}},
+# {{bot_id}}, {{date}} (YYYY-MM-DD), {{weekday}}, {{hour}} (HH:00-HH:59,
+# minute-free so provider caches rebuild at most hourly), {{platform}},
+# {{guild_name}}, {{model}} are available too. Unknown tokens render
+# literally. Identity defaults to what the platform reports at boot;
+# override either part:
+# bot_name = "VersaBot"
+# bot_id = "123456789012345678"
+# Time tokens are UTC by default; shift them with a fixed minute offset
+# (180 = UTC+3). A fixed offset is deliberate - no DST surprises.
+# time_offset_minutes = 0
+# default_system_prompt = "You are {{bot}}, a helpful chat assistant."
+# default_compaction_prompt = "You are {{bot}}. Summarize the conversation above, preserving facts, decisions, names and open questions. Be concise."
 # Live messages kept after each compaction (minimum 1 - zero would make
 # compaction unreachable).
 # compaction_keep_tail = 10

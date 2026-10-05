@@ -23,6 +23,7 @@ use super::model::{
     UsageStats, channel_config_key, channel_state_key, channel_stats_key, default_random_cooldown,
     records_namespace, unix_now,
 };
+use super::prompts;
 use super::providers::{LlmSettings, ModelSettings};
 use super::vision::DEFAULT_IMAGE_PROMPT;
 
@@ -1422,10 +1423,31 @@ fn apply_prompt(
                     "`prompt` cannot be empty - give text, `clear`, or attach a file.".to_owned()
                 );
             }
+            validate_prompt_text(kind, text)?;
             *kind.field_mut(config) = Some(text.to_owned());
             Ok(format!("`{}` updated.", kind.field_name()))
         }
     }
+}
+
+/// System and compaction prompts are template-rendered per request; a typo
+/// must not sit unnoticed in guild storage, so unknown tokens are rejected
+/// at set time with the valid list. Image prompts are not rendered
+/// (token-free by contract) and pass validation untouched.
+fn validate_prompt_text(kind: PromptKind, text: &str) -> Result<(), String> {
+    if matches!(kind, PromptKind::Image) {
+        return Ok(());
+    }
+    let unknown = prompts::unknown_tokens(text);
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let listed =
+        unknown.iter().map(|token| format!("{{{{{token}}}}}")).collect::<Vec<_>>().join(", ");
+    Err(format!(
+        "unknown template token(s) {listed} - valid: {}.",
+        prompts::VALID_TOKENS.join(", ")
+    ))
 }
 
 /// `/llm_set_prompt`: one command for every channel prompt - system persona,
@@ -1506,6 +1528,10 @@ impl CommandHandler for SetPromptLlmHandler {
                     }
                 };
             let characters = prompt.chars().count();
+            if let Err(usage) = validate_prompt_text(kind, &prompt) {
+                services.chat_output.send(command_reply(usage)).await?;
+                return Ok(());
+            }
             let channel = self.locks.lock_for(&event.origin);
             let _channel = channel.lock().await;
             let Some(mut config) = load_assigned_config(event, services).await? else {

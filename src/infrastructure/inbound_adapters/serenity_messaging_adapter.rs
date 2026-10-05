@@ -589,6 +589,10 @@ impl SerenityChatOutputFactory {
 }
 
 impl ChatOutputFactoryPort for SerenityChatOutputFactory {
+    fn platform_name(&self) -> &str {
+        "Discord"
+    }
+
     fn chat_output(&self, origin: &Origin) -> Arc<dyn ChatOutputPort> {
         if let Some(token) = &origin.reply_token {
             return Arc::new(InteractionFollowupOutput {

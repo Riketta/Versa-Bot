@@ -434,6 +434,10 @@ impl ChatOutputPort for ChannelRecordingOutput {
 
 #[async_trait]
 impl ChatOutputFactoryPort for ChannelRecordingFactory {
+    fn platform_name(&self) -> &str {
+        "Test"
+    }
+
     fn chat_output(&self, origin: &crate::kernel::models::Origin) -> Arc<dyn ChatOutputPort> {
         Arc::new(self.output_for(origin.guild_id, origin.channel_id))
     }
@@ -483,6 +487,10 @@ impl ChatOutputPort for FailingChatOutput {
 
 #[async_trait]
 impl ChatOutputFactoryPort for FailingChatOutputFactory {
+    fn platform_name(&self) -> &str {
+        "Test"
+    }
+
     fn chat_output(&self, _origin: &crate::kernel::models::Origin) -> Arc<dyn ChatOutputPort> {
         Arc::new(FailingChatOutput)
     }
@@ -543,6 +551,10 @@ impl RecordingChatOutputFactory {
 }
 
 impl ChatOutputFactoryPort for RecordingChatOutputFactory {
+    fn platform_name(&self) -> &str {
+        "Test"
+    }
+
     fn chat_output(&self, _origin: &crate::kernel::models::Origin) -> Arc<dyn ChatOutputPort> {
         Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
     }

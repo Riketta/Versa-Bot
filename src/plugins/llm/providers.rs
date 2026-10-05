@@ -27,10 +27,20 @@ use super::model::GenParams;
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct LlmSettings {
-    /// System prompt for channels without an override.
+    /// System prompt for channels without an override. Template-rendered
+    /// per request (`{{bot}}` etc. - see the plugin's `prompts` module).
     pub default_system_prompt: String,
-    /// Compaction instruction for channels without an override.
+    /// Compaction instruction for channels without an override. Rendered
+    /// like the system prompt.
     pub default_compaction_prompt: String,
+    /// `{{bot_name}}` override; `None` = discovered at boot from the
+    /// platform adapter (unknown there renders empty).
+    pub bot_name: Option<String>,
+    /// `{{bot_id}}` override; same precedence as `bot_name`.
+    pub bot_id: Option<String>,
+    /// Minute offset from UTC for the prompt time tokens; 0 = UTC. Clamped
+    /// to -1439..=1439 at the composition root.
+    pub time_offset_minutes: i16,
     /// Compaction model fallback; `None` = compact with the channel's chat
     /// model.
     pub compaction_model: Option<String>,
@@ -84,11 +94,14 @@ pub struct LlmSettings {
 impl Default for LlmSettings {
     fn default() -> Self {
         Self {
-            default_system_prompt: "You are a helpful chat assistant.".to_owned(),
+            default_system_prompt: "You are {{bot}}, a helpful chat assistant.".to_owned(),
             default_compaction_prompt:
-                "Summarize the conversation above, preserving facts, decisions, names and open \
-                 questions. Be concise."
+                "You are {{bot}}. Summarize the conversation above, preserving facts, decisions, \
+                 names and open questions. Be concise."
                     .to_owned(),
+            bot_name: None,
+            bot_id: None,
+            time_offset_minutes: 0,
             compaction_model: None,
             compaction_keep_tail: 10,
             max_message_length: 2000,

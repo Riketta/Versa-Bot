@@ -10,6 +10,7 @@ mod completion_port;
 mod conversation;
 mod llm_plugin;
 mod model;
+mod prompts;
 mod providers;
 mod rng;
 mod tools;
@@ -27,6 +28,7 @@ pub use model::{
     CaptureMode, ChannelConfig, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY,
     channel_config_key, channel_state_key,
 };
+pub use prompts::warn_unknown_prompt_tokens;
 pub use providers::{
     LlmSettings, ModelSettings, OpenAiCompatibleAdapter, ProviderSettings, ReasoningStyle,
     SummaryPlacement,

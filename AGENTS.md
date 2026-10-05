@@ -238,7 +238,9 @@ channel/guild without any returned response. `ChatOutputFactoryPort`
 yields the scoped variants: `channel_output` (a configured channel in the
 same guild), `stream_output` (progressive in-place editing of one
 message; throttle/split policy is caller-side), `start_typing`, and
-`react` (cosmetic by contract - per-token failures, never fatal).
+`react` (cosmetic by contract - per-token failures, never fatal). Its
+`platform_name` is adapter-owned presentation (`Discord`) that plugins
+render in user-facing text - the kernel contract names no platform.
 Origins that cannot stream or react (DMs, transactional tokens,
 channel-less events) get undeliverable defaults. `OutboundMessage`
 carries an `ephemeral` hint - honored only on transactional replies;
