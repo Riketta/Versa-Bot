@@ -833,9 +833,12 @@ mod tests {
         assert_eq!(seqs.len() + collisions, 8, "every append either succeeds or collides loudly");
         seqs.sort_unstable();
         for (index, seq) in seqs.iter().enumerate() {
+            // The two seeded records occupy `first` and `first + 1`, so the
+            // concurrent successes continue contiguously at `first + 2` -
+            // collisions fail loudly WITHOUT consuming a sequence.
             assert_eq!(
                 *seq,
-                first + 1 + u64::try_from(index).expect("index fits u64"),
+                first + 2 + u64::try_from(index).expect("index fits u64"),
                 "sequence numbers must stay unique and contiguous: {seqs:?}"
             );
         }
