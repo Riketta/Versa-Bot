@@ -291,52 +291,92 @@ enum TargetKind {
     Champion,
 }
 
+/// Distinct normalized keys in first-appearance order, each represented by
+/// the lowest-id hit among its duplicates. Live LoL data can list one name
+/// under several ids (Evelynn ships twice in the champion table); without
+/// the collapse the resolver dead-ends: it asks for an exact name that
+/// cannot disambiguate identical rows.
+fn collapse<'a, T>(
+    hits: impl IntoIterator<Item = &'a T>,
+    key: impl Fn(&T) -> String,
+    id: impl Fn(&T) -> u64,
+) -> Vec<&'a T> {
+    let mut best: Vec<(String, &T)> = Vec::new();
+    for hit in hits {
+        let key = key(hit);
+        match best.iter_mut().find(|(known, _)| *known == key) {
+            Some(entry) => {
+                if id(entry.1) > id(hit) {
+                    entry.1 = hit;
+                }
+            }
+            None => best.push((key, hit)),
+        }
+    }
+    best.into_iter().map(|(_, hit)| hit).collect()
+}
+
+/// Normalized (champion, skin) identity: different champions may share a
+/// skin name, so both sides must collide for two rows to be duplicates.
+fn skin_pair(hit: &SkinHit) -> String {
+    format!("{}|{}", normalize_name(&hit.champion), normalize_name(&hit.skin))
+}
+
 fn resolve_skin(query: &str, hits: &[SkinHit]) -> Resolved {
     let needle = normalize_name(query);
     let exacts: Vec<&SkinHit> =
         hits.iter().filter(|hit| normalize_name(&hit.skin) == needle).collect();
-    match exacts.len() {
-        1 => Resolved::Hit(WatchTarget::Skin {
-            item_id: exacts.first().expect("len == 1 checked").item_id,
-            champion: exacts.first().expect("len == 1 checked").champion.clone(),
-            skin: exacts.first().expect("len == 1 checked").skin.clone(),
+    match collapse(exacts, skin_pair, |hit| hit.item_id).as_slice() {
+        [hit] => Resolved::Hit(WatchTarget::Skin {
+            item_id: hit.item_id,
+            champion: hit.champion.clone(),
+            skin: hit.skin.clone(),
         }),
-        0 => match hits {
+        [] => match collapse(hits.iter(), skin_pair, |hit| hit.item_id).as_slice() {
             [] => Resolved::Nothing,
             [hit] => Resolved::Hit(WatchTarget::Skin {
                 item_id: hit.item_id,
                 champion: hit.champion.clone(),
                 skin: hit.skin.clone(),
             }),
-            _ => candidate_lines(hits.iter().map(|hit| format!("{} - {}", hit.champion, hit.skin))),
+            many => {
+                candidate_lines(many.iter().map(|hit| format!("{} - {}", hit.champion, hit.skin)))
+            }
         },
-        _ => candidate_lines(exacts.iter().map(|hit| format!("{} - {}", hit.champion, hit.skin))),
+        many => candidate_lines(many.iter().map(|hit| format!("{} - {}", hit.champion, hit.skin))),
     }
 }
 
 fn resolve_champion(query: &str, hits: &[ChampionHit]) -> Resolved {
     let needle = normalize_name(query);
-    let exacts: Vec<&ChampionHit> =
-        hits.iter().filter(|hit| normalize_name(&hit.champion) == needle).collect();
-    match exacts.len() {
-        1 => Resolved::Hit(WatchTarget::Champion {
-            champion_id: exacts.first().expect("len == 1 checked").champion_id,
-            champion: exacts.first().expect("len == 1 checked").champion.clone(),
+    // Every exact hit shares the query's name by construction - several
+    // rows under one name collapse to the lowest champion id instead of
+    // asking for an exact name that cannot disambiguate anything.
+    if let Some(hit) = hits
+        .iter()
+        .filter(|hit| normalize_name(&hit.champion) == needle)
+        .min_by_key(|hit| hit.champion_id)
+    {
+        return Resolved::Hit(WatchTarget::Champion {
+            champion_id: hit.champion_id,
+            champion: hit.champion.clone(),
+        });
+    }
+    let by_name = |hit: &ChampionHit| normalize_name(&hit.champion);
+    match collapse(hits.iter(), by_name, |hit| hit.champion_id).as_slice() {
+        [] => Resolved::Nothing,
+        [hit] => Resolved::Hit(WatchTarget::Champion {
+            champion_id: hit.champion_id,
+            champion: hit.champion.clone(),
         }),
-        0 => match hits {
-            [] => Resolved::Nothing,
-            [hit] => Resolved::Hit(WatchTarget::Champion {
-                champion_id: hit.champion_id,
-                champion: hit.champion.clone(),
-            }),
-            _ => candidate_lines(hits.iter().map(|hit| hit.champion.clone())),
-        },
-        _ => candidate_lines(exacts.iter().map(|hit| hit.champion.clone())),
+        many => candidate_lines(many.iter().map(|hit| hit.champion.clone())),
     }
 }
 
+/// Suggestion lines are backticked: the reply renders as markdown, and the
+/// quotes keep stray whitespace in live names visible instead of silent.
 fn candidate_lines(lines: impl Iterator<Item = String>) -> Resolved {
-    Resolved::Candidates(lines.collect())
+    Resolved::Candidates(lines.map(|line| format!("`{line}`")).collect())
 }
 
 /// `/lol_store_watch`: subscribe to a skin or a champion's whole skin line
@@ -625,5 +665,76 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for DumpHandle
                 .await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::watch::{ChampionHit, SkinHit};
+    use super::{Resolved, WatchTarget, resolve_champion, resolve_skin};
+
+    fn champion(id: u64, name: &str) -> ChampionHit {
+        ChampionHit { champion_id: id, champion: name.to_owned() }
+    }
+
+    fn skin(item_id: u64, champion: &str, name: &str) -> SkinHit {
+        SkinHit { item_id, champion: champion.to_owned(), skin: name.to_owned() }
+    }
+
+    #[test]
+    fn duplicate_champion_rows_resolve_instead_of_dead_ending() {
+        let ascending = vec![champion(57, "Evelynn"), champion(9057, "Evelynn")];
+        let descending: Vec<_> = ascending.iter().rev().cloned().collect();
+        for hits in [ascending, descending] {
+            match resolve_champion("Evelynn", &hits) {
+                Resolved::Hit(WatchTarget::Champion { champion_id, champion }) => {
+                    assert_eq!(champion_id, 57);
+                    assert_eq!(champion, "Evelynn");
+                }
+                _ => panic!("one name under several ids must resolve, not ask again"),
+            }
+        }
+    }
+
+    #[test]
+    fn partial_champion_duplicates_list_one_candidate_per_name() {
+        let hits = vec![champion(9057, "Evelynn"), champion(57, "Evelynn"), champion(120, "Kayn")];
+        match resolve_champion("yn", &hits) {
+            Resolved::Candidates(lines) => {
+                assert_eq!(lines, vec!["`Evelynn`", "`Kayn`"]);
+            }
+            _ => panic!("several distinct names must stay candidates"),
+        }
+    }
+
+    #[test]
+    fn duplicate_skin_rows_collapse_to_the_lowest_item_id() {
+        let hits =
+            vec![skin(103_002, "Ahri", "Foxfire Ahri"), skin(103_001, "Ahri", "Foxfire Ahri")];
+        match resolve_skin("Foxfire Ahri", &hits) {
+            Resolved::Hit(WatchTarget::Skin { item_id, champion, skin }) => {
+                assert_eq!(item_id, 103_001);
+                assert_eq!(champion, "Ahri");
+                assert_eq!(skin, "Foxfire Ahri");
+            }
+            _ => panic!("one distinct skin must resolve, not ask again"),
+        }
+    }
+
+    #[test]
+    fn same_skin_name_across_champions_stays_a_candidate_list() {
+        let hits = vec![skin(1, "Ahri", "Fire"), skin(2, "Annie", "Fire")];
+        match resolve_skin("fire", &hits) {
+            Resolved::Candidates(lines) => {
+                assert_eq!(lines, vec!["`Ahri - Fire`", "`Annie - Fire`"]);
+            }
+            _ => panic!("skins of different champions must stay candidates"),
+        }
+    }
+
+    #[test]
+    fn nothing_matches_without_any_hit() {
+        assert!(matches!(resolve_champion("missing", &[]), Resolved::Nothing));
+        assert!(matches!(resolve_skin("missing", &[]), Resolved::Nothing));
     }
 }

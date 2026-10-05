@@ -783,8 +783,8 @@ mod tests {
             .expect("invoke");
         let first = f.output.messages().first().expect("reply expected").clone();
         assert!(first.contains("Several matches"), "reply: {first}");
-        assert!(first.contains("Foxfire Ahri"));
-        assert!(first.contains("Dynasty Ahri"));
+        assert!(first.contains("`Ahri - Foxfire Ahri`"), "reply: {first}");
+        assert!(first.contains("`Ahri - Dynasty Ahri`"), "reply: {first}");
         assert!(stored_watch_doc(&f).await.is_none());
     }
 

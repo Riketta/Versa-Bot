@@ -367,7 +367,8 @@ Watch notes:
 - Name resolution searches the last known store catalog, so subscribing
   requires the League client to have been reachable; matching afterwards
   is pure id/name comparison. An ambiguous name replies with a candidate
-  list - re-run it with the exact name.
+  list - re-run it with the exact name; a name the live data lists under
+  several ids resolves automatically to one watch.
 - `/lol_store_watch` reports current activity in its confirmation
   ("currently on sale", "currently in the mythic rotation"). Firing is
   edge-based: a skin already on sale when you subscribe will not notify
