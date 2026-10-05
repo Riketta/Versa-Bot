@@ -130,7 +130,56 @@ compiler CI and the Docker image use.
 
 3. Invite the bot with the `bot` + `applications.commands` scopes so slash
    commands appear. Global commands can take up to an hour to propagate on
-   first registration.
+   first registration. Once they do, wire the bot up in Discord - the
+   [demo below](#demo-wiring-up-a-fresh-server) walks a complete setup.
+
+### Demo: wiring up a fresh server
+
+A complete first-run configuration, as a guild administrator would type
+it. A fresh guild starts open (default tier `user`, and Discord guild
+administrators are always `admin`), so every command below works on day
+one without touching `/auth`. Commands marked *in #channel* are
+channel-scoped: they bind the channel they are run in, so run them in
+the target channel.
+
+```text
+/ping                                        # any channel: the loop works
+/set_guild_name name:Versa                   # optional: how this server sees the bot
+/assign_tracker                              # in #audit: join/leave notices land here
+
+/llm_models                                  # what this deployment offers
+/llm_assign model:local/gemma                # in #bot-chat: bind the assistant here
+/llm_set reasoning_effort min                # lightest reasoning
+/llm_set capture_mode all_messages           # track everything - also what enables random chime-ins
+/llm_set images on                           # describe attached images (needs operator [llm] image_model)
+/llm_set react on                            # the model may react to the message it answers
+/llm_set streaming on                        # the answer live-edits while it generates
+/llm_set_prompt kind:system prompt:...       # persona; long prompts ride as an attached file
+/llm_status                                  # verify the whole setup at a glance
+/llm_admin                                   # in #staff: LLM error notices land here
+
+/lol_store_enable                            # in #lol-sales: store tracking on (admin)
+/lol_store_assign                            # in #lol-sales: announcements post here
+/lol_store_role role:@Store Pings            # optional: only opted-in members get pinged
+/lol_client_status                           # watcher health check
+/lol_store_watch target:champion name:Evelynn   # any member: personal sale watch
+```
+
+Prerequisites the commands assume: `/llm_assign` and the `/llm_set`
+tuning need operator-declared models (the `[llm]` config section);
+`/llm_set images on` additionally needs an `[llm] image_model`. The
+`/lol_store_*` block needs the `[lol_store]` config section and the
+League client running on the bot's host - see the plugin sections for
+the operator side. Now @mention the bot in `#bot-chat` and talk to it.
+
+On a locked-down server, close the default instead of leaving it open
+(opt-in - see [Authorization](#authorization-auth-plugin) for the full
+policy model):
+
+```text
+/auth action:default tier:guest
+/auth action:set tier:moderator role:@Mods
+```
 
 ### Gateway intents
 
