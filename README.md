@@ -1004,7 +1004,10 @@ cargo test --locked
   migrations) and they exercise the document roundtrip, guild isolation,
   the reserved namespace guard, and the record log incl. the documented
   concurrent-append contract against the real dialect. Without the
-  variable they report a skip and pass.
+  variable they report a skip and pass - locally that is the default, the
+  variable stays unset unless you point it somewhere yourself. CI sets it
+  in both workflows' test jobs: the suite runs against a `postgres:16`
+  service container on every CI run.
 
 ### CI
 

@@ -211,6 +211,48 @@ mod tests {
         assert!(json.get("default_member_permissions").is_none());
     }
 
+    /// Platform-native gating: a known permission name renders Discord's
+    /// `default_member_permissions`, so Discord itself hides the command
+    /// from members lacking it.
+    #[test]
+    fn administrator_permission_renders_the_platform_gate() {
+        let descriptor = CommandDescriptor {
+            plugin_id: "test".to_owned(),
+            name: "purge".to_owned(),
+            description: "test".to_owned(),
+            arguments: Vec::new(),
+            required_permission: Some(Permission { name: "administrator".to_owned() }),
+            required_tier: None,
+            guild_only: true,
+        };
+
+        let json = application_command_json(&descriptor);
+
+        assert_eq!(field(&json, "default_member_permissions").as_str(), Some("8"));
+        assert_eq!(field(&json, "dm_permission").as_bool(), Some(false));
+    }
+
+    /// Deliberate fail-open: a permission name without a Discord mapping
+    /// publishes WITHOUT `default_member_permissions` (reported, not fatal)
+    /// - pinned so the gap stays visible until kernel-side ACL exists.
+    #[test]
+    fn unknown_permission_publishes_without_a_platform_gate() {
+        let descriptor = CommandDescriptor {
+            plugin_id: "test".to_owned(),
+            name: "wat".to_owned(),
+            description: "test".to_owned(),
+            arguments: Vec::new(),
+            required_permission: Some(Permission { name: "wat".to_owned() }),
+            required_tier: None,
+            guild_only: false,
+        };
+
+        let json = application_command_json(&descriptor);
+
+        assert!(json.get("default_member_permissions").is_none());
+        assert_eq!(field(&json, "dm_permission").as_bool(), Some(true));
+    }
+
     /// Discord accepts `choices` only on string options: the adapter must
     /// drop them elsewhere instead of failing the whole sync at boot.
     #[test]

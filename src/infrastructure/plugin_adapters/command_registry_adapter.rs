@@ -61,9 +61,18 @@ impl CommandRegistryPort for InMemoryCommandRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::models::RequestContext;
+    use parking_lot::Mutex;
+
+    use crate::kernel::models::{
+        ChannelId, CommandPayload, EventKind, EventPayload, GuildId, MessageId, Origin,
+        RequestContext, UserId,
+    };
     use crate::kernel::plugin_ports::CommandArgs;
     use crate::kernel::services::KernelServices;
+    use crate::kernel::spi_ports::ChatOutputPort;
+    use crate::test_support::{
+        RecordingChatOutput, RecordingChatOutputFactory, test_platform_info,
+    };
 
     struct NoopHandler;
 
@@ -91,6 +100,57 @@ mod tests {
         }
     }
 
+    /// Records its tag through a shared log - the fixture that makes WHICH
+    /// handler ran observable (`NoopHandler`s are indistinguishable).
+    struct RecordingHandler {
+        tag: &'static str,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandHandler for RecordingHandler {
+        async fn invoke(
+            &self,
+            _event: &RequestContext,
+            _args: &CommandArgs,
+            _services: &KernelServices,
+        ) -> anyhow::Result<()> {
+            self.log.lock().push(self.tag);
+            Ok(())
+        }
+    }
+
+    fn command_event() -> RequestContext {
+        RequestContext {
+            kind: EventKind::CommandInvoked,
+            origin: Origin {
+                guild_id: Some(GuildId(1)),
+                channel_id: ChannelId(2),
+                user_id: UserId(3),
+                message_id: Some(MessageId(4)),
+                reply_token: None,
+            },
+            payload: EventPayload::Command(CommandPayload {
+                name: "ping".to_owned(),
+                args: Vec::new(),
+                author_roles: Vec::new(),
+                author_permissions: 0,
+            }),
+        }
+    }
+
+    /// The dispatch context for `invoke` - the handler under test never
+    /// replies, so no guild storage is needed (DM-shaped services).
+    fn services() -> KernelServices {
+        let output = RecordingChatOutput::new();
+        KernelServices {
+            chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
+            chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
+            guild_storage: None,
+            platform_info: test_platform_info(),
+        }
+    }
+
     #[test]
     fn register_lookup_roundtrip() {
         let registry = InMemoryCommandRegistry::new();
@@ -114,5 +174,53 @@ mod tests {
         registry.register(descriptor("ping"), Arc::new(NoopHandler));
 
         assert_eq!(registry.descriptors().len(), 1, "same name must not duplicate");
+    }
+
+    /// Contract: last registration wins AND the winner is actually served -
+    /// a regression keeping the replaced handler must be observable, so both
+    /// handlers are tagged and the invocation traced through a shared log.
+    #[tokio::test]
+    async fn re_registration_serves_the_new_handler() {
+        let registry = InMemoryCommandRegistry::new();
+        let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+        registry.register(
+            descriptor("ping"),
+            Arc::new(RecordingHandler { tag: "old", log: Arc::clone(&log) }),
+        );
+        registry.register(
+            descriptor("ping"),
+            Arc::new(RecordingHandler { tag: "new", log: Arc::clone(&log) }),
+        );
+
+        let handler = registry.lookup("ping").expect("command expected registered");
+        handler
+            .invoke(&command_event(), &CommandArgs::default(), &services())
+            .await
+            .expect("invoke expected to succeed");
+
+        assert_eq!(
+            *log.lock(),
+            vec!["new"],
+            "lookup must yield the latest registration, never the replaced one"
+        );
+    }
+
+    /// Contract: `descriptors()` is name-sorted regardless of registration
+    /// order - the deterministic Discord bulk sync payload across boots.
+    #[test]
+    fn descriptors_are_name_sorted_regardless_of_registration_order() {
+        let registry = InMemoryCommandRegistry::new();
+
+        registry.register(descriptor("zebra"), Arc::new(NoopHandler));
+        registry.register(descriptor("midway"), Arc::new(NoopHandler));
+        registry.register(descriptor("alpha"), Arc::new(NoopHandler));
+
+        let names: Vec<String> = registry.descriptors().into_iter().map(|d| d.name).collect();
+        assert_eq!(
+            names,
+            vec!["alpha".to_owned(), "midway".to_owned(), "zebra".to_owned()],
+            "descriptors must come back sorted by name"
+        );
     }
 }

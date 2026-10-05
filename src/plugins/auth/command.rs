@@ -472,6 +472,77 @@ mod tests {
         );
     }
 
+    /// The plugin-wide `policy_writes` lock serializes policy writes: two
+    /// concurrent `set` invocations queue behind the in-flight write instead
+    /// of racing its read-modify-write, so neither update is lost and both
+    /// assignments land in the policy document.
+    #[tokio::test]
+    async fn concurrent_policy_writes_do_not_lose_updates() {
+        let (storage, services, output) = fixture();
+        let handler = Arc::new(AuthCommandHandler::default());
+        // Hold the plugin-wide write lock, as an in-flight admin write would.
+        let guard = handler.policy_writes.lock().await;
+
+        let services_a = services.clone();
+        let services_b = services.clone();
+        let set_user = {
+            let handler = Arc::clone(&handler);
+            tokio::spawn(async move {
+                handler
+                    .invoke(
+                        &command_event(),
+                        &auth_args("set", Some("user"), Some("42"), None),
+                        &services_a,
+                    )
+                    .await
+                    .expect("set expected to succeed");
+            })
+        };
+        let set_role = {
+            let handler = Arc::clone(&handler);
+            tokio::spawn(async move {
+                handler
+                    .invoke(
+                        &command_event(),
+                        &auth_args("set", Some("banned"), None, Some("7")),
+                        &services_b,
+                    )
+                    .await
+                    .expect("set expected to succeed");
+            })
+        };
+
+        // Both writes must queue: until the lock is released, nothing lands.
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            stored_policy(&storage).await,
+            None,
+            "queued writes must wait for the in-flight write to release the lock"
+        );
+
+        drop(guard);
+        set_user.await.expect("set task expected to finish");
+        set_role.await.expect("set task expected to finish");
+
+        assert_eq!(
+            stored_policy(&storage).await,
+            Some(serde_json::json!({
+                "default_tier": "user",
+                "users": { "42": "user" },
+                "roles": { "7": "banned" },
+            })),
+            "the second write must merge onto the first, not lose one update"
+        );
+        let messages = output.messages();
+        assert_eq!(messages.len(), 2, "both invocations must be answered: {messages:?}");
+        assert!(
+            messages.iter().all(|message| message.contains("✅")),
+            "both writes must succeed: {messages:?}"
+        );
+    }
+
     #[tokio::test]
     async fn set_same_tier_is_idempotent() {
         let (storage, services, output) = fixture();

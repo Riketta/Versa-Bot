@@ -721,6 +721,39 @@ mod tests {
         assert_eq!(lol_store_engine_settings(Some(&config)).poll, Duration::from_secs(30));
     }
 
+    /// The status rotator's disable matrix: absent section, zero interval,
+    /// and an empty status list all map to the disabled state; a valid
+    /// section maps interval and statuses through verbatim.
+    #[test]
+    fn status_settings_disable_matrix() {
+        // Absent section.
+        let mut config = Configuration::default();
+        assert_eq!(status_settings(&config), StatusSettings::disabled());
+
+        // A valid section passes through.
+        config.status = Some(
+            serde_json::from_str(r#"{"interval_seconds": 30, "statuses": ["one", "two"]}"#)
+                .expect("valid [status] section deserializes"),
+        );
+        let settings = status_settings(&config);
+        assert_eq!(settings.interval, Duration::from_secs(30));
+        assert_eq!(settings.statuses, ["one", "two"]);
+
+        // Zero interval: disabled, no panic.
+        config.status = Some(
+            serde_json::from_str(r#"{"interval_seconds": 0, "statuses": ["one"]}"#)
+                .expect("zero-interval [status] section deserializes"),
+        );
+        assert_eq!(status_settings(&config), StatusSettings::disabled());
+
+        // Empty status list: disabled, no panic.
+        config.status = Some(
+            serde_json::from_str(r#"{"interval_seconds": 30, "statuses": []}"#)
+                .expect("empty-list [status] section deserializes"),
+        );
+        assert_eq!(status_settings(&config), StatusSettings::disabled());
+    }
+
     struct StubSource;
 
     #[async_trait]
@@ -751,8 +784,8 @@ mod tests {
 
         assert!(leaderboard_settings(None, source).is_none());
 
-        let mut config = LolLeaderboardConfig::default();
-        config.request_interval_secs = 0;
+        let mut config =
+            LolLeaderboardConfig { request_interval_secs: 0, ..LolLeaderboardConfig::default() };
         assert!(leaderboard_settings(Some(&config), source).is_none());
 
         config.request_interval_secs = 1;
@@ -765,5 +798,24 @@ mod tests {
 
         config.cache_ttl_secs = 3600;
         assert!(leaderboard_settings(Some(&config), source).is_some());
+    }
+
+    /// The startup parse-depth cap: an absurd `parse_depth` clamps to the
+    /// 10 000 cap constant (with a warning); a sane value passes through
+    /// unchanged.
+    #[test]
+    fn parse_depth_caps_at_the_limit() {
+        let source = StubSource;
+        let source: &dyn LeaderboardSourcePort = &source;
+
+        let config =
+            LolLeaderboardConfig { parse_depth: 20_000, ..LolLeaderboardConfig::default() };
+        let settings = leaderboard_settings(Some(&config), source).expect("valid section");
+        assert_eq!(settings.parse_depth, 10_000);
+
+        // A sane depth passes through unchanged.
+        let config = LolLeaderboardConfig { parse_depth: 1000, ..LolLeaderboardConfig::default() };
+        let settings = leaderboard_settings(Some(&config), source).expect("valid section");
+        assert_eq!(settings.parse_depth, 1000);
     }
 }

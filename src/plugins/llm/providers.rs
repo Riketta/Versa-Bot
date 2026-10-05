@@ -1776,6 +1776,31 @@ mod tests {
         assert!(matches!(result, Err(LlmError::Request(_))));
     }
 
+    /// A declared proxy reqwest cannot parse fails the adapter construction
+    /// loudly, naming the provider - the boot-fail contract the composition
+    /// root relies on: broken global LLM config must not start the bot.
+    #[test]
+    fn from_settings_rejects_invalid_proxy() {
+        let settings = LlmSettings {
+            providers: BTreeMap::from([(
+                "zai".to_owned(),
+                ProviderSettings {
+                    api_url: "https://example.invalid/v4".to_owned(),
+                    proxy: Some("not a url".to_owned()),
+                    ..ProviderSettings::default()
+                },
+            )]),
+            ..LlmSettings::default()
+        };
+        let message = match OpenAiCompatibleAdapter::from_settings(Arc::new(settings)) {
+            Err(LlmError::Request(message)) => message,
+            Err(err) => panic!("expected a request error, got {err}"),
+            Ok(_) => panic!("expected an error, but the adapter built"),
+        };
+        assert!(message.contains("`zai`"), "provider name expected in: {message}");
+        assert!(message.contains("proxy"), "proxy context expected in: {message}");
+    }
+
     /// A value that cannot be an env var name (dots, slashes) is almost
     /// always the key itself pasted into `api_key_env` - the error says so.
     #[test]
@@ -2019,5 +2044,28 @@ mod tests {
             panic!("expected a request failure, got {result:?}")
         };
         assert!(message.contains("HTTP 429"), "unexpected: {message}");
+    }
+
+    /// A model ref under an undeclared provider is rejected on BOTH port
+    /// paths before any network I/O: the provider lookup precedes the
+    /// request build, so no endpoint is ever dialed and no server fixture
+    /// is needed here. Guilds can only pick among declared models - a
+    /// typo'd provider name must fail closed, not reach somewhere else.
+    #[tokio::test]
+    async fn unknown_provider_is_rejected_on_both_completion_paths() {
+        let adapter = streaming_adapter("http://127.0.0.1:9/v1".to_owned());
+        let mut request = stream_request();
+        request.model = "ghost/m".to_owned();
+
+        let err =
+            adapter.complete(request.clone()).await.expect_err("unknown provider expected to fail");
+        assert!(matches!(err, LlmError::UnknownProvider(name) if name == "ghost"));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let err = adapter
+            .complete_streaming(request, tx)
+            .await
+            .expect_err("unknown provider expected to fail");
+        assert!(matches!(err, LlmError::UnknownProvider(name) if name == "ghost"));
     }
 }

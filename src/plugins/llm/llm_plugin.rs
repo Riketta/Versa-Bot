@@ -1341,6 +1341,61 @@ mod tests {
         assert_eq!(messages.len(), 1, "the reply trigger must get the fallback: {messages:?}");
     }
 
+    /// The panic-path trigger matcher, pinned directly (tests are in-module,
+    /// so the private associated fn is callable): a reply to a recorded
+    /// Assistant turn triggers; a reply to a user turn, or to an unknown
+    /// message id, does not - the role is part of the match.
+    #[tokio::test]
+    async fn reply_targets_bot_matches_only_recorded_assistant_turns() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let guild = storage.guild_scoped("test", GuildId(1));
+        let user_turn = ConversationRecord {
+            message_id: Some(400),
+            role: RecordRole::User,
+            author: Some("alice".to_owned()),
+            sender_id: None,
+            guild_name: None,
+            content: "hello".to_owned(),
+            reply_to: None,
+            captured_at: 0,
+            images: Vec::new(),
+        };
+        let bot_turn = ConversationRecord {
+            message_id: Some(999),
+            role: RecordRole::Assistant,
+            author: None,
+            sender_id: None,
+            guild_name: None,
+            content: "earlier bot answer".to_owned(),
+            reply_to: None,
+            captured_at: 1,
+            images: Vec::new(),
+        };
+        for record in [user_turn, bot_turn] {
+            guild
+                .append(
+                    &records_namespace(2),
+                    serde_json::to_value(&record).expect("record serializes"),
+                )
+                .await
+                .expect("append expected to succeed");
+        }
+
+        assert!(LlmPlugin::reply_targets_bot(&guild, 2, 999, 100, 10).await);
+        assert!(!LlmPlugin::reply_targets_bot(&guild, 2, 400, 100, 10).await);
+        assert!(!LlmPlugin::reply_targets_bot(&guild, 2, 867_5309, 100, 10).await);
+    }
+
+    /// A storage error keeps the reply trigger silent (`false`, logged):
+    /// history integrity is the only source of truth, and guessing would
+    /// fire fallback notices into conversations between users.
+    #[tokio::test]
+    async fn reply_targets_bot_stays_silent_on_storage_failure() {
+        let guild = FailingStorage.guild_scoped("test", GuildId(1));
+
+        assert!(!LlmPlugin::reply_targets_bot(&guild, 2, 999, 100, 10).await);
+    }
+
     #[tokio::test]
     async fn pre_ignores_unassigned_channels() {
         let (plugin, fixture) = fixture();

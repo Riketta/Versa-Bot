@@ -95,6 +95,23 @@ mod tests {
         }
     }
 
+    /// Fast job that stalls (in virtual time) on its 2nd and 4th run - the
+    /// fixture that makes missed ticks observable. A job sleeping on EVERY
+    /// run serializes the loop under all three missed-tick policies alike
+    /// (Burst catch-up ticks still wait for the job body), so only an
+    /// occasional stall lets the policies diverge in run count.
+    struct TwiceStallingJob(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl Job for TwiceStallingJob {
+        async fn run(&self) {
+            let run = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+            if run == 2 || run == 4 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
     /// A zero interval cannot drive a ticker (`tokio::time::interval` would
     /// panic inside the spawned task): the adapter must return a dead handle
     /// without spawning - the job never runs, cancelling stays a no-op.
@@ -200,6 +217,41 @@ mod tests {
             counter.load(Ordering::SeqCst) >= 2,
             "a panicking job must keep being scheduled, got {}",
             counter.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Contract: a slow job skips the ticks it missed while stalled instead
+    /// of burst-catching-up (`MissedTickBehavior::Delay` - the tokio default
+    /// this adapter must override is `Burst`).
+    ///
+    /// Paused (virtual) time, deterministic end to end: a 10ms ticker with
+    /// 50ms stalls on runs 2 and 4 yields ~22 runs in a 300ms window under
+    /// `Delay` (and `Skip`) - the missed deadlines are dropped - while
+    /// `Burst` fires the missed deadlines back-to-back for ~30 runs. The
+    /// bounds sit far from both marks; a fast job alone would never
+    /// differentiate, since every tick lands on its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn slow_job_skips_missed_ticks_without_bursting() {
+        let scheduler = TokioScheduler::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let _handle = scheduler.schedule(
+            "stalling",
+            Duration::from_millis(10),
+            Arc::new(TwiceStallingJob(Arc::clone(&counter))),
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let runs = counter.load(Ordering::SeqCst);
+        assert!(
+            runs < 26,
+            "a stalled job must not burst-catch-up its missed ticks, got {runs} runs \
+             (Burst would produce ~30)"
+        );
+        assert!(
+            runs >= 15,
+            "a stalled job must keep running on the trimmed schedule, got {runs} runs"
         );
     }
 }

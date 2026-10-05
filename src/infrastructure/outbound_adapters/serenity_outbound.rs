@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serenity::all::{
-    ChannelId as SerenityChannelId, CreateMessage, EditMessage, EmojiId,
+    ChannelId as SerenityChannelId, CreateAttachment, CreateMessage, EditMessage, Emoji, EmojiId,
     GuildId as SerenityGuildId, Http, MessageId as SerenityMessageId, MessageReference,
     MessageReferenceKind, ReactionType,
 };
@@ -106,19 +106,21 @@ fn denormalize_mention_tags(content: &str) -> String {
 /// scoped to a specific event origin. When the event carries an interaction
 /// reply token, sends go through the interaction followup endpoint instead
 /// of a plain channel message - plugins cannot tell the difference.
-pub struct SerenityChatOutputFactory {
-    http: Arc<Http>,
+pub struct SerenityChatOutputFactory<T = Http> {
+    http: Arc<T>,
 }
 
-impl SerenityChatOutputFactory {
+// `new` is deliberately unbounded - the private `ChatApi` bound lives on the
+// impls that need it, so the public constructor stays lint-clean.
+impl<T> SerenityChatOutputFactory<T> {
     /// Takes the shared REST client: serenity rate limiting is per `Http`,
     /// so every driven Discord caller must share one instance.
-    pub fn new(http: Arc<Http>) -> Self {
+    pub fn new(http: Arc<T>) -> Self {
         Self { http }
     }
 }
 
-impl ChatOutputFactoryPort for SerenityChatOutputFactory {
+impl<T: ChatApi> ChatOutputFactoryPort for SerenityChatOutputFactory<T> {
     fn chat_output(&self, origin: &Origin) -> Arc<dyn ChatOutputPort> {
         if let Some(token) = &origin.reply_token {
             return Arc::new(InteractionFollowupOutput::new(Arc::clone(&self.http), token.clone()));
@@ -191,15 +193,9 @@ impl ChatOutputFactoryPort for SerenityChatOutputFactory {
         if origin.channel_id.get() == 0 {
             return ChatTypingGuard::dead();
         }
-        let http = Arc::clone(&self.http);
         let channel = SerenityChannelId::new(origin.channel_id.get());
         let token = CancellationToken::new();
-        let cancel = token.clone();
-        tokio::spawn(async move {
-            let typing = http.start_typing(channel);
-            cancel.cancelled().await;
-            drop(typing);
-        });
+        self.http.run_typing(channel, token.clone());
         ChatTypingGuard::new(token)
     }
 
@@ -221,13 +217,13 @@ impl ChatOutputFactoryPort for SerenityChatOutputFactory {
     }
 }
 
-struct SerenityChatOutput {
-    http: Arc<Http>,
+struct SerenityChatOutput<T: ChatApi = Http> {
+    http: Arc<T>,
     channel_id: SerenityChannelId,
 }
 
 #[async_trait]
-impl ChatOutputPort for SerenityChatOutput {
+impl<T: ChatApi> ChatOutputPort for SerenityChatOutput<T> {
     async fn send(&self, message: OutboundMessage) -> Result<(), OutboundError> {
         // Discord rejects messages with neither content nor embeds (400).
         if message.is_empty() {
@@ -251,7 +247,7 @@ impl ChatOutputPort for SerenityChatOutput {
         self.http
             .send_message(self.channel_id, Vec::new(), &create)
             .await
-            .map_err(|err| OutboundError::Send(err.to_string()))?;
+            .map_err(OutboundError::Send)?;
         Ok(())
     }
 }
@@ -274,24 +270,24 @@ impl ChatOutputPort for UndeliverableChatOutput {
 /// in the origin channel. Custom `:name:` tokens resolve against the
 /// guild's current emoji list (one REST fetch per bare-name token -
 /// reactions are rare and capped, and the factory holds no gateway cache).
-struct SerenityReaction {
-    http: Arc<Http>,
+struct SerenityReaction<T: ChatApi = Http> {
+    http: Arc<T>,
     channel_id: SerenityChannelId,
     guild_id: SerenityGuildId,
 }
 
 #[async_trait]
-impl ReactionPort for SerenityReaction {
+impl<T: ChatApi> ReactionPort for SerenityReaction<T> {
     async fn add_reaction(&self, message_id: MessageId, emoji: &str) -> Result<(), OutboundError> {
         let reaction = self.resolve(emoji).await?;
         self.http
             .create_reaction(self.channel_id, SerenityMessageId::new(message_id.get()), &reaction)
             .await
-            .map_err(|err| OutboundError::Reaction(err.to_string()))
+            .map_err(OutboundError::Reaction)
     }
 }
 
-impl SerenityReaction {
+impl<T: ChatApi> SerenityReaction<T> {
     /// Maps a raw protocol token onto a Discord reaction type. Fully
     /// qualified forms (`<:name:id>`, `<a:name:id>`, `:name:id`) build the
     /// custom reaction directly; bare `:name:` needs the guild emoji list;
@@ -304,11 +300,8 @@ impl SerenityReaction {
                 Ok(custom_reaction(animated, &name, &id))
             }
             ParsedReaction::Name(name) => {
-                let emojis = self
-                    .http
-                    .get_emojis(self.guild_id)
-                    .await
-                    .map_err(|err| OutboundError::Reaction(err.to_string()))?;
+                let emojis =
+                    self.http.get_emojis(self.guild_id).await.map_err(OutboundError::Reaction)?;
                 emojis
                     .into_iter()
                     .find(|known| known.name.as_str() == name.as_str())
@@ -400,13 +393,13 @@ fn custom_reaction(animated: bool, name: &str, id: &str) -> ReactionType {
 /// Progressive-rendering output: creates the message on `begin`, then edits
 /// it in place as content arrives. Content-only - embeds are ignored in a
 /// message that exists to be overwritten.
-struct SerenityChatStream {
-    http: Arc<Http>,
+struct SerenityChatStream<T: ChatApi = Http> {
+    http: Arc<T>,
     channel_id: SerenityChannelId,
 }
 
 #[async_trait]
-impl ChatStreamPort for SerenityChatStream {
+impl<T: ChatApi> ChatStreamPort for SerenityChatStream<T> {
     async fn begin(&self, message: OutboundMessage) -> Result<MessageId, OutboundError> {
         if message.content.is_empty() {
             tracing::warn!(channel = %self.channel_id, "dropping empty streaming placeholder");
@@ -420,20 +413,20 @@ impl ChatStreamPort for SerenityChatStream {
             .http
             .send_message(self.channel_id, Vec::new(), &create)
             .await
-            .map_err(|err| OutboundError::Send(err.to_string()))?;
-        Ok(MessageId(created.id.get()))
+            .map_err(OutboundError::Send)?;
+        Ok(MessageId(created.get()))
     }
 
     async fn update(&self, message: MessageId, content: String) -> Result<(), OutboundError> {
         self.http
             .edit_message(
                 self.channel_id,
-                serenity::all::MessageId::new(message.get()),
+                SerenityMessageId::new(message.get()),
                 &EditMessage::new().content(denormalize_mention_tags(&content)),
                 Vec::new(),
             )
             .await
-            .map_err(|err| OutboundError::Send(err.to_string()))?;
+            .map_err(OutboundError::Send)?;
         Ok(())
     }
 }
@@ -486,6 +479,105 @@ impl InteractionApi for Http {
 
     async fn delete_followup(&self, token: &str, id: SerenityMessageId) -> Result<(), String> {
         self.delete_followup_message(token, id).await.map_err(|err| err.to_string())
+    }
+}
+
+/// The transport seam of the plain delivery half: the REST calls the channel
+/// send, streaming, and reaction paths make, plus the typing bridge. Split
+/// from serenity's `Http` so those paths are testable against a scripted
+/// transport (same pattern as [`InteractionApi`], whose two followup calls it
+/// subsumes as a supertrait: the factory's reply-token branch hands `T` to
+/// [`InteractionFollowupOutput`], so one bound covers both seams). Parameter
+/// shapes mirror the `Http` calls they replace; return values are narrowed to
+/// what the callers consume (the message id, not the whole message).
+#[async_trait]
+trait ChatApi: InteractionApi + 'static {
+    /// Mirrors `Http::send_message`; yields the created message's id.
+    async fn send_message(
+        &self,
+        channel_id: SerenityChannelId,
+        files: Vec<CreateAttachment>,
+        builder: &CreateMessage,
+    ) -> Result<SerenityMessageId, String>;
+
+    /// Mirrors `Http::edit_message`; yields the edited message's id.
+    async fn edit_message(
+        &self,
+        channel_id: SerenityChannelId,
+        message_id: SerenityMessageId,
+        builder: &EditMessage,
+        new_attachments: Vec<CreateAttachment>,
+    ) -> Result<SerenityMessageId, String>;
+
+    /// Mirrors `Http::create_reaction`.
+    async fn create_reaction(
+        &self,
+        channel_id: SerenityChannelId,
+        message_id: SerenityMessageId,
+        reaction_type: &ReactionType,
+    ) -> Result<(), String>;
+
+    /// Mirrors `Http::get_emojis`.
+    async fn get_emojis(&self, guild_id: SerenityGuildId) -> Result<Vec<Emoji>, String>;
+
+    /// Keeps serenity's typing indicator refreshing on the channel until
+    /// `cancel` fires: spawns the bridge task that holds serenity's `Typing`
+    /// handle and drops it on cancellation (which stops the refresh loop).
+    /// Sync by contract - the factory returns the guard immediately, and
+    /// refresh failures never surface to the guard's holder. The receiver is
+    /// `&Arc<Self>` because serenity's typing handle wants the owned client.
+    fn run_typing(self: &Arc<Self>, channel_id: SerenityChannelId, cancel: CancellationToken);
+}
+
+#[async_trait]
+impl ChatApi for Http {
+    async fn send_message(
+        &self,
+        channel_id: SerenityChannelId,
+        files: Vec<CreateAttachment>,
+        builder: &CreateMessage,
+    ) -> Result<SerenityMessageId, String> {
+        Http::send_message(self, channel_id, files, builder)
+            .await
+            .map(|message| message.id)
+            .map_err(|err| err.to_string())
+    }
+
+    async fn edit_message(
+        &self,
+        channel_id: SerenityChannelId,
+        message_id: SerenityMessageId,
+        builder: &EditMessage,
+        new_attachments: Vec<CreateAttachment>,
+    ) -> Result<SerenityMessageId, String> {
+        Http::edit_message(self, channel_id, message_id, builder, new_attachments)
+            .await
+            .map(|message| message.id)
+            .map_err(|err| err.to_string())
+    }
+
+    async fn create_reaction(
+        &self,
+        channel_id: SerenityChannelId,
+        message_id: SerenityMessageId,
+        reaction_type: &ReactionType,
+    ) -> Result<(), String> {
+        Http::create_reaction(self, channel_id, message_id, reaction_type)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn get_emojis(&self, guild_id: SerenityGuildId) -> Result<Vec<Emoji>, String> {
+        Http::get_emojis(self, guild_id).await.map_err(|err| err.to_string())
+    }
+
+    fn run_typing(self: &Arc<Self>, channel_id: SerenityChannelId, cancel: CancellationToken) {
+        let http = Arc::clone(self);
+        tokio::spawn(async move {
+            let typing = http.start_typing(channel_id);
+            cancel.cancelled().await;
+            drop(typing);
+        });
     }
 }
 
@@ -624,6 +716,7 @@ fn reply_reference(channel_id: SerenityChannelId, reply_to: MessageId) -> Messag
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::models::{GuildId, UserId};
 
     #[test]
     fn reaction_tokens_parse_into_their_reaction_kinds() {
@@ -858,5 +951,647 @@ mod tests {
         output.send(OutboundMessage::text("hello")).await.expect("delivery expected");
 
         assert_eq!(api.log(), ["create:flags", "delete:placeholder", "create:public"]);
+    }
+
+    // --- Delivery half: plain sends, streaming, reactions, factory routing ---
+    //
+    // `RecordingApi` extends the `ScriptedApi` seam pattern to the rest of
+    // the transport (`ChatApi`), recording each call richly enough to assert
+    // content, flags, and reference fields.
+
+    /// One recorded transport call, modeled on the real call shape so tests
+    /// can assert ids and serialized bodies.
+    #[derive(Debug, Clone, PartialEq)]
+    enum RecordedCall {
+        /// Plain channel send; `body` is the builder as the wire sees it.
+        SendMessage { channel: SerenityChannelId, body: serde_json::Value },
+        /// In-place edit; `body` is the builder as the wire sees it.
+        EditMessage {
+            channel: SerenityChannelId,
+            message: SerenityMessageId,
+            body: serde_json::Value,
+        },
+        /// Reaction applied to a message.
+        CreateReaction {
+            channel: SerenityChannelId,
+            message: SerenityMessageId,
+            reaction: ReactionType,
+        },
+        /// Guild emoji list fetch (bare `:name:` resolution).
+        GetEmojis { guild: SerenityGuildId },
+        /// Interaction followup create.
+        CreateFollowup { token: String, body: serde_json::Value },
+        /// Interaction followup delete.
+        DeleteFollowup { token: String, message: SerenityMessageId },
+        /// Typing bridge started for a channel.
+        RunTyping { channel: SerenityChannelId },
+    }
+
+    /// Scripted [`ChatApi`] recording every transport call. `emojis` scripts
+    /// the guild emoji list that bare `:name:` tokens resolve against; the
+    /// `failures` flags script transport errors per method, so the port's
+    /// negative paths (the `map_err` conversions) can be exercised.
+    struct RecordingApi {
+        calls: std::sync::Mutex<Vec<RecordedCall>>,
+        emojis: Vec<Emoji>,
+        failures: ApiFailures,
+    }
+
+    /// Which transports fail; everything unset succeeds.
+    #[derive(Default)]
+    struct ApiFailures {
+        send: bool,
+        edit: bool,
+        reaction: bool,
+        emojis: bool,
+    }
+
+    impl RecordingApi {
+        fn new(emojis: Vec<Emoji>) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                emojis,
+                failures: ApiFailures::default(),
+            }
+        }
+
+        fn record(&self, call: RecordedCall) {
+            self.calls.lock().expect("call log expected").push(call);
+        }
+
+        fn calls(&self) -> Vec<RecordedCall> {
+            self.calls.lock().expect("call log expected").clone()
+        }
+
+        /// Builds one guild emoji fixture from its wire shape (`Emoji` is
+        /// non-exhaustive, so it cannot be constructed field-by-field here).
+        fn emoji(name: &str, id: u64) -> Emoji {
+            serde_json::from_value(serde_json::json!({
+                "id": id.to_string(),
+                "name": name,
+                "user": null,
+            }))
+            .expect("emoji fixture deserializes")
+        }
+    }
+
+    #[async_trait]
+    impl InteractionApi for RecordingApi {
+        async fn create_followup(
+            &self,
+            token: &str,
+            body: &serde_json::Value,
+        ) -> Result<SerenityMessageId, String> {
+            self.record(RecordedCall::CreateFollowup {
+                token: token.to_owned(),
+                body: body.clone(),
+            });
+            Ok(SerenityMessageId::new(500))
+        }
+
+        async fn delete_followup(
+            &self,
+            token: &str,
+            message: SerenityMessageId,
+        ) -> Result<(), String> {
+            self.record(RecordedCall::DeleteFollowup { token: token.to_owned(), message });
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ChatApi for RecordingApi {
+        async fn send_message(
+            &self,
+            channel: SerenityChannelId,
+            files: Vec<CreateAttachment>,
+            builder: &CreateMessage,
+        ) -> Result<SerenityMessageId, String> {
+            assert!(files.is_empty(), "the delivery half never attaches files");
+            self.record(RecordedCall::SendMessage {
+                channel,
+                body: serde_json::to_value(builder).expect("builder serializes"),
+            });
+            if self.failures.send {
+                return Err("send transport failed".to_owned());
+            }
+            Ok(SerenityMessageId::new(600))
+        }
+
+        async fn edit_message(
+            &self,
+            channel: SerenityChannelId,
+            message: SerenityMessageId,
+            builder: &EditMessage,
+            new_attachments: Vec<CreateAttachment>,
+        ) -> Result<SerenityMessageId, String> {
+            assert!(new_attachments.is_empty(), "the delivery half never attaches files");
+            self.record(RecordedCall::EditMessage {
+                channel,
+                message,
+                body: serde_json::to_value(builder).expect("builder serializes"),
+            });
+            if self.failures.edit {
+                return Err("edit transport failed".to_owned());
+            }
+            Ok(message)
+        }
+
+        async fn create_reaction(
+            &self,
+            channel: SerenityChannelId,
+            message: SerenityMessageId,
+            reaction: &ReactionType,
+        ) -> Result<(), String> {
+            self.record(RecordedCall::CreateReaction {
+                channel,
+                message,
+                reaction: reaction.clone(),
+            });
+            if self.failures.reaction {
+                return Err("reaction transport failed".to_owned());
+            }
+            Ok(())
+        }
+
+        async fn get_emojis(&self, guild: SerenityGuildId) -> Result<Vec<Emoji>, String> {
+            self.record(RecordedCall::GetEmojis { guild });
+            if self.failures.emojis {
+                return Err("emoji transport failed".to_owned());
+            }
+            Ok(self.emojis.clone())
+        }
+
+        fn run_typing(self: &Arc<Self>, channel: SerenityChannelId, _cancel: CancellationToken) {
+            self.record(RecordedCall::RunTyping { channel });
+        }
+    }
+
+    fn delivery_api(emojis: Vec<Emoji>) -> Arc<RecordingApi> {
+        Arc::new(RecordingApi::new(emojis))
+    }
+
+    /// An API whose scripted transport failures exercise the port's
+    /// negative paths (the `map_err` conversions the ChatApi refactor
+    /// rewrote); only the named methods fail.
+    fn failing_api(failures: ApiFailures) -> Arc<RecordingApi> {
+        Arc::new(RecordingApi {
+            calls: std::sync::Mutex::new(Vec::new()),
+            emojis: Vec::new(),
+            failures,
+        })
+    }
+
+    fn delivery_output(api: &Arc<RecordingApi>) -> SerenityChatOutput<RecordingApi> {
+        SerenityChatOutput { http: Arc::clone(api), channel_id: SerenityChannelId::new(5) }
+    }
+
+    fn delivery_stream(api: &Arc<RecordingApi>) -> SerenityChatStream<RecordingApi> {
+        SerenityChatStream { http: Arc::clone(api), channel_id: SerenityChannelId::new(5) }
+    }
+
+    fn delivery_reaction(api: &Arc<RecordingApi>) -> SerenityReaction<RecordingApi> {
+        SerenityReaction {
+            http: Arc::clone(api),
+            channel_id: SerenityChannelId::new(5),
+            guild_id: SerenityGuildId::new(7),
+        }
+    }
+
+    fn delivery_factory(api: &Arc<RecordingApi>) -> SerenityChatOutputFactory<RecordingApi> {
+        SerenityChatOutputFactory::new(Arc::clone(api))
+    }
+
+    fn origin(guild_id: Option<u64>, channel_id: u64, reply_token: Option<&str>) -> Origin {
+        Origin {
+            guild_id: guild_id.map(GuildId),
+            channel_id: ChannelId(channel_id),
+            user_id: UserId(1),
+            message_id: None,
+            reply_token: reply_token.map(str::to_owned),
+        }
+    }
+
+    /// An empty plain send (no content, no embeds) is dropped with `Ok` -
+    /// Discord would reject it with a 400, and the transport is never touched.
+    #[tokio::test]
+    async fn plain_send_of_an_empty_message_drops_without_a_call() {
+        let api = delivery_api(vec![]);
+        let output = delivery_output(&api);
+
+        output.send(OutboundMessage::text("")).await.expect("dropped, not failed");
+
+        assert!(api.calls().is_empty(), "an empty message must not reach the transport");
+    }
+
+    /// A plain send denormalizes `[Name]<@id>` back to bare tags in content
+    /// and embed fields, and the ephemeral hint is ignored: plain channel
+    /// sends are always public, so no flags ride the wire.
+    #[tokio::test]
+    async fn plain_send_denormalizes_and_ignores_the_ephemeral_hint() {
+        let api = delivery_api(vec![]);
+        let output = delivery_output(&api);
+        let message = OutboundMessage {
+            content: "hey [Alice]<@123>!".to_owned(),
+            embeds: vec![Embed {
+                title: "Hi [Bob]<@7>".to_owned(),
+                description: "see [Cara]<@8>".to_owned(),
+            }],
+            ephemeral: true,
+            reply_to: None,
+        };
+
+        output.send(message).await.expect("plain send delivers");
+
+        let calls = api.calls();
+        assert_eq!(calls.len(), 1, "exactly one plain send");
+        let RecordedCall::SendMessage { channel, body } = calls.first().expect("one call") else {
+            panic!("expected a plain channel send, got {:?}", calls.first());
+        };
+        assert_eq!(*channel, SerenityChannelId::new(5));
+        assert_eq!(body.get("content").and_then(serde_json::Value::as_str), Some("hey <@123>!"));
+        let embeds =
+            body.get("embeds").and_then(serde_json::Value::as_array).expect("embeds expected");
+        let embed = embeds.first().expect("one embed expected");
+        assert_eq!(embed.get("title").and_then(serde_json::Value::as_str), Some("Hi <@7>"));
+        assert_eq!(embed.get("description").and_then(serde_json::Value::as_str), Some("see <@8>"));
+        assert_eq!(body.get("flags"), None, "the ephemeral hint is ignored on plain sends");
+        assert_eq!(body.get("message_reference"), None);
+    }
+
+    /// A `reply_to` rides the send as a Default-kind message reference pinned
+    /// to the destination channel, with `fail_if_not_exists` off: a deleted
+    /// target degrades to a normal send instead of failing the delivery (the
+    /// LLM guaranteed-answer contract rides these sends).
+    #[tokio::test]
+    async fn plain_send_carries_the_reply_reference_and_degrades_gracefully() {
+        let api = delivery_api(vec![]);
+        let output = delivery_output(&api);
+
+        output
+            .send(OutboundMessage::text("answering").replying_to(MessageId(42)))
+            .await
+            .expect("reply send delivers");
+
+        let calls = api.calls();
+        let RecordedCall::SendMessage { body, .. } = calls.first().expect("one call") else {
+            panic!("expected a plain channel send, got {:?}", calls.first());
+        };
+        let reference = body.get("message_reference").expect("reply reference expected");
+        assert_eq!(reference.get("type").and_then(serde_json::Value::as_u64), Some(0));
+        assert_eq!(reference.get("message_id").and_then(serde_json::Value::as_str), Some("42"));
+        assert_eq!(reference.get("channel_id").and_then(serde_json::Value::as_str), Some("5"));
+        assert_eq!(
+            reference.get("fail_if_not_exists").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "a deleted target must degrade to a normal send, never fail"
+        );
+    }
+
+    /// An empty streaming placeholder is rejected before the transport: there
+    /// is nothing to create, and the stream contract wants an `Err`, not a
+    /// silent message.
+    #[tokio::test]
+    async fn stream_begin_rejects_an_empty_placeholder_without_a_call() {
+        let api = delivery_api(vec![]);
+        let stream = delivery_stream(&api);
+
+        let result = stream.begin(OutboundMessage::text("")).await;
+
+        assert!(matches!(result, Err(OutboundError::Send(_))));
+        assert!(api.calls().is_empty());
+    }
+
+    /// `begin` creates on the origin channel with denormalized content (and
+    /// the reply reference, when present) and returns the created handle;
+    /// `update` edits that message in place with denormalized content.
+    #[tokio::test]
+    async fn stream_begin_and_update_target_the_channel_and_denormalize() {
+        let api = delivery_api(vec![]);
+        let stream = delivery_stream(&api);
+
+        let created = stream
+            .begin(OutboundMessage::text("hey [Alice]<@123>!").replying_to(MessageId(42)))
+            .await
+            .expect("begin delivers");
+        stream.update(created, "done [Bob]<@7>".to_owned()).await.expect("update delivers");
+
+        assert_eq!(created, MessageId(600), "begin yields the created message's id");
+        let calls = api.calls();
+        assert_eq!(calls.len(), 2);
+        let RecordedCall::SendMessage { channel, body } = calls.first().expect("create expected")
+        else {
+            panic!("expected a channel send, got {:?}", calls.first());
+        };
+        assert_eq!(*channel, SerenityChannelId::new(5));
+        assert_eq!(body.get("content").and_then(serde_json::Value::as_str), Some("hey <@123>!"));
+        assert!(body.get("message_reference").is_some(), "the reply anchor survives begin");
+
+        let RecordedCall::EditMessage { channel, message, body } =
+            calls.get(1).expect("edit expected")
+        else {
+            panic!("expected an edit, got {:?}", calls.get(1));
+        };
+        assert_eq!(*channel, SerenityChannelId::new(5));
+        assert_eq!(*message, SerenityMessageId::new(600), "edits ride the created handle");
+        assert_eq!(body.get("content").and_then(serde_json::Value::as_str), Some("done <@7>"));
+    }
+
+    /// A bare `:name:` token resolves through the guild emoji list: the hit
+    /// reacts as that custom emoji, one lookup ahead of it.
+    #[tokio::test]
+    async fn reaction_bare_name_resolves_through_the_guild_emoji_list() {
+        let api =
+            delivery_api(vec![RecordingApi::emoji("dorkiS", 9), RecordingApi::emoji("other", 3)]);
+        let reaction = delivery_reaction(&api);
+
+        reaction.add_reaction(MessageId(42), ":dorkiS:").await.expect("known emoji reacts");
+
+        assert_eq!(
+            api.calls(),
+            vec![
+                RecordedCall::GetEmojis { guild: SerenityGuildId::new(7) },
+                RecordedCall::CreateReaction {
+                    channel: SerenityChannelId::new(5),
+                    message: SerenityMessageId::new(42),
+                    reaction: ReactionType::Custom {
+                        animated: false,
+                        id: EmojiId::new(9),
+                        name: Some("dorkiS".to_owned()),
+                    },
+                },
+            ],
+            "resolution fetches the guild list, then reacts with the matched emoji"
+        );
+    }
+
+    /// A bare `:name:` the guild does not have fails per-token with no
+    /// reaction call - cosmetic by contract, callers log and continue.
+    #[tokio::test]
+    async fn reaction_unknown_bare_name_fails_per_token_without_a_reaction_call() {
+        let api = delivery_api(vec![RecordingApi::emoji("other", 3)]);
+        let reaction = delivery_reaction(&api);
+
+        let result = reaction.add_reaction(MessageId(42), ":dorkiS:").await;
+
+        assert!(matches!(result, Err(OutboundError::Reaction(_))));
+        assert_eq!(
+            api.calls(),
+            vec![RecordedCall::GetEmojis { guild: SerenityGuildId::new(7) }],
+            "only the lookup happens - no reaction is attempted"
+        );
+    }
+
+    /// An unparseable token fails closed before any transport call: no emoji
+    /// fetch, no reaction.
+    #[tokio::test]
+    async fn reaction_invalid_token_fails_closed_without_a_call() {
+        let api = delivery_api(vec![RecordingApi::emoji("dorkiS", 9)]);
+        let reaction = delivery_reaction(&api);
+
+        let result = reaction.add_reaction(MessageId(42), "not an emoji").await;
+
+        assert!(matches!(result, Err(OutboundError::Reaction(_))));
+        assert!(api.calls().is_empty());
+    }
+
+    // ---- Transport-failure mapping (the negative paths the ChatApi seam
+    // rewrote to point-free `map_err`) ----
+
+    /// A failed send transport surfaces as the port's `Send` error carrying
+    /// the transport message - no panic, no silent drop.
+    #[tokio::test]
+    async fn plain_send_transport_failure_maps_onto_the_port_error() {
+        let api = failing_api(ApiFailures { send: true, ..ApiFailures::default() });
+        let output = delivery_output(&api);
+
+        let result = output.send(OutboundMessage::text("hello")).await;
+
+        match result {
+            Err(OutboundError::Send(message)) => assert_eq!(message, "send transport failed"),
+            other => panic!("expected a send error, got {other:?}"),
+        }
+    }
+
+    /// A failed edit transport mid-stream surfaces as the port's `Send`
+    /// error on the `update` half, exactly like on `begin`.
+    #[tokio::test]
+    async fn stream_update_transport_failure_maps_onto_the_port_error() {
+        let api = failing_api(ApiFailures { edit: true, ..ApiFailures::default() });
+        let stream = delivery_stream(&api);
+        let created = stream
+            .begin(OutboundMessage::text("hi"))
+            .await
+            .expect("begin succeeds while only edits fail");
+
+        let result = stream.update(created, "more".to_owned()).await;
+
+        match result {
+            Err(OutboundError::Send(message)) => assert_eq!(message, "edit transport failed"),
+            other => panic!("expected a send error, got {other:?}"),
+        }
+    }
+
+    /// A failed reaction transport surfaces as the port's `Reaction` error
+    /// carrying the transport message - per-token, never fatal by contract.
+    #[tokio::test]
+    async fn reaction_transport_failure_maps_onto_the_port_error() {
+        let api = failing_api(ApiFailures { reaction: true, ..ApiFailures::default() });
+        let reaction = delivery_reaction(&api);
+
+        let result = reaction.add_reaction(MessageId(42), "🍌").await;
+
+        match result {
+            Err(OutboundError::Reaction(message)) => {
+                assert_eq!(message, "reaction transport failed");
+            }
+            other => panic!("expected a reaction error, got {other:?}"),
+        }
+    }
+
+    /// A failed emoji-list fetch (bare `:name:` resolution) surfaces as the
+    /// port's `Reaction` error - the lookup failing closed, per token.
+    #[tokio::test]
+    async fn emoji_lookup_transport_failure_maps_onto_the_port_error() {
+        let api = failing_api(ApiFailures { emojis: true, ..ApiFailures::default() });
+        let reaction = delivery_reaction(&api);
+
+        let result = reaction.add_reaction(MessageId(42), ":dorkiS:").await;
+
+        assert!(matches!(result, Err(OutboundError::Reaction(_))));
+    }
+
+    /// A reply-token origin routes every send onto the interaction followup
+    /// path - the plain channel path is never touched. The first PUBLIC
+    /// content rides the placeholder dance: the deferred ephemeral original
+    /// cannot carry public content (editing it inherits its state), so the
+    /// slot is consumed with an invoker-only placeholder, that placeholder
+    /// is deleted, and the real content posts as a fresh followup.
+    #[tokio::test]
+    async fn factory_reply_token_origins_route_onto_the_followup_path() {
+        let api = delivery_api(vec![]);
+        let factory = delivery_factory(&api);
+
+        let output = factory.chat_output(&origin(Some(7), 5, Some("tok-1")));
+        output.send(OutboundMessage::text("hello")).await.expect("followup delivers");
+
+        let calls = api.calls();
+        let [placeholder, delete, content] = calls.as_slice() else {
+            panic!("expected placeholder, delete, content; got {calls:?}");
+        };
+        // The placeholder stays generic - only its shape is contractual
+        // (see `placeholder_is_ephemeral_and_non_empty`): invoker-only,
+        // some content, bound to the interaction token.
+        let RecordedCall::CreateFollowup { token, body: placeholder_body } = placeholder else {
+            panic!("expected a followup create first, got {placeholder:?}");
+        };
+        assert_eq!(token, "tok-1");
+        assert_eq!(placeholder_body.get("flags"), Some(&serde_json::json!(64)));
+        assert!(
+            placeholder_body
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| !text.is_empty()),
+            "the placeholder must carry some content"
+        );
+        assert_eq!(
+            delete,
+            &RecordedCall::DeleteFollowup {
+                token: "tok-1".to_owned(),
+                message: SerenityMessageId::new(500),
+            }
+        );
+        assert_eq!(
+            content,
+            &RecordedCall::CreateFollowup {
+                token: "tok-1".to_owned(),
+                body: serde_json::json!({ "content": "hello" }),
+            }
+        );
+    }
+
+    /// A channel-less origin (guild-bound but `ChannelId(0)`) fails fast on
+    /// plain sends: a Discord call for channel 0 is a guaranteed 404, so
+    /// none is attempted.
+    #[tokio::test]
+    async fn factory_channel_less_origins_fail_fast_without_a_call() {
+        let api = delivery_api(vec![]);
+        let factory = delivery_factory(&api);
+
+        let output = factory.chat_output(&origin(Some(7), 0, None));
+        let result = output.send(OutboundMessage::text("hi")).await;
+
+        assert!(matches!(result, Err(OutboundError::Send(_))));
+        assert!(api.calls().is_empty());
+    }
+
+    /// Configured-channel logging is guild-scoped by contract: a DM origin or
+    /// a zero channel yields the undeliverable port (fail, zero calls), while
+    /// a guild-bound origin lands on the configured channel itself.
+    #[tokio::test]
+    async fn factory_configured_channels_are_guild_scoped() {
+        let api = delivery_api(vec![]);
+        let factory = delivery_factory(&api);
+
+        let dm = factory.channel_output(&origin(None, 5, None), ChannelId(9));
+        let channel_less = factory.channel_output(&origin(Some(7), 5, None), ChannelId(0));
+        assert!(matches!(dm.send(OutboundMessage::text("log")).await, Err(OutboundError::Send(_))));
+        assert!(matches!(
+            channel_less.send(OutboundMessage::text("log")).await,
+            Err(OutboundError::Send(_))
+        ));
+
+        let guild_bound = factory.channel_output(&origin(Some(7), 5, None), ChannelId(9));
+        guild_bound.send(OutboundMessage::text("log")).await.expect("guild-bound log delivers");
+
+        let calls = api.calls();
+        assert_eq!(calls.len(), 1, "only the guild-bound send reaches the transport");
+        let RecordedCall::SendMessage { channel, body } = calls.first().expect("one call") else {
+            panic!("expected a plain channel send, got {:?}", calls.first());
+        };
+        assert_eq!(*channel, SerenityChannelId::new(9), "the configured channel is honored");
+        assert_eq!(body.get("content").and_then(serde_json::Value::as_str), Some("log"));
+    }
+
+    /// Reply-token, DM, and channel-less origins get an undeliverable stream:
+    /// both stream calls fail and nothing reaches the transport - guild data
+    /// must not land on a guild-visible surface by accident.
+    #[tokio::test]
+    async fn factory_non_streamable_origins_get_an_undeliverable_stream() {
+        let api = delivery_api(vec![]);
+        let factory = delivery_factory(&api);
+
+        let reply_token = factory.stream_output(&origin(Some(7), 5, Some("tok-1")));
+        let dm = factory.stream_output(&origin(None, 5, None));
+        let channel_less = factory.stream_output(&origin(Some(7), 0, None));
+        for stream in [&reply_token, &dm, &channel_less] {
+            assert!(matches!(
+                stream.begin(OutboundMessage::text("x")).await,
+                Err(OutboundError::Send(_))
+            ));
+            assert!(matches!(
+                stream.update(MessageId(1), "x".to_owned()).await,
+                Err(OutboundError::Send(_))
+            ));
+        }
+
+        assert!(api.calls().is_empty(), "streaming never reaches the transport here");
+    }
+
+    /// A DM origin cannot react: the factory hands out the undeliverable
+    /// reaction port, which fails without touching the transport.
+    #[tokio::test]
+    async fn factory_dm_origins_cannot_react() {
+        let api = delivery_api(vec![]);
+        let factory = delivery_factory(&api);
+
+        let reaction = factory.react(&origin(None, 5, None));
+        let result = reaction.add_reaction(MessageId(42), "👍").await;
+
+        assert!(matches!(result, Err(OutboundError::Reaction(_))));
+        assert!(api.calls().is_empty());
+    }
+
+    /// Typing bridges real channels through the transport seam and stays
+    /// dead for channel-less origins: no bridge, no transport call.
+    #[test]
+    fn factory_start_typing_bridges_real_channels_only() {
+        let api = delivery_api(vec![]);
+        let factory = delivery_factory(&api);
+
+        factory.start_typing(&origin(Some(7), 5, None));
+        factory.start_typing(&origin(Some(7), 0, None));
+
+        assert_eq!(
+            api.calls(),
+            vec![RecordedCall::RunTyping { channel: SerenityChannelId::new(5) }],
+            "the channel-less origin gets a dead guard, never a bridge"
+        );
+    }
+
+    /// The undeliverable ports fail every call outright - they carry no
+    /// transport at all, so nothing can reach the API through them.
+    #[tokio::test]
+    async fn undeliverable_ports_fail_every_call() {
+        let api = delivery_api(vec![]);
+
+        assert!(matches!(
+            UndeliverableChatOutput.send(OutboundMessage::text("hi")).await,
+            Err(OutboundError::Send(_))
+        ));
+        assert!(matches!(
+            UndeliverableChatStream.begin(OutboundMessage::text("hi")).await,
+            Err(OutboundError::Send(_))
+        ));
+        assert!(matches!(
+            UndeliverableChatStream.update(MessageId(1), "hi".to_owned()).await,
+            Err(OutboundError::Send(_))
+        ));
+        assert!(matches!(
+            UndeliverableReactionPort.add_reaction(MessageId(42), "👍").await,
+            Err(OutboundError::Reaction(_))
+        ));
+
+        assert!(api.calls().is_empty(), "nothing is wired - nothing can be called");
     }
 }

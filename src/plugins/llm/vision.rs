@@ -384,6 +384,98 @@ mod tests {
         assert_eq!(body, b"png-bytes");
     }
 
+    /// Redirects are unfollowed (`Policy::none` on the fetch client): a
+    /// `302` surfaces AS the response for the download path to reject as a
+    /// non-success (`VisionError::Download` carrying the status), and the
+    /// Location target is never fetched. The single-accept fixture cannot
+    /// serve a second request, so a followed redirect could not have
+    /// produced this status. The status-mapping branch itself lives inside
+    /// the CDN-pinned `download`, behind the host prefix check, which no
+    /// local fixture URL can pass (the pin forces https; the fixture is
+    /// plain TCP) - so this test pins the unfollowed-redirect precondition
+    /// on the service's own client, the same seam the `read_capped` tests
+    /// use below the host check.
+    #[tokio::test]
+    async fn redirect_responses_are_surfaced_not_followed() {
+        let script = "HTTP/1.1 302 Found\r\nLocation: /moved.png\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+            .to_owned();
+        let (url, server) = raw_http_server(script.into_bytes()).await;
+        // In-module construction keeps the service's REAL client - exactly
+        // the Policy::none configuration the download path relies on.
+        let service = VisionService::new(Arc::new(NeverCompletion));
+
+        let response = service.fetch.get(&url).send().await.expect("redirect expected to surface");
+        let _ = server.await;
+
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    }
+
+    /// A lying `Content-Length` is rejected by the pre-check before any
+    /// body byte is buffered: the streamed body here (4 bytes) would fit
+    /// the cap, so only the header check can produce this `TooLarge`.
+    #[tokio::test]
+    async fn lying_content_length_is_rejected_before_the_body_streams() {
+        let script =
+            "HTTP/1.0 200 OK\r\nContent-Length: 9999\r\nConnection: close\r\n\r\ntiny".to_owned();
+        let (url, server) = raw_http_server(script.into_bytes()).await;
+        let response = reqwest::get(&url).await.expect("fetch expected to succeed");
+
+        let err = VisionService::read_capped(response, 64)
+            .await
+            .expect_err("lying header expected to fail");
+        let _ = server.await;
+
+        assert!(matches!(err, VisionError::TooLarge));
+    }
+
+    /// Batch semantics of `describe`: results keep input order, each source
+    /// is decided independently (a sibling failure never aborts the batch),
+    /// and a rejected source never reaches the completion port - the
+    /// panicking stub would explode the test if it did. The "one good
+    /// source" half of the contract cannot be served hermetically THROUGH
+    /// `describe`: the pinned CDN prefix forces an https URL, which a
+    /// plain-TCP local fixture cannot answer (no TLS) - the same reason the
+    /// `read_capped` tests call the private `read_capped` past the host
+    /// check. The success side (exactly one completion call per good image,
+    /// descriptions in input order) is therefore pinned at the seams that
+    /// exist: the host/redirect/download tests here, and the engine-level
+    /// capture tests, which drive the describer port with a fake.
+    #[tokio::test]
+    async fn describe_preserves_order_and_isolates_failures() {
+        let service = VisionService::new(Arc::new(NeverCompletion));
+        let job = ImageJob {
+            model: "m".to_owned(),
+            prompt: "p".to_owned(),
+            max_side: 512,
+            jpeg_quality: 85,
+            max_source_bytes: 1000,
+        };
+
+        let out = service
+            .describe(
+                &job,
+                vec![
+                    ImageSource {
+                        url: "https://evil.test/first.png".to_owned(),
+                        content_type: Some("image/png".to_owned()),
+                        ext: None,
+                    },
+                    ImageSource {
+                        // Right host, wrong scheme: fails the same prefix
+                        // check - proves the loop moves past a failed
+                        // sibling instead of aborting the batch.
+                        url: "http://cdn.discordapp.com/second.png".to_owned(),
+                        content_type: Some("image/png".to_owned()),
+                        ext: None,
+                    },
+                ],
+            )
+            .await;
+
+        assert_eq!(out, vec![None, None]);
+    }
+
     fn encode_png(image: &image::RgbImage) -> Vec<u8> {
         let mut png = Vec::new();
         image

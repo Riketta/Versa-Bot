@@ -77,11 +77,10 @@ pub fn init(
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(fallback));
     // An explicit `[logging].level` is used verbatim; a typo must not
     // silently change what is captured, so invalid directives abort startup.
-    let file_filter = match logging.and_then(|logging| logging.level.as_deref()) {
-        Some(directives) => EnvFilter::try_new(directives)
+    let file_filter = EnvFilter::new(
+        file_filter_directives(logging.and_then(|logging| logging.level.as_deref()))
             .expect("config [logging].level expected to be valid EnvFilter directives"),
-        None => EnvFilter::new(FILE_DEFAULT_FILTER),
-    };
+    );
 
     let mut file_guard = None;
     let mut file_layer = None;
@@ -111,34 +110,33 @@ pub fn init(
 
     // A malformed DSN must not abort startup: the tracing subscriber is not
     // installed yet, so warn on stderr and continue stdout-only.
-    let guard =
-        sentry_dsn.map(str::trim).filter(|dsn| !dsn.is_empty()).and_then(|dsn| match dsn.parse() {
-            Ok(dsn) => {
-                // `ClientOptions` is `#[non_exhaustive]` - construct via defaults
-                // and field assignment, not a struct literal.
-                let mut options = sentry::ClientOptions::default();
-                options.dsn = Some(dsn);
-                // Cow<'static, str> - the borrowed &str outlives nothing here,
-                // so take ownership first.
-                options.environment = sentry_environment.map(String::from).map(Into::into);
-                options.release = sentry::release_name!();
-                if let Some(rate) = sentry_traces_sample_rate {
-                    if (0.0..=1.0).contains(&rate) {
-                        options = options.traces_sample_rate(rate);
-                    } else {
-                        eprintln!(
-                            "warning: sentry.traces_sample_rate {rate} is outside 0.0..=1.0 \
-                             - performance monitoring disabled"
-                        );
-                    }
-                }
-                Some(sentry::init(options))
+    let guard = effective_dsn(sentry_dsn).and_then(|dsn| match dsn.parse() {
+        Ok(dsn) => {
+            // `ClientOptions` is `#[non_exhaustive]` - construct via defaults
+            // and field assignment, not a struct literal.
+            let mut options = sentry::ClientOptions::default();
+            options.dsn = Some(dsn);
+            // Cow<'static, str> - the borrowed &str outlives nothing here,
+            // so take ownership first.
+            options.environment = sentry_environment.map(String::from).map(Into::into);
+            options.release = sentry::release_name!();
+            match (usable_sample_rate(sentry_traces_sample_rate), sentry_traces_sample_rate) {
+                (Some(rate), _) => options = options.traces_sample_rate(rate),
+                // Reported, not fatal: an out-of-range rate turns performance
+                // monitoring off while error reporting itself stays on.
+                (None, Some(configured)) => eprintln!(
+                    "warning: sentry.traces_sample_rate {configured} is outside 0.0..=1.0 \
+                     - performance monitoring disabled"
+                ),
+                (None, None) => {}
             }
-            Err(err) => {
-                eprintln!("warning: invalid Sentry DSN ({err}) - Sentry reporting disabled");
-                None
-            }
-        });
+            Some(sentry::init(options))
+        }
+        Err(err) => {
+            eprintln!("warning: invalid Sentry DSN ({err}) - Sentry reporting disabled");
+            None
+        }
+    });
 
     match &guard {
         Some(_) => registry
@@ -160,4 +158,106 @@ pub fn init(
     }
 
     ObservabilityGuards { sentry: guard, file: file_guard }
+}
+
+/// The file layer's filter directives: an explicit `[logging].level` is
+/// used verbatim after validation, its absence picks the flight-recorder
+/// default. The `Err` case is the deliberate fail-fast for invalid
+/// directives - `init` turns it into the aborting `expect`, since a typo
+/// must not silently change what is captured.
+fn file_filter_directives(level: Option<&str>) -> Result<String, String> {
+    match level {
+        Some(directives) => EnvFilter::try_new(directives)
+            .map(|_| directives.to_owned())
+            .map_err(|err| err.to_string()),
+        None => Ok(FILE_DEFAULT_FILTER.to_owned()),
+    }
+}
+
+/// The DSN Sentry would parse: trimmed, with an empty or whitespace-only
+/// value treated as absent - reporting disabled without a warning, since a
+/// blank DSN is a configuration, not a misconfiguration. A non-empty value
+/// that still fails the DSN parse is `init`'s warn-and-continue case.
+fn effective_dsn(dsn: Option<&str>) -> Option<&str> {
+    dsn.map(str::trim).filter(|dsn| !dsn.is_empty())
+}
+
+/// The sample rate `init` may hand to the Sentry client: an unset rate
+/// stays `None` (SDK default), an in-range rate passes through, and an
+/// out-of-range one degrades to `None` - performance monitoring off while
+/// error reporting is unaffected. `init` emits the warning for the
+/// degraded case, and only when a DSN is actually wired.
+fn usable_sample_rate(rate: Option<f32>) -> Option<f32> {
+    rate.filter(|rate| (0.0..=1.0).contains(rate))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A DSN that passes `sentry`'s parser - the valid shape of the Sentry
+    /// decisions.
+    const VALID_DSN: &str = "https://examplePublicKey@o0.ingest.sentry.io/0";
+
+    #[test]
+    fn explicit_file_level_is_used_verbatim() {
+        assert_eq!(
+            file_filter_directives(Some("info,versa_bot=trace")).as_deref(),
+            Ok("info,versa_bot=trace")
+        );
+    }
+
+    /// The deliberate fail-fast: invalid directives are an `Err` that
+    /// `init` turns into the aborting `expect` - a typo must not silently
+    /// change what is captured.
+    #[test]
+    fn invalid_file_level_is_the_fail_fast_error() {
+        assert!(file_filter_directives(Some("versa_bot=not_a_level")).is_err());
+    }
+
+    /// Privacy contract: the file default is the flight-recorder filter
+    /// WITHOUT the raw-traffic target - full conversation bodies reach
+    /// files only when the operator names `llm_raw_traffic` explicitly in
+    /// `[logging].level`.
+    #[test]
+    fn file_default_filter_excludes_the_raw_traffic_target() {
+        let default = file_filter_directives(None).expect("default expected to be valid");
+        assert_eq!(default, FILE_DEFAULT_FILTER);
+        assert!(default.contains("versa_bot=debug"), "flight-recorder mode expected");
+        assert!(!default.contains("llm_raw_traffic"));
+    }
+
+    #[test]
+    fn absent_or_blank_dsn_disables_silently() {
+        assert_eq!(effective_dsn(None), None);
+        assert_eq!(effective_dsn(Some("")), None);
+        assert_eq!(effective_dsn(Some("   ")), None);
+    }
+
+    #[test]
+    fn dsn_is_trimmed_not_rejected() {
+        let padded = format!("  {VALID_DSN}  ");
+        assert_eq!(effective_dsn(Some(&padded)), Some(VALID_DSN));
+    }
+
+    /// The malformed-DSN branch: `init` warns on this parse `Err` and
+    /// continues stdout-only - pinned on the pure decision that guards the
+    /// enable path.
+    #[test]
+    fn malformed_dsn_fails_the_parse_guarding_the_enable_path() {
+        assert!("wat".parse::<sentry::types::Dsn>().is_err());
+        assert!(VALID_DSN.parse::<sentry::types::Dsn>().is_ok());
+    }
+
+    #[test]
+    fn sample_rate_passes_only_in_range_values() {
+        assert_eq!(usable_sample_rate(None), None);
+        assert_eq!(usable_sample_rate(Some(0.0)), Some(0.0));
+        assert_eq!(usable_sample_rate(Some(0.5)), Some(0.5));
+        assert_eq!(usable_sample_rate(Some(1.0)), Some(1.0));
+        // Out of range is off: reported and degraded by `init`.
+        assert_eq!(usable_sample_rate(Some(-0.1)), None);
+        assert_eq!(usable_sample_rate(Some(1.5)), None);
+        assert_eq!(usable_sample_rate(Some(f32::NAN)), None);
+    }
 }

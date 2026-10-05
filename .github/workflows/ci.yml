@@ -30,6 +30,16 @@ jobs:
       # Same pinned image as the Forgejo test job and the Dockerfile build
       # stage (suite + compiler).
       image: rust:1.98-bookworm
+    services:
+      # The optional PostgreSQL arms of the sqlx_storage suite (they skip
+      # without VERSABOT_TEST_PG_URL): a throwaway database, migrated by
+      # the tests themselves. Reachable by the service alias as hostname.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: versa_bot_test
+        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -45,6 +55,10 @@ jobs:
           cargo clippy --all-targets --locked
 
       - name: Tests
+        env:
+          # Hostname = the service alias; the job container and the services
+          # share the job's network.
+          VERSABOT_TEST_PG_URL: postgres://postgres:postgres@postgres:5432/versa_bot_test
         run: cargo test --locked
 
   docker:

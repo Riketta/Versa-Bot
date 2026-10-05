@@ -1881,6 +1881,56 @@ mod tests {
         assert_eq!(f.engine.watch_status(&other).await, Some(Vec::new()));
     }
 
+    /// The mythic branch of `watch_status` joins the retained rotation
+    /// snapshot through the catalog: an entry id that resolves reports
+    /// "currently in the mythic rotation" for skin and champion targets, a
+    /// catalog-unresolvable entry falls back to its raw display name, and an
+    /// unrelated target stays idle.
+    #[tokio::test]
+    async fn watch_status_reports_mythic_rotation() {
+        let f = fixture(FakeLcu::online()).await;
+        let target = WatchTarget::Skin {
+            item_id: 1031,
+            champion: "Ahri".to_owned(),
+            skin: "Foxfire Ahri".to_owned(),
+        };
+        // No snapshot yet.
+        assert_eq!(f.engine.watch_status(&target).await, None);
+
+        // Entry "1031" joins the catalog (skin 1031); entry "555" resolves
+        // only through its raw display name.
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        *f.lcu.rotations.lock() = Some(vec![rotation_store("weekly", &["1031", "555"])]);
+        f.engine.tick().await; // baseline retains the active rotation
+
+        assert_eq!(
+            f.engine.watch_status(&target).await,
+            Some(vec!["currently in the mythic rotation".to_owned()])
+        );
+        let champion = WatchTarget::Champion { champion_id: 103, champion: "Ahri".to_owned() };
+        assert_eq!(
+            f.engine.watch_status(&champion).await,
+            Some(vec!["currently in the mythic rotation".to_owned()])
+        );
+        // A catalog-unresolvable entry matches through its display name.
+        let by_name = WatchTarget::Skin {
+            item_id: 999_031,
+            champion: "Ahri".to_owned(),
+            skin: "entry".to_owned(),
+        };
+        assert_eq!(
+            f.engine.watch_status(&by_name).await,
+            Some(vec!["currently in the mythic rotation".to_owned()])
+        );
+        // Negative control: nothing matches, no rotation line.
+        let other = WatchTarget::Skin {
+            item_id: 999_031,
+            champion: "Ahri".to_owned(),
+            skin: "Some Other Skin".to_owned(),
+        };
+        assert_eq!(f.engine.watch_status(&other).await, Some(Vec::new()));
+    }
+
     #[tokio::test]
     async fn unrelated_deltas_never_ping_watchers() {
         let f = fixture(FakeLcu::online()).await;

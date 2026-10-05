@@ -182,3 +182,24 @@ pub trait LlmCompletionPort: Send + Sync {
         Ok(response)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `classify` produces the ONLY error detail allowed into guild-visible
+    /// embeds (service-channel notices): the exact strings are pinned so a
+    /// rewording cannot smuggle endpoint- or operator-domain detail past
+    /// the privacy rule. The full error text stays in tracing.
+    #[test]
+    fn classify_covers_every_variant() {
+        let config_error = "the model is not available (check the bot configuration)";
+        assert_eq!(LlmError::InvalidModelRef("ghost/m".to_owned()).classify(), config_error);
+        assert_eq!(LlmError::UnknownProvider("ghost".to_owned()).classify(), config_error);
+        assert_eq!(
+            LlmError::Request("HTTP 401: account=secret-org".to_owned()).classify(),
+            "the endpoint could not be reached or rejected the request"
+        );
+        assert_eq!(LlmError::EmptyResponse.classify(), "the endpoint returned no content");
+    }
+}

@@ -3078,6 +3078,73 @@ mod tests {
         assert!(ctx.output.messages().iter().any(|message| message.contains("compaction failed")));
     }
 
+    /// The exact boundary is stable: live records at exactly
+    /// `history_depth` compact nothing (`maybe_compact` early-returns on
+    /// `<=`) - no summarizer call, and the cutoff never moves.
+    #[tokio::test]
+    async fn compaction_is_stable_at_the_exact_depth_boundary() {
+        let settings = LlmSettings { compaction_keep_tail: 2, ..LlmSettings::default() };
+        let ctx = ctx_with(settings, vec![Ok("the answer".to_owned())]);
+        let config = ChannelConfig { history_depth: 4, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+        append_record(&ctx.storage, &user_record(1, "a1", "m1")).await;
+        append_record(&ctx.storage, &user_record(2, "a2", "m2")).await;
+        append_record(&ctx.storage, &user_record(3, "a3", "m3")).await;
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
+
+        // 3 seeded records + this capture = 4 live records == depth: the
+        // reply went out, only the chat completion ran, and no state
+        // document (and with it no cutoff) was ever written.
+        assert_eq!(begin_texts(&ctx.begins), vec!["the answer".to_owned()]);
+        assert_eq!(ctx.fake.requests().len(), 1);
+        let state_raw = ctx
+            .storage
+            .guild_scoped("test", GuildId(1))
+            .get(NAMESPACE, &channel_state_key(2))
+            .await
+            .expect("state readable");
+        assert_eq!(state_raw, None);
+    }
+
+    /// A `keep_tail` that would keep the whole live window makes no
+    /// progress: the skip branch fires before any summarizer call, the
+    /// state stays put, and - unlike a compaction FAILURE - no service
+    /// notice is due.
+    #[tokio::test]
+    async fn compaction_skips_when_keep_tail_makes_no_progress() {
+        let settings = LlmSettings { compaction_keep_tail: 10, ..LlmSettings::default() };
+        let ctx = ctx_with(settings, vec![Ok("the answer".to_owned())]);
+        let config = ChannelConfig { history_depth: 2, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+        seed_service_channel(&ctx);
+        append_record(&ctx.storage, &user_record(1, "a1", "m1")).await;
+        append_record(&ctx.storage, &user_record(2, "a2", "m2")).await;
+        append_record(&ctx.storage, &user_record(3, "a3", "m3")).await;
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
+
+        // 4 live records outgrow depth 2, but keep_tail 10 >= 4: only the
+        // chat completion ran, nothing was committed, nothing reported.
+        assert_eq!(ctx.fake.requests().len(), 1);
+        let state_raw = ctx
+            .storage
+            .guild_scoped("test", GuildId(1))
+            .get(NAMESPACE, &channel_state_key(2))
+            .await
+            .expect("state readable");
+        assert_eq!(state_raw, None);
+        assert!(
+            !ctx.output.messages().iter().any(|message| message.contains("compaction")),
+            "a skip is not a failure - no notice: {:?}",
+            ctx.output.messages()
+        );
+    }
+
     /// An unreadable record log degrades to no generated answer - the same
     /// policy as an unreadable state doc. The bot must not answer from a
     /// context that may be silently empty, but a mention still gets the
@@ -3219,6 +3286,30 @@ mod tests {
             "one outage window = one embed, regardless of origin channels"
         );
         assert_eq!(messages.iter().filter(|m| m.contains(FALLBACK_MESSAGE)).count(), 2);
+    }
+
+    /// Without a configured service channel an error notice has nowhere to
+    /// go: `notify_service` returns right after the lookup, so the only
+    /// guild-visible output for a failed mention is the guaranteed fallback
+    /// - no embed, no classification text, and no stream ever began.
+    #[tokio::test]
+    async fn error_notices_stay_silent_without_a_service_channel() {
+        let ctx = ctx(vec![Err(LlmError::Request("endpoint down".to_owned()))]);
+        seed_config(&ctx.storage, &assigned_config());
+        // Deliberately NO seed_service_channel.
+
+        ctx.engine
+            .handle_message(
+                &origin(),
+                &payload(true, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
+            .await;
+
+        assert_eq!(ctx.output.messages(), vec![FALLBACK_MESSAGE.to_owned()]);
+        assert!(begin_texts(&ctx.begins).is_empty());
     }
 
     #[tokio::test]

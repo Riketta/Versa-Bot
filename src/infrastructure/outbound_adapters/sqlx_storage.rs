@@ -748,10 +748,11 @@ mod tests {
 
     // --- PostgreSQL dialect -------------------------------------------------
     // The suite above runs SQLite only; the `$n`-placeholder arms of every
-    // query ship untested without these. They opt in via
+    // query are covered only by these. They opt in via
     // `VERSABOT_TEST_PG_URL` (a throwaway database - the bot runs its own
-    // migrations); without the variable they report a skip and pass, so CI
-    // stays SQLite-only.
+    // migrations); without the variable they report a skip and pass.
+    // CI sets the variable against a `postgres:16` service container;
+    // locally it stays unset unless you point it at a throwaway database.
 
     async fn optional_pg_storage() -> Option<SqlxStorage> {
         let url = std::env::var("VERSABOT_TEST_PG_URL").ok()?;

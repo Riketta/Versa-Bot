@@ -134,6 +134,8 @@ mod tests {
     use std::any::Any;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use parking_lot::Mutex;
+
     use super::*;
 
     struct PingPublished;
@@ -157,6 +159,19 @@ mod tests {
 
         fn as_any(&self) -> &dyn Any {
             self
+        }
+    }
+
+    /// Appends its label to a shared log - the fixture that makes WHEN a
+    /// handler ran observable, unlike position-blind counters.
+    struct OrderedHandler {
+        label: &'static str,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl EventHandler<PingPublished> for OrderedHandler {
+        fn handle(&self, _event: &PingPublished) {
+            self.log.lock().push(self.label);
         }
     }
 
@@ -193,6 +208,21 @@ mod tests {
             2,
             "healthy subscriber must be unaffected by the panicking one"
         );
+    }
+
+    /// Contract: handlers run inline on the publishing task, in subscription
+    /// order - a publish delivers both handlers, first subscriber first.
+    #[test]
+    fn handlers_run_in_subscription_order() {
+        let bus = InMemoryEventBus::new();
+        let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+        bus.subscribe(Arc::new(OrderedHandler { label: "first", log: Arc::clone(&log) }));
+        bus.subscribe(Arc::new(OrderedHandler { label: "second", log: Arc::clone(&log) }));
+
+        bus.publish(Arc::new(PingPublished));
+
+        assert_eq!(*log.lock(), vec!["first", "second"], "handlers must run in subscription order");
     }
 
     /// Contract: unsubscribe is idempotent per the port doc - and a stale

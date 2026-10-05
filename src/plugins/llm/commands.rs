@@ -1797,6 +1797,28 @@ mod tests {
         assert!(apply_prompt(&mut config, PromptKind::System, Some("   ")).is_err());
     }
 
+    /// The set-time token gate: template-rendered kinds (system,
+    /// compaction) reject unknown tokens, naming the offender together with
+    /// the valid list; image prompts are token-free by contract and pass
+    /// untouched - the same text that fails for a persona is a legal image
+    /// instruction. The scanner itself is pinned in prompts.rs; this is the
+    /// wrapper and its per-kind exemption.
+    #[test]
+    fn prompt_validation_rejects_unknown_tokens_except_image_prompts() {
+        let err = validate_prompt_text(PromptKind::System, "You are {{wat}} today.")
+            .expect_err("unknown token expected to be rejected");
+        assert!(err.contains("{{wat}}"), "the offending token must be named: {err}");
+        assert!(err.contains("valid:"), "the valid list must be included: {err}");
+
+        assert!(validate_prompt_text(PromptKind::Compaction, "Summarize {{wat}}.").is_err());
+
+        // No rendering happens for image prompts - unknown tokens are
+        // literal text there, not errors.
+        assert!(validate_prompt_text(PromptKind::Image, "You are {{wat}} today.").is_ok());
+        // Known tokens pass for the rendered kinds.
+        assert!(validate_prompt_text(PromptKind::System, "You are {{bot}} on {{date}}.").is_ok());
+    }
+
     #[test]
     fn float_params_set_and_clear() {
         let mut config = ChannelConfig::assigned("m".to_owned());
