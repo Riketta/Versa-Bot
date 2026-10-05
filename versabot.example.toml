@@ -91,7 +91,7 @@ url = "sqlite://versabot.db"
 # image_jpeg_quality = 85
 # Download cap per image attachment, in bytes; larger images are recorded
 # undescribed.
-# image_max_source_bytes = 8388608
+# image_max_source_bytes = 16777216
 # Cap on images described per captured message; images beyond it are
 # recorded undescribed.
 # max_images_per_message = 2

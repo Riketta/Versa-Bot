@@ -78,7 +78,7 @@ impl Default for LlmConfig {
             image_model: None,
             image_max_side: 512,
             image_jpeg_quality: 85,
-            image_max_source_bytes: 8_388_608,
+            image_max_source_bytes: 16_777_216,
             image_prompt: None,
             max_images_per_message: 2,
             max_consecutive_newlines: None,

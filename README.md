@@ -555,7 +555,7 @@ history.
 # Image recognition: set image_model to a vision-capable declared model;
 # channels then opt in with /llm_set images on. Optional: image_prompt,
 # image_max_side (512), image_jpeg_quality (85), image_max_source_bytes
-# (8 MiB), max_images_per_message (2), react_max_per_message (3 - the
+# (16 MiB), max_images_per_message (2), react_max_per_message (3 - the
 # emoji-reaction tool's per-answer cap).
 # image_model = "local/unsloth/gemma-4-26B-A4B-it-qat-GGUF"
 
