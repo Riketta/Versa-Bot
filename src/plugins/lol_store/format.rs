@@ -214,18 +214,18 @@ pub fn announce_pages(delta: &StoreDelta, index: &NameIndex) -> Vec<String> {
             continue;
         }
         let mut title = format!("Mythic rotation ({})", rotation.label);
-        if let Some(ends) = &rotation.next_rotation {
-            title.push_str(&format!(" \u{b7} ends {}", timestamp(ends)));
+        if let Some(ends) = non_empty(rotation.next_rotation.as_deref()) {
+            title.push_str(&format!(" \u{b7} ends {}", date(ends)));
         }
         sections.push(Section::new(title, lines));
     }
     if let Some(start) = &delta.yourshop {
         let mut line = String::from("Your Shop started");
-        if let Some(started) = start.start.as_deref() {
-            line.push_str(&format!(" \u{b7} started {}", timestamp(started)));
+        if let Some(started) = non_empty(start.start.as_deref()) {
+            line.push_str(&format!(" \u{b7} started {}", date(started)));
         }
-        if let Some(ends) = start.end.as_deref() {
-            line.push_str(&format!(" \u{b7} ends {}", timestamp(ends)));
+        if let Some(ends) = non_empty(start.end.as_deref()) {
+            line.push_str(&format!(" \u{b7} ends {}", date(ends)));
         }
         sections.push(Section::bare(line));
     }
@@ -457,37 +457,17 @@ pub(crate) fn mythic_line(entry: &super::diff::MythicEntry) -> String {
 /// `2026-10-05T17:00:00.000+00:00` -> `2026-10-05`. The input is untrusted
 /// payload text that lands inside section titles - anything implausibly
 /// long degrades to a cut.
-fn date(iso: &str) -> String {
+#[must_use]
+pub(crate) fn date(iso: &str) -> String {
     cut_to_budget(iso.split('T').next().unwrap_or(iso), MAX_TITLE_FIELD_BYTES)
 }
 
-/// `2026-10-01T09:00:00Z` -> `2026-10-01 09:00 UTC`; a non-zero offset is
-/// rendered as-is WITH its sign (dropping it would misread `-05:30` as
-/// `+05:30`). Any deviation degrades to the raw string, clamped - never a
-/// title-budget hazard.
+/// Payload date placeholders (empty strings - e.g. the featured mythic
+/// shelf carries no rotation timestamps) must not render as a dangling
+/// "ends"/"started".
 #[must_use]
-pub(crate) fn timestamp(iso: &str) -> String {
-    let mut parts = iso.split('T');
-    let day = cut_to_budget(parts.next().unwrap_or(iso), MAX_TITLE_FIELD_BYTES);
-    let Some(time) = parts.next() else { return day };
-    let hhmm: String = time.chars().take(5).collect();
-    // Locate the sign char itself (split_once would strip it): everything
-    // after it is the offset body.
-    let offset = time
-        .char_indices()
-        .find(|(_, ch)| *ch == '+' || *ch == '-')
-        .and_then(|(idx, sign)| {
-            let rest = time.get(idx + 1..)?;
-            (!rest.is_empty())
-                .then(|| cut_to_budget(&format!("{sign}{rest}"), MAX_TITLE_FIELD_BYTES))
-        })
-        .unwrap_or_else(|| "Z".to_owned());
-    let label = if offset == "Z" || offset == "+00:00" || offset == "-00:00" {
-        "UTC"
-    } else {
-        offset.as_str()
-    };
-    format!("{day} {hhmm} {label}")
+pub(crate) fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -612,9 +592,7 @@ mod tests {
         assert!(text.contains("- Kayle — Viridian Kayle · 520 RP"));
         assert!(text.contains("**Mythic rotation (weekly)**"));
         assert!(text.contains("- Prestige Ocean Song Seraphine · 35 ME"));
-        assert!(text.contains(
-            "**Your Shop started · started 2026-10-01 09:00 UTC · ends 2026-10-08 09:00 UTC**"
-        ));
+        assert!(text.contains("**Your Shop started · started 2026-10-01 · ends 2026-10-08**"));
     }
 
     #[test]
@@ -751,7 +729,6 @@ mod tests {
     #[test]
     fn oversized_title_fields_are_clamped() {
         assert!(date(&"x".repeat(5000)).chars().count() <= 33);
-        assert!(timestamp(&"y".repeat(4000)).chars().count() <= 70);
 
         let corrupted_end = "corrupted-without-T-".repeat(200);
         let sale = |id: u64| super::super::lcu::Sale {
@@ -788,30 +765,8 @@ mod tests {
         assert!(line.starts_with(stem), "the cut keeps a whole-char prefix");
     }
 
-    /// Degenerate timestamps degrade to the (clamped) raw string.
-    #[test]
-    fn timestamp_degrades_to_clamped_raw() {
-        assert_eq!(timestamp("weird"), "weird");
-        assert!(timestamp(&"y".repeat(400)).chars().count() <= 40);
-    }
-
-    #[test]
-    fn timestamp_trims_to_minutes() {
-        assert_eq!(timestamp("2026-10-01T09:07:33.000Z"), "2026-10-01 09:07 UTC");
-        assert_eq!(timestamp("weird"), "weird");
-    }
-
-    /// A non-zero offset is rendered as given, WITH its sign - dropping it
-    /// would misread `-05:30` as `+05:30`.
-    #[test]
-    fn timestamp_keeps_nonzero_offsets() {
-        assert_eq!(timestamp("2026-10-01T09:07:33.000+00:00"), "2026-10-01 09:07 UTC");
-        assert_eq!(timestamp("2026-10-01T09:07:33.000+02:00"), "2026-10-01 09:07 +02:00");
-        assert_eq!(timestamp("2026-10-01T09:07:33-05:30"), "2026-10-01 09:07 -05:30");
-    }
-
-    /// The rotation section title carries the next-rotation time when the
-    /// payload provides it.
+    /// The rotation section title carries the end date when the payload
+    /// provides it - date only, no time.
     #[test]
     fn rotation_section_title_shows_when_it_ends() {
         let delta = StoreDelta {
@@ -828,10 +783,29 @@ mod tests {
             ..StoreDelta::default()
         };
         let text = announce_pages(&delta, &NameIndex::empty()).join("\n\n");
-        assert!(
-            text.contains("**Mythic rotation (weekly) · ends 2026-10-08 00:00 UTC**"),
-            "text: {text}"
-        );
+        assert!(text.contains("**Mythic rotation (weekly) · ends 2026-10-08**"), "text: {text}");
+    }
+
+    /// A placeholder end date (empty string - the featured mythic shelf
+    /// carries one) must not render a dangling "ends".
+    #[test]
+    fn empty_rotation_end_omits_the_ends_suffix() {
+        let delta = StoreDelta {
+            rotations: vec![super::super::diff::RotationDelta {
+                label: "featured".to_owned(),
+                rotation_start: None,
+                next_rotation: Some("   ".to_owned()),
+                entries: vec![super::super::diff::MythicEntry {
+                    entry_id: None,
+                    name: Some("Hextech Tristana".to_owned()),
+                    mythic_price: Some(125),
+                }],
+            }],
+            ..StoreDelta::default()
+        };
+        let text = announce_pages(&delta, &NameIndex::empty()).join("\n\n");
+        assert!(text.contains("**Mythic rotation (featured)**"), "text: {text}");
+        assert!(!text.contains("ends"), "no dangling ends: {text}");
     }
 
     /// A discounted non-skin item (chest, orb, bundle) gets no champion

@@ -762,10 +762,8 @@ impl<B: EventBusPort> StoreEngine<B> {
                     lines.push("Rotations: none seen yet".to_owned());
                 } else {
                     for (name, rotation) in &state.rotations {
-                        let next = rotation
-                            .next_rotation
-                            .as_deref()
-                            .map(super::format::timestamp)
+                        let next = super::format::non_empty(rotation.next_rotation.as_deref())
+                            .map(super::format::date)
                             .unwrap_or_else(|| "?".to_owned());
                         lines.push(format!(
                             "Rotation {} ({}): next {}",
@@ -1491,8 +1489,8 @@ mod tests {
         assert_eq!(messages.len(), 1);
         let first = messages.first().expect("announcement expected");
         assert!(first.contains("Your Shop started"));
-        assert!(first.contains("2026-10-01 09:00 UTC"));
-        assert!(first.contains("ends 2026-10-08 09:00 UTC"));
+        assert!(first.contains("2026-10-01"));
+        assert!(first.contains("ends 2026-10-08"));
 
         f.engine.tick().await;
         assert_eq!(f.output.messages().len(), 1, "still active: silent");

@@ -55,6 +55,18 @@ pub struct LocalizedText {
     pub name: Option<String>,
 }
 
+/// Accepts an explicit JSON `null` where a collection field would be:
+/// serde's `#[serde(default)]` covers missing keys only, and the live
+/// catalog answers `itemRequirements: null` for every non-skin inventory
+/// type (BUNDLES, EMOTE, ... - about two thirds of all entries).
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// One full-catalog entry (`GET /lol-store/v1/catalog`). Only the fields the
 /// trackers consume are modeled; everything else is ignored, so Riot-side
 /// additions stay harmless.
@@ -65,11 +77,11 @@ pub struct CatalogItem {
     pub item_id: u64,
     #[serde(default)]
     pub inventory_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub prices: Vec<Price>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub localizations: std::collections::BTreeMap<String, LocalizedText>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub item_requirements: Vec<ItemRef>,
 }
 
@@ -944,5 +956,32 @@ mod tests {
         assert_eq!(items.len(), 1, "only the valid item survives");
         let stores = client.rotations().await.expect("rotations expected to parse");
         assert_eq!(stores.len(), 1, "only the valid store survives");
+    }
+
+    /// Non-skin inventory types answer `itemRequirements: null` (explicit
+    /// JSON null, not a missing key) - null sections parse as empty instead
+    /// of voiding the entry.
+    #[tokio::test]
+    async fn catalog_null_sections_parse_as_empty() {
+        let lockfile = lockfile_path("null-sections");
+        write_lockfile(&lockfile, "token");
+        let body = serde_json::json!([{
+            "inventoryType": "BUNDLES", "itemId": 44000,
+            "prices": null, "localizations": null, "itemRequirements": null
+        }]);
+        let transport = Arc::new(ScriptedTransport {
+            answers: Mutex::new(vec![ScriptedTransport::ok(200, body)]),
+            seen: Mutex::new(Vec::new()),
+            rewrite: None,
+        });
+        let client = client_at(transport, lockfile);
+
+        let items = client.catalog().await.expect("null sections expected to parse");
+        assert_eq!(items.len(), 1);
+        let item = items.first().expect("item expected");
+        assert_eq!(item.item_id, 44_000);
+        assert!(item.prices.is_empty());
+        assert!(item.localizations.is_empty());
+        assert!(item.item_requirements.is_empty());
     }
 }
