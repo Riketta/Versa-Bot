@@ -312,7 +312,11 @@ documented in the README; mechanics in rustdoc:
   (Discord gateway -> taxonomy), `outbound_adapters/` (Discord sends,
   sqlx storage, command registrar), `plugin_adapters/` (event bus,
   scheduler, command registry, config watcher); plus `config/` and
-  `observability.rs`.
+  `observability.rs`. Adapter FILES are named for the implementation
+  library (`serenity_gateway`, `serenity_outbound`, `sqlx_storage`),
+  never the chat platform - one platform may gain a second
+  implementation (e.g. a second Discord crate); the platform lives in
+  the type names and the `PlatformInfoPort` values.
 - `src/common/` - shared utilities (e.g. `command_reply`).
 - `src/test_support.rs` - shared fakes and assertion helpers for plugin
   and kernel tests.

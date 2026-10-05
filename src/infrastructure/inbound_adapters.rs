@@ -1,5 +1,3 @@
-mod serenity_messaging_adapter;
+mod serenity_gateway;
 
-pub use serenity_messaging_adapter::{
-    DiscordGatewayAdapter, DiscordPlatform, SerenityChatOutputFactory,
-};
+pub use serenity_gateway::{DiscordGatewayAdapter, DiscordPlatform};

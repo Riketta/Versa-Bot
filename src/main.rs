@@ -9,9 +9,12 @@ use serenity::all::{ClientBuilder, GatewayIntents, Http, HttpBuilder};
 use versa_bot::infrastructure::{
     Configuration, LlmConfig, LlmReasoningStyle, LlmSummaryPlacement, LolLeaderboardConfig,
     LolStoreConfig, PollingConfigWatcher,
-    inbound_adapters::{DiscordGatewayAdapter, DiscordPlatform, SerenityChatOutputFactory},
+    inbound_adapters::{DiscordGatewayAdapter, DiscordPlatform},
     observability,
-    outbound_adapters::{DiscordCommandRegistrar, SerenityNickname, SerenityPresence, SqlxStorage},
+    outbound_adapters::{
+        DiscordCommandRegistrar, SerenityChatOutputFactory, SerenityNickname, SerenityPresence,
+        SqlxStorage,
+    },
     plugin_adapters::{InMemoryCommandRegistry, InMemoryEventBus, TokioScheduler},
 };
 use versa_bot::kernel::{
