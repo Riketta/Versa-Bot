@@ -616,13 +616,7 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for WatchHandl
         storage.set(NAMESPACE, WATCH_KEY, serde_json::to_value(&doc)?).await?;
         drop(_guard);
 
-        // "all" is a category bundle - say so; the watchlist keeps the
-        // short form.
-        let kinds_text = match kinds {
-            WatchKind::All => "all categories".to_owned(),
-            _ => kinds.label().to_owned(),
-        };
-        let mut reply_text = format!("Watch #{id} added: {} ({}).", target.label(), kinds_text);
+        let mut reply_text = format!("Watch #{id} added: {} ({}).", target.label(), kinds.label());
         if let Some(status) = self.engine.watch_status(&target).await {
             for line in status {
                 reply_text.push_str(&format!("\n- {line}"));

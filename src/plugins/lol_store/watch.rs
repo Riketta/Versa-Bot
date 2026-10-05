@@ -56,14 +56,15 @@ impl WatchKind {
         }
     }
 
-    /// The value as shown in lists and confirmations.
+    /// The value as shown in lists and confirmations - "all" alone reads
+    /// as ambiguity to users, so the bundle names itself.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Sale => "sale",
             Self::Mythic => "mythic",
             Self::Release => "release",
-            Self::All => "all",
+            Self::All => "all categories",
         }
     }
 

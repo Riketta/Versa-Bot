@@ -874,7 +874,7 @@ mod tests {
         WatchlistHandler.invoke(&f.event, &Default::default(), &f.services).await.expect("invoke");
         let list = f.output.messages().last().expect("reply expected").clone();
         assert!(list.contains("#1 Ahri - Foxfire Ahri (sale)"), "list: {list}");
-        assert!(list.contains("#2 Ahri (all)"));
+        assert!(list.contains("#2 Ahri (all categories)"));
         assert!(!list.contains("#3"));
 
         // A removal names what went away.
@@ -888,7 +888,7 @@ mod tests {
         UnwatchHandler.invoke(&f.event, &args, &f.services).await.expect("invoke");
         let reply = f.output.messages().last().expect("reply expected").clone();
         assert!(reply.contains("Removed 1 watch(es):"), "reply: {reply}");
-        assert!(reply.contains("- #2 Ahri (all)"), "reply: {reply}");
+        assert!(reply.contains("- #2 Ahri (all categories)"), "reply: {reply}");
         let doc = stored_watch_doc(&f).await.expect("doc expected");
         let subs = doc.get("subs").and_then(|subs| subs.as_array()).expect("subs array");
         assert_eq!(subs.len(), 1, "only user 2's watch survives");
