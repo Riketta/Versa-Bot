@@ -300,7 +300,7 @@ mod tests {
     use crate::kernel::{
         models::{
             ChannelId, CommandPayload, GuildId, MemberPayload, MessageId, MessagePayload, Origin,
-            Platform, UserId,
+            UserId,
         },
         plugin_ports::{CommandArgs, CommandHandler},
         spi_ports::{GUILD_SETTINGS, StoragePort},
@@ -346,7 +346,6 @@ mod tests {
 
     fn origin(user_id: u64) -> Origin {
         Origin {
-            platform: Platform::Discord,
             guild_id: Some(GuildId(1)),
             channel_id: ChannelId(2),
             user_id: UserId(user_id),
@@ -408,7 +407,8 @@ mod tests {
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn crate::kernel::spi_ports::ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
-            guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
+            guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
+            platform_info: crate::test_support::test_platform_info(),
         };
         (services, output)
     }
@@ -420,7 +420,7 @@ mod tests {
     ) -> Arc<InMemoryStorage> {
         let storage = InMemoryStorage::new();
         storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             CONFIG_KEY,
@@ -616,7 +616,7 @@ mod tests {
     async fn legacy_document_behaves_as_open_default() {
         let storage = InMemoryStorage::new();
         storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             CONFIG_KEY,
@@ -633,7 +633,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_config_fails_closed() {
         let storage = InMemoryStorage::new();
-        storage.seed(Platform::Discord, GuildId(1), NAMESPACE, CONFIG_KEY, json!("not an object"));
+        storage.seed("test", GuildId(1), NAMESPACE, CONFIG_KEY, json!("not an object"));
         let (services, output) = test_services(&storage);
         let plugin = test_plugin(&[("ping", AccessTier::User)]);
         let mut event = message_event(3, &[]);
@@ -647,7 +647,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_config_denies_commands_with_policy_unavailable_embed() {
         let storage = InMemoryStorage::new();
-        storage.seed(Platform::Discord, GuildId(1), NAMESPACE, CONFIG_KEY, json!("not an object"));
+        storage.seed("test", GuildId(1), NAMESPACE, CONFIG_KEY, json!("not an object"));
         let (services, output) = test_services(&storage);
         let plugin = test_plugin(&[("ping", AccessTier::User)]);
         let mut event = command_event(3, "ping", &[]);
@@ -686,6 +686,7 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn crate::kernel::spi_ports::ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: None,
+            platform_info: crate::test_support::test_platform_info(),
         };
         let plugin = test_plugin(&[]);
         let mut event = message_event(3, &[]);
@@ -712,8 +713,9 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn crate::kernel::spi_ports::ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: Some(
-                crate::test_support::FailingStorage.guild_scoped(Platform::Discord, GuildId(1)),
+                crate::test_support::FailingStorage.guild_scoped("test", GuildId(1)),
             ),
+            platform_info: crate::test_support::test_platform_info(),
         };
         let plugin = test_plugin(&[]);
         let mut event = command_event(3, "ping", &[]);

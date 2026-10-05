@@ -339,8 +339,7 @@ mod tests {
     use crate::infrastructure::plugin_adapters::InMemoryCommandRegistry;
     use crate::kernel::{
         models::{
-            ChannelId, CommandPayload, EventKind, EventPayload, GuildId, MessageId, Origin,
-            Platform, UserId,
+            ChannelId, CommandPayload, EventKind, EventPayload, GuildId, MessageId, Origin, UserId,
         },
         plugin_ports::{ArgKind, CommandRegistryPort as _, PluginPort as _},
         spi_ports::{ChatOutputPort, StoragePort},
@@ -356,7 +355,8 @@ mod tests {
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
-            guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
+            guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
+            platform_info: crate::test_support::test_platform_info(),
         };
         (storage, services, output)
     }
@@ -366,6 +366,7 @@ mod tests {
             chat_output: Arc::clone(output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(output)).boxed(),
             guild_storage: None,
+            platform_info: crate::test_support::test_platform_info(),
         }
     }
 
@@ -393,7 +394,6 @@ mod tests {
         RequestContext {
             kind: EventKind::CommandInvoked,
             origin: Origin {
-                platform: Platform::Discord,
                 guild_id: Some(GuildId(1)),
                 channel_id: ChannelId(2),
                 user_id: UserId(3),
@@ -411,7 +411,7 @@ mod tests {
 
     async fn stored_policy(storage: &InMemoryStorage) -> Option<serde_json::Value> {
         storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .get(NAMESPACE, CONFIG_KEY)
             .await
             .expect("storage get expected to succeed")
@@ -470,7 +470,7 @@ mod tests {
     async fn set_same_tier_is_idempotent() {
         let (storage, services, output) = fixture();
         storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             CONFIG_KEY,
@@ -495,7 +495,7 @@ mod tests {
     async fn clear_user_removes_assignment() {
         let (storage, services, output) = fixture();
         storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             CONFIG_KEY,
@@ -614,7 +614,7 @@ mod tests {
     async fn show_renders_tiers_with_mentions() {
         let (storage, services, output) = fixture();
         storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             CONFIG_KEY,
@@ -697,7 +697,7 @@ mod tests {
             users.insert(format!("u{id:02}"), serde_json::json!("user"));
         }
         storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             CONFIG_KEY,
@@ -720,13 +720,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_policy_blocks_writes() {
         let (storage, services, output) = fixture();
-        storage.seed(
-            Platform::Discord,
-            GuildId(1),
-            NAMESPACE,
-            CONFIG_KEY,
-            serde_json::json!("not an object"),
-        );
+        storage.seed("test", GuildId(1), NAMESPACE, CONFIG_KEY, serde_json::json!("not an object"));
 
         AuthCommandHandler::default()
             .invoke(

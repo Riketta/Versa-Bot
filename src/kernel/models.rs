@@ -9,7 +9,7 @@ mod storage_error;
 
 pub use event::{
     AttachmentPayload, CommandPayload, Event, EventKind, EventPayload, MemberPayload,
-    MessagePayload, Origin, Platform,
+    MessagePayload, Origin,
 };
 pub use ids::{ChannelId, GuildId, MessageId, UserId};
 pub use outbound_error::OutboundError;

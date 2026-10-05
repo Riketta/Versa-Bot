@@ -21,9 +21,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
-use crate::kernel::models::{ChannelId, Embed, GuildId, Origin, OutboundMessage, Platform, UserId};
+use crate::kernel::models::{ChannelId, Embed, GuildId, Origin, OutboundMessage, UserId};
 use crate::kernel::plugin_ports::{EventBusPort, Job};
-use crate::kernel::spi_ports::{ChatOutputFactoryPort, StoragePort};
+use crate::kernel::spi_ports::{ChatOutputFactoryPort, PlatformInfoPort, StoragePort};
 
 use super::diff::{
     self, LastSeen, Snapshot, StoreDelta, YourShopStart, rotation_delta, rotation_stores,
@@ -92,6 +92,10 @@ pub struct StoreEngine<B: EventBusPort> {
     storage: Arc<dyn StoragePort>,
     factory: Arc<dyn ChatOutputFactoryPort>,
     bus: B,
+    /// The deployment's platform identity - subscriptions of other slugs
+    /// (e.g. rows left by a differently-wired storage) are skipped, and it
+    /// namespaces every storage binding.
+    platform: Arc<dyn PlatformInfoPort>,
     settings: EngineSettings,
     state: Mutex<Option<LastSeen>>,
     champions: Mutex<Option<Arc<HashMap<u64, String>>>>,
@@ -122,6 +126,7 @@ impl<B: EventBusPort> StoreEngine<B> {
         storage: Arc<dyn StoragePort>,
         factory: Arc<dyn ChatOutputFactoryPort>,
         bus: B,
+        platform: Arc<dyn PlatformInfoPort>,
         settings: EngineSettings,
     ) -> Self {
         Self {
@@ -129,6 +134,7 @@ impl<B: EventBusPort> StoreEngine<B> {
             storage,
             factory,
             bus,
+            platform,
             settings,
             state: Mutex::new(None),
             champions: Mutex::new(None),
@@ -319,7 +325,7 @@ impl<B: EventBusPort> StoreEngine<B> {
         &self,
         delta: &StoreDelta,
         index: &NameIndex,
-        targets: &[(Platform, GuildId, ChannelId, Option<String>)],
+        targets: &[(GuildId, ChannelId, Option<String>)],
     ) -> Vec<String> {
         if index.catalog.is_empty() {
             tracing::warn!(
@@ -369,9 +375,8 @@ impl<B: EventBusPort> StoreEngine<B> {
         let record_text = pages.join("\n\n");
 
         let mut delivered_guilds = 0usize;
-        for &(platform, guild_id, channel_id, ref role_id) in targets {
+        for &(guild_id, channel_id, ref role_id) in targets {
             let origin = Origin {
-                platform,
                 guild_id: Some(guild_id),
                 channel_id,
                 user_id: UserId(0),
@@ -385,7 +390,7 @@ impl<B: EventBusPort> StoreEngine<B> {
                 .as_deref()
                 .and_then(|id| id.parse::<u64>().ok())
                 .map_or(String::new(), |id| format!("<@&{id}>"));
-            let storage = self.storage.guild_scoped(platform, guild_id);
+            let storage = self.storage.guild_scoped(self.platform.slug(), guild_id);
             let output = self.factory.channel_output(&origin, channel_id);
             let mut delivered = true;
             for (n, embed) in embeds.iter().enumerate() {
@@ -414,7 +419,7 @@ impl<B: EventBusPort> StoreEngine<B> {
                 tracing::warn!(%err, guild = guild_id.get(), "failed to record store announcement");
             }
             for kind in &kinds {
-                self.bus.publish(Arc::new(LolStoreAnnounced { platform, guild_id, kind: *kind }));
+                self.bus.publish(Arc::new(LolStoreAnnounced { guild_id, kind: *kind }));
             }
         }
 
@@ -496,13 +501,13 @@ impl<B: EventBusPort> StoreEngine<B> {
         &self,
         delta: &StoreDelta,
         index: &NameIndex,
-        targets: &[(Platform, GuildId, ChannelId, Option<String>)],
+        targets: &[(GuildId, ChannelId, Option<String>)],
     ) {
         if targets.is_empty() {
             return;
         }
-        for &(platform, guild_id, channel_id, _) in targets {
-            let storage = self.storage.guild_scoped(platform, guild_id);
+        for &(guild_id, channel_id, _) in targets {
+            let storage = self.storage.guild_scoped(self.platform.slug(), guild_id);
             let doc = match storage.get(NAMESPACE, watch::WATCH_KEY).await {
                 Ok(Some(raw)) => match serde_json::from_value::<WatchDoc>(raw) {
                     Ok(doc) => doc,
@@ -521,7 +526,6 @@ impl<B: EventBusPort> StoreEngine<B> {
                 continue;
             };
             let origin = Origin {
-                platform,
                 guild_id: Some(guild_id),
                 channel_id,
                 user_id: UserId(0),
@@ -627,14 +631,19 @@ impl<B: EventBusPort> StoreEngine<B> {
         Some(lines)
     }
 
-    /// Guilds with the tracker enabled and a channel assigned.
-    async fn enabled_guilds(&self) -> Vec<(Platform, GuildId, ChannelId, Option<String>)> {
+    /// Guilds of this deployment's platform with the tracker enabled and a
+    /// channel assigned. Rows of other slugs (storage written by a
+    /// differently-wired deployment) are skipped.
+    async fn enabled_guilds(&self) -> Vec<(GuildId, ChannelId, Option<String>)> {
         let mut targets = Vec::new();
         let Ok(guilds) = self.storage.list_guilds().await else {
             return targets;
         };
-        for (platform, guild_id) in guilds {
-            let storage = self.storage.guild_scoped(platform, guild_id);
+        for (row_platform, guild_id) in guilds {
+            if row_platform != self.platform.slug() {
+                continue;
+            }
+            let storage = self.storage.guild_scoped(self.platform.slug(), guild_id);
             let raw = match storage.get(NAMESPACE, CONFIG_KEY).await {
                 Ok(Some(raw)) => raw,
                 Ok(None) => continue,
@@ -670,7 +679,7 @@ impl<B: EventBusPort> StoreEngine<B> {
                     );
                 }
             }
-            targets.push((platform, guild_id, ChannelId(channel), config.role_id));
+            targets.push((guild_id, ChannelId(channel), config.role_id));
         }
         targets
     }
@@ -703,8 +712,11 @@ impl<B: EventBusPort> StoreEngine<B> {
     /// replayed or missed delta after a restart).
     async fn load_persisted_state(&self) -> Option<LastSeen> {
         let guilds = self.storage.list_guilds().await.ok()?;
-        for (platform, guild_id) in guilds {
-            let storage = self.storage.guild_scoped(platform, guild_id);
+        for (row_platform, guild_id) in guilds {
+            if row_platform != self.platform.slug() {
+                continue;
+            }
+            let storage = self.storage.guild_scoped(self.platform.slug(), guild_id);
             match storage.get(NAMESPACE, LAST_SEEN_KEY).await {
                 Ok(Some(raw)) => match serde_json::from_value::<LastSeen>(raw) {
                     Ok(state) => return Some(state),
@@ -735,8 +747,11 @@ impl<B: EventBusPort> StoreEngine<B> {
         let Ok(guilds) = self.storage.list_guilds().await else {
             return;
         };
-        for (platform, guild_id) in guilds {
-            let storage = self.storage.guild_scoped(platform, guild_id);
+        for (row_platform, guild_id) in guilds {
+            if row_platform != self.platform.slug() {
+                continue;
+            }
+            let storage = self.storage.guild_scoped(self.platform.slug(), guild_id);
             match storage.get(NAMESPACE, CONFIG_KEY).await {
                 Ok(Some(_)) => {}
                 Ok(None) => continue,
@@ -1008,6 +1023,7 @@ mod tests {
             Arc::clone(&storage) as Arc<dyn StoragePort>,
             factory,
             bus.clone(),
+            crate::test_support::test_platform_info(),
             EngineSettings {
                 poll: Duration::from_secs(60),
                 flags,
@@ -1023,7 +1039,7 @@ mod tests {
     }
 
     async fn enable_guild(storage: &InMemoryStorage, guild: u64, channel: Option<&str>) {
-        let scoped = storage.guild_scoped(Platform::Discord, GuildId(guild));
+        let scoped = storage.guild_scoped("test", GuildId(guild));
         scoped
             .set(
                 NAMESPACE,
@@ -1061,7 +1077,7 @@ mod tests {
         target: serde_json::Value,
         kinds: &str,
     ) {
-        let scoped = storage.guild_scoped(Platform::Discord, GuildId(guild));
+        let scoped = storage.guild_scoped("test", GuildId(guild));
         scoped
             .set(
                 NAMESPACE,
@@ -1159,7 +1175,7 @@ mod tests {
         assert!(f.bus.log().is_empty());
         let persisted = f
             .storage
-            .guild_scoped(Platform::Discord, GuildId(GUILD))
+            .guild_scoped("test", GuildId(GUILD))
             .get(NAMESPACE, LAST_SEEN_KEY)
             .await
             .expect("read expected")
@@ -1227,7 +1243,7 @@ mod tests {
         assert!(first.contains("607 RP"));
         assert!(first.contains("until 2026-10-05"));
 
-        let scoped = f.storage.guild_scoped(Platform::Discord, GuildId(GUILD));
+        let scoped = f.storage.guild_scoped("test", GuildId(GUILD));
         let records = scoped.list_last(NAMESPACE, 10).await.expect("records read expected");
         assert_eq!(records.len(), 1, "the announcement must be recorded");
         assert_eq!(f.bus.log(), vec![("lol_store.announced", GUILD, "sales")]);
@@ -1301,7 +1317,7 @@ mod tests {
         let f = fixture(FakeLcu::online()).await;
         // Enabled + channel + subscription role.
         f.storage
-            .guild_scoped(Platform::Discord, GuildId(GUILD))
+            .guild_scoped("test", GuildId(GUILD))
             .set(
                 NAMESPACE,
                 CONFIG_KEY,
@@ -1329,7 +1345,7 @@ mod tests {
     async fn role_tag_rides_only_the_first_page() {
         let f = fixture(FakeLcu::online()).await;
         f.storage
-            .guild_scoped(Platform::Discord, GuildId(GUILD))
+            .guild_scoped("test", GuildId(GUILD))
             .set(
                 NAMESPACE,
                 CONFIG_KEY,
@@ -1381,7 +1397,7 @@ mod tests {
         let f = fixture(FakeLcu::online()).await;
         enable_guild(&f.storage, GUILD, Some("55")).await;
         f.storage
-            .guild_scoped(Platform::Discord, GuildId(999))
+            .guild_scoped("test", GuildId(999))
             .set(NAMESPACE, CONFIG_KEY, serde_json::json!({ "enabled": "not-a-bool" }))
             .await
             .expect("config write expected");
@@ -1420,8 +1436,8 @@ mod tests {
         // the bot was "down".
         let storage2 = Arc::new(InMemoryStorage::new());
         {
-            let from = f.storage.guild_scoped(Platform::Discord, GuildId(GUILD));
-            let to = storage2.guild_scoped(Platform::Discord, GuildId(GUILD));
+            let from = f.storage.guild_scoped("test", GuildId(GUILD));
+            let to = storage2.guild_scoped("test", GuildId(GUILD));
             for key in [CONFIG_KEY, LAST_SEEN_KEY] {
                 if let Some(value) = from.get(NAMESPACE, key).await.expect("read expected") {
                     to.set(NAMESPACE, key, value).await.expect("copy expected");
@@ -1437,6 +1453,7 @@ mod tests {
             Arc::clone(&storage2) as Arc<dyn StoragePort>,
             factory2,
             bus2.clone(),
+            crate::test_support::test_platform_info(),
             EngineSettings {
                 poll: Duration::from_secs(60),
                 flags: AnnounceFlags::all_on(),
@@ -1481,6 +1498,7 @@ mod tests {
             Arc::clone(&f.storage) as Arc<dyn StoragePort>,
             factory2,
             f.bus.clone(),
+            crate::test_support::test_platform_info(),
             EngineSettings {
                 poll: Duration::from_secs(60),
                 flags: AnnounceFlags::all_on(),
@@ -1532,7 +1550,7 @@ mod tests {
         assert!(ping.contains("<@111>"), "the tag rides the content: {messages:?}");
         assert!(ping.contains("Foxfire Ahri"));
 
-        let scoped = f.storage.guild_scoped(Platform::Discord, GuildId(GUILD));
+        let scoped = f.storage.guild_scoped("test", GuildId(GUILD));
         let records = scoped.list_last(NAMESPACE, 10).await.expect("records read expected");
         let kinds: Vec<&str> = records
             .iter()
@@ -1582,7 +1600,7 @@ mod tests {
         let f = fixture(FakeLcu::online()).await;
         enable_guild(&f.storage, GUILD, Some("55")).await;
         // Champion release watch + a skin release watch that must stay silent.
-        let scoped = f.storage.guild_scoped(Platform::Discord, GuildId(GUILD));
+        let scoped = f.storage.guild_scoped("test", GuildId(GUILD));
         scoped
             .set(
                 NAMESPACE,
@@ -1644,6 +1662,7 @@ mod tests {
             Arc::clone(&storage) as Arc<dyn StoragePort>,
             Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
             RecorderBus::default(),
+            crate::test_support::test_platform_info(),
             EngineSettings {
                 poll: Duration::from_secs(60),
                 flags: AnnounceFlags::all_on(),
@@ -1680,6 +1699,7 @@ mod tests {
             Arc::clone(&storage) as Arc<dyn StoragePort>,
             Arc::new(FailingChatOutputFactory) as Arc<dyn ChatOutputFactoryPort>,
             bus.clone(),
+            crate::test_support::test_platform_info(),
             EngineSettings {
                 poll: Duration::from_secs(60),
                 flags: AnnounceFlags::all_on(),
@@ -1693,7 +1713,7 @@ mod tests {
         *lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
         engine.tick().await; // delivery fails
 
-        let scoped = storage.guild_scoped(Platform::Discord, GuildId(GUILD));
+        let scoped = storage.guild_scoped("test", GuildId(GUILD));
         let records = scoped.list_last(NAMESPACE, 10).await.expect("records read expected");
         assert!(records.is_empty(), "no record on failed delivery: {records:?}");
         assert!(bus.log().is_empty(), "no bus event on failed delivery");
@@ -1717,6 +1737,7 @@ mod tests {
             Arc::clone(&storage) as Arc<dyn StoragePort>,
             Arc::new(FailingChatOutputFactory) as Arc<dyn ChatOutputFactoryPort>,
             bus.clone(),
+            crate::test_support::test_platform_info(),
             EngineSettings {
                 poll: Duration::from_secs(60),
                 flags: AnnounceFlags::all_on(),
@@ -1731,7 +1752,7 @@ mod tests {
         *lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
         engine.tick().await; // both sends fail
 
-        let scoped = storage.guild_scoped(Platform::Discord, GuildId(GUILD));
+        let scoped = storage.guild_scoped("test", GuildId(GUILD));
         let records = scoped.list_last(NAMESPACE, 10).await.expect("records read expected");
         assert!(records.is_empty(), "neither announcement nor watch recorded");
         assert!(bus.log().is_empty());
@@ -1755,6 +1776,7 @@ mod tests {
             Arc::clone(&storage) as Arc<dyn StoragePort>,
             Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
             RecorderBus::default(),
+            crate::test_support::test_platform_info(),
             EngineSettings {
                 poll: Duration::from_secs(60),
                 flags: AnnounceFlags::all_on(),
@@ -1790,7 +1812,7 @@ mod tests {
             let storage = Arc::clone(&storage);
             async move {
                 storage
-                    .guild_scoped(Platform::Discord, GuildId(guild))
+                    .guild_scoped("test", GuildId(guild))
                     .list_last(NAMESPACE, 10)
                     .await
                     .expect("records read expected")

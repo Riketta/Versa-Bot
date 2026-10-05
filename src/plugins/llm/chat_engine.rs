@@ -38,6 +38,7 @@ use super::providers::LlmSettings;
 use super::rng::{RandomPort, RandomScope};
 use super::tools;
 use super::vision::{self, DEFAULT_IMAGE_PROMPT, ImageDescriber, ImageJob, ImageSource};
+use crate::kernel::spi_ports::PlatformInfoPort;
 
 /// One undescribed placeholder entry per image (feature off, cap overflow,
 /// or recognition failure - the record still shows THAT an image existed).
@@ -223,6 +224,9 @@ pub struct ChatEngine {
     /// Image recognition (capture-time descriptions); a no-op fake in
     /// tests.
     describer: Arc<dyn ImageDescriber>,
+    /// The deployment's platform identity (adapter-owned values) - prompt
+    /// templates and slug-keyed cooldowns read it.
+    platform_info: Arc<dyn PlatformInfoPort>,
     /// Last error-notice time per channel (see [`NOTICE_COOLDOWN`]).
     notices: Mutex<HashMap<ChannelKey, Instant>>,
     /// Last random chime-in time per channel; the cooldown length is the
@@ -241,12 +245,14 @@ impl ChatEngine {
         completion: Arc<dyn LlmCompletionPort>,
         rng: Arc<dyn RandomPort>,
         describer: Arc<dyn ImageDescriber>,
+        platform_info: Arc<dyn PlatformInfoPort>,
     ) -> Self {
         Self {
             settings,
             completion,
             rng,
             describer,
+            platform_info,
             notices: Mutex::new(HashMap::new()),
             chimes: Mutex::new(HashMap::new()),
             react_chimes: Mutex::new(HashMap::new()),
@@ -502,20 +508,15 @@ impl ChatEngine {
     /// report is measured against, and the window size for the audit row.
     /// Shared by the triggered/chime answer and the silent-react chime.
     /// Request-scoped prompt template values: bot identity from settings,
-    /// the platform display name from the wired adapter (via services), a
-    /// time snapshot taken now, guild/model from the current request.
-    fn prompt_vars(
-        &self,
-        services: &KernelServices,
-        guild_name: Option<&str>,
-        model: &str,
-    ) -> PromptVars {
+    /// the deployment's platform display name, a time snapshot taken now,
+    /// guild/model from the current request.
+    fn prompt_vars(&self, guild_name: Option<&str>, model: &str) -> PromptVars {
         PromptVars::new(
             self.settings.bot_name.clone(),
             self.settings.bot_id.clone(),
             i64::try_from(unix_now()).unwrap_or(i64::MAX),
             self.settings.time_offset_minutes,
-            services.chat_output_factory.platform_name(),
+            self.platform_info.display_name(),
             guild_name,
             model,
         )
@@ -577,7 +578,7 @@ impl ChatEngine {
         // failure included, the caller's fallback follows right after.
         let _typing = typing.unwrap_or_else(|| services.chat_output_factory.start_typing(origin));
         let channel_id = origin.channel_id.get();
-        let vars = self.prompt_vars(services, guild_name, &config.model);
+        let vars = self.prompt_vars(guild_name, &config.model);
         let (request, context_chars, budget, window_used) =
             self.assemble_prompt(config, state, live, usage_stats, &vars);
         let started = Instant::now();
@@ -953,7 +954,7 @@ impl ChatEngine {
     ) {
         let config = request.config;
         let reply_scope = RandomScope {
-            platform: origin.platform.as_str(),
+            platform: self.platform_info.slug(),
             guild_id: origin.guild_id.map_or(0, GuildId::get),
             channel_id: origin.channel_id.get(),
             purpose: "reply",
@@ -1015,7 +1016,7 @@ impl ChatEngine {
     ) {
         let AnswerRequest { config, state, live, usage_stats, guild_name, .. } = request;
         let channel_id = origin.channel_id.get();
-        let vars = self.prompt_vars(services, guild_name, &config.model);
+        let vars = self.prompt_vars(guild_name, &config.model);
         let (mut request, context_chars, budget, _) =
             self.assemble_prompt(config, state, live, usage_stats, &vars);
         // This invocation is a reaction decision, not a reply: without a
@@ -1259,7 +1260,7 @@ impl ChatEngine {
             .unwrap_or_else(|| config.model.clone());
         // The summarizer model executes this prompt - `{{model}}` names it,
         // not the channel's chat model.
-        let vars = self.prompt_vars(services, guild_name, &model);
+        let vars = self.prompt_vars(guild_name, &model);
         let resolved = config
             .compaction_prompt
             .clone()
@@ -1428,7 +1429,7 @@ impl ChatEngine {
 
     fn error_notice_allowed(&self, origin: &Origin, service_channel: u64) -> bool {
         let key: ChannelKey = (
-            origin.platform.as_str().to_owned(),
+            self.platform_info.slug().to_owned(),
             origin.guild_id.map_or(0, GuildId::get),
             service_channel,
         );
@@ -1444,7 +1445,7 @@ impl ChatEngine {
 
     fn chime_allowed(&self, origin: &Origin, cooldown_secs: u64) -> bool {
         let key: ChannelKey = (
-            origin.platform.as_str().to_owned(),
+            self.platform_info.slug().to_owned(),
             origin.guild_id.map_or(0, GuildId::get),
             origin.channel_id.get(),
         );
@@ -1454,7 +1455,7 @@ impl ChatEngine {
 
     fn note_chime(&self, origin: &Origin) {
         let key: ChannelKey = (
-            origin.platform.as_str().to_owned(),
+            self.platform_info.slug().to_owned(),
             origin.guild_id.map_or(0, GuildId::get),
             origin.channel_id.get(),
         );
@@ -1465,7 +1466,7 @@ impl ChatEngine {
     /// duration as the reply chime, but an independent tracker.
     fn react_chime_allowed(&self, origin: &Origin, cooldown_secs: u64) -> bool {
         let key: ChannelKey = (
-            origin.platform.as_str().to_owned(),
+            self.platform_info.slug().to_owned(),
             origin.guild_id.map_or(0, GuildId::get),
             origin.channel_id.get(),
         );
@@ -1475,7 +1476,7 @@ impl ChatEngine {
 
     fn note_react_chime(&self, origin: &Origin) {
         let key: ChannelKey = (
-            origin.platform.as_str().to_owned(),
+            self.platform_info.slug().to_owned(),
             origin.guild_id.map_or(0, GuildId::get),
             origin.channel_id.get(),
         );
@@ -1538,7 +1539,7 @@ impl ChatEngine {
 mod tests {
     use super::*;
     use crate::kernel::models::{
-        AttachmentPayload, ChannelId, GuildId, MessageId, OutboundError, Platform, StorageError,
+        AttachmentPayload, ChannelId, GuildId, MessageId, OutboundError, StorageError,
         UserId,
     };
     use crate::kernel::spi_ports::{
@@ -1626,10 +1627,6 @@ mod tests {
     }
 
     impl ChatOutputFactoryPort for StreamRecordingFactory {
-        fn platform_name(&self) -> &str {
-            "Test"
-        }
-
         fn chat_output(&self, _origin: &Origin) -> Arc<dyn ChatOutputPort> {
             Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
         }
@@ -1708,10 +1705,6 @@ mod tests {
 
     #[async_trait]
     impl ChatOutputFactoryPort for FailingReactionFactory {
-        fn platform_name(&self) -> &str {
-            "Test"
-        }
-
         fn chat_output(&self, _origin: &Origin) -> Arc<dyn ChatOutputPort> {
             Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
         }
@@ -1880,6 +1873,7 @@ mod tests {
             completion,
             Arc::new(FixedRandom(false)),
             Arc::new(FakeDescriber::default()),
+        crate::test_support::test_platform_info(),
         );
         let storage = Arc::new(InMemoryStorage::new());
         let output = RecordingChatOutput::new();
@@ -1895,7 +1889,8 @@ mod tests {
         let services = Arc::new(KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
-            guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
+            guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
+            platform_info: crate::test_support::test_platform_info(),
         });
         DeltaCtx {
             engine,
@@ -1969,11 +1964,11 @@ mod tests {
 
     #[async_trait]
     impl StoragePort for RecordsFailStorage {
-        fn guild_scoped(&self, platform: Platform, guild_id: GuildId) -> Arc<dyn GuildStorage> {
+        fn guild_scoped(&self, platform: &str, guild_id: GuildId) -> Arc<dyn GuildStorage> {
             Arc::new(RecordsFailView { guild: self.documents.guild_scoped(platform, guild_id) })
         }
 
-        async fn list_guilds(&self) -> Result<Vec<(Platform, GuildId)>, StorageError> {
+        async fn list_guilds(&self) -> Result<Vec<(String, GuildId)>, StorageError> {
             self.documents.list_guilds().await
         }
     }
@@ -2035,11 +2030,11 @@ mod tests {
 
     #[async_trait]
     impl StoragePort for AppendFailStorage {
-        fn guild_scoped(&self, platform: Platform, guild_id: GuildId) -> Arc<dyn GuildStorage> {
+        fn guild_scoped(&self, platform: &str, guild_id: GuildId) -> Arc<dyn GuildStorage> {
             Arc::new(AppendFailView { guild: self.documents.guild_scoped(platform, guild_id) })
         }
 
-        async fn list_guilds(&self) -> Result<Vec<(Platform, GuildId)>, StorageError> {
+        async fn list_guilds(&self) -> Result<Vec<(String, GuildId)>, StorageError> {
             self.documents.list_guilds().await
         }
     }
@@ -2101,6 +2096,7 @@ mod tests {
             Arc::clone(&fake) as Arc<dyn LlmCompletionPort>,
             rng,
             Arc::clone(&describer) as Arc<dyn ImageDescriber>,
+        crate::test_support::test_platform_info(),
         );
         let storage = Arc::new(InMemoryStorage::new());
         let output = RecordingChatOutput::new();
@@ -2116,7 +2112,8 @@ mod tests {
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
-            guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
+            guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
+        platform_info: crate::test_support::test_platform_info(),
         };
         TestCtx { engine, fake, storage, output, begins, factory, services, describer }
     }
@@ -2156,10 +2153,6 @@ mod tests {
 
     #[async_trait]
     impl ChatOutputFactoryPort for FailingDeliveryFactory {
-        fn platform_name(&self) -> &str {
-            "Test"
-        }
-
         fn chat_output(&self, _origin: &Origin) -> Arc<dyn ChatOutputPort> {
             Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
         }
@@ -2202,7 +2195,8 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::new(FailingDeliveryFactory { output: Arc::clone(&output) })
                 as Arc<dyn ChatOutputFactoryPort>,
-            guild_storage: Some(ctx.storage.guild_scoped(Platform::Discord, GuildId(1))),
+            guild_storage: Some(ctx.storage.guild_scoped("test", GuildId(1))),
+        platform_info: crate::test_support::test_platform_info(),
         };
         seed_config(&ctx.storage, &assigned_config());
 
@@ -2259,7 +2253,7 @@ mod tests {
 
     fn seed_config(storage: &InMemoryStorage, config: &ChannelConfig) {
         storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             &channel_config_key(2),
@@ -2269,7 +2263,6 @@ mod tests {
 
     fn origin() -> Origin {
         Origin {
-            platform: Platform::Discord,
             guild_id: Some(GuildId(1)),
             channel_id: ChannelId(2),
             user_id: UserId(3),
@@ -2325,7 +2318,7 @@ mod tests {
     async fn append_record(storage: &Arc<InMemoryStorage>, record: &ConversationRecord) {
         let payload = serde_json::to_value(record).expect("record expected to serialize");
         storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .append(&records_namespace(2), payload)
             .await
             .expect("append expected to succeed");
@@ -2337,7 +2330,7 @@ mod tests {
 
     async fn stored_records_in(storage: &Arc<InMemoryStorage>) -> Vec<ConversationRecord> {
         storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .list_after(&records_namespace(2), 0, 100)
             .await
             .expect("records readable")
@@ -2351,7 +2344,7 @@ mod tests {
 
     fn seed_service_channel(ctx: &TestCtx) {
         ctx.storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             SERVICE_CHANNEL_KEY,
@@ -2817,7 +2810,7 @@ mod tests {
         let ctx = ctx(vec![Ok("ok".to_owned())]);
         seed_config(&ctx.storage, &assigned_config());
         ctx.storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             &channel_state_key(2),
@@ -2848,7 +2841,7 @@ mod tests {
         let ctx = ctx(vec![Ok("fresh answer".to_owned())]);
         seed_config(&ctx.storage, &assigned_config());
         ctx.storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             &channel_state_key(2),
@@ -2917,6 +2910,7 @@ mod tests {
             Arc::clone(&fake) as Arc<dyn LlmCompletionPort>,
             Arc::new(RandRandom) as Arc<dyn RandomPort>,
             Arc::new(FakeDescriber::default()) as Arc<dyn ImageDescriber>,
+        crate::test_support::test_platform_info(),
         );
         let output = RecordingChatOutput::new();
         let services = KernelServices {
@@ -2925,8 +2919,9 @@ mod tests {
                 Arc::clone(&output),
             )),
             guild_storage: Some(
-                crate::test_support::FailingStorage.guild_scoped(Platform::Discord, GuildId(1)),
+                crate::test_support::FailingStorage.guild_scoped("test", GuildId(1)),
             ),
+        platform_info: crate::test_support::test_platform_info(),
         };
 
         engine
@@ -2968,7 +2963,7 @@ mod tests {
 
         let state_raw = ctx
             .storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .get(NAMESPACE, &channel_state_key(2))
             .await
             .expect("state readable")
@@ -3023,7 +3018,7 @@ mod tests {
         assert_eq!(ctx.fake.requests().len(), 2);
         let stats_raw = ctx
             .storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .get(NAMESPACE, &channel_stats_key(2))
             .await
             .expect("stats readable")
@@ -3055,7 +3050,7 @@ mod tests {
         assert_eq!(begin_texts(&ctx.begins), vec!["the answer".to_owned()]);
         let state_raw = ctx
             .storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .get(NAMESPACE, &channel_state_key(2))
             .await
             .expect("state readable");
@@ -3072,7 +3067,7 @@ mod tests {
         let mut ctx = ctx(vec![Ok("should not answer".to_owned())]);
         ctx.services.guild_storage = Some(
             RecordsFailStorage { documents: Arc::clone(&ctx.storage) }
-                .guild_scoped(Platform::Discord, GuildId(1)),
+                .guild_scoped("test", GuildId(1)),
         );
         seed_config(&ctx.storage, &assigned_config());
 
@@ -3099,7 +3094,7 @@ mod tests {
         let mut ctx = ctx(vec![Ok("fabricated answer".to_owned())]);
         ctx.services.guild_storage = Some(
             AppendFailStorage { documents: Arc::clone(&ctx.storage) }
-                .guild_scoped(Platform::Discord, GuildId(1)),
+                .guild_scoped("test", GuildId(1)),
         );
         seed_config(&ctx.storage, &assigned_config());
 
@@ -3223,7 +3218,7 @@ mod tests {
         assert_eq!(ctx.fake.requests().len(), 1);
         let state_raw = ctx
             .storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .get(NAMESPACE, &channel_state_key(2))
             .await
             .expect("state readable");
@@ -3584,7 +3579,8 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::new(FailingReactionFactory { output: Arc::clone(&output) })
                 as Arc<dyn ChatOutputFactoryPort>,
-            guild_storage: Some(ctx.storage.guild_scoped(Platform::Discord, GuildId(1))),
+            guild_storage: Some(ctx.storage.guild_scoped("test", GuildId(1))),
+        platform_info: crate::test_support::test_platform_info(),
         };
 
         ctx.engine.handle_message(&origin(), &payload(true, None), &config, &services, None).await;
@@ -3670,7 +3666,7 @@ mod tests {
         // The call was real: usage stats recorded despite the silence.
         let stats = ctx
             .storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .get(NAMESPACE, &channel_stats_key(2))
             .await
             .expect("stats readable");
@@ -3770,7 +3766,7 @@ mod tests {
 
         let stats_raw = ctx
             .storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .get(NAMESPACE, &channel_stats_key(2))
             .await
             .expect("stats readable")
@@ -3803,7 +3799,7 @@ mod tests {
 
         let stats_raw = ctx
             .storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .get(NAMESPACE, &channel_stats_key(2))
             .await
             .expect("stats readable")
@@ -3849,7 +3845,7 @@ mod tests {
 
         let stats_raw = ctx
             .storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .get(NAMESPACE, &channel_stats_key(2))
             .await
             .expect("stats readable")
@@ -3875,7 +3871,7 @@ mod tests {
 
         // A compacted past: one old user record folded away by a cutoff at
         // seq 1 - and a state doc whose summary field is the wrong type.
-        let scoped = ctx.storage.guild_scoped(Platform::Discord, GuildId(1));
+        let scoped = ctx.storage.guild_scoped("test", GuildId(1));
         let old_record = ConversationRecord {
             message_id: None,
             role: RecordRole::User,
@@ -3895,7 +3891,7 @@ mod tests {
             .await
             .expect("append expected to succeed");
         ctx.storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             &channel_state_key(2),

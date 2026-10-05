@@ -9,7 +9,7 @@ use serenity::all::{ClientBuilder, GatewayIntents, Http, HttpBuilder};
 use versa_bot::infrastructure::{
     Configuration, LlmConfig, LlmReasoningStyle, LlmSummaryPlacement, LolLeaderboardConfig,
     LolStoreConfig, PollingConfigWatcher,
-    inbound_adapters::{DiscordGatewayAdapter, SerenityChatOutputFactory},
+    inbound_adapters::{DiscordGatewayAdapter, DiscordPlatform, SerenityChatOutputFactory},
     observability,
     outbound_adapters::{DiscordCommandRegistrar, SerenityNickname, SerenityPresence, SqlxStorage},
     plugin_adapters::{InMemoryCommandRegistry, InMemoryEventBus, TokioScheduler},
@@ -18,8 +18,8 @@ use versa_bot::kernel::{
     plugin_ports::{CommandRegistryPort, Job, MiddlewarePluginPort, PluginPort, SchedulerPort},
     services::KernelService,
     spi_ports::{
-        ChatOutputFactoryPort, ConfigChangeHandler, ConfigPort, NicknamePort, PresencePort,
-        StoragePort,
+        ChatOutputFactoryPort, ConfigChangeHandler, ConfigPort, NicknamePort, PlatformInfoPort,
+        PresencePort, StoragePort,
     },
 };
 use versa_bot::plugins::audit::AuditLogPlugin;
@@ -79,6 +79,10 @@ async fn main() -> ExitCode {
     // Bot identity for LLM prompt templates (`{{bot_name}}`/`{{bot_id}}`):
     // resolved once here, config overrides take precedence per part.
     let bot_user = bootstrap.get_current_user().await.expect("bot user expected to be resolvable");
+    // The deployment's platform identity - adapter-owned values (one
+    // constant in the serenity adapter). The kernel binds storage under the
+    // slug; plugins render the display name (prompt templates).
+    let platform_info: Arc<dyn PlatformInfoPort> = Arc::new(DiscordPlatform);
 
     // One shared REST client for every driven Discord call (factory outputs,
     // command registration): serenity rate limiting is per `Http`, so one
@@ -146,6 +150,7 @@ async fn main() -> ExitCode {
         Arc::clone(&llm_completion),
         Arc::new(DeckRandom::new()) as Arc<dyn RandomPort>,
         llm_describer as Arc<dyn ImageDescriber>,
+        Arc::clone(&platform_info),
     ));
     let llm =
         Arc::new(LlmPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>, llm_engine));
@@ -191,6 +196,7 @@ async fn main() -> ExitCode {
         Arc::clone(&storage) as Arc<dyn StoragePort>,
         Arc::clone(&chat_factory),
         event_bus.clone(),
+        Arc::clone(&platform_info),
         lol_settings,
     ));
     let lol_store = Arc::new(LolStorePlugin::new(
@@ -269,6 +275,7 @@ async fn main() -> ExitCode {
             .event_bus(event_bus)
             .chat_output_factory(Arc::clone(&chat_factory))
             .storage(Arc::clone(&storage) as Arc<dyn StoragePort>)
+            .platform_info(Arc::clone(&platform_info))
             .build(),
     );
 

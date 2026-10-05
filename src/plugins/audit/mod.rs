@@ -10,7 +10,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::kernel::{
-    models::{GuildId, Platform, PluginError, UserId},
+    models::{GuildId, PluginError, UserId},
     plugin_ports::{EventBusPort, EventBusSubscription, EventHandler, PluginPort},
 };
 use crate::plugins::tracker::{UserJoinedGuild, UserLeftGuild};
@@ -84,17 +84,12 @@ impl EventHandler<UserLeftGuild> for MembershipAudit {
 
 /// Accessors shared by the two membership event types.
 trait MembershipEvent {
-    fn platform(&self) -> Platform;
     fn guild_id(&self) -> GuildId;
     fn user_id(&self) -> UserId;
     fn username(&self) -> Option<&str>;
 }
 
 impl MembershipEvent for UserJoinedGuild {
-    fn platform(&self) -> Platform {
-        self.platform
-    }
-
     fn guild_id(&self) -> GuildId {
         self.guild_id
     }
@@ -109,10 +104,6 @@ impl MembershipEvent for UserJoinedGuild {
 }
 
 impl MembershipEvent for UserLeftGuild {
-    fn platform(&self) -> Platform {
-        self.platform
-    }
-
     fn guild_id(&self) -> GuildId {
         self.guild_id
     }
@@ -129,7 +120,6 @@ impl MembershipEvent for UserLeftGuild {
 fn log_membership(what: &str, event: &impl MembershipEvent) {
     tracing::info!(
         target: "audit",
-        platform = event.platform().as_str(),
         guild_id = event.guild_id().get(),
         user_id = event.user_id().get(),
         username = event.username().unwrap_or("unknown"),
@@ -161,7 +151,6 @@ mod tests {
 
     fn joined_event() -> UserJoinedGuild {
         UserJoinedGuild {
-            platform: Platform::Discord,
             guild_id: GuildId(1),
             user_id: UserId(3),
             username: Some("someone".to_owned()),
@@ -169,12 +158,7 @@ mod tests {
     }
 
     fn left_event() -> UserLeftGuild {
-        UserLeftGuild {
-            platform: Platform::Discord,
-            guild_id: GuildId(1),
-            user_id: UserId(3),
-            username: None,
-        }
+        UserLeftGuild { guild_id: GuildId(1), user_id: UserId(3), username: None }
     }
 
     /// `init()` must subscribe both membership event types: publishing on the
@@ -199,7 +183,6 @@ mod tests {
         assert!(log.contains("user joined the guild"), "log: {log}");
         assert!(log.contains("user left the guild"), "log: {log}");
         // fmt quotes string field values.
-        assert!(log.contains("platform=\"discord\""), "log: {log}");
         assert!(log.contains("guild_id=1"), "log: {log}");
         assert!(log.contains("username=\"someone\""), "log: {log}");
         assert!(log.contains("username=\"unknown\""), "log: {log}");

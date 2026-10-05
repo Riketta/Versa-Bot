@@ -271,9 +271,7 @@ impl<B: EventBusPort> PluginPort for LolStorePlugin<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::models::{
-        CommandPayload, EventKind, EventPayload, GuildId, Origin, Platform, UserId,
-    };
+    use crate::kernel::models::{CommandPayload, EventKind, EventPayload, GuildId, Origin, UserId};
     use crate::kernel::plugin_ports::{CommandArgs, CommandHandler, Job};
     use crate::kernel::services::KernelServices;
     use crate::kernel::spi_ports::{ChatOutputPort, StoragePort};
@@ -373,6 +371,7 @@ mod tests {
             Arc::new(InMemoryStorage::new()) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecordingBus::default(),
+            crate::test_support::test_platform_info(),
             EngineSettings {
                 poll: Duration::ZERO,
                 flags: AnnounceFlags::all_on(),
@@ -405,6 +404,7 @@ mod tests {
             Arc::new(InMemoryStorage::new()) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecordingBus::default(),
+            crate::test_support::test_platform_info(),
             EngineSettings {
                 poll: Duration::from_secs(90),
                 flags: AnnounceFlags::all_on(),
@@ -568,7 +568,6 @@ mod tests {
     async fn command_fixture_with(guilded: bool, storage: Arc<InMemoryStorage>) -> CommandFixture {
         let output = RecordingChatOutput::new();
         let origin = Origin {
-            platform: Platform::Discord,
             guild_id: guilded.then(|| GuildId(42)),
             channel_id: crate::kernel::models::ChannelId(555),
             user_id: UserId(1),
@@ -578,7 +577,8 @@ mod tests {
         let services = KernelServices {
             chat_output: output.clone() as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
-            guild_storage: guilded.then(|| storage.guild_scoped(Platform::Discord, GuildId(42))),
+            guild_storage: guilded.then(|| storage.guild_scoped("test", GuildId(42))),
+            platform_info: crate::test_support::test_platform_info(),
         };
         let event = crate::kernel::models::RequestContext {
             origin,
@@ -596,7 +596,7 @@ mod tests {
     async fn stored_watch_doc(fixture: &CommandFixture) -> Option<serde_json::Value> {
         fixture
             .storage
-            .guild_scoped(Platform::Discord, GuildId(42))
+            .guild_scoped("test", GuildId(42))
             .get(NAMESPACE, WATCH_KEY)
             .await
             .expect("watch doc read expected")
@@ -605,7 +605,7 @@ mod tests {
     async fn seed_watch_doc(fixture: &CommandFixture, doc: serde_json::Value) {
         fixture
             .storage
-            .guild_scoped(Platform::Discord, GuildId(42))
+            .guild_scoped("test", GuildId(42))
             .set(NAMESPACE, WATCH_KEY, doc)
             .await
             .expect("watch doc write expected");
@@ -626,6 +626,7 @@ mod tests {
             Arc::clone(&storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecordingBus::default(),
+            crate::test_support::test_platform_info(),
             EngineSettings {
                 poll: Duration::from_secs(60),
                 flags: AnnounceFlags::all_on(),
@@ -640,7 +641,7 @@ mod tests {
     async fn stored_config(fixture: &CommandFixture) -> Option<GuildConfig> {
         fixture
             .storage
-            .guild_scoped(Platform::Discord, GuildId(42))
+            .guild_scoped("test", GuildId(42))
             .get(NAMESPACE, CONFIG_KEY)
             .await
             .expect("config read expected")
@@ -683,7 +684,7 @@ mod tests {
 
         // Without the role: cleared, everything else untouched.
         f.storage
-            .guild_scoped(Platform::Discord, GuildId(42))
+            .guild_scoped("test", GuildId(42))
             .set(
                 NAMESPACE,
                 CONFIG_KEY,
@@ -916,7 +917,7 @@ mod tests {
         );
         let recovered = f
             .storage
-            .guild_scoped(Platform::Discord, GuildId(42))
+            .guild_scoped("test", GuildId(42))
             .get(NAMESPACE, crate::plugins::lol_store::commands::WATCH_RECOVERY_KEY)
             .await
             .expect("recovery read expected");
@@ -1000,6 +1001,7 @@ mod tests {
             Arc::clone(&storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecordingBus::default(),
+            crate::test_support::test_platform_info(),
             EngineSettings {
                 poll: Duration::from_secs(60),
                 flags: AnnounceFlags::all_on(),
@@ -1048,6 +1050,7 @@ mod tests {
             Arc::clone(&storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecordingBus::default(),
+            crate::test_support::test_platform_info(),
             EngineSettings {
                 poll: Duration::from_secs(60),
                 flags: AnnounceFlags::all_on(),
@@ -1079,6 +1082,7 @@ mod tests {
             Arc::clone(&storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecordingBus::default(),
+            crate::test_support::test_platform_info(),
             EngineSettings {
                 poll: Duration::from_secs(60),
                 flags: AnnounceFlags::all_on(),

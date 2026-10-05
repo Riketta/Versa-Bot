@@ -75,7 +75,7 @@ impl CommandHandler for LeaderboardHandler {
 mod tests {
     use super::*;
     use crate::kernel::models::{
-        ChannelId, CommandPayload, EventKind, EventPayload, GuildId, Origin, Platform, UserId,
+        ChannelId, CommandPayload, EventKind, EventPayload, GuildId, Origin, UserId,
     };
     use crate::plugins::lol_leaderboard::ResolvedView;
     use crate::plugins::lol_leaderboard::engine::{EngineSettings, test_support::FakeSource};
@@ -107,6 +107,7 @@ mod tests {
             chat_output: output.clone(),
             chat_output_factory: factory.clone(),
             guild_storage: None,
+            platform_info: crate::test_support::test_platform_info(),
         }
     }
 
@@ -114,7 +115,6 @@ mod tests {
         RequestContext {
             kind: EventKind::CommandInvoked,
             origin: Origin {
-                platform: Platform::Discord,
                 guild_id: Some(GuildId(1)),
                 channel_id: ChannelId(2),
                 user_id: UserId(3),

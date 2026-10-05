@@ -125,14 +125,12 @@ impl<B: EventBusPort> MiddlewarePluginPort for UserActivityTrackerPlugin<B> {
         // what happened, not to whether the audit log could be written.
         let derived: Arc<dyn Event> = if joined {
             Arc::new(UserJoinedGuild {
-                platform: event.origin.platform,
                 guild_id,
                 user_id: event.origin.user_id,
                 username: username.clone(),
             })
         } else {
             Arc::new(UserLeftGuild {
-                platform: event.origin.platform,
                 guild_id,
                 user_id: event.origin.user_id,
                 username: username.clone(),
@@ -265,7 +263,7 @@ mod tests {
     use crate::kernel::{
         models::{
             ChannelId as ChannelIdModel, CommandPayload, GuildId, MemberPayload, MessageId, Origin,
-            Platform, UserId,
+            UserId,
         },
         plugin_ports::EventHandler,
         spi_ports::{
@@ -306,10 +304,6 @@ mod tests {
     }
 
     impl ChatOutputFactoryPort for ChannelRecordingFactory {
-        fn platform_name(&self) -> &str {
-            "Test"
-        }
-
         fn chat_output(&self, origin: &Origin) -> Arc<dyn ChatOutputPort> {
             self.channel_output(origin, origin.channel_id)
         }
@@ -369,7 +363,6 @@ mod tests {
 
     fn origin(guild: Option<u64>) -> Origin {
         Origin {
-            platform: Platform::Discord,
             guild_id: guild.map(GuildId),
             channel_id: ChannelIdModel(2),
             user_id: UserId(3),
@@ -389,7 +382,7 @@ mod tests {
     fn configured_storage(channel: &str) -> Arc<InMemoryStorage> {
         let storage = InMemoryStorage::new();
         storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             CONFIG_KEY,
@@ -419,8 +412,8 @@ mod tests {
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::new(ChannelRecordingFactory { sent: Arc::clone(&sent) }),
-            guild_storage: storage
-                .map(|storage| storage.guild_scoped(Platform::Discord, GuildId(1))),
+            guild_storage: storage.map(|storage| storage.guild_scoped("test", GuildId(1))),
+            platform_info: crate::test_support::test_platform_info(),
         };
 
         let plugin = UserActivityTrackerPlugin::new(bus, Arc::new(InMemoryCommandRegistry::new()));
@@ -482,13 +475,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_config_skips_audit_but_publishes() {
         let storage = InMemoryStorage::new();
-        storage.seed(
-            Platform::Discord,
-            GuildId(1),
-            NAMESPACE,
-            CONFIG_KEY,
-            serde_json::json!("not an object"),
-        );
+        storage.seed("test", GuildId(1), NAMESPACE, CONFIG_KEY, serde_json::json!("not an object"));
         let (plugin, services, fixture) = fixture(Some(Arc::new(storage)));
         let mut event = member_event(EventKind::MemberJoined, Some(1), "someone");
 
@@ -510,8 +497,9 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::new(ChannelRecordingFactory { sent: Arc::clone(&sent) }),
             guild_storage: Some(
-                crate::test_support::FailingStorage.guild_scoped(Platform::Discord, GuildId(1)),
+                crate::test_support::FailingStorage.guild_scoped("test", GuildId(1)),
             ),
+            platform_info: crate::test_support::test_platform_info(),
         };
         let plugin = UserActivityTrackerPlugin::new(bus, Arc::new(InMemoryCommandRegistry::new()));
         let mut event = member_event(EventKind::MemberJoined, Some(1), "someone");
@@ -527,7 +515,7 @@ mod tests {
     #[tokio::test]
     async fn missing_audit_channel_skips_audit_but_publishes() {
         let storage = InMemoryStorage::new();
-        storage.seed(Platform::Discord, GuildId(1), NAMESPACE, CONFIG_KEY, serde_json::json!({}));
+        storage.seed("test", GuildId(1), NAMESPACE, CONFIG_KEY, serde_json::json!({}));
         let (plugin, services, fixture) = fixture(Some(Arc::new(storage)));
         let mut event = member_event(EventKind::MemberJoined, Some(1), "someone");
 
@@ -570,7 +558,7 @@ mod tests {
     async fn missing_username_falls_back_to_user_id() {
         let storage = InMemoryStorage::new();
         storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             CONFIG_KEY,
@@ -605,7 +593,7 @@ mod tests {
             .expect("assign expected to succeed");
 
         let stored = storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .get(NAMESPACE, CONFIG_KEY)
             .await
             .expect("storage get expected to succeed");
@@ -627,7 +615,7 @@ mod tests {
             .expect("assign expected to succeed");
 
         let stored = storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .get(NAMESPACE, CONFIG_KEY)
             .await
             .expect("storage get expected to succeed");
@@ -647,7 +635,7 @@ mod tests {
             .expect("unassign expected to succeed");
 
         let stored = storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .get(NAMESPACE, CONFIG_KEY)
             .await
             .expect("storage get expected to succeed");

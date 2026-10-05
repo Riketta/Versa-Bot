@@ -2,29 +2,11 @@ use std::any::Any;
 
 use super::{ChannelId, GuildId, MessageId, UserId};
 
-/// Chat platform an event originated from.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Platform {
-    Discord,
-}
-
-impl Platform {
-    /// Stable storage/telemetry key for the platform.
-    #[must_use]
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Discord => "discord",
-        }
-    }
-}
-
 /// Where an inbound event came from. Scopes event-driven outbound ports:
 /// a `ChatOutputPort` built from an origin sends to `channel_id` inside
 /// `guild_id`, so a plugin replies without a returned response.
 #[derive(Debug, Clone)]
 pub struct Origin {
-    pub platform: Platform,
     /// `None` for direct messages.
     pub guild_id: Option<GuildId>,
     /// Channel the event belongs to and where an origin-bound reply lands.

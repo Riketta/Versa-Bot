@@ -142,7 +142,7 @@ mod tests {
     use crate::kernel::{
         models::{
             ChannelId, CommandPayload, EventKind, EventPayload, GuildId, MessageId, Origin,
-            OutboundError, Platform, UserId,
+            OutboundError, UserId,
         },
         spi_ports::ChatOutputPort,
     };
@@ -185,7 +185,6 @@ mod tests {
         RequestContext {
             kind: EventKind::CommandInvoked,
             origin: Origin {
-                platform: Platform::Discord,
                 guild_id: guild.map(GuildId),
                 channel_id: ChannelId(6),
                 user_id: UserId(3),
@@ -213,6 +212,7 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: None,
+            platform_info: crate::test_support::test_platform_info(),
         };
         (output, services)
     }

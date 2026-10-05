@@ -15,7 +15,7 @@ use crate::kernel::{
     models::{GuildId, Origin, PluginError, RequestContext},
     plugin_ports::{EventBusPort, MiddlewarePluginPort, Next, PluginPort},
     services::KernelServices,
-    spi_ports::{ChatOutputFactoryPort, StoragePort},
+    spi_ports::{ChatOutputFactoryPort, PlatformInfoPort, StoragePort},
 };
 
 /// The kernel: assembles the middleware chain and runs it, but never knows
@@ -31,6 +31,9 @@ pub struct KernelService<E: EventBusPort> {
     event_bus: E,
     chat_output_factory: Arc<dyn ChatOutputFactoryPort>,
     storage: Arc<dyn StoragePort>,
+    /// The deployment's platform identity (adapter-owned values), stamped
+    /// into every event's service context and storage binding.
+    platform_info: Arc<dyn PlatformInfoPort>,
     /// One-shot guard: the explicit `shutdown()` and the `Drop` fallback
     /// together must stop plugins exactly once.
     shutdown_started: AtomicBool,
@@ -54,6 +57,7 @@ impl<E: EventBusPort> KernelService<E> {
         event_bus: E,
         chat_output_factory: Arc<dyn ChatOutputFactoryPort>,
         storage: Arc<dyn StoragePort>,
+        platform_info: Arc<dyn PlatformInfoPort>,
     ) -> Self {
         Self {
             plugins,
@@ -61,6 +65,7 @@ impl<E: EventBusPort> KernelService<E> {
             event_bus,
             chat_output_factory,
             storage,
+            platform_info,
             shutdown_started: AtomicBool::new(false),
             boot_started: AtomicBool::new(false),
             started: Mutex::new(Vec::new()),
@@ -223,7 +228,8 @@ impl<E: EventBusPort> KernelService<E> {
             chat_output_factory: Arc::clone(&self.chat_output_factory),
             guild_storage: origin
                 .guild_id
-                .map(|guild_id| self.storage.guild_scoped(origin.platform, guild_id)),
+                .map(|guild_id| self.storage.guild_scoped(self.platform_info.slug(), guild_id)),
+            platform_info: Arc::clone(&self.platform_info),
         }
     }
 }
@@ -245,7 +251,7 @@ impl<E: EventBusPort> RequestHandlerPort for KernelService<E> {
     async fn handle(&self, event: RequestContext) {
         let span = tracing::info_span!(
             "handle_event",
-            platform = ?event.origin.platform,
+            platform = self.platform_info.slug(),
             kind = ?event.kind,
             guild_id = event.origin.guild_id.map(GuildId::get),
             channel_id = event.origin.channel_id.get(),
@@ -335,8 +341,8 @@ impl<E: EventBusPort> KernelService<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::models::EventKind;
     use crate::kernel::models::OutboundMessage;
-    use crate::kernel::models::{EventKind, Platform};
     use crate::kernel::plugin_ports::EventBusSubscription;
     use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
     use parking_lot::Mutex;
@@ -556,7 +562,6 @@ mod tests {
 
     fn test_origin() -> Origin {
         Origin {
-            platform: Platform::Discord,
             guild_id: Some(GuildId(1)),
             channel_id: crate::kernel::models::ChannelId(2),
             user_id: crate::kernel::models::UserId(3),
@@ -577,6 +582,7 @@ mod tests {
             .event_bus(TestEventBus)
             .chat_output_factory(RecordingChatOutputFactory::new(Arc::clone(&output)).boxed())
             .storage(storage)
+            .platform_info(crate::test_support::test_platform_info())
             .build();
         (kernel, output)
     }
@@ -769,7 +775,7 @@ mod tests {
     async fn pipeline_hands_plugin_guild_scoped_storage() {
         let storage = Arc::new(InMemoryStorage::new());
         // Guild 1 is greeted by config; guild 2 has none and gets the default.
-        storage.seed(Platform::Discord, GuildId(1), "greeter", "greeting", json!("privit"));
+        storage.seed("test", GuildId(1), "greeter", "greeting", json!("privit"));
 
         let (kernel, output) = test_kernel(
             storage,

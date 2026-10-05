@@ -17,14 +17,32 @@ use crate::kernel::{
     api_ports::RequestHandlerPort,
     models::{
         AttachmentPayload, ChannelId, CommandPayload, Embed, EventKind, EventPayload, GuildId,
-        MemberPayload, MessageId, Origin, OutboundError, OutboundMessage, Platform, RequestContext,
-        UserId,
+        MemberPayload, MessageId, Origin, OutboundError, OutboundMessage, RequestContext, UserId,
     },
     spi_ports::{
-        ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard, ReactionPort,
-        UndeliverableReactionPort,
+        ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard, PlatformInfoPort,
+        ReactionPort, UndeliverableReactionPort,
     },
 };
+
+/// Stable storage/telemetry slug of this adapter's platform - the value
+/// [`DiscordPlatform`] serves and the namespace label stamped into every
+/// storage row this deployment writes.
+pub const PLATFORM_SLUG: &str = "discord";
+
+/// The deployment's platform identity, owned by this adapter: the port
+/// values and every `Origin` the adapter builds share one constant.
+pub struct DiscordPlatform;
+
+impl PlatformInfoPort for DiscordPlatform {
+    fn slug(&self) -> &'static str {
+        PLATFORM_SLUG
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Discord"
+    }
+}
 
 /// Kernel driving adapter: normalizes Discord gateway events onto the
 /// chat-agnostic `RequestContext` taxonomy and pushes each through the
@@ -99,7 +117,6 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
             .collect();
 
         let origin = Origin {
-            platform: Platform::Discord,
             guild_id: message.guild_id.map(|guild_id| GuildId(guild_id.get())),
             channel_id: ChannelId(message.channel_id.get()),
             user_id: UserId(message.author.id.get()),
@@ -220,7 +237,6 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
             .map_or(0, |permissions| permissions.bits());
 
         let origin = Origin {
-            platform: Platform::Discord,
             guild_id: command.guild_id.map(|guild_id| GuildId(guild_id.get())),
             channel_id: ChannelId(command.channel_id.get()),
             user_id: UserId(command.user.id.get()),
@@ -281,7 +297,6 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
 /// Origin for channel-less member lifecycle events (`ChannelId(0)` sentinel).
 fn member_origin(guild_id: SerenityGuildId, user: &User) -> Origin {
     Origin {
-        platform: Platform::Discord,
         guild_id: Some(GuildId(guild_id.get())),
         channel_id: ChannelId(0),
         user_id: UserId(user.id.get()),
@@ -589,10 +604,6 @@ impl SerenityChatOutputFactory {
 }
 
 impl ChatOutputFactoryPort for SerenityChatOutputFactory {
-    fn platform_name(&self) -> &str {
-        "Discord"
-    }
-
     fn chat_output(&self, origin: &Origin) -> Arc<dyn ChatOutputPort> {
         if let Some(token) = &origin.reply_token {
             return Arc::new(InteractionFollowupOutput {

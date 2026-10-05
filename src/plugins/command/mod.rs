@@ -161,7 +161,7 @@ mod tests {
     use super::*;
     use crate::infrastructure::plugin_adapters::InMemoryCommandRegistry;
     use crate::kernel::{
-        models::{ChannelId, EventKind, GuildId, MessageId, Origin, Platform, UserId},
+        models::{ChannelId, EventKind, GuildId, MessageId, Origin, UserId},
         spi_ports::StoragePort,
     };
     use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
@@ -186,7 +186,6 @@ mod tests {
 
     fn origin() -> Origin {
         Origin {
-            platform: Platform::Discord,
             guild_id: Some(GuildId(1)),
             channel_id: ChannelId(2),
             user_id: UserId(3),
@@ -230,7 +229,8 @@ mod tests {
         KernelServices {
             chat_output: Arc::clone(output) as Arc<dyn crate::kernel::spi_ports::ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(output)).boxed(),
-            guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
+            guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
+            platform_info: crate::test_support::test_platform_info(),
         }
     }
 

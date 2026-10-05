@@ -11,15 +11,39 @@ use serde_json::Value;
 use async_trait::async_trait;
 
 use crate::kernel::{
-    models::{GuildId, OutboundError, OutboundMessage, Platform, StorageError},
+    models::{GuildId, OutboundError, OutboundMessage, StorageError},
     plugin_ports::{
         CommandDescriptor, CommandHandler, CommandRegistryPort, Job, JobHandle, SchedulerPort,
     },
     spi_ports::{
         ChatOutputFactoryPort, ChatOutputPort, ChatTypingGuard, GUILD_SETTINGS, GuildStorage,
-        StoragePort, StoredRecord,
+        PlatformInfoPort, StoragePort, StoredRecord,
     },
 };
+
+/// Slug of the test platform - what [`TestPlatformInfo`] serves and what
+/// test fixtures namespace their storage rows under.
+pub const TEST_PLATFORM_SLUG: &str = "test";
+
+/// [`PlatformInfoPort`] for tests: identity is just a constant, exactly as
+/// an adapter would declare it.
+pub struct TestPlatformInfo;
+
+impl PlatformInfoPort for TestPlatformInfo {
+    fn slug(&self) -> &'static str {
+        TEST_PLATFORM_SLUG
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Test"
+    }
+}
+
+/// Arc'd [`TestPlatformInfo`] for `KernelServices` fixtures.
+#[must_use]
+pub fn test_platform_info() -> std::sync::Arc<dyn PlatformInfoPort> {
+    std::sync::Arc::new(TestPlatformInfo)
+}
 
 type Row = (String, i64, String, String);
 
@@ -44,19 +68,14 @@ impl InMemoryStorage {
     /// the port).
     pub fn seed(
         &self,
-        platform: Platform,
+        platform: &str,
         guild_id: GuildId,
         namespace: &str,
         key: &str,
         value: Value,
     ) {
         self.documents.lock().insert(
-            (
-                platform.as_str().to_owned(),
-                guild_id.get() as i64,
-                namespace.to_owned(),
-                key.to_owned(),
-            ),
+            (platform.to_owned(), guild_id.get() as i64, namespace.to_owned(), key.to_owned()),
             value,
         );
     }
@@ -64,18 +83,18 @@ impl InMemoryStorage {
 
 #[async_trait]
 impl StoragePort for InMemoryStorage {
-    fn guild_scoped(&self, platform: Platform, guild_id: GuildId) -> Arc<dyn GuildStorage> {
+    fn guild_scoped(&self, platform: &str, guild_id: GuildId) -> Arc<dyn GuildStorage> {
         Arc::new(ScopedView {
             documents: Arc::clone(&self.documents),
             records: Arc::clone(&self.records),
-            key_prefix: (platform.as_str().to_owned(), guild_id.get() as i64),
+            key_prefix: (platform.to_owned(), guild_id.get() as i64),
         })
     }
 
     /// Distinct scopes over seeded documents and record logs, ordered - the
     /// fake mirrors the real adapter's shape so poll-driven plugins test
     /// their discovery logic.
-    async fn list_guilds(&self) -> Result<Vec<(Platform, GuildId)>, StorageError> {
+    async fn list_guilds(&self) -> Result<Vec<(String, GuildId)>, StorageError> {
         let mut scopes: Vec<(String, i64)> = Vec::new();
         {
             let documents = self.documents.lock();
@@ -91,10 +110,6 @@ impl StoragePort for InMemoryStorage {
         Ok(scopes
             .into_iter()
             .filter_map(|(platform, guild)| {
-                let platform = match platform.as_str() {
-                    "discord" => Platform::Discord,
-                    _ => return None,
-                };
                 let guild = u64::try_from(guild).ok()?;
                 Some((platform, GuildId(guild)))
             })
@@ -229,7 +244,7 @@ mod tests {
     #[tokio::test]
     async fn reserved_guild_namespace_rejects_plugin_writes() {
         let storage = InMemoryStorage::new();
-        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        let guild = storage.guild_scoped("test", GuildId(1));
 
         let set = guild.set(GUILD_SETTINGS, "language", Value::String("en".to_owned())).await;
         assert!(matches!(set, Err(StorageError::Forbidden(_))));
@@ -241,7 +256,7 @@ mod tests {
         // Arrangement seeding is direct (not via the port); reads stay
         // permitted for every caller.
         storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             GUILD_SETTINGS,
             "language",
@@ -352,11 +367,11 @@ impl GuildStorage for FailingView {
 
 #[async_trait]
 impl StoragePort for FailingStorage {
-    fn guild_scoped(&self, _platform: Platform, _guild_id: GuildId) -> Arc<dyn GuildStorage> {
+    fn guild_scoped(&self, _platform: &str, _guild_id: GuildId) -> Arc<dyn GuildStorage> {
         Arc::new(FailingView)
     }
 
-    async fn list_guilds(&self) -> Result<Vec<(Platform, GuildId)>, StorageError> {
+    async fn list_guilds(&self) -> Result<Vec<(String, GuildId)>, StorageError> {
         Err(StorageError::Database("simulated storage failure".to_owned()))
     }
 }
@@ -434,10 +449,6 @@ impl ChatOutputPort for ChannelRecordingOutput {
 
 #[async_trait]
 impl ChatOutputFactoryPort for ChannelRecordingFactory {
-    fn platform_name(&self) -> &str {
-        "Test"
-    }
-
     fn chat_output(&self, origin: &crate::kernel::models::Origin) -> Arc<dyn ChatOutputPort> {
         Arc::new(self.output_for(origin.guild_id, origin.channel_id))
     }
@@ -487,10 +498,6 @@ impl ChatOutputPort for FailingChatOutput {
 
 #[async_trait]
 impl ChatOutputFactoryPort for FailingChatOutputFactory {
-    fn platform_name(&self) -> &str {
-        "Test"
-    }
-
     fn chat_output(&self, _origin: &crate::kernel::models::Origin) -> Arc<dyn ChatOutputPort> {
         Arc::new(FailingChatOutput)
     }
@@ -551,10 +558,6 @@ impl RecordingChatOutputFactory {
 }
 
 impl ChatOutputFactoryPort for RecordingChatOutputFactory {
-    fn platform_name(&self) -> &str {
-        "Test"
-    }
-
     fn chat_output(&self, _origin: &crate::kernel::models::Origin) -> Arc<dyn ChatOutputPort> {
         Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
     }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::kernel::models::{GuildId, Platform, StorageError};
+use crate::kernel::models::{GuildId, StorageError};
 
 /// Namespace reserved for guild-level settings (timezone, language, feature
 /// flags). Plugins use their registered slug as namespace.
@@ -15,12 +15,16 @@ pub const GUILD_SETTINGS: &str = "guild";
 /// to discover which guilds exist at all.
 #[async_trait]
 pub trait StoragePort: Send + Sync {
-    fn guild_scoped(&self, platform: Platform, guild_id: GuildId) -> Arc<dyn GuildStorage>;
+    /// `platform` is the deployment's stable slug (see `PlatformInfoPort`) -
+    /// a namespace label the storage never interprets.
+    fn guild_scoped(&self, platform: &str, guild_id: GuildId) -> Arc<dyn GuildStorage>;
 
     /// Every guild that has at least one stored document, in stable
-    /// (platform, guild) order. Poll-driven plugins iterate this to find
-    /// their per-guild config instead of keeping their own registry.
-    async fn list_guilds(&self) -> Result<Vec<(Platform, GuildId)>, StorageError>;
+    /// (platform, guild) order. The platform slug is returned as stored -
+    /// poll-driven plugins compare it against `PlatformInfoPort::slug` to
+    /// keep their own deployment's guilds. Poll-driven plugins iterate this
+    /// to find their per-guild config instead of keeping their own registry.
+    async fn list_guilds(&self) -> Result<Vec<(String, GuildId)>, StorageError>;
 }
 
 /// One appended record: its guild-scoped sequence number and payload.

@@ -10,7 +10,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{SqlSafeStr, sqlite::SqlitePool};
 
 use crate::kernel::{
-    models::{GuildId, Platform, StorageError},
+    models::{GuildId, StorageError},
     spi_ports::{GUILD_SETTINGS, GuildStorage, StoragePort, StoredRecord},
 };
 
@@ -105,19 +105,20 @@ impl SqlxStorage {
 
 #[async_trait]
 impl StoragePort for SqlxStorage {
-    fn guild_scoped(&self, platform: Platform, guild_id: GuildId) -> Arc<dyn GuildStorage> {
+    fn guild_scoped(&self, platform: &str, guild_id: GuildId) -> Arc<dyn GuildStorage> {
         Arc::new(ScopedGuildStorage {
             db: Arc::clone(&self.db),
-            platform: platform.as_str().to_owned(),
+            platform: platform.to_owned(),
             // Discord snowflakes fit i64; engines store integers natively.
             guild_id: guild_id.get() as i64,
         })
     }
 
     /// Distinct scopes over the documents table: the poll-driven plugins'
-    /// view of "which guilds exist". Unknown platform strings are skipped
-    /// (the enum is ahead of the storage, never behind).
-    async fn list_guilds(&self) -> Result<Vec<(Platform, GuildId)>, StorageError> {
+    /// view of "which guilds exist". The platform slug is returned as
+    /// stored - callers keep their own deployment's rows via
+    /// `PlatformInfoPort::slug` equality.
+    async fn list_guilds(&self) -> Result<Vec<(String, GuildId)>, StorageError> {
         let rows: Vec<(String, i64)> = match &*self.db {
             Db::Sqlite(pool) => {
                 sqlx::query_as(
@@ -141,10 +142,6 @@ impl StoragePort for SqlxStorage {
         Ok(rows
             .into_iter()
             .filter_map(|(platform, guild_id)| {
-                let platform = match platform.as_str() {
-                    "discord" => Platform::Discord,
-                    _ => return None,
-                };
                 let guild_id = u64::try_from(guild_id).ok()?;
                 Some((platform, GuildId(guild_id)))
             })
@@ -531,7 +528,7 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_within_guild() {
         let storage = sqlite_storage().await;
-        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        let guild = storage.guild_scoped("discord", GuildId(1));
 
         assert_eq!(guild.get("command", "prefix").await.unwrap(), None);
         guild.set("command", "prefix", Value::String("!".to_owned())).await.unwrap();
@@ -545,8 +542,8 @@ mod tests {
     #[tokio::test]
     async fn guilds_are_isolated_by_construction() {
         let storage = sqlite_storage().await;
-        let first = storage.guild_scoped(Platform::Discord, GuildId(1));
-        let second = storage.guild_scoped(Platform::Discord, GuildId(2));
+        let first = storage.guild_scoped("discord", GuildId(1));
+        let second = storage.guild_scoped("discord", GuildId(2));
 
         first.set("command", "prefix", Value::String("!".to_owned())).await.unwrap();
 
@@ -563,7 +560,7 @@ mod tests {
         // The upsert path is what the LLM plugin's one-atomic-write state
         // commit rides: the same key must replace, not duplicate.
         let storage = sqlite_storage().await;
-        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        let guild = storage.guild_scoped("discord", GuildId(1));
 
         guild.set("llm", "state", Value::String("first".to_owned())).await.unwrap();
         guild.set("llm", "state", Value::String("second".to_owned())).await.unwrap();
@@ -580,7 +577,7 @@ mod tests {
     #[tokio::test]
     async fn reserved_guild_namespace_permits_reads() {
         let storage = sqlite_storage().await;
-        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        let guild = storage.guild_scoped("discord", GuildId(1));
 
         let seeded = guild.get(GUILD_SETTINGS, "language").await.unwrap();
         assert_eq!(seeded, None);
@@ -590,7 +587,7 @@ mod tests {
     #[tokio::test]
     async fn reserved_guild_namespace_rejects_writes() {
         let storage = sqlite_storage().await;
-        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        let guild = storage.guild_scoped("discord", GuildId(1));
 
         let set = guild.set(GUILD_SETTINGS, "language", Value::String("en".to_owned())).await;
         assert!(matches!(set, Err(StorageError::Forbidden(_))));
@@ -601,7 +598,7 @@ mod tests {
     #[tokio::test]
     async fn delete_and_namespaces_do_not_mix() {
         let storage = sqlite_storage().await;
-        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        let guild = storage.guild_scoped("discord", GuildId(1));
 
         guild.set("command", "prefix", Value::String("!".to_owned())).await.unwrap();
         guild.set("greeter", "greeting", Value::String("hi".to_owned())).await.unwrap();
@@ -615,7 +612,7 @@ mod tests {
     #[tokio::test]
     async fn records_append_in_order_with_increasing_seq() {
         let storage = sqlite_storage().await;
-        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        let guild = storage.guild_scoped("discord", GuildId(1));
 
         let first = guild.append("llm", Value::String("a".to_owned())).await.unwrap();
         let second = guild.append("llm", Value::String("b".to_owned())).await.unwrap();
@@ -635,7 +632,7 @@ mod tests {
     #[tokio::test]
     async fn list_after_and_count_after_window_records() {
         let storage = sqlite_storage().await;
-        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        let guild = storage.guild_scoped("discord", GuildId(1));
 
         let first = guild.append("llm", Value::from(1)).await.unwrap();
         guild.append("llm", Value::from(2)).await.unwrap();
@@ -658,7 +655,7 @@ mod tests {
     #[tokio::test]
     async fn list_last_returns_the_newest_tail_in_ascending_order() {
         let storage = sqlite_storage().await;
-        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        let guild = storage.guild_scoped("discord", GuildId(1));
 
         for value in 1..=5 {
             guild.append("llm", Value::from(value)).await.unwrap();
@@ -683,7 +680,7 @@ mod tests {
         );
 
         // Namespaces and guilds do not mix (same partitioning as list_after).
-        let other = storage.guild_scoped(Platform::Discord, GuildId(2));
+        let other = storage.guild_scoped("discord", GuildId(2));
         other.append("llm", Value::from(99)).await.unwrap();
         assert_eq!(guild.list_last("llm", 100).await.unwrap().len(), 5);
         assert_eq!(other.list_last("llm", 100).await.unwrap().len(), 1);
@@ -708,13 +705,13 @@ mod tests {
         let url = format!("sqlite://{}", path.display());
         {
             let storage = SqlxStorage::connect(&url).await.expect("connect expected");
-            let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+            let guild = storage.guild_scoped("discord", GuildId(1));
             guild.set("llm", "k", Value::String("v".to_owned())).await.unwrap();
             guild.append("llm", Value::from(7)).await.unwrap();
         }
 
         let reopened = SqlxStorage::connect(&url).await.expect("reopen expected");
-        let guild = reopened.guild_scoped(Platform::Discord, GuildId(1));
+        let guild = reopened.guild_scoped("discord", GuildId(1));
         assert_eq!(guild.get("llm", "k").await.unwrap(), Some(Value::String("v".to_owned())));
         assert_eq!(guild.list_last("llm", 10).await.unwrap().len(), 1);
 
@@ -724,8 +721,8 @@ mod tests {
     #[tokio::test]
     async fn records_do_not_mix_across_namespaces_and_guilds() {
         let storage = sqlite_storage().await;
-        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
-        let other_guild = storage.guild_scoped(Platform::Discord, GuildId(2));
+        let guild = storage.guild_scoped("discord", GuildId(1));
+        let other_guild = storage.guild_scoped("discord", GuildId(2));
 
         guild.append("llm", Value::String("one".to_owned())).await.unwrap();
         guild.append("tracker", Value::String("two".to_owned())).await.unwrap();
@@ -740,7 +737,7 @@ mod tests {
     #[tokio::test]
     async fn reserved_guild_namespace_rejects_appends() {
         let storage = sqlite_storage().await;
-        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        let guild = storage.guild_scoped("discord", GuildId(1));
 
         let append = guild.append(GUILD_SETTINGS, Value::String("x".to_owned())).await;
         assert!(matches!(append, Err(StorageError::Forbidden(_))));
@@ -775,7 +772,7 @@ mod tests {
             return;
         };
         let ns = unique_pg_namespace("docs");
-        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        let guild = storage.guild_scoped("discord", GuildId(1));
 
         assert_eq!(guild.get(&ns, "k").await.unwrap(), None);
         guild.set(&ns, "k", Value::String("v1".to_owned())).await.unwrap();
@@ -784,7 +781,7 @@ mod tests {
         assert_eq!(guild.list_keys(&ns).await.unwrap(), ["k"]);
 
         // Guild isolation - the core privacy claim, now dialect-checked.
-        let other = storage.guild_scoped(Platform::Discord, GuildId(2));
+        let other = storage.guild_scoped("discord", GuildId(2));
         assert_eq!(other.get(&ns, "k").await.unwrap(), None);
 
         // The reserved namespace is guarded on this dialect too.
@@ -805,7 +802,7 @@ mod tests {
             return;
         };
         let ns = unique_pg_namespace("records");
-        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        let guild = storage.guild_scoped("discord", GuildId(1));
 
         let first = guild.append(&ns, Value::String("a".to_owned())).await.unwrap();
         assert_eq!(guild.append(&ns, Value::String("b".to_owned())).await.unwrap(), first + 1);
@@ -816,7 +813,7 @@ mod tests {
 
         let mut handles = Vec::new();
         for i in 0..8u64 {
-            let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+            let guild = storage.guild_scoped("discord", GuildId(1));
             let ns = ns.clone();
             handles.push(tokio::spawn(async move { guild.append(&ns, Value::from(i)).await }));
         }

@@ -587,7 +587,7 @@ impl CommandHandler for CutoffLlmHandler {
                 .await?;
             return Ok(());
         };
-        let channel = self.locks.lock_for(&event.origin);
+        let channel = self.locks.lock_for(services.platform_info.slug(), &event.origin);
         let _channel = channel.lock().await;
 
         let channel_id = event.origin.channel_id.get();
@@ -1042,7 +1042,7 @@ impl CommandHandler for SetLlmHandler {
     ) -> anyhow::Result<()> {
         // The lock spans load-apply-save: two admins setting values on the
         // same channel must not lose one update.
-        let channel = self.locks.lock_for(&event.origin);
+        let channel = self.locks.lock_for(services.platform_info.slug(), &event.origin);
         let _channel = channel.lock().await;
         let Some(mut config) = load_assigned_config(event, services).await? else {
             return Ok(());
@@ -1532,7 +1532,7 @@ impl CommandHandler for SetPromptLlmHandler {
                 services.chat_output.send(command_reply(usage)).await?;
                 return Ok(());
             }
-            let channel = self.locks.lock_for(&event.origin);
+            let channel = self.locks.lock_for(services.platform_info.slug(), &event.origin);
             let _channel = channel.lock().await;
             let Some(mut config) = load_assigned_config(event, services).await? else {
                 return Ok(());
@@ -1554,7 +1554,7 @@ impl CommandHandler for SetPromptLlmHandler {
             // Mutation: read-modify-write under the channel lock.
             Some(text) => {
                 let cleared = matches!(text, "clear" | "none" | "default");
-                let channel = self.locks.lock_for(&event.origin);
+                let channel = self.locks.lock_for(services.platform_info.slug(), &event.origin);
                 let _channel = channel.lock().await;
                 let Some(mut config) = load_assigned_config(event, services).await? else {
                     return Ok(());
@@ -1654,7 +1654,7 @@ fn validate_prompt_file_url(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::models::{GuildId, Platform};
+    use crate::kernel::models::GuildId;
     use crate::kernel::spi_ports::StoragePort;
     use crate::plugins::llm::RecordRole;
     use crate::plugins::llm::completion_port::{ResponseTiming, TokenUsage};
@@ -2082,7 +2082,7 @@ mod tests {
     #[tokio::test]
     async fn usage_lines_stay_hidden_without_calibration() {
         let storage = InMemoryStorage::new();
-        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        let guild = storage.guild_scoped("test", GuildId(1));
 
         let lines = usage_lines(
             &guild,
@@ -2103,7 +2103,7 @@ mod tests {
     #[tokio::test]
     async fn usage_lines_render_response_time_with_and_without_usage() {
         let storage = InMemoryStorage::new();
-        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        let guild = storage.guild_scoped("test", GuildId(1));
 
         let timed = UsageStats {
             last_timing: Some(ResponseTiming::reported(50_237)),
@@ -2132,7 +2132,7 @@ mod tests {
     #[tokio::test]
     async fn usage_lines_render_estimate_and_last_request() {
         let storage = InMemoryStorage::new();
-        let guild = storage.guild_scoped(Platform::Discord, GuildId(1));
+        let guild = storage.guild_scoped("test", GuildId(1));
         // Two live turns of 10 chars each after the cutoff.
         for content in ["aaaaaaaaaa", "bbbbbbbbbb"] {
             guild

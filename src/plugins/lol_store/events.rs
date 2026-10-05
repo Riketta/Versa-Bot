@@ -4,7 +4,7 @@
 
 use std::any::Any;
 
-use crate::kernel::models::{GuildId, Platform};
+use crate::kernel::models::GuildId;
 
 /// Which tracker produced the announcement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,7 +33,6 @@ impl StoreEventKind {
 /// the allow.
 #[allow(dead_code)]
 pub struct LolStoreAnnounced {
-    pub platform: Platform,
     pub guild_id: GuildId,
     pub kind: StoreEventKind,
 }

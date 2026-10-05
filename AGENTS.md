@@ -141,9 +141,10 @@ the origin is transactional.
 **Guild isolation:** `StoragePort` is guild-partitioned document storage
 (`sqlx` over an ORM by decision: tiny schema, isolation visible in every
 query; SQLite/PostgreSQL via URL, one shared migration set). The kernel
-binds a `GuildStorage` handle to the event's `(platform, guild_id)`
-origin; the handle exposes no guild parameter, so cross-guild access is
-impossible by construction (DMs get no handle). Namespaces are per-plugin
+binds a `GuildStorage` handle to the event's guild under the deployment's
+platform slug (via `PlatformInfoPort`); the handle exposes no guild
+parameter, so cross-guild access is impossible by construction (DMs get
+no handle). Namespaces are per-plugin
 slug; plugins may sub-partition (the LLM plugin keeps one record log per
 channel). The `guild` namespace is reserved for guild settings -
 enforced: plugin writes/deletes there are rejected with
@@ -172,8 +173,12 @@ the `metrics` crate facade directly - still no port.
 
 **Inbound events:** `RequestContext` is a chat-agnostic EVENT, not just a
 message: kinds (`MessageReceived`, `MemberJoined`, `CommandInvoked`, ...)
-plus origin context (platform, guild, channel, optional transactional
-`reply_token`, optional `locale`). The driving adapter normalizes ALL
+plus origin context (guild, channel, optional transactional
+`reply_token`, optional `locale`). The deployment serves exactly one chat
+platform per process: platform identity is deployment metadata via the
+driven `PlatformInfoPort` (adapter-owned stable slug for storage keys +
+presentation display name) - the kernel carries no platform vocabulary,
+only the concept. The driving adapter normalizes ALL
 platform events onto this taxonomy, including mention-tag rewriting
 (`<@id>` -> `[Name]<@id>` inbound, so models see name + id; outbound
 sends invert the shape back to the bare tag). Attachments ride
@@ -238,9 +243,10 @@ channel/guild without any returned response. `ChatOutputFactoryPort`
 yields the scoped variants: `channel_output` (a configured channel in the
 same guild), `stream_output` (progressive in-place editing of one
 message; throttle/split policy is caller-side), `start_typing`, and
-`react` (cosmetic by contract - per-token failures, never fatal). Its
-`platform_name` is adapter-owned presentation (`Discord`) that plugins
-render in user-facing text - the kernel contract names no platform.
+`react` (cosmetic by contract - per-token failures, never fatal).
+Platform identity and presentation live on the driven `PlatformInfoPort`
+(adapter-owned slug + display name) - the kernel contract names no
+platform and carries no platform vocabulary.
 Origins that cannot stream or react (DMs, transactional tokens,
 channel-less events) get undeliverable defaults. `OutboundMessage`
 carries an `ephemeral` hint - honored only on transactional replies;

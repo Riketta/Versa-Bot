@@ -63,12 +63,9 @@ impl ChannelLocks {
         Arc::new(Self::default())
     }
 
-    pub(super) fn lock_for(&self, origin: &Origin) -> Arc<AsyncMutex<()>> {
-        let key: ChannelKey = (
-            origin.platform.as_str().to_owned(),
-            origin.guild_id.map_or(0, GuildId::get),
-            origin.channel_id.get(),
-        );
+    pub(super) fn lock_for(&self, slug: &'static str, origin: &Origin) -> Arc<AsyncMutex<()>> {
+        let key: ChannelKey =
+            (slug.to_owned(), origin.guild_id.map_or(0, GuildId::get), origin.channel_id.get());
         Arc::clone(self.locks.lock().entry(key).or_default())
     }
 }
@@ -88,12 +85,9 @@ impl ChannelPermits {
         Arc::new(Self::default())
     }
 
-    fn permit_for(&self, origin: &Origin) -> Arc<Semaphore> {
-        let key: ChannelKey = (
-            origin.platform.as_str().to_owned(),
-            origin.guild_id.map_or(0, GuildId::get),
-            origin.channel_id.get(),
-        );
+    fn permit_for(&self, slug: &'static str, origin: &Origin) -> Arc<Semaphore> {
+        let key: ChannelKey =
+            (slug.to_owned(), origin.guild_id.map_or(0, GuildId::get), origin.channel_id.get());
         Arc::clone(
             self.permits
                 .lock()
@@ -226,8 +220,8 @@ impl LlmPlugin {
         }
     }
 
-    fn channel_lock(&self, origin: &Origin) -> Arc<AsyncMutex<()>> {
-        self.channel_locks.lock_for(origin)
+    fn channel_lock(&self, slug: &'static str, origin: &Origin) -> Arc<AsyncMutex<()>> {
+        self.channel_locks.lock_for(slug, origin)
     }
 
     fn descriptor(
@@ -493,7 +487,11 @@ impl MiddlewarePluginPort for LlmPlugin {
         // channel. `try_acquire` never blocks the pipeline - a channel
         // flooding past the cap sheds its excess messages (not captured,
         // warned) instead of accumulating unbounded work.
-        let Ok(permit) = self.channel_permits.permit_for(origin).try_acquire_owned() else {
+        let Ok(permit) = self
+            .channel_permits
+            .permit_for(services.platform_info.slug(), origin)
+            .try_acquire_owned()
+        else {
             tracing::warn!(
                 channel = origin.channel_id.get(),
                 "engine run backlog full - shedding message"
@@ -528,7 +526,7 @@ impl MiddlewarePluginPort for LlmPlugin {
         // Off the pipeline task; capture/trigger decisions happen inside,
         // under the channel lock, on fresh records. The permit rides along
         // and frees when the run finishes.
-        let lock = self.channel_lock(&origin);
+        let lock = self.channel_lock(services.platform_info.slug(), &origin);
         let engine = Arc::clone(&self.engine);
         let services = services.clone();
         let shutdown = self.shutdown.clone();
@@ -606,7 +604,7 @@ mod tests {
     use crate::kernel::{
         models::{
             ChannelId as ChannelIdModel, CommandPayload, EventKind, EventPayload, GuildId,
-            MessageId, Origin, Platform, RequestContext, UserId,
+            MessageId, Origin, RequestContext, UserId,
         },
         plugin_ports::{CommandArgs, CommandHandler},
         services::KernelServices,
@@ -671,7 +669,6 @@ mod tests {
         RequestContext {
             kind: EventKind::MessageReceived,
             origin: Origin {
-                platform: Platform::Discord,
                 guild_id: Some(GuildId(1)),
                 channel_id: ChannelIdModel(channel_id),
                 user_id: UserId(3),
@@ -695,7 +692,6 @@ mod tests {
         RequestContext {
             kind: EventKind::CommandInvoked,
             origin: Origin {
-                platform: Platform::Discord,
                 guild_id: guild.map(GuildId),
                 channel_id: ChannelIdModel(if guild.is_some() { 2 } else { 5 }),
                 user_id: UserId(3),
@@ -726,7 +722,8 @@ mod tests {
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
-            guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
+            guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
+            platform_info: crate::test_support::test_platform_info(),
         };
         let mut settings = LlmSettings::default();
         for reference in ["local/gemma", "zai/glm-5.3-flash"] {
@@ -737,6 +734,7 @@ mod tests {
             Arc::new(StubCompletion) as Arc<dyn LlmCompletionPort>,
             Arc::new(RandRandom) as Arc<dyn RandomPort>,
             Arc::new(FakeDescriber) as Arc<dyn ImageDescriber>,
+            crate::test_support::test_platform_info(),
         ));
         let plugin = LlmPlugin::new(
             Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
@@ -750,6 +748,7 @@ mod tests {
             chat_output: Arc::clone(output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(output)).boxed(),
             guild_storage: None,
+            platform_info: crate::test_support::test_platform_info(),
         }
     }
 
@@ -1121,7 +1120,7 @@ mod tests {
             .expect("unassign expected to succeed");
         assert_eq!(
             storage
-                .guild_scoped(Platform::Discord, GuildId(1))
+                .guild_scoped("test", GuildId(1))
                 .list_keys(NAMESPACE)
                 .await
                 .expect("keys readable"),
@@ -1202,7 +1201,7 @@ mod tests {
 
     fn seed_config_in(storage: &InMemoryStorage) {
         storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             &channel_config_key(2),
@@ -1242,13 +1241,15 @@ mod tests {
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
-            guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
+            guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
+            platform_info: crate::test_support::test_platform_info(),
         };
         let engine = Arc::new(ChatEngine::new(
             Arc::new(LlmSettings::default()),
             Arc::new(PanickingCompletion) as Arc<dyn LlmCompletionPort>,
             Arc::new(RandRandom) as Arc<dyn RandomPort>,
             Arc::new(FakeDescriber) as Arc<dyn ImageDescriber>,
+            crate::test_support::test_platform_info(),
         ));
         let plugin = LlmPlugin::new(
             Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
@@ -1287,13 +1288,15 @@ mod tests {
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
-            guild_storage: Some(storage.guild_scoped(Platform::Discord, GuildId(1))),
+            guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
+            platform_info: crate::test_support::test_platform_info(),
         };
         let engine = Arc::new(ChatEngine::new(
             Arc::new(LlmSettings::default()),
             Arc::new(PanickingCompletion) as Arc<dyn LlmCompletionPort>,
             Arc::new(RandRandom) as Arc<dyn RandomPort>,
             Arc::new(FakeDescriber) as Arc<dyn ImageDescriber>,
+            crate::test_support::test_platform_info(),
         ));
         let plugin = LlmPlugin::new(
             Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
@@ -1315,7 +1318,7 @@ mod tests {
             images: Vec::new(),
         };
         storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .append(
                 &records_namespace(2),
                 serde_json::to_value(&bot_turn).expect("record serializes"),
@@ -1364,7 +1367,8 @@ mod tests {
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
-            guild_storage: Some(FailingStorage.guild_scoped(Platform::Discord, GuildId(1))),
+            guild_storage: Some(FailingStorage.guild_scoped("test", GuildId(1))),
+            platform_info: crate::test_support::test_platform_info(),
         };
 
         let mut event = message_event(2, true);
@@ -1383,7 +1387,7 @@ mod tests {
         let (plugin, fixture) = fixture();
         plugin.init().expect("init expected to succeed");
         fixture.storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             &channel_config_key(2),
@@ -1421,14 +1425,13 @@ mod tests {
     fn channel_permits_bound_outstanding_runs_per_channel() {
         let permits = ChannelPermits::new();
         let origin = Origin {
-            platform: Platform::Discord,
             guild_id: Some(GuildId(1)),
             channel_id: ChannelIdModel(2),
             user_id: UserId(3),
             message_id: None,
             reply_token: None,
         };
-        let gate = permits.permit_for(&origin);
+        let gate = permits.permit_for("test", &origin);
         // Hold the permits - a dropped permit releases its slot instantly.
         let held: Vec<_> =
             (0..MAX_PENDING_RUNS_PER_CHANNEL).filter_map(|_| gate.try_acquire().ok()).collect();
@@ -1436,7 +1439,7 @@ mod tests {
         assert!(gate.try_acquire().is_err(), "cap expected");
 
         let other = Origin { channel_id: ChannelIdModel(9), ..origin };
-        assert!(permits.permit_for(&other).try_acquire().is_ok());
+        assert!(permits.permit_for("test", &other).try_acquire().is_ok());
     }
 
     /// A full backlog sheds the message at intake: not captured, no engine
@@ -1447,14 +1450,13 @@ mod tests {
         plugin.init().expect("init expected to succeed");
         seed_config_in(&fixture.storage);
         let origin = Origin {
-            platform: Platform::Discord,
             guild_id: Some(GuildId(1)),
             channel_id: ChannelIdModel(2),
             user_id: UserId(3),
             message_id: Some(MessageId(4)),
             reply_token: None,
         };
-        let gate = plugin.channel_permits.permit_for(&origin);
+        let gate = plugin.channel_permits.permit_for("test", &origin);
         // Hold the permits so the backlog is genuinely full when `pre` runs.
         let held: Vec<_> =
             (0..MAX_PENDING_RUNS_PER_CHANNEL).filter_map(|_| gate.try_acquire().ok()).collect();
@@ -1491,7 +1493,7 @@ mod tests {
     async fn stored_records(fixture: &Fixture) -> Vec<ConversationRecord> {
         fixture
             .storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .list_after(&records_namespace(2), 0, 100)
             .await
             .expect("records readable")
@@ -1508,7 +1510,7 @@ mod tests {
 
         fixture
             .storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .append(
                 &records_namespace(2),
                 serde_json::to_value(ConversationRecord {
@@ -1527,7 +1529,7 @@ mod tests {
             .await
             .expect("append expected to succeed");
         fixture.storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             &channel_state_key(2),
@@ -1565,7 +1567,7 @@ mod tests {
         plugin.init().expect("init expected to succeed");
         seed_config_in(&fixture.storage);
         fixture.storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             &channel_state_key(2),
@@ -1585,13 +1587,13 @@ mod tests {
         .expect("record expected to serialize");
         fixture
             .storage
-            .guild_scoped(Platform::Discord, GuildId(1))
+            .guild_scoped("test", GuildId(1))
             .append(&records_namespace(2), record)
             .await
             .expect("append expected to succeed");
 
         // Hold the engine-side lock for the channel.
-        let lock = plugin.channel_lock(&command_event(Some(1)).origin);
+        let lock = plugin.channel_lock("test", &command_event(Some(1)).origin);
         let guard = lock.lock().await;
 
         let services = fixture.services.clone();
@@ -1646,7 +1648,7 @@ mod tests {
         plugin.init().expect("init expected to succeed");
         seed_config_in(&fixture.storage);
         fixture.storage.seed(
-            Platform::Discord,
+            "test",
             GuildId(1),
             NAMESPACE,
             &channel_state_key(2),
