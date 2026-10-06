@@ -29,6 +29,16 @@ pub fn channel_state_key(channel_id: u64) -> String {
     format!("channel:{channel_id}:state")
 }
 
+/// Document key of a channel's cutoff-undo stash: `channel:{id}:state_undo`.
+/// Holds the state document exactly as it was before the last
+/// `/llm_cutoff` (JSON `null` = the channel had no state document, i.e.
+/// the full history was live). Consumed and cleared by `/llm_cutoff_undo`;
+/// overwritten by every new cutoff - one undo level.
+#[must_use]
+pub fn channel_state_undo_key(channel_id: u64) -> String {
+    format!("channel:{channel_id}:state_undo")
+}
+
 /// Document key of a channel's completion statistics:
 /// `channel:{id}:stats` - last reported token usage + the calibration
 /// estimate derived from it. Observability only: unreadable stats never

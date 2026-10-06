@@ -20,8 +20,8 @@ use super::conversation::ConversationRecord;
 use super::llm_plugin::ChannelLocks;
 use super::model::{
     CaptureMode, ChannelConfig, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY,
-    UsageStats, channel_config_key, channel_state_key, channel_stats_key, default_random_cooldown,
-    records_namespace, unix_now,
+    UsageStats, channel_config_key, channel_state_key, channel_state_undo_key, channel_stats_key,
+    default_random_cooldown, records_namespace, unix_now,
 };
 use super::prompts;
 use super::providers::{LlmSettings, ModelSettings};
@@ -618,6 +618,18 @@ impl CommandHandler for CutoffLlmHandler {
 
         let channel_id = event.origin.channel_id.get();
         let records_ns = records_namespace(channel_id);
+        // Stash the state document exactly as it is: `/llm_cutoff_undo`
+        // restores it verbatim (summary and cutoff position). JSON `null`
+        // records "no state document existed" - undo then removes the state
+        // again. Written under the channel lock like the cutoff itself.
+        let previous = storage.get(NAMESPACE, &channel_state_key(channel_id)).await?;
+        storage
+            .set(
+                NAMESPACE,
+                &channel_state_undo_key(channel_id),
+                previous.unwrap_or(serde_json::Value::Null),
+            )
+            .await?;
         // The cutoff moves past the NEWEST SEQUENCE (read from the log
         // itself, not inferred from the count - sequence numbering stays
         // correct even if retention/deletion ever exists). Safe only under
@@ -634,6 +646,71 @@ impl CommandHandler for CutoffLlmHandler {
             .chat_output
             .send(command_reply(
                 "Context cleared: this channel starts a fresh conversation (stored history is kept).",
+            ))
+            .await?;
+        Ok(())
+    }
+}
+
+/// `/llm_cutoff_undo`: restores the state document stashed by the last
+/// `/llm_cutoff` in this channel - the exact previous context (summary and
+/// cutoff position); records were never touched, so nothing else changes.
+/// One level deep: every cutoff overwrites the stash, every undo consumes
+/// it. Same channel lock as the cutoff - no in-flight run can interleave.
+pub(super) struct CutoffUndoLlmHandler {
+    locks: Arc<ChannelLocks>,
+}
+
+impl CutoffUndoLlmHandler {
+    pub(super) fn new(locks: Arc<ChannelLocks>) -> Self {
+        Self { locks }
+    }
+}
+
+#[async_trait]
+impl CommandHandler for CutoffUndoLlmHandler {
+    async fn invoke(
+        &self,
+        event: &RequestContext,
+        _args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
+        let Some(storage) = &services.guild_storage else {
+            services
+                .chat_output
+                .send(command_reply("This command only works inside a server."))
+                .await?;
+            return Ok(());
+        };
+        let channel = self.locks.lock_for(services.platform_info.slug(), &event.origin);
+        let _channel = channel.lock().await;
+
+        let channel_id = event.origin.channel_id.get();
+        let Some(previous) = storage.get(NAMESPACE, &channel_state_undo_key(channel_id)).await?
+        else {
+            services
+                .chat_output
+                .send(command_reply(
+                    "Nothing to undo: no /llm_cutoff was run in this channel (or it was \
+                     already undone).",
+                ))
+                .await?;
+            return Ok(());
+        };
+        if previous == serde_json::Value::Null {
+            // The channel had no state document before the cutoff: restore
+            // that absence rather than a default-shaped document.
+            storage.delete(NAMESPACE, &channel_state_key(channel_id)).await?;
+        } else {
+            storage.set(NAMESPACE, &channel_state_key(channel_id), previous).await?;
+        }
+        storage.delete(NAMESPACE, &channel_state_undo_key(channel_id)).await?;
+
+        services
+            .chat_output
+            .send(command_reply(
+                "Context restored: the channel is back to its state before the last \
+                 /llm_cutoff.",
             ))
             .await?;
         Ok(())

@@ -21,9 +21,9 @@ use crate::kernel::{
 use super::chat_engine::ChatEngine;
 use super::commands::{
     AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler, CutoffLlmHandler,
-    DumpLlmHandler, GetLlmHandler, GlobalUsageLlmHandler, ModelsLlmHandler, SET_KEYS,
-    SetLlmHandler, SetPromptLlmHandler, StatusLlmHandler, UnassignLlmHandler, UsageLlmHandler,
-    model_choices,
+    CutoffUndoLlmHandler, DumpLlmHandler, GetLlmHandler, GlobalUsageLlmHandler, ModelsLlmHandler,
+    SET_KEYS, SetLlmHandler, SetPromptLlmHandler, StatusLlmHandler, UnassignLlmHandler,
+    UsageLlmHandler, model_choices,
 };
 use super::conversation::{ConversationRecord, RecordRole};
 use super::model::{
@@ -412,6 +412,15 @@ impl PluginPort for LlmPlugin {
         );
         self.registry.register(
             self.descriptor(
+                "llm_cutoff_undo",
+                "Undo this channel's last /llm_cutoff: restore the context as it was before",
+                Vec::new(),
+                AccessTier::Moderator,
+            ),
+            Arc::new(CutoffUndoLlmHandler::new(Arc::clone(&self.channel_locks))),
+        );
+        self.registry.register(
+            self.descriptor(
                 "llm_status",
                 "Show this channel's chat bot settings, context state and usage stats",
                 Vec::new(),
@@ -688,7 +697,7 @@ mod tests {
     };
     use crate::plugins::llm::model::{
         ChannelConfig, ConversationState, NAMESPACE, SERVICE_CHANNEL_KEY, channel_config_key,
-        channel_state_key, records_namespace,
+        channel_state_key, channel_state_undo_key, records_namespace,
     };
     use crate::plugins::llm::providers::ModelSettings;
     use crate::plugins::llm::{
@@ -857,6 +866,7 @@ mod tests {
                 "llm_admin_clear",
                 "llm_assign",
                 "llm_cutoff",
+                "llm_cutoff_undo",
                 "llm_dump",
                 "llm_get",
                 "llm_models",
@@ -2065,6 +2075,165 @@ mod tests {
             serde_json::from_value(state_raw).expect("state expected to deserialize");
         assert_eq!(state.summary, None);
         assert_eq!(state.cutoff_seq, 1);
+    }
+
+    /// `/llm_cutoff` stashes the exact previous state, and
+    /// `/llm_cutoff_undo` restores it verbatim - summary and cutoff
+    /// position. The stash is consumed: a second undo reports nothing left.
+    #[tokio::test]
+    async fn cutoff_undo_restores_the_pre_cutoff_state() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&fixture.storage);
+        fixture
+            .storage
+            .guild_scoped("test", GuildId(1))
+            .append(
+                &records_namespace(2),
+                serde_json::to_value(ConversationRecord {
+                    message_id: Some(10),
+                    role: RecordRole::User,
+                    author: Some("alice".to_owned()),
+                    sender_id: None,
+                    guild_name: None,
+                    content: "old".to_owned(),
+                    reply_to: None,
+                    captured_at: 0,
+                    images: Vec::new(),
+                })
+                .expect("record expected to serialize"),
+            )
+            .await
+            .expect("append expected to succeed");
+        let previous = serde_json::json!({
+            "summary": "old gist",
+            "cutoff_seq": 0,
+            "cutoff_at": 1_717_000_000
+        });
+        fixture.storage.seed(
+            "test",
+            GuildId(1),
+            NAMESPACE,
+            &channel_state_key(2),
+            previous.clone(),
+        );
+
+        CutoffLlmHandler::new(ChannelLocks::new())
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("cutoff expected to succeed");
+        CutoffUndoLlmHandler::new(ChannelLocks::new())
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("undo expected to succeed");
+
+        let state_raw = fixture
+            .services
+            .guild_storage
+            .as_ref()
+            .expect("guild storage expected")
+            .get(NAMESPACE, &channel_state_key(2))
+            .await
+            .expect("state readable")
+            .expect("state expected");
+        assert_eq!(state_raw, previous, "the pre-cutoff state must be restored verbatim");
+        let undo_raw = fixture
+            .services
+            .guild_storage
+            .as_ref()
+            .expect("guild storage expected")
+            .get(NAMESPACE, &channel_state_undo_key(2))
+            .await
+            .expect("undo stash readable");
+        assert_eq!(undo_raw, None, "the stash must be consumed");
+        assert!(fixture.output.messages().iter().any(|m| m.contains("Context restored")));
+
+        // The stash is spent: a second undo declines without touching state.
+        CutoffUndoLlmHandler::new(ChannelLocks::new())
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("second undo expected to succeed");
+        assert!(
+            fixture.output.messages().iter().any(|m| m.contains("Nothing to undo")),
+            "spent stash expected: {:?}",
+            fixture.output.messages()
+        );
+    }
+
+    /// A channel with no state document before its cutoff gets that absence
+    /// back: undo removes the state document again - the full history is the
+    /// live window, exactly as before.
+    #[tokio::test]
+    async fn cutoff_undo_restores_the_absence_of_state() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&fixture.storage);
+        fixture
+            .storage
+            .guild_scoped("test", GuildId(1))
+            .append(
+                &records_namespace(2),
+                serde_json::to_value(ConversationRecord {
+                    message_id: Some(10),
+                    role: RecordRole::User,
+                    author: Some("alice".to_owned()),
+                    sender_id: None,
+                    guild_name: None,
+                    content: "old".to_owned(),
+                    reply_to: None,
+                    captured_at: 0,
+                    images: Vec::new(),
+                })
+                .expect("record expected to serialize"),
+            )
+            .await
+            .expect("append expected to succeed");
+
+        CutoffLlmHandler::new(ChannelLocks::new())
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("cutoff expected to succeed");
+        CutoffUndoLlmHandler::new(ChannelLocks::new())
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("undo expected to succeed");
+
+        let storage = fixture.services.guild_storage.as_ref().expect("guild storage expected");
+        let state_raw =
+            storage.get(NAMESPACE, &channel_state_key(2)).await.expect("state readable");
+        assert_eq!(state_raw, None, "the state document must be removed again");
+        let undo_raw =
+            storage.get(NAMESPACE, &channel_state_undo_key(2)).await.expect("stash readable");
+        assert_eq!(undo_raw, None, "the stash must be consumed");
+    }
+
+    /// `/llm_cutoff_undo` without a prior cutoff in this channel: the
+    /// explicit notice, and no state document is created.
+    #[tokio::test]
+    async fn cutoff_undo_without_a_cutoff_reports_nothing_to_undo() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&fixture.storage);
+
+        CutoffUndoLlmHandler::new(ChannelLocks::new())
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("undo expected to succeed");
+
+        assert!(
+            fixture.output.messages().iter().any(|m| m.contains("Nothing to undo")),
+            "unexpected: {:?}",
+            fixture.output.messages()
+        );
+        let state_raw = fixture
+            .services
+            .guild_storage
+            .as_ref()
+            .expect("guild storage expected")
+            .get(NAMESPACE, &channel_state_key(2))
+            .await
+            .expect("state readable");
+        assert_eq!(state_raw, None, "no state document may appear");
     }
 
     #[tokio::test]
