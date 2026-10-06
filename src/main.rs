@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use config::{Config, Environment, File};
+use parking_lot::Mutex;
 use serenity::all::{ClientBuilder, GatewayIntents, Http, HttpBuilder};
 
 use versa_bot::infrastructure::{
@@ -255,6 +256,9 @@ async fn main() -> ExitCode {
     // must not hand a fresh snapshot to an already-stopped plugin.
     let watcher = Arc::new(PollingConfigWatcher::new(load_config));
     watcher.seed(config.clone());
+    watcher.subscribe(Arc::new(ConfigSectionDiffLogger {
+        last: Mutex::new(Some(Arc::new(config.clone()))),
+    }));
     watcher.subscribe(Arc::new(StatusSettingsReloader { plugin: Arc::clone(&status_plugin) }));
     watcher.subscribe(Arc::new(AuthOwnersReloader { plugin: Arc::clone(&auth) }));
     watcher.subscribe(Arc::new(LolStoreSettingsReloader { engine: Arc::clone(&lol_engine) }));
@@ -644,6 +648,71 @@ fn leaderboard_engine_settings(
     })
 }
 
+/// Names the configuration sections that changed, block by block. The
+/// watcher is generic - it can only see "the snapshot differs"; section
+/// knowledge lives here in the composition root. Hot sections are applied
+/// by the reloaders subscribed after this one (their own lines carry the
+/// values); startup-only sections are named explicitly as kept, so an
+/// edit there cannot read as applied.
+struct ConfigSectionDiffLogger {
+    last: Mutex<Option<Arc<Configuration>>>,
+}
+
+impl ConfigChangeHandler<Configuration> for ConfigSectionDiffLogger {
+    fn on_change(&self, config: Arc<Configuration>) {
+        let previous = self.last.lock().replace(Arc::clone(&config));
+        let Some(previous) = previous.as_deref() else { return };
+        let (hot, startup_only) = section_changes(previous, &config);
+        if hot.is_empty() && startup_only.is_empty() {
+            return;
+        }
+        tracing::info!(?hot, ?startup_only, "configuration sections changed");
+    }
+}
+
+/// Block-level diff of two configuration snapshots: the changed sections,
+/// split into hot-applied (a subscribed reloader picks them up) and
+/// startup-only (kept until restart). Exhaustive over the `Configuration`
+/// fields - a new section must be added here or its changes go unnamed.
+fn section_changes(
+    previous: &Configuration,
+    current: &Configuration,
+) -> (Vec<&'static str>, Vec<&'static str>) {
+    let mut hot = Vec::new();
+    let mut startup_only = Vec::new();
+    if previous.status != current.status {
+        hot.push("status");
+    }
+    if previous.owners != current.owners {
+        hot.push("owners");
+    }
+    if previous.lol_store != current.lol_store {
+        hot.push("lol_store");
+    }
+    if previous.lol_leaderboard != current.lol_leaderboard {
+        hot.push("lol_leaderboard");
+    }
+    if previous.debug != current.debug {
+        startup_only.push("debug");
+    }
+    if previous.discord != current.discord {
+        startup_only.push("discord");
+    }
+    if previous.storage != current.storage {
+        startup_only.push("storage");
+    }
+    if previous.sentry != current.sentry {
+        startup_only.push("sentry");
+    }
+    if previous.logging != current.logging {
+        startup_only.push("logging");
+    }
+    if previous.llm != current.llm {
+        startup_only.push("llm");
+    }
+    (hot, startup_only)
+}
+
 /// Applies `[status]` changes to the rotator; the plugin itself ignores
 /// identical settings, so unrelated config edits don't reset the rotation.
 struct StatusSettingsReloader {
@@ -683,7 +752,7 @@ impl ConfigChangeHandler<Configuration> for LolStoreSettingsReloader {
     fn on_change(&self, config: Arc<Configuration>) {
         let settings = lol_store_engine_settings(config.lol_store.as_ref());
         if settings.poll.is_zero() {
-            tracing::debug!("config [lol_store] absent or disabled - current values kept");
+            tracing::info!("config lol_store absent or disabled - watcher values kept");
             return;
         }
         self.engine.update_settings(settings);
@@ -900,6 +969,37 @@ mod tests {
         let config =
             LolLeaderboardConfig { request_interval_secs: 0, ..LolLeaderboardConfig::default() };
         assert!(leaderboard_engine_settings(Some(&config), source).regions.is_empty());
+    }
+
+    /// The section diff names every changed block and splits hot-applied
+    /// from startup-only. Exhaustive over the `Configuration` fields.
+    #[test]
+    fn section_changes_names_and_classifies_blocks() {
+        let base = Configuration::default();
+
+        // Hot blocks: applied by the reloaders.
+        let mut current = Configuration::default();
+        current.owners = vec!["42".to_owned()];
+        current.status = Some(
+            serde_json::from_str(r#"{"interval_seconds": 30, "statuses": ["one"]}"#)
+                .expect("valid [status] section deserializes"),
+        );
+        let (hot, startup_only) = section_changes(&base, &current);
+        assert_eq!(hot, vec!["status", "owners"]);
+        assert!(startup_only.is_empty());
+
+        // Startup-only blocks: named as kept, never applied.
+        let mut current = Configuration::default();
+        current.debug = true;
+        current.llm = Some(LlmConfig::default());
+        let (hot, startup_only) = section_changes(&base, &current);
+        assert!(hot.is_empty());
+        assert_eq!(startup_only, vec!["debug", "llm"]);
+
+        // No change: nothing named (defensive - the watcher only fires on
+        // a differing snapshot).
+        let (hot, startup_only) = section_changes(&base, &base);
+        assert!(hot.is_empty() && startup_only.is_empty());
     }
 
     /// The startup parse-depth cap: an absurd `parse_depth` clamps to the

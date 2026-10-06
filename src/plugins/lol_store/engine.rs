@@ -168,11 +168,45 @@ impl<B: EventBusPort> StoreEngine<B> {
         {
             return;
         }
+        let mut changes: Vec<String> = Vec::new();
+        if current.flags.sales != settings.flags.sales {
+            changes.push(format!("sales {} -> {}", current.flags.sales, settings.flags.sales));
+        }
+        if current.flags.new_skins != settings.flags.new_skins {
+            changes.push(format!(
+                "new_skins {} -> {}",
+                current.flags.new_skins, settings.flags.new_skins
+            ));
+        }
+        if current.flags.mythic_rotation != settings.flags.mythic_rotation {
+            changes.push(format!(
+                "mythic_rotation {} -> {}",
+                current.flags.mythic_rotation, settings.flags.mythic_rotation
+            ));
+        }
+        if current.flags.yourshop != settings.flags.yourshop {
+            changes.push(format!(
+                "yourshop {} -> {}",
+                current.flags.yourshop, settings.flags.yourshop
+            ));
+        }
+        if current.watch_user_cap != settings.watch_user_cap {
+            changes.push(format!(
+                "watch_user_cap {} -> {}",
+                current.watch_user_cap, settings.watch_user_cap
+            ));
+        }
+        if current.watch_guild_cap != settings.watch_guild_cap {
+            changes.push(format!(
+                "watch_guild_cap {} -> {}",
+                current.watch_guild_cap, settings.watch_guild_cap
+            ));
+        }
         current.flags = settings.flags;
         current.watch_user_cap = settings.watch_user_cap;
         current.watch_guild_cap = settings.watch_guild_cap;
         drop(current);
-        tracing::info!("lol store announce flags / watch caps changed");
+        tracing::info!(changes = ?changes, "config lol_store hot-reloaded");
     }
 
     /// One poll cycle. Never fails outward: every failure mode is a logged,

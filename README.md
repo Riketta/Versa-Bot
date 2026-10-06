@@ -71,7 +71,9 @@ commands, permission tiers - lives in [Plugins](#plugins).
 - Configuration hot reload: hot-reloadable sections apply live (`[status]`,
   `owners`, `[lol_store]` announce flags and watch caps, `[lol_leaderboard]`
   regions/depth/TTL/view); startup-only settings (token, storage, Sentry,
-  LLM providers, poll and pacing intervals) require a restart.
+  LLM providers, poll and pacing intervals) require a restart. Every
+  accepted change is logged per section, with the changed fields at the
+  apply sites - a startup-only edit is explicitly named as kept.
 - Graceful shutdown on Ctrl-C (plugins stop in reverse order).
 
 ## Getting started

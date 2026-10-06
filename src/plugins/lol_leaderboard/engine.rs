@@ -175,12 +175,26 @@ impl LeaderboardEngine {
         {
             return;
         }
+        let mut changes: Vec<String> = Vec::new();
+        if current.regions != settings.regions {
+            changes.push(format!("regions {:?} -> {:?}", current.regions, settings.regions));
+        }
+        if current.parse_depth != settings.parse_depth {
+            changes
+                .push(format!("parse_depth {} -> {}", current.parse_depth, settings.parse_depth));
+        }
+        if current.cache_ttl != settings.cache_ttl {
+            changes.push(format!("cache_ttl {:?} -> {:?}", current.cache_ttl, settings.cache_ttl));
+        }
+        if current.view != settings.view {
+            changes.push(format!("view {:?} -> {:?}", current.view, settings.view));
+        }
         current.regions = settings.regions;
         current.parse_depth = settings.parse_depth;
         current.cache_ttl = settings.cache_ttl;
         current.view = settings.view;
         drop(current);
-        tracing::info!("leaderboard data window changed");
+        tracing::info!(changes = ?changes, "config lol_leaderboard hot-reloaded");
     }
 
     /// Returns a snapshot, refreshing stale regions first (under the

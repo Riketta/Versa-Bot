@@ -82,9 +82,9 @@ impl StatusRotatorPlugin {
         }
 
         tracing::info!(
-            statuses = settings.statuses.len(),
+            statuses = ?settings.statuses,
             interval_secs = settings.interval.as_secs(),
-            "applying new status rotation settings"
+            "config status hot-reloaded"
         );
         // A stopped plugin stores the settings but schedules nothing - the
         // next `start` picks them up. Runtime config ticks have no business

@@ -166,7 +166,7 @@ impl AuthPlugin {
     /// Hot reload: swaps the owner list. Identical content is a no-op.
     pub fn update_owners(&self, raw: &[String]) {
         if self.owners.replace(raw) {
-            tracing::debug!(count = self.owners.len(), "bot owner list changed");
+            tracing::info!(count = self.owners.len(), "config owners hot-reloaded");
         }
     }
 }
