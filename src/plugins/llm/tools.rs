@@ -42,7 +42,8 @@ pub(crate) const REACT_TOOL: &str = "react";
 pub(crate) const REACT_TOOL_PROMPT: &str = "[[tool: reactions]]
 You may react to the message you are replying to. To react, emit a marker line in your answer:
 [[react: emoji]]
-- Unicode (🤓) and custom (:name:) emojis both work, separated by spaces.
+- Unicode (🤓) and custom emojis both work, separated by spaces.
+- Custom emojis: bare (:name:) or the exact form the conversation shows (<:name:id>, <a:name:id>) - copying that exact form is the most reliable.
 - Usually skip it, or pick ONE emoji that fits best; never more than 3.
 - The marker is removed from your answer before it is shown; never mention it in text.";
 
@@ -197,11 +198,21 @@ fn is_known_tool(name: &str) -> bool {
 /// Parses a react marker's payload into emoji tokens (R5 - per-item): valid
 /// tokens keep their order, invalid ones are dropped individually. A token
 /// is valid when it is a Discord custom form (`:name:`, `:name:id`,
-/// `<:name:id>`, `<a:name:id>`) or contains at least one non-ASCII character
-/// (covers every real emoji, including multi-codepoint clusters with skin
-/// tones, ZWJ sequences and flags, while rejecting prose words).
+/// `:name:id:`, `<:name:id>`, `<a:name:id>`) or contains at least one
+/// non-ASCII character (covers every real emoji, including multi-codepoint
+/// clusters with skin tones, ZWJ sequences and flags, while rejecting prose
+/// words). Drops are debug-logged - a silent empty reaction list is
+/// undiagnosable from the channel alone.
 pub(crate) fn react_tokens(payload: &str) -> Vec<String> {
-    payload.split_whitespace().filter(|token| is_reactable(token)).map(str::to_owned).collect()
+    let mut tokens = Vec::new();
+    for token in payload.split_whitespace() {
+        if is_reactable(token) {
+            tokens.push(token.to_owned());
+        } else {
+            tracing::debug!(%token, "reaction token dropped - unrecognized emoji form");
+        }
+    }
+    tokens
 }
 
 /// Union of the react markers' tokens, deduplicated in order and capped at
@@ -242,10 +253,18 @@ fn parse_qualified_custom(token: &str) -> Option<()> {
     validate_custom(rest)
 }
 
-/// `:name:` or `:name:id` - the bare custom form; the adapter resolves the
-/// name against the origin guild's emojis.
+/// `:name:`, `:name:id` or `:name:id:` - the bare custom form and the
+/// trailing-colon blend models slip into between the bare and qualified
+/// shapes; the adapter resolves the name against the origin guild's emojis
+/// or sends the qualified id straight to Discord.
 fn parse_custom_name(token: &str) -> Option<()> {
     let body = token.strip_prefix(':')?;
+    // `:name:id:` - only strip the trailing colon when what remains is the
+    // qualified form; bare `:name:` keeps its plain path.
+    let body = match body.strip_suffix(':') {
+        Some(stripped) if stripped.contains(':') => stripped,
+        _ => body,
+    };
     validate_custom(body)
 }
 
@@ -457,14 +476,14 @@ mod tests {
     #[test]
     fn custom_form_tokens_pass() {
         assert_eq!(
-            react_tokens(":dorkiS: :robot_: <:bot:123> <a:spin:456> :id:789"),
-            vec![":dorkiS:", ":robot_:", "<:bot:123>", "<a:spin:456>", ":id:789"]
+            react_tokens(":dorkiS: :robot_: <:bot:123> <a:spin:456> :id:789 :blend:42:"),
+            vec![":dorkiS:", ":robot_:", "<:bot:123>", "<a:spin:456>", ":id:789", ":blend:42:"]
         );
     }
 
     #[test]
     fn invalid_tokens_are_dropped_individually() {
-        let tokens = react_tokens("word :bad name: :: :ok: <nope> 42 🤓");
+        let tokens = react_tokens("word :bad name: :: :ok: <nope> 42 🤓 :blend:x: :blend:1:2:");
         assert_eq!(tokens, vec![":ok:", "🤓"]);
     }
 

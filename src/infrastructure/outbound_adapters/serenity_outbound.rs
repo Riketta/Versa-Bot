@@ -289,10 +289,11 @@ impl<T: ChatApi> ReactionPort for SerenityReaction<T> {
 
 impl<T: ChatApi> SerenityReaction<T> {
     /// Maps a raw protocol token onto a Discord reaction type. Fully
-    /// qualified forms (`<:name:id>`, `<a:name:id>`, `:name:id`) build the
-    /// custom reaction directly; bare `:name:` needs the guild emoji list;
-    /// anything else is a Unicode emoji (tokens the plugin already
-    /// validated - an unparseable token here fails per-token, by design).
+    /// qualified forms (`<:name:id>`, `<a:name:id>`, `:name:id`, and the
+    /// trailing-colon blend `:name:id:`) build the custom reaction
+    /// directly; bare `:name:` needs the guild emoji list; anything else is
+    /// a Unicode emoji (tokens the plugin already validated - an
+    /// unparseable token here fails per-token, by design).
     async fn resolve(&self, emoji: &str) -> Result<ReactionType, OutboundError> {
         let parsed = parse_reaction_token(emoji);
         match parsed {
@@ -361,6 +362,13 @@ fn parse_reaction_token(token: &str) -> ParsedReaction {
         };
     }
     if let Some(body) = token.strip_prefix(':') {
+        // `:name:id:` - the trailing-colon blend of the bare and qualified
+        // forms - degrades to the qualified custom reaction; bare `:name:`
+        // keeps its plain path.
+        let body = match body.strip_suffix(':') {
+            Some(stripped) if stripped.contains(':') => stripped,
+            _ => body,
+        };
         if let Some(name) = body.strip_suffix(':') {
             return if valid_name(name) {
                 ParsedReaction::Name(name.to_owned())
@@ -744,13 +752,33 @@ mod tests {
         // Bare name needs guild resolution.
         assert_eq!(parse_reaction_token(":dorkiS:"), ParsedReaction::Name("dorkiS".to_owned()));
         assert_eq!(parse_reaction_token(":x:"), ParsedReaction::Name("x".to_owned()));
+        // The trailing-colon blend models slip into between the bare and
+        // qualified forms degrades to the qualified custom reaction.
+        assert_eq!(
+            parse_reaction_token(":dorkiS:872106192514711582:"),
+            ParsedReaction::Custom {
+                animated: false,
+                name: "dorkiS".to_owned(),
+                id: "872106192514711582".to_owned()
+            }
+        );
         // Anything with a non-ASCII character is a Unicode emoji.
         assert_eq!(parse_reaction_token("🤓"), ParsedReaction::Unicode);
         assert_eq!(parse_reaction_token("👍🏽"), ParsedReaction::Unicode);
         // Malformed tokens fail per-token (the plugin's per-item rule); a
         // name-shaped token like `:x:` stays resolvable - the API has the
         // final say on whether the emoji exists.
-        for bad in ["word", "::", ":bad name:", "<nope>", "<:bad>", "42", ":id:abc"] {
+        for bad in [
+            "word",
+            "::",
+            ":bad name:",
+            "<nope>",
+            "<:bad>",
+            "42",
+            ":id:abc",
+            ":id:abc:",
+            ":id:1:2:",
+        ] {
             assert_eq!(parse_reaction_token(bad), ParsedReaction::Invalid, "token `{bad}`");
         }
     }

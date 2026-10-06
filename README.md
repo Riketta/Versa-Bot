@@ -778,7 +778,9 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   The marker is stripped before the answer is shown or recorded, and the
   tokens fire as reactions on the reply target: Unicode (`🤓`), custom
   (`:dorkiS:` - resolved against the guild's own emojis, foreign ones
-  skip silently) and fully qualified (`<:name:id>`) forms all work.
+  skip silently) and fully qualified (`<:name:id>`; the bracketless
+  `:name:id` and trailing-colon `:name:id:` model slips are tolerated)
+  forms all work.
   Degradation is per-token: an invalid token drops, valid siblings fire,
   and a failed reaction never touches the answer. An answer that is only
   a marker is answered with just the reaction - no fallback, no phantom
