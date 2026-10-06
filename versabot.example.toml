@@ -8,6 +8,12 @@
 # e.g. RUST_LOG="info,versa_bot=debug,serenity=debug".
 debug = true
 
+# Bot owners: deployment-global identities (platform user IDs) above every
+# guild-side access tier. Owners keep full access even where a guild policy
+# would ban them, cannot be granted or revoked through the bot (only here),
+# and the list hot-reloads. Absent or empty = no owners.
+# owners = ["123456789012345678"]
+
 [discord]
 token = "YOUR_TOKEN"
 # SOCKS/HTTP proxy for Discord REST calls. REST only - the gateway WebSocket

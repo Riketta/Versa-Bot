@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::kernel::{
@@ -47,10 +48,85 @@ pub struct AuthConfig {
     pub roles: BTreeMap<String, AccessTier>,
 }
 
+impl AuthConfig {
+    /// Clamps every stored tier to [`AccessTier::Admin`]. Guild-side data
+    /// must never mint an [`AccessTier::Owner`]: only the config-injected
+    /// owner list may. A hand-edited policy document containing `"owner"`
+    /// deserializes fine but resolves at most to `Admin`.
+    #[must_use]
+    pub fn sanitized(mut self) -> Self {
+        self.default_tier = self.default_tier.min(AccessTier::Admin);
+        for tier in self.users.values_mut() {
+            *tier = (*tier).min(AccessTier::Admin);
+        }
+        for tier in self.roles.values_mut() {
+            *tier = (*tier).min(AccessTier::Admin);
+        }
+        self
+    }
+}
+
 impl Default for AuthConfig {
     fn default() -> Self {
         Self { default_tier: AccessTier::User, users: BTreeMap::new(), roles: BTreeMap::new() }
     }
+}
+
+/// Deployment-global bot-owner identities (platform user IDs as strings),
+/// injected from the composition root's config. Never guild data: no
+/// guild-side code path can read or change the list. Shared between the
+/// auth gate (tier resolution) and the `/auth` command (write guard,
+/// owner self-status). Hot-reloadable: the config watcher swaps the
+/// contents via [`AuthPlugin::update_owners`].
+#[derive(Clone, Default)]
+pub struct OwnerList {
+    ids: Arc<RwLock<Vec<String>>>,
+}
+
+impl OwnerList {
+    /// Builds from raw config strings: trimmed, empties dropped, sorted and
+    /// deduplicated - the order carries no meaning.
+    #[must_use]
+    pub fn from_ids(raw: &[String]) -> Self {
+        Self { ids: Arc::new(RwLock::new(normalize_owners(raw))) }
+    }
+
+    /// Replaces the list in place. Returns whether anything changed
+    /// (identical content is a no-op, per the config-watcher contract).
+    #[must_use]
+    pub fn replace(&self, raw: &[String]) -> bool {
+        let normalized = normalize_owners(raw);
+        let mut ids = self.ids.write();
+        if *ids == normalized {
+            return false;
+        }
+        *ids = normalized;
+        true
+    }
+
+    #[must_use]
+    pub fn contains(&self, user_id: &str) -> bool {
+        self.ids.read().iter().any(|id| id == user_id)
+    }
+
+    /// Number of configured owners - boot and reload telemetry only.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ids.read().len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ids.read().is_empty()
+    }
+}
+
+fn normalize_owners(raw: &[String]) -> Vec<String> {
+    let mut ids: Vec<String> =
+        raw.iter().map(|id| id.trim().to_owned()).filter(|id| !id.is_empty()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 /// Per-guild bot access control - the first short-circuiting middleware.
@@ -71,14 +147,27 @@ impl Default for AuthConfig {
 ///   the `Guest` floor.
 /// - A malformed config document fails closed - corruption never widens
 ///   access. A storage failure fails closed the same way.
+/// - Above the guild policy sits the deployment-global [`OwnerList`]: bot
+///   owners resolve to [`AccessTier::Owner`] regardless of any guild-side
+///   rank, ban included. The list comes from the operator's config and is
+///   hot-reloadable ([`Self::update_owners`]); the bot itself cannot
+///   change it.
 pub struct AuthPlugin {
     registry: Arc<dyn CommandRegistryPort>,
+    owners: OwnerList,
 }
 
 impl AuthPlugin {
     #[must_use]
-    pub fn new(registry: Arc<dyn CommandRegistryPort>) -> Self {
-        Self { registry }
+    pub fn new(registry: Arc<dyn CommandRegistryPort>, owners: OwnerList) -> Self {
+        Self { registry, owners }
+    }
+
+    /// Hot reload: swaps the owner list. Identical content is a no-op.
+    pub fn update_owners(&self, raw: &[String]) {
+        if self.owners.replace(raw) {
+            tracing::debug!(count = self.owners.len(), "bot owner list changed");
+        }
     }
 }
 
@@ -116,6 +205,8 @@ impl PluginPort for AuthPlugin {
                             .to_owned(),
                         required: false,
                         kind: ArgKind::String,
+                        // `owner` deliberately absent: config-injected rank,
+                        // never offered as a choice or accepted by the parser.
                         choices: Some(vec![
                             "banned".to_owned(),
                             "guest".to_owned(),
@@ -127,7 +218,7 @@ impl PluginPort for AuthPlugin {
                     ArgDescriptor {
                         name: "user".to_owned(),
                         description: "User to assign a tier to (`set`/`clear`; one target per \
-                             call)"
+                             call; bot owners are config-managed)"
                             .to_owned(),
                         required: false,
                         kind: ArgKind::User,
@@ -146,7 +237,7 @@ impl PluginPort for AuthPlugin {
                 required_tier: Some(AccessTier::Admin),
                 guild_only: true,
             },
-            Arc::new(AuthCommandHandler::default()),
+            Arc::new(AuthCommandHandler::new().with_owners(self.owners.clone())),
         );
         Ok(())
     }
@@ -187,7 +278,7 @@ impl MiddlewarePluginPort for AuthPlugin {
         };
 
         let config = match loaded {
-            Some(Ok(config)) => config,
+            Some(Ok(config)) => config.sanitized(),
             Some(Err(_)) => {
                 tracing::warn!(namespace = NAMESPACE, "auth config is malformed - failing closed");
                 self.answer_denial(
@@ -205,7 +296,7 @@ impl MiddlewarePluginPort for AuthPlugin {
             None => AuthConfig::default(),
         };
 
-        let tier = Self::effective_tier(&config, event);
+        let tier = Self::effective_tier(&config, &self.owners, event);
 
         if tier == AccessTier::Banned {
             tracing::info!(user = %event.origin.user_id, guild_id = ?event.origin.guild_id, "event denied by auth: banned (ignored silently)");
@@ -240,6 +331,9 @@ impl MiddlewarePluginPort for AuthPlugin {
 
 impl AuthPlugin {
     /// Effective tier of the event's author:
+    /// - A configured bot owner is [`AccessTier::Owner`], above every
+    ///   guild-side rank: bans, explicit assignments, and the Discord
+    ///   administrator clamp never reach an owner.
     /// - Discord guild administrators are `Admin` by construction - the
     ///   clamp IS the "cannot be removed" guarantee; there is no stored
     ///   entry to lose, and no code path anywhere needs a special case.
@@ -247,7 +341,19 @@ impl AuthPlugin {
     /// - Otherwise: the user's assignment (or the guild default) lifted by
     ///   the best qualifying role - an explicit assignment below the
     ///   default (e.g. `Guest`) stays below it until a role lifts it.
-    fn effective_tier(config: &AuthConfig, event: &RequestContext) -> AccessTier {
+    ///
+    /// The config arrives pre-sanitized, so stored tiers top out at
+    /// `Admin`: only the owner list can yield `Owner`.
+    fn effective_tier(
+        config: &AuthConfig,
+        owners: &OwnerList,
+        event: &RequestContext,
+    ) -> AccessTier {
+        let user_id = event.origin.user_id.get().to_string();
+        if owners.contains(&user_id) {
+            return AccessTier::Owner;
+        }
+
         let (author_roles, author_permissions) = match &event.payload {
             EventPayload::Message(message) => (&message.author_roles, message.author_permissions),
             EventPayload::Command(command) => (&command.author_roles, command.author_permissions),
@@ -258,7 +364,6 @@ impl AuthPlugin {
             return AccessTier::Admin;
         }
 
-        let user_id = event.origin.user_id.get().to_string();
         if config.users.get(&user_id) == Some(&AccessTier::Banned) {
             return AccessTier::Banned;
         }
@@ -331,6 +436,17 @@ mod tests {
     /// Registry fixture carrying the descriptors the gate looks up. The
     /// `/auth` handler tests live in `command.rs`; handlers here are no-ops.
     fn test_plugin(commands: &[(&str, AccessTier)]) -> AuthPlugin {
+        AuthPlugin::new(test_registry(commands), OwnerList::default())
+    }
+
+    /// Same gate, but with configured bot owners (deployment-global
+    /// identities above every guild-side rank).
+    fn test_plugin_with_owners(commands: &[(&str, AccessTier)], owner_ids: &[u64]) -> AuthPlugin {
+        let owners: Vec<String> = owner_ids.iter().map(ToString::to_string).collect();
+        AuthPlugin::new(test_registry(commands), OwnerList::from_ids(&owners))
+    }
+
+    fn test_registry(commands: &[(&str, AccessTier)]) -> Arc<InMemoryCommandRegistry> {
         struct NoopHandler;
 
         #[async_trait]
@@ -360,7 +476,7 @@ mod tests {
                 Arc::new(NoopHandler),
             );
         }
-        AuthPlugin::new(registry)
+        registry
     }
 
     fn origin(user_id: u64) -> Origin {
@@ -748,5 +864,102 @@ mod tests {
         assert_eq!(messages.len(), 1, "denial embed expected");
         assert!(messages.first().is_some_and(|m| m.contains("temporarily unavailable")));
         assert!(output.sent().first().is_some_and(|m| m.ephemeral));
+    }
+
+    /// A configured owner is above every guild-side rank: an explicit
+    /// `Banned` assignment (and the ban's silent drop) never reaches them,
+    /// and no denial output appears.
+    #[tokio::test]
+    async fn configured_owner_overrides_ban_and_assignments() {
+        let storage = configured_storage(AccessTier::User, &[("3", AccessTier::Banned)], &[]);
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin_with_owners(&[("auth", AccessTier::Admin)], &[3]);
+        let mut message = message_event(3, &[]);
+        let mut command = command_event(3, "auth", &[]);
+
+        assert!(matches!(plugin.pre(&mut message, &services).await, Next::Continue));
+        assert!(matches!(plugin.pre(&mut command, &services).await, Next::Continue));
+        assert!(output.messages().is_empty());
+    }
+
+    /// The owner tier comes only from the config list. Guild-side data is
+    /// sanitized to `Admin` at most: even a hand-edited `"owner"` assignment
+    /// in the policy document stays below an Owner-gated command, while the
+    /// configured owner passes it - and overrides a ban on top.
+    #[tokio::test]
+    async fn owner_tier_comes_only_from_config() {
+        let storage = configured_storage(AccessTier::User, &[("3", AccessTier::Owner)], &[]);
+        let (services, _output) = test_services(&storage);
+        let plugin = test_plugin(&[("owner_tool", AccessTier::Owner)]);
+        let mut denied = command_event(3, "owner_tool", &[]);
+        assert!(matches!(plugin.pre(&mut denied, &services).await, Next::Stop));
+
+        let plugin = test_plugin_with_owners(&[("owner_tool", AccessTier::Owner)], &[3]);
+        let mut allowed = command_event(3, "owner_tool", &[]);
+        assert!(matches!(plugin.pre(&mut allowed, &services).await, Next::Continue));
+
+        let banned = configured_storage(AccessTier::User, &[("3", AccessTier::Banned)], &[]);
+        let (banned_services, _out) = test_services(&banned);
+        let plugin = test_plugin_with_owners(&[("owner_tool", AccessTier::Owner)], &[3]);
+        let mut command = command_event(3, "owner_tool", &[]);
+        assert!(matches!(plugin.pre(&mut command, &banned_services).await, Next::Continue));
+    }
+
+    /// A hand-edited `"owner"` assignment is clamped to `Admin` - enough for
+    /// admin commands, never for owner-only surfaces.
+    #[tokio::test]
+    async fn hand_edited_owner_assignment_clamps_to_admin() {
+        let storage = configured_storage(AccessTier::User, &[("3", AccessTier::Owner)], &[]);
+        let (services, _output) = test_services(&storage);
+        let plugin = test_plugin(&[("auth", AccessTier::Admin)]);
+        let mut command = command_event(3, "auth", &[]);
+
+        assert!(matches!(plugin.pre(&mut command, &services).await, Next::Continue));
+    }
+
+    #[test]
+    fn sanitized_clamps_stored_tiers_to_admin() {
+        let config = AuthConfig {
+            default_tier: AccessTier::Owner,
+            users: BTreeMap::from([
+                ("3".to_owned(), AccessTier::Owner),
+                ("4".to_owned(), AccessTier::User),
+            ]),
+            roles: BTreeMap::from([("9".to_owned(), AccessTier::Owner)]),
+        }
+        .sanitized();
+
+        assert_eq!(config.default_tier, AccessTier::Admin);
+        assert_eq!(config.users.get("3"), Some(&AccessTier::Admin));
+        assert_eq!(config.users.get("4"), Some(&AccessTier::User));
+        assert_eq!(config.roles.get("9"), Some(&AccessTier::Admin));
+    }
+
+    /// Config strings are trimmed, empties dropped, duplicates collapsed;
+    /// matching is exact (a padded ID never matches).
+    #[test]
+    fn owner_list_normalizes_and_matches_exactly() {
+        let owners =
+            OwnerList::from_ids(&[" 7 ".to_owned(), "7".to_owned(), String::new(), "3".to_owned()]);
+
+        assert_eq!(owners.len(), 2);
+        assert!(owners.contains("7"));
+        assert!(owners.contains("3"));
+        assert!(!owners.contains(" 7 "));
+        assert!(!owners.is_empty());
+    }
+
+    /// Hot reload: identical content is a no-op, new content swaps in place
+    /// (the same handle the gate and the command share see the update).
+    #[test]
+    fn owner_list_replace_reports_changes() {
+        let owners = OwnerList::from_ids(&["3".to_owned()]);
+
+        assert!(!owners.replace(&[" 3 ".to_owned()]));
+        assert!(owners.replace(&["4".to_owned()]));
+        assert!(owners.contains("4"));
+        assert!(!owners.contains("3"));
+        assert!(owners.replace(&[]));
+        assert!(owners.is_empty());
     }
 }

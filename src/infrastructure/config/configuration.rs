@@ -41,5 +41,42 @@ pub struct Configuration {
     /// the command in "not configured" mode.
     #[serde(default)]
     pub lol_leaderboard: Option<LolLeaderboardConfig>,
+    /// Deployment-global bot-owner identities (`owners = ["..."]`):
+    /// platform user IDs as strings, matched exactly after trimming. Owners
+    /// sit above every guild-side access tier and cannot be modified through
+    /// the bot - the list lives only here (hot-reloadable). Absent or empty
+    /// means no owners.
+    #[serde(default)]
+    pub owners: Vec<String>,
     pub storage: StorageConfig,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_json() -> String {
+        r#"{ "discord": { "token": "t" }, "storage": { "url": "sqlite://db.sqlite3" } }"#.to_owned()
+    }
+
+    #[test]
+    fn owners_default_to_empty() {
+        let config = serde_json::from_str::<Configuration>(&minimal_json())
+            .expect("minimal config deserializes");
+        assert!(config.owners.is_empty());
+    }
+
+    #[test]
+    fn owners_deserialize_from_list() {
+        let config = serde_json::from_str::<Configuration>(
+            r#"{
+                "discord": { "token": "t" },
+                "storage": { "url": "sqlite://db.sqlite3" },
+                "owners": ["162549842042683392", "42"]
+            }"#,
+        )
+        .expect("config with owners deserializes");
+
+        assert_eq!(config.owners, vec!["162549842042683392".to_owned(), "42".to_owned()]);
+    }
 }

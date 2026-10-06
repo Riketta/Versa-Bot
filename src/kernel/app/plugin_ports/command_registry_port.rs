@@ -72,12 +72,13 @@ pub struct CommandDescriptor {
     pub guild_only: bool,
 }
 
-/// Per-guild access ladder, ordered from most to least privileged (derive
-/// order is the rank). Declared by plugins on `CommandDescriptor` as ACL
-/// data; interpreted exclusively by the auth plugin, which computes each
-/// caller's effective tier from the guild policy and compares. Discord
-/// guild administrators are `Admin` by construction (the auth plugin's
-/// resolution clamps them up) - that guarantee lives there, not here.
+/// Access ladder, ordered from least to most privileged (derive order is
+/// the rank). Declared by plugins on `CommandDescriptor` as ACL data;
+/// interpreted exclusively by the auth plugin, which computes each caller's
+/// effective tier and compares. `Owner` is deployment-global (operator
+/// config), everything below it is per-guild policy; Discord guild
+/// administrators are `Admin` by construction (the auth plugin's resolution
+/// clamps them up) - those guarantees live there, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AccessTier {
@@ -93,6 +94,11 @@ pub enum AccessTier {
     Moderator,
     /// Everything, including `/auth` tier management.
     Admin,
+    /// Bot deployment owner. Injected from the operator's config (never
+    /// guild data), above every guild-side rank: bans, assignments, and the
+    /// admin clamp never reach an owner. Only the config-injected identity
+    /// list can produce this tier - it is not assignable through `/auth`.
+    Owner,
 }
 
 impl AccessTier {
@@ -105,6 +111,7 @@ impl AccessTier {
             AccessTier::User => "user",
             AccessTier::Moderator => "moderator",
             AccessTier::Admin => "admin",
+            AccessTier::Owner => "owner",
         }
     }
 }
@@ -117,6 +124,7 @@ impl fmt::Display for AccessTier {
             AccessTier::User => "User",
             AccessTier::Moderator => "Moderator",
             AccessTier::Admin => "Admin",
+            AccessTier::Owner => "Owner",
         })
     }
 }

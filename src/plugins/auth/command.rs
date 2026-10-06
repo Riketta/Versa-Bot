@@ -15,7 +15,7 @@ use crate::kernel::{
     spi_ports::GuildStorage,
 };
 
-use super::{AuthConfig, CONFIG_KEY, NAMESPACE};
+use super::{AuthConfig, CONFIG_KEY, NAMESPACE, OwnerList};
 
 /// `/auth action:[show|set|clear|default] [tier] [user] [role]` - manage the
 /// guild's tier policy. Runs through the pipeline like every command, so the
@@ -26,12 +26,21 @@ use super::{AuthConfig, CONFIG_KEY, NAMESPACE};
 /// concurrent admin updates.
 pub struct AuthCommandHandler {
     policy_writes: Arc<AsyncMutex<()>>,
+    owners: OwnerList,
 }
 
 impl AuthCommandHandler {
     #[must_use]
     pub fn new() -> Self {
-        Self { policy_writes: Arc::new(AsyncMutex::new(())) }
+        Self { policy_writes: Arc::new(AsyncMutex::new(())), owners: OwnerList::default() }
+    }
+
+    /// Wires the deployment-global owner list (production path; the default
+    /// is empty, which disables the owner guards in tests).
+    #[must_use]
+    pub fn with_owners(mut self, owners: OwnerList) -> Self {
+        self.owners = owners;
+        self
     }
 }
 
@@ -53,8 +62,30 @@ impl CommandHandler for AuthCommandHandler {
             return reply(services, text("This command only works inside a server.")).await;
         };
 
+        // Bot owners are config-managed: set/clear refuse to touch them.
+        // Tier resolution ignores guild-side entries for owners anyway; this
+        // is the explicit feedback that the write did not happen.
         match args.get("action") {
-            Some("show") => show_policy(&**storage, services).await,
+            Some("set") | Some("clear")
+                if args.get("user").is_some_and(|user| self.owners.contains(user)) =>
+            {
+                return reply(
+                    services,
+                    text(
+                        "Bot owners are managed in the bot's configuration and cannot be \
+                         changed here.",
+                    ),
+                )
+                .await;
+            }
+            _ => {}
+        }
+
+        match args.get("action") {
+            Some("show") => {
+                let caller_is_owner = self.owners.contains(&event.origin.user_id.get().to_string());
+                show_policy(&**storage, services, caller_is_owner).await
+            }
             Some("set") => set_tier(&**storage, &self.policy_writes, event, services, args).await,
             Some("clear") => clear_target(&**storage, &self.policy_writes, services, args).await,
             Some("default") => {
@@ -70,6 +101,9 @@ enum Target {
     Role(String),
 }
 
+/// The assignable tiers. [`AccessTier::Owner`] is deliberately absent: it
+/// is config-injected and must never be offered - not in the `/auth`
+/// dropdown, not accepted by [`parse_tier`].
 fn all_tiers() -> [AccessTier; 5] {
     [
         AccessTier::Banned,
@@ -246,7 +280,11 @@ async fn set_default_tier(
     reply(services, text(format!("✅ Default tier is now {}.{}", tier, warning))).await
 }
 
-async fn show_policy(storage: &dyn GuildStorage, services: &KernelServices) -> anyhow::Result<()> {
+async fn show_policy(
+    storage: &dyn GuildStorage,
+    services: &KernelServices,
+    caller_is_owner: bool,
+) -> anyhow::Result<()> {
     let policy = match read_policy(storage).await {
         Ok(policy) => policy,
         Err(message) => return reply(services, message).await,
@@ -258,6 +296,12 @@ async fn show_policy(storage: &dyn GuildStorage, services: &KernelServices) -> a
     description.push_str("\n\nRoles:");
     description.push_str(&render_assignments(&policy.roles, role_mention));
     description.push_str("\n\nDiscord administrators always act as Admin.");
+    if caller_is_owner {
+        description.push_str(
+            "\nYou are a bot owner: your access outranks this policy and comes from the bot's \
+             configuration.",
+        );
+    }
 
     reply(
         services,
@@ -860,6 +904,27 @@ mod tests {
         );
     }
 
+    /// `owner` is a config-injected rank, not an assignable tier: the
+    /// dropdown never offers it, and submitting it directly is rejected -
+    /// the reply lists the assignable tiers only.
+    #[tokio::test]
+    async fn set_with_owner_tier_is_rejected() {
+        let (_storage, services, output) = fixture();
+
+        AuthCommandHandler::default()
+            .invoke(&command_event(), &auth_args("set", Some("owner"), Some("42"), None), &services)
+            .await
+            .expect("invoke expected to succeed");
+
+        assert!(
+            output
+                .messages()
+                .into_iter()
+                .next()
+                .is_some_and(|message| message.contains("Unknown tier `owner`"))
+        );
+    }
+
     #[tokio::test]
     async fn missing_target_shows_usage() {
         let (_storage, services, output) = fixture();
@@ -943,7 +1008,7 @@ mod tests {
     #[test]
     fn init_registers_auth_command() {
         let registry = Arc::new(InMemoryCommandRegistry::new());
-        let plugin = AuthPlugin::new(registry.clone());
+        let plugin = AuthPlugin::new(registry.clone(), OwnerList::default());
 
         plugin.init().expect("init expected to succeed");
 
@@ -986,5 +1051,111 @@ mod tests {
         );
         assert!(arguments.iter().any(|argument| argument.kind == ArgKind::User));
         assert!(arguments.iter().any(|argument| argument.kind == ArgKind::Role));
+    }
+
+    fn handler_with_owners(ids: &[&str]) -> AuthCommandHandler {
+        let owned: Vec<String> = ids.iter().map(|id| (*id).to_owned()).collect();
+        AuthCommandHandler::new().with_owners(OwnerList::from_ids(&owned))
+    }
+
+    /// `set` refuses to write a policy entry for a bot owner: the identity
+    /// is config-managed, and the refusal is the explicit feedback.
+    #[tokio::test]
+    async fn set_targeting_bot_owner_is_rejected() {
+        let (storage, services, output) = fixture();
+        let handler = handler_with_owners(&["7"]);
+
+        handler
+            .invoke(&command_event(), &auth_args("set", Some("banned"), Some("7"), None), &services)
+            .await
+            .expect("invoke expected to succeed");
+
+        assert_eq!(stored_policy(&storage).await, None);
+        assert!(output.messages().into_iter().any(|message| message.contains("cannot be changed")));
+    }
+
+    /// `clear` refuses the same way, and the stored policy is untouched.
+    #[tokio::test]
+    async fn clear_targeting_bot_owner_is_rejected() {
+        let (storage, services, output) = fixture();
+        storage.seed(
+            "test",
+            GuildId(1),
+            NAMESPACE,
+            CONFIG_KEY,
+            serde_json::json!({
+                "default_tier": "user",
+                "users": { "7": "moderator" },
+                "roles": {}
+            }),
+        );
+        let handler = handler_with_owners(&["7"]);
+
+        handler
+            .invoke(&command_event(), &auth_args("clear", None, Some("7"), None), &services)
+            .await
+            .expect("invoke expected to succeed");
+
+        assert_eq!(
+            stored_policy(&storage).await,
+            Some(serde_json::json!({
+                "default_tier": "user",
+                "users": { "7": "moderator" },
+                "roles": {}
+            }))
+        );
+        assert!(output.messages().into_iter().any(|message| message.contains("cannot be changed")));
+    }
+
+    /// The owner guard is scoped to the `user` argument: other targets and
+    /// non-owner users keep working with owners configured.
+    #[tokio::test]
+    async fn set_non_owner_target_unaffected_by_owner_guard() {
+        let (storage, services, output) = fixture();
+        let handler = handler_with_owners(&["7"]);
+
+        handler
+            .invoke(
+                &command_event(),
+                &auth_args("set", Some("moderator"), Some("42"), None),
+                &services,
+            )
+            .await
+            .expect("invoke expected to succeed");
+
+        assert!(stored_policy(&storage).await.is_some());
+        assert!(output.messages().into_iter().any(|message| message.contains("is now Moderator")));
+    }
+
+    /// A bot owner running `/auth show` sees their own status - a
+    /// self-verification hint, not the list (the list never enters
+    /// guild-visible surfaces).
+    #[tokio::test]
+    async fn show_announces_owner_status_to_owner() {
+        let (_storage, services, output) = fixture();
+        // "3" is the invoker used by `command_event`.
+        let handler = handler_with_owners(&["3"]);
+
+        handler
+            .invoke(&command_event(), &auth_args("show", None, None, None), &services)
+            .await
+            .expect("show expected to succeed");
+
+        let message = output.messages().into_iter().next().expect("reply expected");
+        assert!(message.contains("You are a bot owner"));
+    }
+
+    /// Non-owners get no owner line at all.
+    #[tokio::test]
+    async fn show_hides_owner_status_from_non_owners() {
+        let (_storage, services, output) = fixture();
+
+        AuthCommandHandler::default()
+            .invoke(&command_event(), &auth_args("show", None, None, None), &services)
+            .await
+            .expect("show expected to succeed");
+
+        let message = output.messages().into_iter().next().expect("reply expected");
+        assert!(!message.contains("bot owner"));
     }
 }

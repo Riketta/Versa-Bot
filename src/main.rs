@@ -26,7 +26,7 @@ use versa_bot::kernel::{
     },
 };
 use versa_bot::plugins::audit::AuditLogPlugin;
-use versa_bot::plugins::auth::AuthPlugin;
+use versa_bot::plugins::auth::{AuthPlugin, OwnerList};
 use versa_bot::plugins::command::CommandPlugin;
 use versa_bot::plugins::llm::{
     ChatEngine, DeckRandom, ImageDescriber, LlmCompletionPort, LlmPlugin, LlmSettings,
@@ -110,7 +110,13 @@ async fn main() -> ExitCode {
     let event_bus = InMemoryEventBus::new();
 
     // Chain order = registration order: auth gates everything below it.
-    let auth = Arc::new(AuthPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>));
+    // Bot owners: deployment-global identities from the root `owners` config
+    // (platform user IDs). They sit above every guild-side rank, are
+    // hot-reloadable, and cannot be changed through the bot.
+    let owners = OwnerList::from_ids(&config.owners);
+    tracing::info!(count = owners.len(), "bot owner list configured");
+    let auth =
+        Arc::new(AuthPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>, owners));
     let command =
         Arc::new(CommandPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>));
     // The bus is kernel-owned; each plugin receives its own clone at
@@ -257,6 +263,7 @@ async fn main() -> ExitCode {
     let watcher = Arc::new(PollingConfigWatcher::new(load_config));
     watcher.seed(config.clone());
     watcher.subscribe(Arc::new(StatusSettingsReloader { plugin: Arc::clone(&status_plugin) }));
+    watcher.subscribe(Arc::new(AuthOwnersReloader { plugin: Arc::clone(&auth) }));
     let config_watch_job = scheduler.schedule(
         "config_watcher",
         Duration::from_secs(5),
@@ -634,6 +641,19 @@ struct StatusSettingsReloader {
 impl ConfigChangeHandler<Configuration> for StatusSettingsReloader {
     fn on_change(&self, config: Arc<Configuration>) {
         self.plugin.update(status_settings(&config));
+    }
+}
+
+/// Hot-reloads the deployment-global bot-owner list. Owner identity is
+/// config data, not connection state - unlike token/providers it can apply
+/// without a restart.
+struct AuthOwnersReloader {
+    plugin: Arc<AuthPlugin>,
+}
+
+impl ConfigChangeHandler<Configuration> for AuthOwnersReloader {
+    fn on_change(&self, config: Arc<Configuration>) {
+        self.plugin.update_owners(&config.owners);
     }
 }
 
