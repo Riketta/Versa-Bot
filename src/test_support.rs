@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -109,7 +109,9 @@ impl PluginStorage for ScopedPluginView {
             .documents
             .lock()
             .iter()
-            .filter(|((_, row_namespace, _), _)| row_namespace == namespace)
+            .filter(|((row_platform, row_namespace, _), _)| {
+                row_platform == &self.platform && row_namespace == namespace
+            })
             .map(|((_, _, key), _)| key.clone())
             .collect();
         keys.sort();
@@ -123,6 +125,92 @@ impl PluginStorage for ScopedPluginView {
 pub fn test_plugin_storage() -> Arc<dyn PluginStorage> {
     let storage = InMemoryPluginStorage::new();
     storage.plugin_scoped(TEST_PLATFORM_SLUG)
+}
+
+/// [`PluginStoragePort`] whose reads and writes fail until released -
+/// fixture for the tracker's seed-failure and flush-failure paths. While
+/// healthy it delegates to a real in-memory backend, so `rows()` asserts
+/// what actually persisted.
+pub struct FailingPluginStorage {
+    failing: Arc<AtomicBool>,
+    backend: InMemoryPluginStorage,
+}
+
+impl FailingPluginStorage {
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            failing: Arc::new(AtomicBool::new(true)),
+            backend: InMemoryPluginStorage::new(),
+        })
+    }
+
+    /// Stops (or resumes) failing; tests flip this to simulate a storage
+    /// outage healing mid-test.
+    pub fn set_failing(&self, failing: bool) {
+        self.failing.store(failing, Ordering::SeqCst);
+    }
+
+    /// Every persisted row, for assertions.
+    #[must_use]
+    pub fn rows(&self, platform: &str) -> Vec<(String, String, Value)> {
+        self.backend.rows(platform)
+    }
+}
+
+impl Default for FailingPluginStorage {
+    fn default() -> Self {
+        Self { failing: Arc::new(AtomicBool::new(true)), backend: InMemoryPluginStorage::new() }
+    }
+}
+
+impl PluginStoragePort for FailingPluginStorage {
+    fn plugin_scoped(&self, platform: &str) -> Arc<dyn PluginStorage> {
+        Arc::new(FailingPluginView {
+            failing: Arc::clone(&self.failing),
+            backend: self.backend.plugin_scoped(platform),
+        })
+    }
+}
+
+struct FailingPluginView {
+    failing: Arc<AtomicBool>,
+    backend: Arc<dyn PluginStorage>,
+}
+
+#[async_trait]
+impl PluginStorage for FailingPluginView {
+    async fn get(&self, namespace: &str, key: &str) -> Result<Option<Value>, StorageError> {
+        if self.failing.load(Ordering::SeqCst) {
+            Err(StorageError::Database("simulated storage failure".to_owned()))
+        } else {
+            self.backend.get(namespace, key).await
+        }
+    }
+
+    async fn set(&self, namespace: &str, key: &str, value: Value) -> Result<(), StorageError> {
+        if self.failing.load(Ordering::SeqCst) {
+            Err(StorageError::Database("simulated storage failure".to_owned()))
+        } else {
+            self.backend.set(namespace, key, value).await
+        }
+    }
+
+    async fn delete(&self, namespace: &str, key: &str) -> Result<(), StorageError> {
+        if self.failing.load(Ordering::SeqCst) {
+            Err(StorageError::Database("simulated storage failure".to_owned()))
+        } else {
+            self.backend.delete(namespace, key).await
+        }
+    }
+
+    async fn list_keys(&self, namespace: &str) -> Result<Vec<String>, StorageError> {
+        if self.failing.load(Ordering::SeqCst) {
+            Err(StorageError::Database("simulated storage failure".to_owned()))
+        } else {
+            self.backend.list_keys(namespace).await
+        }
+    }
 }
 
 /// [`SchedulerPort`] that never runs jobs: lifecycle tests need the

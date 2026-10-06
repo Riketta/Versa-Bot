@@ -813,7 +813,7 @@ fn react_label(config: &ChannelConfig) -> String {
 /// percent plus the per-channel minimum interval, or `off` at zero chance.
 fn chime_label(chance: f64, cooldown_secs: u64) -> String {
     if chance > 0.0 {
-        format!("{chance:.1}% \u{b7} {cooldown_secs}s cooldown")
+        format!("{chance:.1}% · {cooldown_secs}s cooldown")
     } else {
         "off".to_owned()
     }
@@ -833,8 +833,14 @@ fn grouped(count: u64) -> String {
 
 /// One rendered usage line: requests plus the prompt/completion split.
 fn usage_line(label: &str, total: &Dimension) -> String {
+    format!("{label}: {}", usage_counts(total))
+}
+
+/// The counts without a label - the per-model list prefixes them with the
+/// model ref instead of a label.
+fn usage_counts(total: &Dimension) -> String {
     format!(
-        "{label}: {} requests, {} prompt / {} completion tokens",
+        "{} requests, {} prompt / {} completion tokens",
         grouped(total.requests),
         grouped(total.prompt_tokens),
         grouped(total.completion_tokens)
@@ -886,7 +892,7 @@ impl CommandHandler for UsageLlmHandler {
                 lines.push(String::new());
                 lines.push("By model (all time):".to_owned());
                 for (model, total) in &all_time.models {
-                    lines.push(format!("- `{model}` \u{b7} {}", usage_line("", total).trim_start()))
+                    lines.push(format!("- `{model}` \u{b7} {}", usage_counts(total)));
                 }
             }
             lines.join("\n")

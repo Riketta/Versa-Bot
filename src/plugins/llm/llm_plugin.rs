@@ -363,6 +363,13 @@ impl LlmPlugin {
             Arc::new(UnassignLlmHandler::new(Arc::clone(&self.channel_locks))),
         );
     }
+
+    /// Final usage-totals flush for the composition root's shutdown path:
+    /// awaited there (bounded by the caller's timeout), so a graceful
+    /// restart actually persists what the last 60s tick did not cover.
+    pub async fn flush_usage_totals(&self) {
+        self.engine.usage().flush().await;
+    }
 }
 
 impl PluginPort for LlmPlugin {
@@ -501,18 +508,11 @@ impl PluginPort for LlmPlugin {
         if let Some(handle) = self.flush_job.lock().take() {
             handle.cancel();
         }
-        // Best-effort final flush so a graceful restart loses nothing
-        // beyond the last 60s tick. `stop` is sync and the runtime is
-        // already winding down - the spawn races process exit, hence only
-        // "best effort"; the persisted totals stay approximate by design.
-        // A runtime context is required to spawn - without one (a sync
-        // teardown path), the tick cadence already bounded the loss.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            let tracker = self.engine.usage();
-            tokio::spawn(async move {
-                let _timeout = tokio::time::timeout(Duration::from_secs(3), tracker.flush()).await;
-            });
-        }
+        // The final usage flush is NOT done here: `stop` is sync, and a
+        // detached spawn would race process exit (a `#[tokio::main]`
+        // runtime drops right after `main` returns, killing the task).
+        // The composition root awaits [`Self::flush_usage_totals`]
+        // (bounded) after the kernel shutdown instead.
         Ok(())
     }
 }
@@ -666,6 +666,7 @@ mod tests {
     use super::*;
     use crate::infrastructure::plugin_adapters::InMemoryCommandRegistry;
     use crate::kernel::models::MessagePayload;
+    use crate::kernel::spi_ports::PluginStoragePort;
     use crate::kernel::{
         models::{
             ChannelId as ChannelIdModel, CommandPayload, EventKind, EventPayload, GuildId,
@@ -784,12 +785,14 @@ mod tests {
         output: Arc<RecordingChatOutput>,
         engine: Arc<ChatEngine>,
         scheduler: Arc<crate::test_support::NeverScheduler>,
+        plugin_storage: Arc<crate::test_support::InMemoryPluginStorage>,
     }
 
     fn fixture() -> (LlmPlugin, Fixture) {
         let registry = Arc::new(InMemoryCommandRegistry::new());
         let storage = Arc::new(InMemoryStorage::new());
         let output = RecordingChatOutput::new();
+        let plugin_storage = Arc::new(crate::test_support::InMemoryPluginStorage::new());
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
@@ -807,7 +810,7 @@ mod tests {
             Arc::new(RandRandom) as Arc<dyn RandomPort>,
             Arc::new(FakeDescriber) as Arc<dyn ImageDescriber>,
             crate::test_support::test_platform_info(),
-            crate::test_support::test_plugin_storage(),
+            Arc::clone(&plugin_storage).plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG),
         ));
         let scheduler = crate::test_support::NeverScheduler::new();
         let plugin = LlmPlugin::new(
@@ -815,7 +818,7 @@ mod tests {
             Arc::clone(&engine),
             Arc::clone(&scheduler) as Arc<dyn SchedulerPort>,
         );
-        (plugin, Fixture { registry, storage, services, output, engine, scheduler })
+        (plugin, Fixture { registry, storage, services, output, engine, scheduler, plugin_storage })
     }
 
     fn dm_services(output: &Arc<RecordingChatOutput>) -> KernelServices {
@@ -945,8 +948,56 @@ mod tests {
         assert!(reply.contains("Today"), "today bucket expected: {reply}");
         assert!(reply.contains("zai/glm"), "per-model breakdown expected: {reply}");
         assert!(reply.contains("1,000"), "grouped tokens expected: {reply}");
+        // Pin the exact per-model line: catches separator artifacts and
+        // formatting drift the loose `contains` probes above cannot.
+        assert!(
+            reply.contains("- `zai/glm` \u{b7} 1 requests, 1,000 prompt / 100 completion tokens"),
+            "unexpected per-model line: {reply}"
+        );
         assert!(!reply.contains("2,000"), "global totals leaked: {reply}");
         assert!(!reply.contains("200 "), "cross-guild completion leaked: {reply}");
+    }
+
+    /// `/llm_usage` for a guild with no records: the explicit notice, not
+    /// zero lines.
+    #[tokio::test]
+    async fn usage_zero_requests_renders_the_no_usage_notice() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+
+        UsageLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("usage expected to succeed");
+
+        let reply = fixture.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("No LLM usage recorded"), "unexpected: {reply}");
+        assert!(!reply.contains("All time"), "unexpected: {reply}");
+    }
+
+    /// The composition root's shutdown flush: awaited in `main` after the
+    /// kernel shutdown, it must persist what the last tick did not cover.
+    #[tokio::test]
+    async fn flush_usage_totals_persists_pending_records() {
+        use crate::plugins::llm::usage_total::Sample;
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        let usage = crate::plugins::llm::completion_port::TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+            cached_tokens: None,
+            reasoning_tokens: None,
+        };
+        fixture.engine.usage().record("zai/glm", Some(1), Sample::reported(&usage));
+        assert!(fixture.plugin_storage.rows(crate::test_support::TEST_PLATFORM_SLUG).is_empty());
+
+        plugin.flush_usage_totals().await;
+
+        assert!(
+            !fixture.plugin_storage.rows(crate::test_support::TEST_PLATFORM_SLUG).is_empty(),
+            "shutdown flush expected to persist"
+        );
     }
 
     /// `/llm_usage` outside a server: the standard ephemeral guard.

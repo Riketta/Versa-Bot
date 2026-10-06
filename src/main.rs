@@ -333,6 +333,10 @@ async fn main() -> ExitCode {
     let start_result = client.start().await;
     kernel.shutdown();
     config_watch_job.cancel();
+    // The usage flush cannot run inside the plugin's sync `stop` (it would
+    // race process exit as a detached task) - the composition root awaits
+    // it here, bounded: a graceful restart must not hang on observability.
+    let _timeout = tokio::time::timeout(Duration::from_secs(3), llm.flush_usage_totals()).await;
     gateway_exit_code(start_result)
 }
 

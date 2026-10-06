@@ -128,12 +128,24 @@ impl VisionService {
         &self,
         job: &ImageJob,
         image: &ImageSource,
-    ) -> (Option<String>, Option<TokenUsage>) {
+        usage: Option<&UsageSink<'_>>,
+    ) -> Option<String> {
         match self.describe_one_inner(job, image).await {
-            Ok((description, usage)) => (Some(description), usage),
+            Ok((description, reported)) => {
+                if let Some(sink) = usage {
+                    // Endpoint numbers when reported; a request-only sample
+                    // otherwise (image tokens cannot be estimated from
+                    // chars). Recorded on the SUCCESS path only - a failed
+                    // job never ran a completion, so it is not a request.
+                    let sample =
+                        reported.as_ref().map_or_else(Sample::unreported_request, Sample::reported);
+                    sink.tracker.record(&job.model, sink.guild_id, sample);
+                }
+                Some(description)
+            }
             Err(err) => {
                 tracing::warn!(%err, "image recognition failed - recording undescribed");
-                (None, None)
+                None
             }
         }
     }
@@ -225,15 +237,7 @@ impl ImageDescriber for VisionService {
     ) -> Vec<Option<String>> {
         let mut descriptions = Vec::with_capacity(images.len());
         for image in &images {
-            let (description, reported) = self.describe_one(job, image).await;
-            if let Some(sink) = &usage {
-                // Endpoint numbers when reported; a request-only sample
-                // otherwise (image tokens cannot be estimated from chars).
-                let sample =
-                    reported.as_ref().map_or_else(Sample::unreported_request, Sample::reported);
-                sink.tracker.record(&job.model, sink.guild_id, sample);
-            }
-            descriptions.push(description);
+            descriptions.push(self.describe_one(job, image, usage.as_ref()).await);
         }
         descriptions
     }
@@ -518,6 +522,42 @@ mod tests {
             .await;
 
         assert_eq!(out, vec![None, None]);
+    }
+
+    /// The usage sink records COMPLETED vision jobs only: an untrusted or
+    /// failed image never ran a completion, so it must not inflate the
+    /// request counter.
+    #[tokio::test]
+    async fn untrusted_host_records_no_usage() {
+        use crate::kernel::spi_ports::PluginStoragePort;
+        let storage = Arc::new(crate::test_support::InMemoryPluginStorage::new());
+        let tracker = crate::plugins::llm::usage_total::UsageTracker::new(
+            storage.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG),
+        );
+        let service = VisionService::new(Arc::new(NeverCompletion));
+        let job = ImageJob {
+            model: "m".to_owned(),
+            prompt: "p".to_owned(),
+            max_side: 512,
+            jpeg_quality: 85,
+            max_source_bytes: 1000,
+        };
+
+        let out = service
+            .describe(
+                &job,
+                vec![ImageSource {
+                    url: "https://evil.test/a.png".to_owned(),
+                    content_type: Some("image/png".to_owned()),
+                    ext: None,
+                }],
+                Some(UsageSink::new(&tracker, Some(7))),
+            )
+            .await;
+
+        assert_eq!(out, vec![None]);
+        let (all_time, _today) = tracker.guild_snapshot(7).await;
+        assert_eq!(all_time.total.requests, 0, "a failed job is not a request");
     }
 
     fn encode_png(image: &image::RgbImage) -> Vec<u8> {

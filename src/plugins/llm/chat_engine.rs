@@ -107,6 +107,8 @@ struct AnswerAudit<'a> {
 struct CompactionAudit {
     model: String,
     sample: Sample,
+    /// Whether the usage came from the endpoint or the estimator.
+    reported: bool,
     cumulative: Dimension,
 }
 
@@ -1391,6 +1393,7 @@ impl ChatEngine {
         // Global totals: endpoint numbers when reported, the channel's
         // calibration as the estimate otherwise.
         let completion_chars = u64::try_from(response.content.chars().count()).unwrap_or(u64::MAX);
+        let reported = response.usage.is_some();
         let sample =
             response.usage.as_ref().map(Sample::reported).unwrap_or_else(|| {
                 Sample::estimated(context_chars, completion_chars, tokens_per_char)
@@ -1408,7 +1411,7 @@ impl ChatEngine {
                 new_state,
                 chunk.len(),
                 keep_tail,
-                CompactionAudit { model, sample, cumulative },
+                CompactionAudit { model, sample, reported, cumulative },
                 services,
             )
             .await;
@@ -1462,6 +1465,7 @@ impl ChatEngine {
                     model = %audit.model,
                     prompt_tokens = audit.sample.prompt_tokens,
                     completion_tokens = audit.sample.completion_tokens,
+                    usage_source = if audit.reported { "reported" } else { "estimated" },
                     cumulative_requests = audit.cumulative.requests,
                     cumulative_prompt_tokens = audit.cumulative.prompt_tokens,
                     cumulative_completion_tokens = audit.cumulative.completion_tokens,

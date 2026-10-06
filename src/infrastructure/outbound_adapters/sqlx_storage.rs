@@ -200,7 +200,12 @@ impl PluginStorage for ScopedPluginStorage {
             }
         }
         .map_err(|err| StorageError::Database(err.to_string()))?;
-        Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()))
+        let value = match raw {
+            Some(raw) => serde_json::from_str(&raw)
+                .map_err(|err| StorageError::Serialization(err.to_string()))?,
+            None => return Ok(None),
+        };
+        Ok(Some(value))
     }
 
     async fn set(&self, namespace: &str, key: &str, value: Value) -> Result<(), StorageError> {

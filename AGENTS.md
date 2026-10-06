@@ -102,10 +102,14 @@ Dockerfile, and local dev.
 
 **Port families and cardinality:**
 
-- Kernel service ports (`StoragePort`, `ConfigPort`, `SchedulerPort`,
-  `EventBusPort`, ...): infra the kernel consumes and exposes to plugins.
-  One active adapter, one instance per kernel, owned by the kernel, wired
-  at the composition root, shared with plugins via injection.
+- Kernel service ports (`StoragePort`, `PluginStoragePort`, `ConfigPort`,
+  `SchedulerPort`, `EventBusPort`, ...): infra the kernel consumes and
+  exposes to plugins. One active adapter, one instance per kernel, owned by
+  the kernel, wired at the composition root, shared with plugins via
+  injection. `PluginStoragePort` is the one deliberately NOT
+  guild-partitioned view: plugin-global documents for operator-side
+  aggregates and settings (counters, ids, keys) - user content (message
+  text, prompts) must never land there.
 - Plugin-facing ports (`PluginPort`, `MiddlewarePluginPort`): contracts
   plugins implement - many adapters, one per participating plugin.
   `PluginPort` is the full implementation surface: identity + lifecycle

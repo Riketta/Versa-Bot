@@ -838,9 +838,9 @@ recognition alike. Endpoint-reported numbers are used as-is; a completion
 without a usage report is estimated from the channel's calibrated
 tokens-per-character ratio (vision calls, whose token cost is dominated by
 image bytes, count as requests only) - the totals are approximate by
-contract, and the per-completion info log lines state which side they used
-(`usage_source = reported` or `estimated`). `/llm_usage` shows a server its
-own totals; global numbers and cross-guild rankings are operator
+contract, and the per-answer and compaction log lines state which side they
+used (`usage_source = reported` or `estimated`). `/llm_usage` shows a
+server its own totals; global numbers and cross-guild rankings are operator
 information - never a command. The data lives in the storage backend's
 `plugin_documents` table (one row per document) and is written for exactly
 this external use - point a script or dashboard at it:
@@ -856,8 +856,11 @@ with one flat row per view:
 "prompt_tokens", "completion_tokens", "cached_tokens", "reasoning_tokens"}`.
 Cached and reasoning tokens are breakdowns the endpoint reported (cached is
 a subset of prompt, never additive). Values are flushed to storage every 60
-seconds when dirty and on graceful shutdown, so a crash loses at most one
-interval - past days are finalized and never rewritten.
+seconds when dirty, and the composition root awaits one final bounded
+flush on graceful shutdown - a crash loses at most one interval. Past days
+are finalized and never rewritten (a backwards clock step counts into
+all-time totals only), and day documents are never pruned - one small row
+per day.
 
 **Delivery.** The bot holds the channel's typing indicator from the
 moment a triggered run is accepted - through any wait for a previous

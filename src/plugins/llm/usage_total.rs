@@ -24,11 +24,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::sync::OnceCell;
 
+use crate::kernel::models::StorageError;
 use crate::kernel::spi_ports::PluginStorage;
 use crate::plugins::llm::completion_port::TokenUsage;
 use crate::plugins::llm::model::NAMESPACE;
@@ -124,19 +126,21 @@ pub(crate) struct Dimension {
 
 impl Dimension {
     fn add(&mut self, sample: Sample) {
-        self.requests += sample.requests;
-        self.prompt_tokens += sample.prompt_tokens;
-        self.completion_tokens += sample.completion_tokens;
-        self.cached_tokens += sample.cached_tokens;
-        self.reasoning_tokens += sample.reasoning_tokens;
+        // Saturating on purpose: counters are observability - a wrapped or
+        // panicking u64 would be worse than a pinned-at-max total.
+        self.requests = self.requests.saturating_add(sample.requests);
+        self.prompt_tokens = self.prompt_tokens.saturating_add(sample.prompt_tokens);
+        self.completion_tokens = self.completion_tokens.saturating_add(sample.completion_tokens);
+        self.cached_tokens = self.cached_tokens.saturating_add(sample.cached_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(sample.reasoning_tokens);
     }
 
     fn merge(&mut self, other: Self) {
-        self.requests += other.requests;
-        self.prompt_tokens += other.prompt_tokens;
-        self.completion_tokens += other.completion_tokens;
-        self.cached_tokens += other.cached_tokens;
-        self.reasoning_tokens += other.reasoning_tokens;
+        self.requests = self.requests.saturating_add(other.requests);
+        self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
+        self.completion_tokens = self.completion_tokens.saturating_add(other.completion_tokens);
+        self.cached_tokens = self.cached_tokens.saturating_add(other.cached_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
     }
 }
 
@@ -278,20 +282,50 @@ struct Inner {
     dirty_models: bool,
     dirty_guilds: BTreeSet<u64>,
     dirty_days: BTreeSet<String>,
+    /// Highest day a record ever landed in - a clock stepping backwards
+    /// must not reopen a finalized day (its bucket is gone; a fresh empty
+    /// one would overwrite the stored document on the next flush).
+    last_day: Option<String>,
 }
 
 /// The live usage truth: in-memory counters, lazily seeded from storage
 /// (merge-add, so records that landed before a successful seed are never
-/// lost), flushed by the plugin's scheduler job.
+/// lost), flushed by the plugin's scheduler job. The clock is injected so
+/// day-boundary behavior (rollover, finalized-day protection) is testable.
 pub(crate) struct UsageTracker {
     storage: Arc<dyn PluginStorage>,
     inner: Mutex<Inner>,
     seeded: OnceCell<()>,
+    now_day: Arc<dyn Fn() -> String + Send + Sync>,
 }
 
 impl UsageTracker {
     pub(crate) fn new(storage: Arc<dyn PluginStorage>) -> Arc<Self> {
-        Arc::new(Self { storage, inner: Mutex::new(Inner::default()), seeded: OnceCell::new() })
+        Self::with_clock(storage, Arc::new(current_day))
+    }
+
+    fn with_clock(
+        storage: Arc<dyn PluginStorage>,
+        now_day: Arc<dyn Fn() -> String + Send + Sync>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            storage,
+            inner: Mutex::new(Inner::default()),
+            seeded: OnceCell::new(),
+            now_day,
+        })
+    }
+
+    fn day(&self) -> String {
+        (self.now_day)()
+    }
+
+    /// Whether any view is waiting to be persisted - the regression probe
+    /// for the flush's consume-on-snapshot dirty handling.
+    #[cfg(test)]
+    fn is_dirty(&self) -> bool {
+        let inner = self.inner.lock();
+        inner.dirty_models || !inner.dirty_guilds.is_empty() || !inner.dirty_days.is_empty()
     }
 
     /// Loads the stored totals once per process. Merge-add into whatever is
@@ -326,9 +360,9 @@ impl UsageTracker {
             guilds.insert(guild_id, usage);
         }
         // Today's bucket (yesterday and older stay on disk as finalized).
-        let today = current_day();
+        let today = self.day();
         let mut days = BTreeMap::new();
-        if let Some(doc) = read_doc_opt(storage, &usage_daily_key(&today)).await? {
+        if let Some(doc) = read_doc_inner(storage, &usage_daily_key(&today)).await? {
             let mut bucket = DayBucket::default();
             bucket.merge_doc(doc);
             days.insert(today, bucket);
@@ -351,9 +385,13 @@ impl UsageTracker {
     }
 
     /// Records one completion and returns the model's updated all-time
-    /// totals (what the audit log line reports as cumulative).
+    /// totals (what the audit log line reports as cumulative). A record
+    /// dated BEFORE the highest day ever seen (clock stepped backwards
+    /// after a rollover) is counted in the all-time views but not
+    /// re-opened into the daily series - that day is finalized on disk,
+    /// and rewriting it from a partial bucket would destroy its history.
     pub(crate) fn record(&self, model: &str, guild_id: Option<u64>, sample: Sample) -> Dimension {
-        let today = current_day();
+        let today = self.day();
         let mut inner = self.inner.lock();
         let cumulative = {
             let total = inner.models.entry(model.to_owned()).or_default();
@@ -364,9 +402,20 @@ impl UsageTracker {
             inner.guilds.entry(guild_id).or_default().add(model, sample);
             inner.dirty_guilds.insert(guild_id);
         }
-        inner.days.entry(today.clone()).or_default().add(model, guild_id, sample);
+        let reopens_finalized_day =
+            inner.last_day.as_ref().is_some_and(|last| today.as_str() < last.as_str());
+        if reopens_finalized_day {
+            tracing::warn!(
+                day = %today,
+                last = ?inner.last_day,
+                "clock stepped backwards - usage counted in totals, not re-opened into the daily series"
+            );
+        } else {
+            inner.last_day = Some(today.clone());
+            inner.days.entry(today.clone()).or_default().add(model, guild_id, sample);
+            inner.dirty_days.insert(today);
+        }
         inner.dirty_models = true;
-        inner.dirty_days.insert(today);
         cumulative
     }
 
@@ -375,7 +424,7 @@ impl UsageTracker {
     /// history.
     pub(crate) async fn guild_snapshot(&self, guild_id: u64) -> (GuildUsageSnapshot, Dimension) {
         self.ensure_seeded().await;
-        let today = current_day();
+        let today = self.day();
         let inner = self.inner.lock();
         let all_time = inner
             .guilds
@@ -398,17 +447,22 @@ impl UsageTracker {
 
     /// Flushes every dirty view to storage. Refuses to run unseeded - a
     /// partial in-memory view must never overwrite stored history. Each
-    /// document is a whole-view upsert; a failed write keeps its dirty flag,
-    /// and a past day stops being rewritten once its final flush succeeded.
+    /// document is a whole-view upsert; the dirty flags are consumed in the
+    /// snapshot critical section and re-marked only for failed writes, so a
+    /// record landing mid-flush re-marks its view and the next tick's
+    /// whole-view upsert carries it (approximate, never lost while the
+    /// process lives). A past day stops being rewritten once its final
+    /// flush succeeded.
     pub(crate) async fn flush(&self) {
         self.ensure_seeded().await;
         if self.seeded.get().is_none() {
             return; // storage still unreachable - counters keep accumulating
         }
-        let today = current_day();
-        // Take the data snapshot and the dirty set under one short lock; the
-        // async writes run without the lock. A record landing mid-flush
-        // re-marks its views dirty - the next tick covers it (approximate).
+        let today = self.day();
+        // Consume the dirty set and snapshot the data under one short lock:
+        // anything recorded after this point re-marks its view dirty (the
+        // flags are already clear), so the next tick's upsert covers it. The
+        // async writes run without the lock.
         let writes = {
             let mut inner = self.inner.lock();
             let mut writes = FlushWrites::default();
@@ -416,11 +470,12 @@ impl UsageTracker {
                 writes.models = Some(TotalsDoc::entries(
                     inner.models.iter().map(|(model, dim)| Entry::model(model, dim)).collect(),
                 ));
+                inner.dirty_models = false;
             }
-            for guild_id in &inner.dirty_guilds {
-                if let Some(usage) = inner.guilds.get(guild_id) {
+            for guild_id in inner.dirty_guilds.clone() {
+                if let Some(usage) = inner.guilds.get(&guild_id) {
                     writes.guilds.push((
-                        *guild_id,
+                        guild_id,
                         TotalsDoc::entries(
                             usage
                                 .models
@@ -430,45 +485,50 @@ impl UsageTracker {
                         ),
                     ));
                 }
+                inner.dirty_guilds.remove(&guild_id);
             }
-            for day in &inner.dirty_days {
-                if let Some(bucket) = inner.days.get(day) {
-                    writes.days.push((day.clone(), doc_from_day(day, bucket)));
+            for day in inner.dirty_days.clone() {
+                if let Some(bucket) = inner.days.get(&day) {
+                    writes.days.push((day.clone(), doc_from_day(&day, bucket)));
                 }
+                inner.dirty_days.remove(&day);
             }
             writes
         };
 
+        // Write failures re-mark their views: the data is still only in
+        // memory, and the next flush must retry it.
         let mut models_ok = true;
         if let Some(doc) = writes.models {
             models_ok = write_doc(&self.storage, USAGE_MODEL_TOTALS_KEY, &doc).await;
         }
-        let mut guilds_ok = Vec::with_capacity(writes.guilds.len());
+        let mut guilds_failed = Vec::new();
         for (guild_id, doc) in &writes.guilds {
             let key = usage_guild_totals_key(*guild_id);
-            if write_doc(&self.storage, &key, doc).await {
-                guilds_ok.push(*guild_id);
+            if !write_doc(&self.storage, &key, doc).await {
+                guilds_failed.push(*guild_id);
             }
         }
-        let mut days_ok = Vec::with_capacity(writes.days.len());
+        let mut days_failed = Vec::new();
         for (day, doc) in &writes.days {
             let key = usage_daily_key(day);
-            if write_doc(&self.storage, &key, doc).await {
-                days_ok.push(day.clone());
+            if !write_doc(&self.storage, &key, doc).await {
+                days_failed.push(day.clone());
             }
         }
 
-        // Finalize past days first: their bucket is dropped once its last
-        // write succeeded (a still-dirty past day stays for retry).
+        // Finalize past days: their bucket is dropped once its last write
+        // succeeded (a failed past day keeps its bucket and dirty flag for
+        // retry - see the re-marking above).
         let mut inner = self.inner.lock();
-        if models_ok {
-            inner.dirty_models = false;
+        if !models_ok {
+            inner.dirty_models = true;
         }
-        for guild_id in guilds_ok {
-            inner.dirty_guilds.remove(&guild_id);
+        for guild_id in guilds_failed {
+            inner.dirty_guilds.insert(guild_id);
         }
-        for day in days_ok {
-            inner.dirty_days.remove(&day);
+        for day in days_failed {
+            inner.dirty_days.insert(day);
         }
         let stale: Vec<String> = inner
             .days
@@ -513,23 +573,17 @@ fn doc_from_day(day: &str, bucket: &DayBucket) -> TotalsDoc {
 }
 
 async fn read_doc(storage: &Arc<dyn PluginStorage>, key: &str) -> Result<TotalsDoc, ()> {
-    match storage.get(NAMESPACE, key).await {
-        Ok(Some(raw)) => match serde_json::from_value(raw) {
-            Ok(doc) => Ok(doc),
-            Err(err) => {
-                // A malformed usage document resets its view instead of
-                // bricking the seed (and with it every future flush) -
-                // totals are observability, never reply-blocking.
-                tracing::warn!(key, %err, "usage totals document malformed - starting fresh");
-                Ok(TotalsDoc::entries(Vec::new()))
-            }
-        },
-        Ok(None) => Ok(TotalsDoc::entries(Vec::new())),
-        Err(_) => Err(()),
-    }
+    read_doc_inner(storage, key)
+        .await
+        .map(|doc| doc.unwrap_or_else(|| TotalsDoc::entries(Vec::new())))
 }
 
-async fn read_doc_opt(
+/// `Ok(None)` = the document does not exist. A MALFORMED or corrupt
+/// document is a distinct outcome: totals are observability, never
+/// reply-blocking, so it resets its view (warned) instead of failing the
+/// seed forever - a permanently failing seed would stop every future
+/// flush, silently freezing all persistence.
+async fn read_doc_inner(
     storage: &Arc<dyn PluginStorage>,
     key: &str,
 ) -> Result<Option<TotalsDoc>, ()> {
@@ -542,7 +596,14 @@ async fn read_doc_opt(
             }
         },
         Ok(None) => Ok(None),
-        Err(_) => Err(()),
+        Err(StorageError::Serialization(err)) => {
+            tracing::warn!(key, %err, "usage totals document corrupt - starting fresh");
+            Ok(None)
+        }
+        Err(err) => {
+            tracing::debug!(key, %err, "usage totals read failed - retrying on next use");
+            Err(())
+        }
     }
 }
 
@@ -575,6 +636,8 @@ mod tests {
     use super::*;
     use crate::kernel::spi_ports::PluginStoragePort;
     use crate::test_support::InMemoryPluginStorage;
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn tracker() -> (Arc<UsageTracker>, Arc<InMemoryPluginStorage>) {
         let storage = Arc::new(InMemoryPluginStorage::new());
@@ -688,5 +751,166 @@ mod tests {
         assert_eq!(model_entry.map(|entry| entry.prompt_tokens), Some(100));
         let guild_entry = doc.entries.iter().find(|entry| entry.dim == EntryDim::Guild);
         assert_eq!(guild_entry.map(|entry| entry.key.as_str()), Some("42"));
+    }
+
+    /// A storage fake whose first `set` records through a weak tracker
+    /// reference - the mid-flush record the flush race test needs.
+    struct MidFlushStorage {
+        backend: Arc<dyn PluginStorage>,
+        tracker: Arc<Mutex<std::sync::Weak<UsageTracker>>>,
+        fired: AtomicBool,
+    }
+
+    #[async_trait]
+    impl PluginStorage for MidFlushStorage {
+        async fn get(&self, namespace: &str, key: &str) -> Result<Option<Value>, StorageError> {
+            self.backend.get(namespace, key).await
+        }
+
+        async fn set(&self, namespace: &str, key: &str, value: Value) -> Result<(), StorageError> {
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                if let Some(tracker) = self.tracker.lock().upgrade() {
+                    tracker.record(
+                        "zai/glm",
+                        Some(42),
+                        Sample { requests: 1, ..Sample::default() },
+                    );
+                }
+            }
+            self.backend.set(namespace, key, value).await
+        }
+
+        async fn delete(&self, namespace: &str, key: &str) -> Result<(), StorageError> {
+            self.backend.delete(namespace, key).await
+        }
+
+        async fn list_keys(&self, namespace: &str) -> Result<Vec<String>, StorageError> {
+            self.backend.list_keys(namespace).await
+        }
+    }
+
+    /// The flush CONSUMES the dirty flags in its snapshot critical section:
+    /// a record landing while the documents are being written re-marks its
+    /// view, so the next flush's whole-view upsert carries it. (The old
+    /// clear-after-write ordering erased the re-mark and silently dropped
+    /// the record until some later record re-dirtied the view.)
+    #[tokio::test]
+    async fn record_landing_mid_flush_is_not_lost() {
+        use std::sync::Weak;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let store = Arc::new(InMemoryPluginStorage::new());
+        let tracker_cell = Arc::new(Mutex::new(Weak::new()));
+        let storage = Arc::new(MidFlushStorage {
+            backend: store.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG),
+            tracker: Arc::clone(&tracker_cell),
+            fired: AtomicBool::new(false),
+        });
+        let tracker = UsageTracker::with_clock(
+            Arc::clone(&storage) as Arc<dyn PluginStorage>,
+            Arc::new(|| "2026-01-02".to_owned()),
+        );
+        *tracker_cell.lock() = Arc::downgrade(&tracker);
+
+        tracker.record("zai/glm", Some(42), Sample::reported(&usage(100, 10)));
+        tracker.flush().await;
+        // The mid-flush record fired inside the first `set`; the view must
+        // still be dirty, and the next flush must persist BOTH records.
+        assert!(tracker.is_dirty(), "mid-flush record lost: view not re-marked");
+        tracker.flush().await;
+        assert!(!tracker.is_dirty());
+
+        let raw = store
+            .plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG)
+            .get(NAMESPACE, USAGE_MODEL_TOTALS_KEY)
+            .await
+            .expect("read expected")
+            .expect("model document expected");
+        let doc: TotalsDoc = serde_json::from_value(raw).expect("schema expected");
+        let total = doc.entries.first().expect("model entry expected");
+        assert_eq!(total.requests, 2, "mid-flush record missing from storage");
+    }
+
+    /// A failed flush re-marks its views (the data lives only in memory);
+    /// a healed storage flushes them on the next tick. Seed failure must
+    /// refuse the flush entirely - a partial in-memory view must never
+    /// overwrite stored history.
+    #[tokio::test]
+    async fn flush_and_seed_failures_keep_views_dirty_until_storage_recovers() {
+        let storage = crate::test_support::FailingPluginStorage::new();
+        let tracker =
+            UsageTracker::new(storage.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG));
+        tracker.record("zai/glm", Some(1), Sample::reported(&usage(100, 10)));
+
+        // Storage down: flush refuses (the seed fails), nothing persists.
+        tracker.flush().await;
+        assert!(storage.rows(crate::test_support::TEST_PLATFORM_SLUG).is_empty());
+        assert!(tracker.is_dirty());
+
+        // Healed: seed lands, flush persists the in-memory record.
+        storage.set_failing(false);
+        tracker.flush().await;
+        assert!(!tracker.is_dirty());
+        assert_eq!(
+            storage.rows(crate::test_support::TEST_PLATFORM_SLUG).len(),
+            3, // model totals + guild totals + the day document
+        );
+    }
+
+    /// A clock stepping backwards (NTP correction) after a day was
+    /// finalized must not reopen it: the record counts in the all-time
+    /// views, but the daily series on disk is never rewritten from a
+    /// partial bucket.
+    #[tokio::test]
+    async fn record_never_reopens_a_finalized_day() {
+        let day_cell = Arc::new(parking_lot::Mutex::new("2026-01-02".to_owned()));
+        let clock: Arc<dyn Fn() -> String + Send + Sync> = {
+            let day_cell = Arc::clone(&day_cell);
+            Arc::new(move || day_cell.lock().clone())
+        };
+        let store = Arc::new(InMemoryPluginStorage::new());
+        let tracker = UsageTracker::with_clock(
+            store.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG),
+            clock,
+        );
+
+        tracker.record("zai/glm", Some(1), Sample::reported(&usage(100, 10)));
+        tracker.flush().await;
+
+        // Clock steps back into the finalized day.
+        *day_cell.lock() = "2026-01-01".to_owned();
+        tracker.record("zai/glm", Some(1), Sample::reported(&usage(50, 5)));
+        tracker.flush().await;
+
+        let scoped = store.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG);
+        let model_raw = scoped
+            .get(NAMESPACE, USAGE_MODEL_TOTALS_KEY)
+            .await
+            .expect("read expected")
+            .expect("model doc expected");
+        let model_doc: TotalsDoc = serde_json::from_value(model_raw).expect("schema expected");
+        assert_eq!(
+            model_doc.entries.first().map(|entry| entry.requests),
+            Some(2),
+            "all-time counts both"
+        );
+
+        let finalized_raw = scoped
+            .get(NAMESPACE, &usage_daily_key("2026-01-02"))
+            .await
+            .expect("read expected")
+            .expect("finalized day doc expected");
+        let finalized: TotalsDoc = serde_json::from_value(finalized_raw).expect("schema expected");
+        assert_eq!(
+            finalized.entries.first().map(|entry| entry.requests),
+            Some(1),
+            "finalized day untouched"
+        );
+
+        assert_eq!(
+            scoped.get(NAMESPACE, &usage_daily_key("2026-01-01")).await.expect("read expected"),
+            None,
+            "the reopened day must not be written"
+        );
     }
 }
