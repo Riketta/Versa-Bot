@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use crate::kernel::{
     models::{ChannelId, Embed, GuildId, MessageId, MessagePayload, Origin, OutboundMessage},
     services::KernelServices,
-    spi_ports::{ChatStreamPort, ChatTypingGuard, GuildStorage},
+    spi_ports::{ChatStreamPort, ChatTypingGuard, GuildStorage, PluginStorage},
 };
 
 use super::completion_port::{
@@ -38,7 +38,8 @@ use super::prompts::{PromptVars, render_prompt};
 use super::providers::LlmSettings;
 use super::rng::{RandomPort, RandomScope};
 use super::tools;
-use super::vision::{self, DEFAULT_IMAGE_PROMPT, ImageDescriber, ImageJob, ImageSource};
+use super::usage_total::{Dimension, Sample, UsageTracker};
+use super::vision::{self, DEFAULT_IMAGE_PROMPT, ImageDescriber, ImageJob, ImageSource, UsageSink};
 use crate::kernel::spi_ports::PlatformInfoPort;
 
 /// One undescribed placeholder entry per image (feature off, cap overflow,
@@ -75,6 +76,9 @@ struct UsageRecord {
     usage: Option<TokenUsage>,
     timing: ResponseTiming,
     context_chars: u64,
+    /// Delivered answer size in characters - the completion-side measure the
+    /// estimate falls back to when the endpoint reports no usage.
+    completion_chars: u64,
     tokens_per_char: f64,
     budget: Option<u64>,
 }
@@ -93,6 +97,17 @@ struct AnswerAudit<'a> {
     window_used: usize,
     context_chars: u64,
     calibrated: bool,
+    /// Whether the usage row came from the endpoint or the estimator.
+    usage_source: &'static str,
+    /// The model's updated all-time totals after this completion.
+    cumulative: Dimension,
+}
+
+/// The compaction call's usage, carried to the commit's audit line.
+struct CompactionAudit {
+    model: String,
+    sample: Sample,
+    cumulative: Dimension,
 }
 
 /// Outcome of a streaming completion attempt: `Done` carries the full
@@ -228,6 +243,9 @@ pub struct ChatEngine {
     /// The deployment's platform identity (adapter-owned values) - prompt
     /// templates and slug-keyed cooldowns read it.
     platform_info: Arc<dyn PlatformInfoPort>,
+    /// Plugin-global token usage totals (models, guilds, UTC days). The
+    /// tracker owns its plugin-global storage binding.
+    usage: Arc<UsageTracker>,
     /// Last error-notice time per channel (see [`NOTICE_COOLDOWN`]).
     notices: Mutex<HashMap<ChannelKey, Instant>>,
     /// Last random chime-in time per channel; the cooldown length is the
@@ -247,6 +265,7 @@ impl ChatEngine {
         rng: Arc<dyn RandomPort>,
         describer: Arc<dyn ImageDescriber>,
         platform_info: Arc<dyn PlatformInfoPort>,
+        plugin_storage: Arc<dyn PluginStorage>,
     ) -> Self {
         Self {
             settings,
@@ -254,10 +273,18 @@ impl ChatEngine {
             rng,
             describer,
             platform_info,
+            usage: UsageTracker::new(plugin_storage),
             notices: Mutex::new(HashMap::new()),
             chimes: Mutex::new(HashMap::new()),
             react_chimes: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Plugin-facing read access to the usage tracker: the plugin flushes it
+    /// on a scheduler job and `/llm_usage` renders its snapshots.
+    #[must_use]
+    pub fn usage(&self) -> Arc<UsageTracker> {
+        Arc::clone(&self.usage)
     }
 
     /// Plugin-facing read access to the operator settings (command handlers
@@ -285,6 +312,9 @@ impl ChatEngine {
             return; // DMs cannot have channel config; unreachable via `pre`.
         };
         let channel_id = origin.channel_id.get();
+        // Usage totals seed lazily on first use; the seed is a no-op once
+        // done, so every message pays one `OnceCell::get`.
+        self.usage.ensure_seeded().await;
 
         // History integrity unknown -> no generated answer. A mention is
         // decidable without any storage read, so the guaranteed-answer
@@ -389,6 +419,7 @@ impl ChatEngine {
             &state,
             &seqs,
             &live_records,
+            usage_stats.tokens_per_char,
             payload.guild_name.as_deref(),
             services,
         )
@@ -415,7 +446,7 @@ impl ChatEngine {
         ) {
             return None;
         }
-        let images = self.describe_images(config, payload).await;
+        let images = self.describe_images(config, payload, origin).await;
         let record = ConversationRecord {
             message_id: origin.message_id.map(MessageId::get),
             role: RecordRole::User,
@@ -445,6 +476,7 @@ impl ChatEngine {
         &self,
         config: &ChannelConfig,
         payload: &MessagePayload,
+        origin: &Origin,
     ) -> Vec<conversation::RecordImage> {
         let sources: Vec<ImageSource> = payload
             .attachments
@@ -490,13 +522,21 @@ impl ChatEngine {
             max_source_bytes: self.settings.image_max_source_bytes,
         };
         let started = Instant::now();
-        let results = self.describer.describe(&job, described.to_vec()).await;
+        // Recognition usage lands in the plugin-global totals (reported by
+        // the endpoint, request-only when unreported) - never in the
+        // channel's chat stats (compaction precedent).
+        let sink = Some(UsageSink::new(&self.usage, origin.guild_id.map(GuildId::get)));
+        let results = self.describer.describe(&job, described.to_vec(), sink).await;
         let described_count = results.iter().filter(|result| result.is_some()).count();
+        let cumulative = self.usage.cumulative(&job.model);
         tracing::info!(
             total = sources.len(),
             described = described_count,
             elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             model = %job.model,
+            cumulative_requests = cumulative.requests,
+            cumulative_prompt_tokens = cumulative.prompt_tokens,
+            cumulative_completion_tokens = cumulative.completion_tokens,
             "image recognition completed"
         );
         let mut images: Vec<_> = results
@@ -617,6 +657,15 @@ impl ChatEngine {
                 // would contradict visible text. Finalize the partial,
                 // log, and report through the service channel.
                 self.report_stream_interrupted(origin, config, services).await;
+                // The usage report died with the stream - the channel's
+                // calibration and the delivered characters are all that is
+                // left. Estimate, so the totals keep counting real spend.
+                let completion_chars = u64::try_from(partial.chars().count()).unwrap_or(u64::MAX);
+                let cumulative = self.usage.record(
+                    &config.model,
+                    origin.guild_id.map(GuildId::get),
+                    Sample::estimated(context_chars, completion_chars, usage_stats.tokens_per_char),
+                );
                 // Reduced audit row: a partial answer WAS delivered (and
                 // deliver_reply records it as a bot turn), so the
                 // per-completion trail must not skip it. Usage and provider
@@ -630,6 +679,10 @@ impl ChatEngine {
                     window = live.len(),
                     window_used,
                     partial = true,
+                    usage_source = "estimated",
+                    cumulative_requests = cumulative.requests,
+                    cumulative_prompt_tokens = cumulative.prompt_tokens,
+                    cumulative_completion_tokens = cumulative.completion_tokens,
                     "LLM answer generated (partial - stream interrupted)"
                 );
                 return self
@@ -641,6 +694,26 @@ impl ChatEngine {
                 return false;
             }
         };
+        // Totals first (the audit row reports the post-completion
+        // cumulative), then the per-channel stats, then the audit itself.
+        let usage_source = if response.usage.is_some() { "reported" } else { "estimated" };
+        let cumulative = self
+            .record_usage(
+                services,
+                origin,
+                channel_id,
+                &config.model,
+                UsageRecord {
+                    usage: response.usage,
+                    timing: response.timing,
+                    context_chars,
+                    completion_chars: u64::try_from(response.content.chars().count())
+                        .unwrap_or(u64::MAX),
+                    tokens_per_char: usage_stats.tokens_per_char,
+                    budget,
+                },
+            )
+            .await;
         // Per-completion audit: usage, latency and context shape.
         Self::log_answer_audit(
             channel_id,
@@ -654,20 +727,10 @@ impl ChatEngine {
                 window_used,
                 context_chars,
                 calibrated: usage_stats.last.is_some(),
+                usage_source,
+                cumulative,
             },
         );
-        self.record_usage(
-            services,
-            channel_id,
-            UsageRecord {
-                usage: response.usage,
-                timing: response.timing,
-                context_chars,
-                tokens_per_char: usage_stats.tokens_per_char,
-                budget,
-            },
-        )
-        .await;
 
         // Tool protocol (R3/R4): markers never reach the channel or the
         // history - the cleaned text is what is delivered and recorded.
@@ -929,6 +992,8 @@ impl ChatEngine {
             window_used,
             context_chars,
             calibrated,
+            usage_source,
+            cumulative,
         } = *audit;
         tracing::info!(
             channel = channel_id,
@@ -941,6 +1006,10 @@ impl ChatEngine {
             completion_tokens = usage.map_or(0, |usage| usage.completion_tokens),
             cached_tokens = ?usage.and_then(|usage| usage.cached_tokens),
             reasoning_tokens = ?usage.and_then(|usage| usage.reasoning_tokens),
+            usage_source,
+            cumulative_requests = cumulative.requests,
+            cumulative_prompt_tokens = cumulative.prompt_tokens,
+            cumulative_completion_tokens = cumulative.completion_tokens,
             window,
             window_used,
             context_chars,
@@ -1045,11 +1114,15 @@ impl ChatEngine {
         };
         self.record_usage(
             services,
+            origin,
             channel_id,
+            &config.model,
             UsageRecord {
                 usage: response.usage,
                 timing: response.timing,
                 context_chars,
+                completion_chars: u64::try_from(response.content.chars().count())
+                    .unwrap_or(u64::MAX),
                 tokens_per_char: usage_stats.tokens_per_char,
                 budget,
             },
@@ -1240,6 +1313,7 @@ impl ChatEngine {
         state: &ConversationState,
         seqs: &[u64],
         records: &[ConversationRecord],
+        tokens_per_char: f64,
         guild_name: Option<&str>,
         services: &KernelServices,
     ) {
@@ -1280,11 +1354,15 @@ impl ChatEngine {
         let prompt = render_prompt(&resolved, &vars);
 
         let messages = conversation::compaction_input(&prompt, state.summary.as_deref(), chunk);
+        #[allow(clippy::cast_precision_loss)] // estimator: precision loss is fine
+        let context_chars: u64 =
+            messages.iter().map(|message| message.content.chars().count() as u64).sum();
         // The summarizer call is deliberately NOT recorded into the channel's
         // chat stats: the EWMA ratio and the "last request" report must
-        // reflect chat completions only, not compaction traffic.
+        // reflect chat completions only, not compaction traffic. The global
+        // usage totals DO count it - compaction is real spend.
         let request = CompletionRequest {
-            model,
+            model: model.clone(),
             messages,
             // Summarization needs no sampling tuning - provider defaults.
             params: GenParams::default(),
@@ -1310,14 +1388,30 @@ impl ChatEngine {
                 return;
             }
         };
+        // Global totals: endpoint numbers when reported, the channel's
+        // calibration as the estimate otherwise.
+        let completion_chars = u64::try_from(response.content.chars().count()).unwrap_or(u64::MAX);
+        let sample =
+            response.usage.as_ref().map(Sample::reported).unwrap_or_else(|| {
+                Sample::estimated(context_chars, completion_chars, tokens_per_char)
+            });
+        let cumulative = self.usage.record(&model, origin.guild_id.map(GuildId::get), sample);
         let new_state = ConversationState {
             summary: Some(response.content),
             cutoff_seq: chunk_end_seq,
             cutoff_at: Some(unix_now()),
         };
         if let Some(storage) = &services.guild_storage {
-            self.commit_compaction(origin, storage, new_state, chunk.len(), keep_tail, services)
-                .await;
+            self.commit_compaction(
+                origin,
+                storage,
+                new_state,
+                chunk.len(),
+                keep_tail,
+                CompactionAudit { model, sample, cumulative },
+                services,
+            )
+            .await;
         }
     }
 
@@ -1330,6 +1424,7 @@ impl ChatEngine {
         new_state: ConversationState,
         folded: usize,
         keep_tail: usize,
+        audit: CompactionAudit,
         services: &KernelServices,
     ) {
         let channel_id = origin.channel_id.get();
@@ -1364,6 +1459,12 @@ impl ChatEngine {
                     channel = channel_id,
                     folded,
                     cutoff = new_state.cutoff_seq,
+                    model = %audit.model,
+                    prompt_tokens = audit.sample.prompt_tokens,
+                    completion_tokens = audit.sample.completion_tokens,
+                    cumulative_requests = audit.cumulative.requests,
+                    cumulative_prompt_tokens = audit.cumulative.prompt_tokens,
+                    cumulative_completion_tokens = audit.cumulative.completion_tokens,
                     "conversation compacted"
                 );
                 self.notify_service(
@@ -1477,16 +1578,33 @@ impl ChatEngine {
 
     /// Persists the last chat completion's response time and - when the
     /// endpoint reports usage - token stats, blending the observed
-    /// tokens-per-character ratio into the channel's estimate. Compaction
-    /// never records (its transcript is not chat traffic). Best effort: a
-    /// failed write only degrades the next estimate back to the previous
-    /// ratio. A usage-less response keeps the previously reported usage:
-    /// dropping it would silently disable token-budget context filling (the
-    /// budget gate keys on a stored usage) after one omitted report.
-    async fn record_usage(&self, services: &KernelServices, channel_id: u64, record: UsageRecord) {
-        let UsageRecord { usage, timing, context_chars, tokens_per_char, budget } = record;
+    /// tokens-per-character ratio into the channel's estimate. The same
+    /// completion feeds the plugin-global totals: provider numbers when
+    /// reported, the channel's calibration as the estimate otherwise.
+    /// Compaction records only into the global totals (its transcript is not
+    /// chat traffic). Best effort: a failed write only degrades the next
+    /// estimate back to the previous ratio. A usage-less response keeps the
+    /// previously reported usage: dropping it would silently disable
+    /// token-budget context filling (the budget gate keys on a stored usage)
+    /// after one omitted report. Returns the model's updated cumulative
+    /// totals for the audit row.
+    async fn record_usage(
+        &self,
+        services: &KernelServices,
+        origin: &Origin,
+        channel_id: u64,
+        model: &str,
+        record: UsageRecord,
+    ) -> Dimension {
+        let UsageRecord { usage, timing, context_chars, completion_chars, tokens_per_char, budget } =
+            record;
+        let sample = usage
+            .as_ref()
+            .map(Sample::reported)
+            .unwrap_or_else(|| Sample::estimated(context_chars, completion_chars, tokens_per_char));
+        let cumulative = self.usage.record(model, origin.guild_id.map(GuildId::get), sample);
         let Some(storage) = &services.guild_storage else {
-            return;
+            return cumulative;
         };
         let (last, tokens_per_char) = match usage {
             Some(usage) => {
@@ -1506,12 +1624,13 @@ impl ChatEngine {
                     %err,
                     "failed to serialize usage stats - not persisted"
                 );
-                return;
+                return cumulative;
             }
         };
         if let Err(err) = storage.set(NAMESPACE, &channel_stats_key(channel_id), value).await {
             tracing::warn!(channel = channel_id, %err, "failed to persist token usage stats");
         }
+        cumulative
     }
 
     /// The channel's calibration state; unreadable stats fall back to the
@@ -1789,7 +1908,12 @@ mod tests {
 
     #[async_trait]
     impl ImageDescriber for FakeDescriber {
-        async fn describe(&self, job: &ImageJob, images: Vec<ImageSource>) -> Vec<Option<String>> {
+        async fn describe(
+            &self,
+            job: &ImageJob,
+            images: Vec<ImageSource>,
+            _usage: Option<UsageSink<'_>>,
+        ) -> Vec<Option<String>> {
             self.jobs.lock().push((job.model.clone(), job.prompt.clone(), images.len()));
             let mut out = Vec::with_capacity(images.len());
             for _ in images {
@@ -1865,6 +1989,7 @@ mod tests {
             Arc::new(FixedRandom(false)),
             Arc::new(FakeDescriber::default()),
             crate::test_support::test_platform_info(),
+            crate::test_support::test_plugin_storage(),
         );
         let storage = Arc::new(InMemoryStorage::new());
         let output = RecordingChatOutput::new();
@@ -1881,6 +2006,7 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
             guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
+            plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         });
         DeltaCtx {
@@ -2088,6 +2214,7 @@ mod tests {
             rng,
             Arc::clone(&describer) as Arc<dyn ImageDescriber>,
             crate::test_support::test_platform_info(),
+            crate::test_support::test_plugin_storage(),
         );
         let storage = Arc::new(InMemoryStorage::new());
         let output = RecordingChatOutput::new();
@@ -2104,6 +2231,7 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
             guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
+            plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
         TestCtx { engine, fake, storage, output, begins, factory, services, describer }
@@ -2187,6 +2315,7 @@ mod tests {
             chat_output_factory: Arc::new(FailingDeliveryFactory { output: Arc::clone(&output) })
                 as Arc<dyn ChatOutputFactoryPort>,
             guild_storage: Some(ctx.storage.guild_scoped("test", GuildId(1))),
+            plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
         seed_config(&ctx.storage, &assigned_config());
@@ -2931,6 +3060,7 @@ mod tests {
             Arc::new(RandRandom) as Arc<dyn RandomPort>,
             Arc::new(FakeDescriber::default()) as Arc<dyn ImageDescriber>,
             crate::test_support::test_platform_info(),
+            crate::test_support::test_plugin_storage(),
         );
         let output = RecordingChatOutput::new();
         let services = KernelServices {
@@ -2941,6 +3071,7 @@ mod tests {
             guild_storage: Some(
                 crate::test_support::FailingStorage.guild_scoped("test", GuildId(1)),
             ),
+            plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
 
@@ -3046,6 +3177,79 @@ mod tests {
         let stats: UsageStats =
             serde_json::from_value(stats_raw).expect("stats expected to deserialize");
         assert_eq!(stats.last.map(|usage| usage.prompt_tokens), Some(100));
+    }
+
+    /// The same two completions DO land in the plugin-global totals: the
+    /// chat answer and the summarizer are both real spend, attributed to
+    /// their model and the originating guild. Channel stats stay unpolluted
+    /// (see `compaction_does_not_pollute_chat_stats`).
+    #[tokio::test]
+    async fn global_usage_totals_count_chat_and_compaction() {
+        let settings = LlmSettings { compaction_keep_tail: 2, ..LlmSettings::default() };
+        let ctx =
+            ctx_with(settings, vec![Ok("summary text".to_owned()), Ok("the answer".to_owned())]);
+        ctx.fake.set_usage_per_call(vec![
+            Some(TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 10,
+                total_tokens: 110,
+                cached_tokens: None,
+                reasoning_tokens: None,
+            }),
+            Some(TokenUsage {
+                prompt_tokens: 50_000,
+                completion_tokens: 20,
+                total_tokens: 50_020,
+                cached_tokens: None,
+                reasoning_tokens: None,
+            }),
+        ]);
+        let config = ChannelConfig { history_depth: 3, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+        append_record(&ctx.storage, &user_record(1, "a1", "m1")).await;
+        append_record(&ctx.storage, &user_record(2, "a2", "m2")).await;
+        append_record(&ctx.storage, &user_record(3, "a3", "m3")).await;
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
+
+        let model = config.model.as_str();
+        let (all_time, today) = ctx.engine.usage().guild_snapshot(1).await;
+        assert_eq!(all_time.total.requests, 2, "chat + compaction");
+        assert_eq!(all_time.total.prompt_tokens, 100 + 50_000);
+        assert_eq!(all_time.total.completion_tokens, 30);
+        // Both completions share the channel's model (no compaction_model
+        // override): one per-model breakdown, same totals.
+        let model_totals =
+            all_time.models.iter().map(|(name, dim)| (name.as_str(), *dim)).collect::<Vec<_>>();
+        assert_eq!(model_totals.len(), 1);
+        assert_eq!(model_totals.first().expect("model expected").0, model);
+        assert_eq!(today.requests, 2);
+        // Other guilds stay untouched.
+        let (other, _) = ctx.engine.usage().guild_snapshot(2).await;
+        assert_eq!(other.total.requests, 0);
+    }
+
+    /// A completion without an endpoint usage report still counts: the
+    /// channel's calibrated tokens-per-character ratio estimates both sides,
+    /// so the totals keep tracking real spend (approximate by contract).
+    #[tokio::test]
+    async fn usageless_completion_falls_back_to_the_estimate() {
+        let ctx = ctx(vec![Ok("an answer of some length".to_owned())]);
+        ctx.fake.set_usage(None);
+        let config = assigned_config();
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
+
+        let (all_time, today) = ctx.engine.usage().guild_snapshot(1).await;
+        assert_eq!(all_time.total.requests, 1);
+        assert!(all_time.total.prompt_tokens > 0, "context estimated");
+        assert!(all_time.total.completion_tokens > 0, "answer estimated");
+        assert_eq!(today.requests, 1);
     }
 
     #[tokio::test]
@@ -3691,6 +3895,7 @@ mod tests {
             chat_output_factory: Arc::new(FailingReactionFactory { output: Arc::clone(&output) })
                 as Arc<dyn ChatOutputFactoryPort>,
             guild_storage: Some(ctx.storage.guild_scoped("test", GuildId(1))),
+            plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
 

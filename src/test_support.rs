@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -17,13 +18,140 @@ use crate::kernel::{
     },
     spi_ports::{
         ChatOutputFactoryPort, ChatOutputPort, ChatTypingGuard, GUILD_SETTINGS, GuildStorage,
-        PlatformInfoPort, StoragePort, StoredRecord,
+        PlatformInfoPort, PluginStorage, PluginStoragePort, StoragePort, StoredRecord,
     },
 };
 
 /// Slug of the test platform - what [`TestPlatformInfo`] serves and what
 /// test fixtures namespace their storage rows under.
 pub const TEST_PLATFORM_SLUG: &str = "test";
+
+/// In-memory [`PluginStoragePort`] - the plugin-global document store fake.
+/// Mirrors the real adapter's shape (platform-partitioned rows) without any
+/// guild dimension.
+#[derive(Default)]
+pub struct InMemoryPluginStorage {
+    documents: Arc<Mutex<HashMap<(String, String, String), Value>>>,
+}
+
+impl InMemoryPluginStorage {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seeds a document directly (test arrangement without going through
+    /// the port).
+    pub fn seed(&self, platform: &str, namespace: &str, key: &str, value: Value) {
+        self.documents
+            .lock()
+            .insert((platform.to_owned(), namespace.to_owned(), key.to_owned()), value);
+    }
+
+    /// Every stored row as `(namespace, key, value)`, ordered - assertions
+    /// read what a plugin flushed.
+    #[must_use]
+    pub fn rows(&self, platform: &str) -> Vec<(String, String, Value)> {
+        let mut rows: Vec<(String, String, Value)> = self
+            .documents
+            .lock()
+            .iter()
+            .filter(|((row_platform, _, _), _)| row_platform.as_str() == platform)
+            .map(|((_, namespace, key), value)| (namespace.clone(), key.clone(), value.clone()))
+            .collect();
+        rows.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+        rows
+    }
+}
+
+impl PluginStoragePort for InMemoryPluginStorage {
+    fn plugin_scoped(&self, platform: &str) -> Arc<dyn PluginStorage> {
+        Arc::new(ScopedPluginView {
+            platform: platform.to_owned(),
+            documents: Arc::clone(&self.documents),
+        })
+    }
+}
+
+struct ScopedPluginView {
+    platform: String,
+    documents: Arc<Mutex<HashMap<(String, String, String), Value>>>,
+}
+
+#[async_trait]
+impl PluginStorage for ScopedPluginView {
+    async fn get(&self, namespace: &str, key: &str) -> Result<Option<Value>, StorageError> {
+        Ok(self
+            .documents
+            .lock()
+            .get(&(self.platform.clone(), namespace.to_owned(), key.to_owned()))
+            .cloned())
+    }
+
+    async fn set(&self, namespace: &str, key: &str, value: Value) -> Result<(), StorageError> {
+        self.documents
+            .lock()
+            .insert((self.platform.clone(), namespace.to_owned(), key.to_owned()), value);
+        Ok(())
+    }
+
+    async fn delete(&self, namespace: &str, key: &str) -> Result<(), StorageError> {
+        self.documents.lock().remove(&(
+            self.platform.clone(),
+            namespace.to_owned(),
+            key.to_owned(),
+        ));
+        Ok(())
+    }
+
+    async fn list_keys(&self, namespace: &str) -> Result<Vec<String>, StorageError> {
+        let mut keys: Vec<String> = self
+            .documents
+            .lock()
+            .iter()
+            .filter(|((_, row_namespace, _), _)| row_namespace == namespace)
+            .map(|((_, _, key), _)| key.clone())
+            .collect();
+        keys.sort();
+        Ok(keys)
+    }
+}
+
+/// Fresh plugin-global storage fake for one fixture - every call gets its
+/// own empty store, mirroring [`InMemoryStorage::new`] per-test isolation.
+#[must_use]
+pub fn test_plugin_storage() -> Arc<dyn PluginStorage> {
+    let storage = InMemoryPluginStorage::new();
+    storage.plugin_scoped(TEST_PLATFORM_SLUG)
+}
+
+/// [`SchedulerPort`] that never runs jobs: lifecycle tests need the
+/// schedule/cancel contract, not execution. Records what was scheduled so
+/// tests can assert the registration.
+pub struct NeverScheduler {
+    scheduled: Mutex<Vec<(String, Duration)>>,
+}
+
+impl NeverScheduler {
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self { scheduled: Mutex::new(Vec::new()) })
+    }
+
+    /// Every `(name, interval)` pair passed to [`SchedulerPort::schedule`],
+    /// in call order.
+    #[must_use]
+    pub fn scheduled(&self) -> Vec<(String, Duration)> {
+        self.scheduled.lock().clone()
+    }
+}
+
+impl SchedulerPort for NeverScheduler {
+    fn schedule(&self, name: &str, interval: Duration, _job: Arc<dyn Job>) -> JobHandle {
+        self.scheduled.lock().push((name.to_owned(), interval));
+        JobHandle::new(Arc::new(|| {}))
+    }
+}
 
 /// [`PlatformInfoPort`] for tests: identity is just a constant, exactly as
 /// an adapter would declare it.

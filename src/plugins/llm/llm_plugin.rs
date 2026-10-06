@@ -12,8 +12,8 @@ use crate::common::panic_message;
 use crate::kernel::{
     models::{EventKind, EventPayload, MessagePayload, Origin, PluginError, RequestContext},
     plugin_ports::{
-        AccessTier, ArgDescriptor, ArgKind, CommandDescriptor, CommandRegistryPort,
-        MiddlewarePluginPort, Next, PluginPort,
+        AccessTier, ArgDescriptor, ArgKind, CommandDescriptor, CommandHandler, CommandRegistryPort,
+        Job, JobHandle, MiddlewarePluginPort, Next, PluginPort, SchedulerPort,
     },
     services::KernelServices,
 };
@@ -22,7 +22,7 @@ use super::chat_engine::ChatEngine;
 use super::commands::{
     AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler, CutoffLlmHandler,
     DumpLlmHandler, GetLlmHandler, ModelsLlmHandler, SET_KEYS, SetLlmHandler, SetPromptLlmHandler,
-    StatusLlmHandler, UnassignLlmHandler, model_choices,
+    StatusLlmHandler, UnassignLlmHandler, UsageLlmHandler, model_choices,
 };
 use super::conversation::{ConversationRecord, RecordRole};
 use super::model::{
@@ -30,6 +30,7 @@ use super::model::{
     records_namespace,
 };
 use super::model::{ChannelKey, channel_key};
+use super::usage_total::{FLUSH_INTERVAL_SECS, UsageTracker};
 
 /// Whole-request timeout for prompt-file downloads from the Discord CDN -
 /// deliberately shorter than provider timeouts: the fetch is interactive
@@ -108,6 +109,10 @@ pub struct LlmPlugin {
     /// Admission permits bounding outstanding engine runs per channel (the
     /// flood valve - see [`MAX_PENDING_RUNS_PER_CHANNEL`]).
     channel_permits: Arc<ChannelPermits>,
+    /// The usage-totals flush job, scheduled in `start`, cancelled in
+    /// `stop` (same lifecycle as the status rotator's job).
+    scheduler: Arc<dyn SchedulerPort>,
+    flush_job: Mutex<Option<JobHandle>>,
     /// Cancelled in `stop`: afterwards no new engine runs are admitted (the
     /// kernel stops plugins during shutdown). In-flight runs finish
     /// naturally while the process lives - they are bounded by the permits;
@@ -119,6 +124,21 @@ pub struct LlmPlugin {
     prompt_fetch: reqwest::Client,
 }
 
+/// The scheduler unit behind the usage totals: flush dirty views to the
+/// plugin-global store. A panicking flush is contained by the scheduler
+/// (same policy as every job); a failed flush keeps the dirty flags and
+/// retries next tick.
+struct UsageFlushJob {
+    tracker: Arc<UsageTracker>,
+}
+
+#[async_trait]
+impl Job for UsageFlushJob {
+    async fn run(&self) {
+        self.tracker.flush().await;
+    }
+}
+
 impl LlmPlugin {
     /// Builds the plugin with its prompt-file download client.
     ///
@@ -126,7 +146,11 @@ impl LlmPlugin {
     /// Only if reqwest cannot build a client from purely static settings
     /// (TLS backend unavailable) - a process-level defect, not config.
     #[must_use]
-    pub fn new(registry: Arc<dyn CommandRegistryPort>, engine: Arc<ChatEngine>) -> Self {
+    pub fn new(
+        registry: Arc<dyn CommandRegistryPort>,
+        engine: Arc<ChatEngine>,
+        scheduler: Arc<dyn SchedulerPort>,
+    ) -> Self {
         let prompt_fetch = reqwest::Client::builder()
             // Same trust boundary as vision downloads: the CDN host is
             // prefix-checked per request - redirects must not carry the
@@ -140,6 +164,8 @@ impl LlmPlugin {
             engine,
             channel_locks: ChannelLocks::new(),
             channel_permits: ChannelPermits::new(),
+            scheduler,
+            flush_job: Mutex::new(None),
             shutdown: CancellationToken::new(),
             prompt_fetch,
         }
@@ -387,6 +413,15 @@ impl PluginPort for LlmPlugin {
         );
         self.registry.register(
             self.descriptor(
+                "llm_usage",
+                "Show this server's LLM token usage: all-time totals and today, per model",
+                Vec::new(),
+                AccessTier::Moderator,
+            ),
+            Arc::new(UsageLlmHandler::new(Arc::clone(&self.engine))),
+        );
+        self.registry.register(
+            self.descriptor(
                 "llm_set",
                 "Change a channel chat setting (model, images, reasoning, sampling, reactions)",
                 vec![
@@ -442,11 +477,42 @@ impl PluginPort for LlmPlugin {
         Ok(())
     }
 
+    /// Schedules the usage-totals flush. The job name is the plugin's own -
+    /// log attribution only. First run is immediate per the scheduler
+    /// contract: harmless, the tracker is empty and the flush refuses to
+    /// run before its lazy seed succeeds.
+    fn start(&self) -> Result<(), PluginError> {
+        let mut job = self.flush_job.lock();
+        if job.is_none() {
+            *job = Some(self.scheduler.schedule(
+                self.name(),
+                Duration::from_secs(FLUSH_INTERVAL_SECS),
+                Arc::new(UsageFlushJob { tracker: self.engine.usage() }),
+            ));
+        }
+        Ok(())
+    }
+
     fn stop(&self) -> Result<(), PluginError> {
         // Shutdown gate: the kernel stops plugins while the gateway is
         // already tearing down - admit no new engine runs from here on.
         // Runs already admitted finish naturally (bounded by the permits).
         self.shutdown.cancel();
+        if let Some(handle) = self.flush_job.lock().take() {
+            handle.cancel();
+        }
+        // Best-effort final flush so a graceful restart loses nothing
+        // beyond the last 60s tick. `stop` is sync and the runtime is
+        // already winding down - the spawn races process exit, hence only
+        // "best effort"; the persisted totals stay approximate by design.
+        // A runtime context is required to spawn - without one (a sync
+        // teardown path), the tick cadence already bounded the loss.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let tracker = self.engine.usage();
+            tokio::spawn(async move {
+                let _timeout = tokio::time::timeout(Duration::from_secs(3), tracker.flush()).await;
+            });
+        }
         Ok(())
     }
 }
@@ -632,7 +698,12 @@ mod tests {
 
     #[async_trait]
     impl ImageDescriber for FakeDescriber {
-        async fn describe(&self, _job: &ImageJob, images: Vec<ImageSource>) -> Vec<Option<String>> {
+        async fn describe(
+            &self,
+            _job: &ImageJob,
+            images: Vec<ImageSource>,
+            _usage: Option<crate::plugins::llm::vision::UsageSink<'_>>,
+        ) -> Vec<Option<String>> {
             images.iter().map(|_| None).collect()
         }
     }
@@ -712,6 +783,7 @@ mod tests {
         services: KernelServices,
         output: Arc<RecordingChatOutput>,
         engine: Arc<ChatEngine>,
+        scheduler: Arc<crate::test_support::NeverScheduler>,
     }
 
     fn fixture() -> (LlmPlugin, Fixture) {
@@ -722,6 +794,7 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
+            plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
         let mut settings = LlmSettings::default();
@@ -734,12 +807,15 @@ mod tests {
             Arc::new(RandRandom) as Arc<dyn RandomPort>,
             Arc::new(FakeDescriber) as Arc<dyn ImageDescriber>,
             crate::test_support::test_platform_info(),
+            crate::test_support::test_plugin_storage(),
         ));
+        let scheduler = crate::test_support::NeverScheduler::new();
         let plugin = LlmPlugin::new(
             Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
             Arc::clone(&engine),
+            Arc::clone(&scheduler) as Arc<dyn SchedulerPort>,
         );
-        (plugin, Fixture { registry, storage, services, output, engine })
+        (plugin, Fixture { registry, storage, services, output, engine, scheduler })
     }
 
     fn dm_services(output: &Arc<RecordingChatOutput>) -> KernelServices {
@@ -747,6 +823,7 @@ mod tests {
             chat_output: Arc::clone(output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(output)).boxed(),
             guild_storage: None,
+            plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         }
     }
@@ -773,7 +850,8 @@ mod tests {
                 "llm_set",
                 "llm_set_prompt",
                 "llm_status",
-                "llm_unassign"
+                "llm_unassign",
+                "llm_usage"
             ]
         );
         for descriptor in fixture.registry.descriptors() {
@@ -837,6 +915,70 @@ mod tests {
         assert!(reply.contains("`react`: off"), "unexpected: {reply}");
         assert!(reply.contains("`model`: local/gemma"), "unexpected: {reply}");
         assert!(reply.contains("plugin default"), "unexpected: {reply}");
+    }
+
+    /// `/llm_usage`: this server's numbers only - the other guild's usage
+    /// must not appear anywhere in the reply.
+    #[tokio::test]
+    async fn usage_lists_this_guilds_totals_only() {
+        use crate::plugins::llm::usage_total::Sample;
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        let usage = crate::plugins::llm::completion_port::TokenUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 100,
+            total_tokens: 1100,
+            cached_tokens: None,
+            reasoning_tokens: None,
+        };
+        fixture.engine.usage().record("zai/glm", Some(1), Sample::reported(&usage));
+        // Another guild's spend must never leak into guild 1's reply.
+        fixture.engine.usage().record("zai/glm", Some(2), Sample::reported(&usage));
+
+        UsageLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("usage expected to succeed");
+
+        let reply = fixture.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("All time"), "totals expected: {reply}");
+        assert!(reply.contains("Today"), "today bucket expected: {reply}");
+        assert!(reply.contains("zai/glm"), "per-model breakdown expected: {reply}");
+        assert!(reply.contains("1,000"), "grouped tokens expected: {reply}");
+        assert!(!reply.contains("2,000"), "global totals leaked: {reply}");
+        assert!(!reply.contains("200 "), "cross-guild completion leaked: {reply}");
+    }
+
+    /// `/llm_usage` outside a server: the standard ephemeral guard.
+    #[tokio::test]
+    async fn usage_outside_a_server_declines() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+
+        UsageLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(&command_event(None), &CommandArgs::default(), &dm_services(&fixture.output))
+            .await
+            .expect("usage expected to succeed");
+
+        let reply = fixture.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("only works inside a server"), "guard expected: {reply}");
+    }
+
+    /// The usage flush is a scheduled job: registered once in `start` with
+    /// the flush interval, cancelled in `stop` (never double-cancelled).
+    #[test]
+    fn start_schedules_the_usage_flush_and_stop_cancels_it() {
+        let (plugin, fixture) = fixture();
+        assert!(fixture.scheduler.scheduled().is_empty(), "nothing before start");
+
+        plugin.start().expect("start expected to succeed");
+        plugin.start().expect("second start expected to succeed");
+        assert_eq!(fixture.scheduler.scheduled().len(), 1, "start is idempotent");
+        let (name, interval) = fixture.scheduler.scheduled().first().expect("job expected").clone();
+        assert_eq!(name, "llm");
+        assert_eq!(interval, Duration::from_secs(super::super::usage_total::FLUSH_INTERVAL_SECS));
+
+        plugin.stop().expect("stop expected to succeed");
     }
 
     /// `/llm_dump`: every key at once, `key = value` inside a three-backtick
@@ -1285,6 +1427,7 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
+            plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
         let engine = Arc::new(ChatEngine::new(
@@ -1293,10 +1436,13 @@ mod tests {
             Arc::new(RandRandom) as Arc<dyn RandomPort>,
             Arc::new(FakeDescriber) as Arc<dyn ImageDescriber>,
             crate::test_support::test_platform_info(),
+            crate::test_support::test_plugin_storage(),
         ));
+        let scheduler = crate::test_support::NeverScheduler::new();
         let plugin = LlmPlugin::new(
             Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
             Arc::clone(&engine),
+            scheduler,
         );
         plugin.init().expect("init expected to succeed");
         seed_config_in(&storage);
@@ -1332,6 +1478,7 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
+            plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
         let engine = Arc::new(ChatEngine::new(
@@ -1340,10 +1487,13 @@ mod tests {
             Arc::new(RandRandom) as Arc<dyn RandomPort>,
             Arc::new(FakeDescriber) as Arc<dyn ImageDescriber>,
             crate::test_support::test_platform_info(),
+            crate::test_support::test_plugin_storage(),
         ));
+        let scheduler = crate::test_support::NeverScheduler::new();
         let plugin = LlmPlugin::new(
             Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
             Arc::clone(&engine),
+            scheduler,
         );
         plugin.init().expect("init expected to succeed");
         seed_config_in(&storage);
@@ -1466,6 +1616,7 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: Some(FailingStorage.guild_scoped("test", GuildId(1))),
+            plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
 

@@ -15,7 +15,9 @@ use crate::kernel::{
     models::{GuildId, Origin, PluginError, RequestContext},
     plugin_ports::{EventBusPort, MiddlewarePluginPort, Next, PluginPort},
     services::KernelServices,
-    spi_ports::{ChatOutputFactoryPort, PlatformInfoPort, StoragePort},
+    spi_ports::{
+        ChatOutputFactoryPort, PlatformInfoPort, PluginStorage, PluginStoragePort, StoragePort,
+    },
 };
 
 /// The kernel: assembles the middleware chain and runs it, but never knows
@@ -31,6 +33,10 @@ pub struct KernelService<E: EventBusPort> {
     event_bus: E,
     chat_output_factory: Arc<dyn ChatOutputFactoryPort>,
     storage: Arc<dyn StoragePort>,
+    /// Plugin-global document store, pre-bound to the deployment's platform
+    /// slug at construction - the same instance every event's service
+    /// context shares (aggregates only, never user content).
+    plugin_storage: Arc<dyn PluginStorage>,
     /// The deployment's platform identity (adapter-owned values), stamped
     /// into every event's service context and storage binding.
     platform_info: Arc<dyn PlatformInfoPort>,
@@ -57,6 +63,7 @@ impl<E: EventBusPort> KernelService<E> {
         event_bus: E,
         chat_output_factory: Arc<dyn ChatOutputFactoryPort>,
         storage: Arc<dyn StoragePort>,
+        plugin_storage: Arc<dyn PluginStoragePort>,
         platform_info: Arc<dyn PlatformInfoPort>,
     ) -> Self {
         Self {
@@ -65,6 +72,7 @@ impl<E: EventBusPort> KernelService<E> {
             event_bus,
             chat_output_factory,
             storage,
+            plugin_storage: plugin_storage.plugin_scoped(platform_info.slug()),
             platform_info,
             shutdown_started: AtomicBool::new(false),
             boot_started: AtomicBool::new(false),
@@ -244,6 +252,7 @@ impl<E: EventBusPort> KernelService<E> {
             guild_storage: origin
                 .guild_id
                 .map(|guild_id| self.storage.guild_scoped(self.platform_info.slug(), guild_id)),
+            plugin_storage: Arc::clone(&self.plugin_storage),
             platform_info: Arc::clone(&self.platform_info),
         }
     }
@@ -633,6 +642,8 @@ mod tests {
             .event_bus(TestEventBus)
             .chat_output_factory(RecordingChatOutputFactory::new(Arc::clone(&output)).boxed())
             .storage(storage)
+            .plugin_storage(Arc::new(crate::test_support::InMemoryPluginStorage::new())
+                as Arc<dyn PluginStoragePort>)
             .platform_info(crate::test_support::test_platform_info())
             .build();
         (kernel, output)

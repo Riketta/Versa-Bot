@@ -147,6 +147,7 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: None,
+            plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: test_platform_info(),
         }
     }

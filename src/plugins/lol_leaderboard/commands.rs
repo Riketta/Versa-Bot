@@ -110,6 +110,7 @@ mod tests {
             chat_output: output.clone(),
             chat_output_factory: factory.clone(),
             guild_storage: None,
+            plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         }
     }

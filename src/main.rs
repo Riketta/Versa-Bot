@@ -22,7 +22,7 @@ use versa_bot::kernel::{
     services::KernelService,
     spi_ports::{
         ChatOutputFactoryPort, ConfigChangeHandler, ConfigPort, NicknamePort, PlatformInfoPort,
-        PresencePort, StoragePort,
+        PluginStoragePort, PresencePort, StoragePort,
     },
 };
 use versa_bot::plugins::audit::AuditLogPlugin;
@@ -149,21 +149,32 @@ async fn main() -> ExitCode {
     // recognition service (same adapter, per the cardinality rule).
     let llm_completion = Arc::new(llm_adapter) as Arc<dyn LlmCompletionPort>;
     let llm_describer = Arc::new(VisionService::new(Arc::clone(&llm_completion)));
+    // Plugin-global storage for the usage totals: the same backend, bound
+    // to the deployment slug once (the kernel's context shares the same
+    // instance for event-scoped access).
+    let llm_usage_storage = Arc::clone(&storage) as Arc<dyn PluginStoragePort>;
     let llm_engine = Arc::new(ChatEngine::new(
         llm_settings,
         Arc::clone(&llm_completion),
         Arc::new(DeckRandom::new()) as Arc<dyn RandomPort>,
         llm_describer as Arc<dyn ImageDescriber>,
         Arc::clone(&platform_info),
+        llm_usage_storage.plugin_scoped(platform_info.slug()),
     ));
-    let llm =
-        Arc::new(LlmPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>, llm_engine));
+
+    // Kernel scheduling service + presence: the status rotator's and the
+    // LLM usage flush's drives.
+    let scheduler = Arc::new(TokioScheduler::new());
+    let llm = Arc::new(LlmPlugin::new(
+        Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
+        llm_engine,
+        Arc::clone(&scheduler) as Arc<dyn SchedulerPort>,
+    ));
     // Bus-only plugin: in `plugins` for lifecycle, never in the middleware
     // chain - it reacts to derived events, not to raw inbound ones.
     let audit = Arc::new(AuditLogPlugin::new(event_bus.clone()));
 
     // Kernel scheduling service + presence: the status rotator's drives.
-    let scheduler = Arc::new(TokioScheduler::new());
     let (presence, gateway_context) = SerenityPresence::new();
     let presence = Arc::new(presence);
 
@@ -276,6 +287,7 @@ async fn main() -> ExitCode {
             .event_bus(event_bus)
             .chat_output_factory(Arc::clone(&chat_factory))
             .storage(Arc::clone(&storage) as Arc<dyn StoragePort>)
+            .plugin_storage(Arc::clone(&storage) as Arc<dyn PluginStoragePort>)
             .platform_info(Arc::clone(&platform_info))
             .build(),
     );

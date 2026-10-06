@@ -796,6 +796,7 @@ plugin](#authorization-auth-plugin)).
 | `/llm_dump` | moderator | dump every setting at once in one copy-pasteable code fence (`key = value`, effective values); lines that differ from a fresh `/llm_assign` carry a `*` marker; prompts are not dumped at all - only set-or-not and size, the text is one argument-free `/llm_set_prompt kind` away |
 | `/llm_cutoff` | moderator | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
 | `/llm_status` | user | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, compaction, image recognition (state, model, prompt length), reactions (state, silent-react chance), capture mode, chime-in chance, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
+| `/llm_usage` | moderator | this server's LLM token usage: all-time totals (per model) and today's aggregate - chat answers, silent-react chimes, compaction and image recognition all count; global totals are deliberately not served to clients, they live in the operator logs and the `plugin_documents` table |
 | `/llm_admin` | moderator | make this channel the guild's service channel for error notices (one per guild, last write wins) |
 | `/llm_admin_clear` | moderator | stop service notices |
 
@@ -830,6 +831,33 @@ uploaded files for long texts.
 | `random_react_chance` | 0-100 (clamped) | 10 | percent chance for a silent react (emoji only, no reply) on a captured non-trigger message; independent of `random_chance`; needs `react` on |
 | `max_length` | 1 up to the platform's message limit | `max_message_length` | per-channel reply-splitting limit |
 | `turn_template` | template containing `{sender}` and `{message}` | `[{sender}](<@{user_id}>): {message}` | how user turns render into the model context; fields: `{sender}`, `{user_id}`, `{guild_name}`, `{time}` (unix), `{message}` |
+
+**Token usage tracking.** Every LLM call counts toward plugin-global
+totals: chat answers, silent-react chimes, compaction summaries and image
+recognition alike. Endpoint-reported numbers are used as-is; a completion
+without a usage report is estimated from the channel's calibrated
+tokens-per-character ratio (vision calls, whose token cost is dominated by
+image bytes, count as requests only) - the totals are approximate by
+contract, and the per-completion info log lines state which side they used
+(`usage_source = reported` or `estimated`). `/llm_usage` shows a server its
+own totals; global numbers and cross-guild rankings are operator
+information - never a command. The data lives in the storage backend's
+`plugin_documents` table (one row per document) and is written for exactly
+this external use - point a script or dashboard at it:
+
+- `llm` / `usage_model_totals` - all-time totals per model,
+- `llm` / `usage_guild_totals:<guild_id>` - all-time totals per model within one guild,
+- `llm` / `usage_daily:<YYYY-MM-DD>` - one UTC day's entries (`dim` `model`
+  is deployment-wide, `guild` is a per-guild aggregate).
+
+Each document is `{"day": "<date, daily docs only>", "entries": [...]}`
+with one flat row per view:
+`{"dim": "model"|"guild", "key": "<model or guild id>", "requests",
+"prompt_tokens", "completion_tokens", "cached_tokens", "reasoning_tokens"}`.
+Cached and reasoning tokens are breakdowns the endpoint reported (cached is
+a subset of prompt, never additive). Values are flushed to storage every 60
+seconds when dirty and on graceful shutdown, so a crash loses at most one
+interval - past days are finalized and never rewritten.
 
 **Delivery.** The bot holds the channel's typing indicator from the
 moment a triggered run is accepted - through any wait for a previous

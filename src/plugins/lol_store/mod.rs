@@ -578,6 +578,7 @@ mod tests {
             chat_output: output.clone() as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: guilded.then(|| storage.guild_scoped("test", GuildId(42))),
+            plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
         let event = crate::kernel::models::RequestContext {

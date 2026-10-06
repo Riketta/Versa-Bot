@@ -427,6 +427,7 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn crate::kernel::spi_ports::ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
+            plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
         (services, output)
@@ -705,6 +706,7 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn crate::kernel::spi_ports::ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
             guild_storage: None,
+            plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
         let plugin = test_plugin(&[]);
@@ -734,6 +736,7 @@ mod tests {
             guild_storage: Some(
                 crate::test_support::FailingStorage.guild_scoped("test", GuildId(1)),
             ),
+            plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
         let plugin = test_plugin(&[]);

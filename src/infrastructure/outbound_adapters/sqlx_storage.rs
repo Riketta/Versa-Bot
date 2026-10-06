@@ -11,7 +11,9 @@ use sqlx::{SqlSafeStr, sqlite::SqlitePool};
 
 use crate::kernel::{
     models::{GuildId, StorageError},
-    spi_ports::{GUILD_SETTINGS, GuildStorage, StoragePort, StoredRecord},
+    spi_ports::{
+        GUILD_SETTINGS, GuildStorage, PluginStorage, PluginStoragePort, StoragePort, StoredRecord,
+    },
 };
 
 /// Connection to one of the supported engines. Kept as an explicit enum
@@ -35,6 +37,11 @@ fn embedded_migrations() -> Vec<Migration> {
             include_str!("../../../migrations/0001_guild_documents.sql"),
         ),
         migration(2, "guild_records", include_str!("../../../migrations/0002_guild_records.sql")),
+        migration(
+            3,
+            "plugin_documents",
+            include_str!("../../../migrations/0003_plugin_documents.sql"),
+        ),
     ]
 }
 
@@ -149,6 +156,134 @@ impl StoragePort for SqlxStorage {
                 Some((platform, GuildId(guild_id)))
             })
             .collect())
+    }
+}
+
+#[async_trait]
+impl PluginStoragePort for SqlxStorage {
+    fn plugin_scoped(&self, platform: &str) -> Arc<dyn PluginStorage> {
+        Arc::new(ScopedPluginStorage { db: Arc::clone(&self.db), platform: platform.to_owned() })
+    }
+}
+
+/// Plugin-global documents of one deployment (see [`PluginStoragePort`]).
+/// Same shape as the guild documents minus the guild dimension - rows exist
+/// per `(platform, namespace, key)`.
+struct ScopedPluginStorage {
+    db: Arc<Db>,
+    platform: String,
+}
+
+#[async_trait]
+impl PluginStorage for ScopedPluginStorage {
+    async fn get(&self, namespace: &str, key: &str) -> Result<Option<Value>, StorageError> {
+        let raw: Option<String> = match &*self.db {
+            Db::Sqlite(pool) => {
+                sqlx::query_scalar(
+                    "SELECT value FROM plugin_documents WHERE platform = ? AND namespace = ? AND key = ?",
+                )
+                .bind(&self.platform)
+                .bind(namespace)
+                .bind(key)
+                .fetch_optional(pool)
+                .await
+            }
+            Db::Postgres(pool) => {
+                sqlx::query_scalar(
+                    "SELECT value FROM plugin_documents WHERE platform = $1 AND namespace = $2 AND key = $3",
+                )
+                .bind(&self.platform)
+                .bind(namespace)
+                .bind(key)
+                .fetch_optional(pool)
+                .await
+            }
+        }
+        .map_err(|err| StorageError::Database(err.to_string()))?;
+        Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()))
+    }
+
+    async fn set(&self, namespace: &str, key: &str, value: Value) -> Result<(), StorageError> {
+        let raw = serde_json::to_string(&value)
+            .map_err(|err| StorageError::Serialization(err.to_string()))?;
+        match &*self.db {
+            Db::Sqlite(pool) => sqlx::query(
+                "INSERT INTO plugin_documents (platform, namespace, key, value) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT (platform, namespace, key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(&self.platform)
+            .bind(namespace)
+            .bind(key)
+            .bind(raw)
+            .execute(pool)
+            .await
+            .map(|_| ()),
+            Db::Postgres(pool) => sqlx::query(
+                "INSERT INTO plugin_documents (platform, namespace, key, value) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (platform, namespace, key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(&self.platform)
+            .bind(namespace)
+            .bind(key)
+            .bind(raw)
+            .execute(pool)
+            .await
+            .map(|_| ()),
+        }
+        .map_err(|err| StorageError::Database(err.to_string()))
+    }
+
+    async fn delete(&self, namespace: &str, key: &str) -> Result<(), StorageError> {
+        match &*self.db {
+            Db::Sqlite(pool) => sqlx::query(
+                "DELETE FROM plugin_documents WHERE platform = ? AND namespace = ? AND key = ?",
+            )
+            .bind(&self.platform)
+            .bind(namespace)
+            .bind(key)
+            .execute(pool)
+            .await
+            .map(|_| ()),
+            Db::Postgres(pool) => sqlx::query(
+                "DELETE FROM plugin_documents WHERE platform = $1 AND namespace = $2 AND key = $3",
+            )
+            .bind(&self.platform)
+            .bind(namespace)
+            .bind(key)
+            .execute(pool)
+            .await
+            .map(|_| ()),
+        }
+        .map_err(|err| StorageError::Database(err.to_string()))
+    }
+
+    async fn list_keys(&self, namespace: &str) -> Result<Vec<String>, StorageError> {
+        let keys: Vec<String> = match &*self.db {
+            Db::Sqlite(pool) => {
+                sqlx::query_scalar(
+                    "SELECT key FROM plugin_documents WHERE platform = ? AND namespace = ? \
+                     ORDER BY key",
+                )
+                .bind(&self.platform)
+                .bind(namespace)
+                .fetch_all(pool)
+                .await
+            }
+            Db::Postgres(pool) => {
+                sqlx::query_scalar(
+                    "SELECT key FROM plugin_documents WHERE platform = $1 AND namespace = $2 \
+                     ORDER BY key",
+                )
+                .bind(&self.platform)
+                .bind(namespace)
+                .fetch_all(pool)
+                .await
+            }
+        }
+        .map_err(|err| StorageError::Database(err.to_string()))?;
+        Ok(keys)
     }
 }
 
@@ -612,6 +747,38 @@ mod tests {
         assert_eq!(guild.list_keys("greeter").await.unwrap(), ["greeting"]);
     }
 
+    // --- plugin-global storage ----------------------------------------------
+
+    /// The plugin-global documents live in their own table: namespace
+    /// scoping within one deployment, platform scoping across deployments,
+    /// and no mixing with the guild-partitioned table.
+    #[tokio::test]
+    async fn plugin_documents_roundtrip_namespaced_and_platform_scoped() {
+        let storage = sqlite_storage().await;
+        let discord = storage.plugin_scoped("discord");
+        let other = storage.plugin_scoped("irc");
+
+        assert_eq!(discord.get("llm", "usage_model_totals").await.unwrap(), None);
+        discord.set("llm", "usage_model_totals", Value::from(7)).await.unwrap();
+        assert_eq!(discord.get("llm", "usage_model_totals").await.unwrap(), Some(Value::from(7)));
+        // Platform scoping: another deployment's rows are invisible.
+        assert_eq!(other.get("llm", "usage_model_totals").await.unwrap(), None);
+        other.set("llm", "usage_model_totals", Value::from(1)).await.unwrap();
+        assert_eq!(discord.list_keys("llm").await.unwrap(), ["usage_model_totals"]);
+        assert_eq!(other.list_keys("llm").await.unwrap(), ["usage_model_totals"]);
+        // Upsert replaces, never duplicates.
+        discord.set("llm", "usage_model_totals", Value::from(8)).await.unwrap();
+        assert_eq!(discord.list_keys("llm").await.unwrap(), ["usage_model_totals"]);
+        discord.delete("llm", "usage_model_totals").await.unwrap();
+        assert_eq!(discord.get("llm", "usage_model_totals").await.unwrap(), None);
+        assert_eq!(other.get("llm", "usage_model_totals").await.unwrap(), Some(Value::from(1)));
+        // Guild documents live in a different table - the two stores never
+        // mix, even under identical (namespace, key).
+        let guild = storage.guild_scoped("discord", GuildId(1));
+        guild.set("llm", "usage_model_totals", Value::from(99)).await.unwrap();
+        assert_eq!(discord.get("llm", "usage_model_totals").await.unwrap(), None);
+    }
+
     #[tokio::test]
     async fn records_append_in_order_with_increasing_seq() {
         let storage = sqlite_storage().await;
@@ -791,6 +958,33 @@ mod tests {
         // The reserved namespace is guarded on this dialect too.
         let forbidden = guild.set(GUILD_SETTINGS, "language", Value::String("en".to_owned())).await;
         assert!(matches!(forbidden, Err(StorageError::Forbidden(_))));
+    }
+
+    /// The `$n`-placeholder arms of the plugin-global document queries.
+    #[tokio::test]
+    async fn postgres_plugin_documents_roundtrip() {
+        let Some(storage) = optional_pg_storage().await else {
+            eprintln!("VERSABOT_TEST_PG_URL not set - skipping Postgres tests");
+            return;
+        };
+        let ns = unique_pg_namespace("plugin_docs");
+        let scoped = storage.plugin_scoped("discord");
+
+        assert_eq!(scoped.get(&ns, "k").await.unwrap(), None);
+        scoped.set(&ns, "k", Value::String("v1".to_owned())).await.unwrap();
+        scoped.set(&ns, "k", Value::String("v2".to_owned())).await.unwrap();
+        assert_eq!(scoped.get(&ns, "k").await.unwrap(), Some(Value::String("v2".to_owned())));
+        assert_eq!(scoped.list_keys(&ns).await.unwrap(), ["k"]);
+
+        // Platform scoping on this dialect too.
+        let other = storage.plugin_scoped("irc");
+        assert_eq!(other.get(&ns, "k").await.unwrap(), None);
+        other.set(&ns, "k", Value::String("other".to_owned())).await.unwrap();
+        assert_eq!(scoped.get(&ns, "k").await.unwrap(), Some(Value::String("v2".to_owned())));
+
+        scoped.delete(&ns, "k").await.unwrap();
+        assert_eq!(scoped.get(&ns, "k").await.unwrap(), None);
+        assert_eq!(scoped.list_keys(&ns).await.unwrap(), Vec::<String>::new());
     }
 
     /// The documented append contract (see `GuildStorage::append`): sequence

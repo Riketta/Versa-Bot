@@ -16,8 +16,11 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-use super::completion_port::{ChatMessage, ChatRole, CompletionRequest, LlmCompletionPort};
+use super::completion_port::{
+    ChatMessage, ChatRole, CompletionRequest, LlmCompletionPort, TokenUsage,
+};
 use super::model::GenParams;
+use super::usage_total::{Sample, UsageTracker};
 
 /// Built-in recognition prompt when the operator set no `[llm]
 /// image_prompt`.
@@ -62,12 +65,34 @@ pub struct ImageJob {
     pub max_source_bytes: u64,
 }
 
+/// Where one batch's usage lands: the engine's tracker plus the owning
+/// guild. `None` in tests and fakes - usage tracking is observability,
+/// never a description requirement.
+pub struct UsageSink<'a> {
+    tracker: &'a UsageTracker,
+    guild_id: Option<u64>,
+}
+
+impl<'a> UsageSink<'a> {
+    pub(crate) fn new(tracker: &'a UsageTracker, guild_id: Option<u64>) -> Self {
+        Self { tracker, guild_id }
+    }
+}
+
 /// Driven port: turn image sources into descriptions, in input order -
 /// `None` marks an undescribed image. Injections keep the engine's capture
-/// path testable without network or a vision endpoint.
+/// path testable without network or a vision endpoint. When a sink is
+/// given, every completion's usage is recorded into it (endpoint-reported;
+/// a completion without a usage report counts as a request only - image
+/// tokens have no honest character-based estimate).
 #[async_trait]
 pub trait ImageDescriber: Send + Sync {
-    async fn describe(&self, job: &ImageJob, images: Vec<ImageSource>) -> Vec<Option<String>>;
+    async fn describe(
+        &self,
+        job: &ImageJob,
+        images: Vec<ImageSource>,
+        usage: Option<UsageSink<'_>>,
+    ) -> Vec<Option<String>>;
 }
 
 /// Whether an attachment qualifies for recognition: image MIME types only
@@ -99,12 +124,16 @@ impl VisionService {
         Self { completion, fetch }
     }
 
-    async fn describe_one(&self, job: &ImageJob, image: &ImageSource) -> Option<String> {
+    async fn describe_one(
+        &self,
+        job: &ImageJob,
+        image: &ImageSource,
+    ) -> (Option<String>, Option<TokenUsage>) {
         match self.describe_one_inner(job, image).await {
-            Ok(description) => Some(description),
+            Ok((description, usage)) => (Some(description), usage),
             Err(err) => {
                 tracing::warn!(%err, "image recognition failed - recording undescribed");
-                None
+                (None, None)
             }
         }
     }
@@ -113,7 +142,7 @@ impl VisionService {
         &self,
         job: &ImageJob,
         image: &ImageSource,
-    ) -> Result<String, VisionError> {
+    ) -> Result<(String, Option<TokenUsage>), VisionError> {
         let bytes = self.download(image, job.max_source_bytes).await?;
         let jpeg = resize_to_jpeg(&bytes, job.max_side, job.jpeg_quality)?;
         let request = CompletionRequest {
@@ -134,7 +163,7 @@ impl VisionService {
             usage = ?response.usage,
             "image recognition completion finished"
         );
-        Ok(response.content.trim().to_owned())
+        Ok((response.content.trim().to_owned(), response.usage))
     }
 
     async fn download(
@@ -188,10 +217,23 @@ impl VisionService {
 
 #[async_trait]
 impl ImageDescriber for VisionService {
-    async fn describe(&self, job: &ImageJob, images: Vec<ImageSource>) -> Vec<Option<String>> {
+    async fn describe(
+        &self,
+        job: &ImageJob,
+        images: Vec<ImageSource>,
+        usage: Option<UsageSink<'_>>,
+    ) -> Vec<Option<String>> {
         let mut descriptions = Vec::with_capacity(images.len());
         for image in &images {
-            descriptions.push(self.describe_one(job, image).await);
+            let (description, reported) = self.describe_one(job, image).await;
+            if let Some(sink) = &usage {
+                // Endpoint numbers when reported; a request-only sample
+                // otherwise (image tokens cannot be estimated from chars).
+                let sample =
+                    reported.as_ref().map_or_else(Sample::unreported_request, Sample::reported);
+                sink.tracker.record(&job.model, sink.guild_id, sample);
+            }
+            descriptions.push(description);
         }
         descriptions
     }
@@ -328,6 +370,7 @@ mod tests {
                     content_type: Some("image/png".to_owned()),
                     ext: None,
                 }],
+                None,
             )
             .await;
 
@@ -470,6 +513,7 @@ mod tests {
                         ext: None,
                     },
                 ],
+                None,
             )
             .await;
 

@@ -25,6 +25,7 @@ use super::model::{
 };
 use super::prompts;
 use super::providers::{LlmSettings, ModelSettings};
+use super::usage_total::Dimension;
 use super::vision::DEFAULT_IMAGE_PROMPT;
 
 /// Recognized `/llm_set` keys, in display order. Doubles as the Discord
@@ -812,9 +813,86 @@ fn react_label(config: &ChannelConfig) -> String {
 /// percent plus the per-channel minimum interval, or `off` at zero chance.
 fn chime_label(chance: f64, cooldown_secs: u64) -> String {
     if chance > 0.0 {
-        format!("{chance:.1}% · {cooldown_secs}s cooldown")
+        format!("{chance:.1}% \u{b7} {cooldown_secs}s cooldown")
     } else {
         "off".to_owned()
+    }
+}
+
+/// Digit grouping for token counts (`1234567` -> `1,234,567`) - totals get
+/// large enough that raw digits are hard to read at a glance.
+fn grouped(count: u64) -> String {
+    let digits = count.to_string();
+    let groups: Vec<String> = digits
+        .as_bytes()
+        .rchunks(3)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect();
+    groups.into_iter().rev().collect::<Vec<_>>().join(",")
+}
+
+/// One rendered usage line: requests plus the prompt/completion split.
+fn usage_line(label: &str, total: &Dimension) -> String {
+    format!(
+        "{label}: {} requests, {} prompt / {} completion tokens",
+        grouped(total.requests),
+        grouped(total.prompt_tokens),
+        grouped(total.completion_tokens)
+    )
+}
+
+/// `/llm_usage`: this server's token usage - all-time totals (per model)
+/// and today's aggregate. Deliberately guild-scoped only: global totals and
+/// cross-guild rankings are operator information that lives in the logs and
+/// the plugin-global store, never in a client-visible command (guild data
+/// must not cross guild boundaries).
+pub(super) struct UsageLlmHandler {
+    engine: Arc<ChatEngine>,
+}
+
+impl UsageLlmHandler {
+    pub(super) fn new(engine: Arc<ChatEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+#[async_trait]
+impl CommandHandler for UsageLlmHandler {
+    async fn invoke(
+        &self,
+        event: &RequestContext,
+        _args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
+        let Some(guild_id) = event.origin.guild_id else {
+            services
+                .chat_output
+                .send(command_reply("This command only works inside a server."))
+                .await?;
+            return Ok(());
+        };
+        // The snapshot seeds lazily, so a fresh process still serves the
+        // stored history.
+        let (all_time, today) = self.engine.usage().guild_snapshot(guild_id.get()).await;
+        let text = if all_time.total.requests == 0 {
+            "No LLM usage recorded for this server yet.".to_owned()
+        } else {
+            let mut lines = vec![
+                "**LLM usage for this server**".to_owned(),
+                usage_line("All time", &all_time.total),
+                usage_line("Today", &today),
+            ];
+            if !all_time.models.is_empty() {
+                lines.push(String::new());
+                lines.push("By model (all time):".to_owned());
+                for (model, total) in &all_time.models {
+                    lines.push(format!("- `{model}` \u{b7} {}", usage_line("", total).trim_start()))
+                }
+            }
+            lines.join("\n")
+        };
+        services.chat_output.send(command_reply(text)).await?;
+        Ok(())
     }
 }
 

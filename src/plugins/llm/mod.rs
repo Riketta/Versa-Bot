@@ -14,6 +14,7 @@ mod prompts;
 mod providers;
 mod rng;
 mod tools;
+mod usage_total;
 mod vision;
 
 pub use chat_engine::ChatEngine;
@@ -33,4 +34,4 @@ pub use providers::{
     SummaryPlacement,
 };
 pub use rng::{DeckRandom, RandRandom, RandomPort, RandomScope};
-pub use vision::{ImageDescriber, ImageJob, ImageSource, VisionService};
+pub use vision::{ImageDescriber, ImageJob, ImageSource, UsageSink, VisionService};
