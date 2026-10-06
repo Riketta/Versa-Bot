@@ -814,7 +814,8 @@ plugin](#authorization-auth-plugin)).
 | `/llm_dump` | moderator | dump every setting at once in one copy-pasteable code fence (`key = value`, effective values); lines that differ from a fresh `/llm_assign` carry a `*` marker; prompts are not dumped at all - only set-or-not and size, the text is one argument-free `/llm_set_prompt kind` away |
 | `/llm_cutoff` | moderator | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
 | `/llm_status` | user | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, compaction, image recognition (state, model, prompt length), reactions (state, silent-react chance), capture mode, chime-in chance, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
-| `/llm_usage` | moderator | this server's LLM token usage: all-time totals (per model) and today's aggregate - chat answers, silent-react chimes, compaction and image recognition all count; global totals are deliberately not served to clients, they live in the operator logs and the `plugin_documents` table |
+| `/llm_usage` | moderator | this server's LLM token usage: all-time totals (per model) and today's aggregate - chat answers, silent-react chimes, compaction and image recognition all count |
+| `/llm_usage_global` | owner | global LLM token usage across all servers: all-time totals, today, per model and per server (ranked, capped) - the reply is ephemeral, so cross-guild numbers stay between the bot and the invoking owner |
 | `/llm_admin` | moderator | make this channel the guild's service channel for error notices (one per guild, last write wins) |
 | `/llm_admin_clear` | moderator | stop service notices |
 
@@ -858,8 +859,10 @@ tokens-per-character ratio (vision calls, whose token cost is dominated by
 image bytes, count as requests only) - the totals are approximate by
 contract, and the per-answer and compaction log lines state which side they
 used (`usage_source = reported` or `estimated`). `/llm_usage` shows a
-server its own totals; global numbers and cross-guild rankings are operator
-information - never a command. The data lives in the storage backend's
+server its own totals; `/llm_usage_global` is the one cross-guild surface -
+owner-tier (bot owners are config-injected, never guild-assignable) and
+ephemeral, so the numbers still never reach a guild-visible channel. The
+data lives in the storage backend's
 `plugin_documents` table (one row per document) and is written for exactly
 this external use - point a script or dashboard at it:
 

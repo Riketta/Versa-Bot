@@ -21,8 +21,9 @@ use crate::kernel::{
 use super::chat_engine::ChatEngine;
 use super::commands::{
     AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler, CutoffLlmHandler,
-    DumpLlmHandler, GetLlmHandler, ModelsLlmHandler, SET_KEYS, SetLlmHandler, SetPromptLlmHandler,
-    StatusLlmHandler, UnassignLlmHandler, UsageLlmHandler, model_choices,
+    DumpLlmHandler, GetLlmHandler, GlobalUsageLlmHandler, ModelsLlmHandler, SET_KEYS,
+    SetLlmHandler, SetPromptLlmHandler, StatusLlmHandler, UnassignLlmHandler, UsageLlmHandler,
+    model_choices,
 };
 use super::conversation::{ConversationRecord, RecordRole};
 use super::model::{
@@ -426,6 +427,15 @@ impl PluginPort for LlmPlugin {
                 AccessTier::Moderator,
             ),
             Arc::new(UsageLlmHandler::new(Arc::clone(&self.engine))),
+        );
+        self.registry.register(
+            self.descriptor(
+                "llm_usage_global",
+                "Show global LLM token usage across all servers: totals, per model and per server",
+                Vec::new(),
+                AccessTier::Owner,
+            ),
+            Arc::new(GlobalUsageLlmHandler::new(Arc::clone(&self.engine))),
         );
         self.registry.register(
             self.descriptor(
@@ -854,17 +864,19 @@ mod tests {
                 "llm_set_prompt",
                 "llm_status",
                 "llm_unassign",
-                "llm_usage"
+                "llm_usage",
+                "llm_usage_global"
             ]
         );
         for descriptor in fixture.registry.descriptors() {
             assert_eq!(descriptor.plugin_id, "llm");
             assert!(descriptor.guild_only, "every llm command is guild-only");
             assert!(descriptor.required_permission.is_none(), "tier-gated, not platform-gated");
-            let expected = if matches!(descriptor.name.as_str(), "llm_status" | "llm_models") {
-                AccessTier::User
-            } else {
-                AccessTier::Moderator
+            let expected = match descriptor.name.as_str() {
+                "llm_status" | "llm_models" => AccessTier::User,
+                // Operator information: config-injected bot owners only.
+                "llm_usage_global" => AccessTier::Owner,
+                _ => AccessTier::Moderator,
             };
             assert_eq!(descriptor.required_tier, Some(expected), "command {}", descriptor.name);
         }
@@ -1013,6 +1025,119 @@ mod tests {
 
         let reply = fixture.output.messages().last().expect("reply expected").clone();
         assert!(reply.contains("only works inside a server"), "guard expected: {reply}");
+    }
+
+    /// `/llm_usage_global`: every server's numbers, ranked by requests, plus
+    /// the global aggregate. Cross-guild data is the point here (owner-tier,
+    /// ephemeral) - the exact per-server lines pin the format.
+    #[tokio::test]
+    async fn usage_global_lists_all_servers_ranked() {
+        use crate::plugins::llm::usage_total::Sample;
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        let usage = crate::plugins::llm::completion_port::TokenUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 100,
+            total_tokens: 1100,
+            cached_tokens: None,
+            reasoning_tokens: None,
+        };
+        // Guild 2 out-spends guild 1 - it must rank first.
+        fixture.engine.usage().record("zai/glm", Some(1), Sample::reported(&usage));
+        fixture.engine.usage().record("zai/glm", Some(2), Sample::reported(&usage));
+        fixture.engine.usage().record("zai/glm", Some(2), Sample::reported(&usage));
+
+        GlobalUsageLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("global usage expected to succeed");
+
+        let reply = fixture.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("across all servers"), "unexpected: {reply}");
+        assert!(reply.contains("All time: 3 requests"), "global aggregate expected: {reply}");
+        assert!(
+            reply.contains("- `zai/glm` \u{b7} 3 requests, 3,000 prompt / 300 completion tokens"),
+            "unexpected per-model line: {reply}"
+        );
+        assert!(reply.contains("- `2` \u{b7} 2 requests"), "top server expected: {reply}");
+        assert!(reply.contains("- `1` \u{b7} 1 requests"), "second server expected: {reply}");
+        let top = reply.find("- `2`").expect("guild 2 line expected");
+        let second = reply.find("- `1`").expect("guild 1 line expected");
+        assert!(top < second, "servers expected ranked by requests: {reply}");
+        assert!(!reply.contains("...and"), "nothing to hide yet: {reply}");
+    }
+
+    /// The per-server ranking caps at [`GLOBAL_GUILD_CAP`] entries - a large
+    /// deployment must not grow one reply without bound.
+    #[tokio::test]
+    async fn usage_global_caps_the_server_ranking() {
+        use crate::plugins::llm::commands::GLOBAL_GUILD_CAP;
+        use crate::plugins::llm::usage_total::Sample;
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        let usage = crate::plugins::llm::completion_port::TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            cached_tokens: None,
+            reasoning_tokens: None,
+        };
+        for guild in 1..=(u64::try_from(GLOBAL_GUILD_CAP).expect("cap fits u64") + 1) {
+            fixture.engine.usage().record("zai/glm", Some(guild), Sample::reported(&usage));
+        }
+
+        GlobalUsageLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("global usage expected to succeed");
+
+        let reply = fixture.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("...and 1 more"), "overflow line expected: {reply}");
+        assert!(!reply.contains("- `11`"), "capped server must not render: {reply}");
+    }
+
+    /// `/llm_usage_global` with no records: the explicit notice, not zero
+    /// lines.
+    #[tokio::test]
+    async fn usage_global_zero_requests_renders_the_no_usage_notice() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+
+        GlobalUsageLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("global usage expected to succeed");
+
+        let reply = fixture.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("No LLM usage recorded"), "unexpected: {reply}");
+        assert!(!reply.contains("All time"), "unexpected: {reply}");
+    }
+
+    /// `/llm_usage_global` outside a server: declined like the guild view.
+    /// Defense in depth - DMs bypass the auth gate, so a DM invocation could
+    /// not be tier-checked at all.
+    #[tokio::test]
+    async fn usage_global_outside_a_server_declines() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        use crate::plugins::llm::usage_total::Sample;
+        let usage = crate::plugins::llm::completion_port::TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 1,
+            total_tokens: 11,
+            cached_tokens: None,
+            reasoning_tokens: None,
+        };
+        fixture.engine.usage().record("zai/glm", Some(1), Sample::reported(&usage));
+
+        GlobalUsageLlmHandler::new(Arc::clone(&fixture.engine))
+            .invoke(&command_event(None), &CommandArgs::default(), &dm_services(&fixture.output))
+            .await
+            .expect("global usage expected to succeed");
+
+        let reply = fixture.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("only works inside a server"), "guard expected: {reply}");
+        assert!(!reply.contains("All time"), "no data may leak: {reply}");
     }
 
     /// The usage flush is a scheduled job: registered once in `start` with

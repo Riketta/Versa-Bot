@@ -848,10 +848,9 @@ fn usage_counts(total: &Dimension) -> String {
 }
 
 /// `/llm_usage`: this server's token usage - all-time totals (per model)
-/// and today's aggregate. Deliberately guild-scoped only: global totals and
-/// cross-guild rankings are operator information that lives in the logs and
-/// the plugin-global store, never in a client-visible command (guild data
-/// must not cross guild boundaries).
+/// and today's aggregate. Cross-guild numbers are operator information:
+/// they surface only through the owner-tier `/llm_usage_global` (ephemeral),
+/// never in a guild-facing reply.
 pub(super) struct UsageLlmHandler {
     engine: Arc<ChatEngine>,
 }
@@ -893,6 +892,81 @@ impl CommandHandler for UsageLlmHandler {
                 lines.push("By model (all time):".to_owned());
                 for (model, total) in &all_time.models {
                     lines.push(format!("- `{model}` \u{b7} {}", usage_counts(total)));
+                }
+            }
+            lines.join("\n")
+        };
+        services.chat_output.send(command_reply(text)).await?;
+        Ok(())
+    }
+}
+
+/// Cap on the per-server ranking: a deployment serving many guilds must
+/// not grow one reply without bound - the long tail is the small one.
+pub(super) const GLOBAL_GUILD_CAP: usize = 10;
+
+/// `/llm_usage_global`: every server's token usage. Operator information,
+/// therefore owner-tier: the auth gate enforces the tier (bot owners come
+/// from the deployment config) - this handler never checks identity. The
+/// reply is ephemeral - visible to the invoking owner alone - so
+/// cross-guild numbers never reach a guild-visible surface. The guild
+/// guard is defense in depth, not decoration: DMs bypass the auth gate
+/// entirely, so a DM invocation could not be tier-checked at all.
+pub(super) struct GlobalUsageLlmHandler {
+    engine: Arc<ChatEngine>,
+}
+
+impl GlobalUsageLlmHandler {
+    pub(super) fn new(engine: Arc<ChatEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+#[async_trait]
+impl CommandHandler for GlobalUsageLlmHandler {
+    async fn invoke(
+        &self,
+        event: &RequestContext,
+        _args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
+        if event.origin.guild_id.is_none() {
+            services
+                .chat_output
+                .send(command_reply("This command only works inside a server."))
+                .await?;
+            return Ok(());
+        }
+        // The snapshot seeds lazily, so a fresh process still serves the
+        // stored history.
+        let (snapshot, today) = self.engine.usage().global_snapshot().await;
+        let text = if snapshot.total.requests == 0 {
+            "No LLM usage recorded yet.".to_owned()
+        } else {
+            let mut lines = vec![
+                "**LLM usage across all servers**".to_owned(),
+                usage_line("All time", &snapshot.total),
+                usage_line("Today", &today),
+            ];
+            if !snapshot.models.is_empty() {
+                lines.push(String::new());
+                lines.push("By model (all time):".to_owned());
+                for (model, total) in &snapshot.models {
+                    lines.push(format!("- `{model}` \u{b7} {}", usage_counts(total)));
+                }
+            }
+            if !snapshot.guilds.is_empty() {
+                lines.push(String::new());
+                lines.push("By server (all time):".to_owned());
+                let mut guilds = snapshot.guilds.clone();
+                guilds.sort_by(|a, b| b.1.requests.cmp(&a.1.requests));
+                let shown = guilds.len().min(GLOBAL_GUILD_CAP);
+                for (guild_id, dim) in guilds.iter().take(shown) {
+                    lines.push(format!("- `{guild_id}` \u{b7} {}", usage_counts(dim)));
+                }
+                let hidden = guilds.len().saturating_sub(shown);
+                if hidden > 0 {
+                    lines.push(format!("...and {hidden} more"));
                 }
             }
             lines.join("\n")

@@ -439,6 +439,31 @@ impl UsageTracker {
         (all_time, today_total.unwrap_or_default())
     }
 
+    /// Deployment-wide all-time usage plus today's aggregate - what
+    /// `/llm_usage_global` renders (owner-tier, ephemeral). The global
+    /// total folds the per-model view; the per-server list carries each
+    /// guild's all-time aggregate for the ranking. Seeding runs first.
+    pub(crate) async fn global_snapshot(&self) -> (GlobalUsageSnapshot, Dimension) {
+        self.ensure_seeded().await;
+        let today = self.day();
+        let inner = self.inner.lock();
+        let models: Vec<(String, Dimension)> =
+            inner.models.iter().map(|(model, dim)| (model.clone(), *dim)).collect();
+        let mut total = Dimension::default();
+        for (_, dim) in &models {
+            total.merge(*dim);
+        }
+        let guilds: Vec<(u64, Dimension)> =
+            inner.guilds.iter().map(|(id, usage)| (*id, usage.total)).collect();
+        let mut today_total = Dimension::default();
+        if let Some(bucket) = inner.days.get(&today) {
+            for dim in bucket.models.values() {
+                today_total.merge(*dim);
+            }
+        }
+        (GlobalUsageSnapshot { total, models, guilds }, today_total)
+    }
+
     /// The stored all-time totals for one model - what the vision audit
     /// line reports as cumulative.
     pub(crate) fn cumulative(&self, model: &str) -> Dimension {
@@ -547,6 +572,15 @@ impl UsageTracker {
 pub(crate) struct GuildUsageSnapshot {
     pub total: Dimension,
     pub models: Vec<(String, Dimension)>,
+}
+
+/// The `/llm_usage_global` projection: deployment-wide all-time usage and
+/// the per-server aggregates behind the ranking.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GlobalUsageSnapshot {
+    pub total: Dimension,
+    pub models: Vec<(String, Dimension)>,
+    pub guilds: Vec<(u64, Dimension)>,
 }
 
 fn merge_guild(target: &mut GuildUsage, loaded: GuildUsage) {
