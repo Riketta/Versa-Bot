@@ -21,9 +21,9 @@ use crate::kernel::{
 use super::chat_engine::ChatEngine;
 use super::commands::{
     AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler, CutoffLlmHandler,
-    CutoffUndoLlmHandler, DumpLlmHandler, GetLlmHandler, GlobalUsageLlmHandler, ModelsLlmHandler,
-    SET_KEYS, SetLlmHandler, SetPromptLlmHandler, StatusLlmHandler, UnassignLlmHandler,
-    UsageLlmHandler, model_choices,
+    CutoffUndoLlmHandler, DumpLlmHandler, EmojiWhitelistLlmHandler, GetLlmHandler,
+    GlobalUsageLlmHandler, ModelsLlmHandler, SET_KEYS, SetLlmHandler, SetPromptLlmHandler,
+    StatusLlmHandler, UnassignLlmHandler, UsageLlmHandler, model_choices,
 };
 use super::conversation::{ConversationRecord, RecordRole};
 use super::model::{
@@ -418,6 +418,47 @@ impl PluginPort for LlmPlugin {
                 AccessTier::Moderator,
             ),
             Arc::new(CutoffUndoLlmHandler::new(Arc::clone(&self.channel_locks))),
+        );
+        self.registry.register(
+            self.descriptor(
+                "llm_emoji_whitelist",
+                "Manage the server emoji whitelist for react_emoji_inject whitelist mode",
+                vec![
+                    ArgDescriptor {
+                        name: "action".to_owned(),
+                        description: "Whitelist action - add, remove, list, or clear".to_owned(),
+                        required: true,
+                        kind: ArgKind::String,
+                        choices: Some(
+                            ["add", "remove", "list", "clear"]
+                                .iter()
+                                .map(|action| (*action).to_owned())
+                                .collect(),
+                        ),
+                    },
+                    ArgDescriptor {
+                        name: "scope".to_owned(),
+                        description: "Which list: guild-wide baseline or this channel's own \
+                             override"
+                            .to_owned(),
+                        required: true,
+                        kind: ArgKind::String,
+                        choices: Some(
+                            ["guild", "channel"].iter().map(|scope| (*scope).to_owned()).collect(),
+                        ),
+                    },
+                    ArgDescriptor {
+                        name: "name".to_owned(),
+                        description: "Custom emoji name to add or remove (exact, e.g. dorkiS)"
+                            .to_owned(),
+                        required: false,
+                        kind: ArgKind::String,
+                        choices: None,
+                    },
+                ],
+                AccessTier::Moderator,
+            ),
+            Arc::new(EmojiWhitelistLlmHandler),
         );
         self.registry.register(
             self.descriptor(
@@ -868,6 +909,7 @@ mod tests {
                 "llm_cutoff",
                 "llm_cutoff_undo",
                 "llm_dump",
+                "llm_emoji_whitelist",
                 "llm_get",
                 "llm_models",
                 "llm_set",

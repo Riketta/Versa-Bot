@@ -14,6 +14,18 @@ pub const NAMESPACE: &str = "llm";
 /// LLM errors and service notices are reported. Absent = tracing only.
 pub const SERVICE_CHANNEL_KEY: &str = "service_channel";
 
+/// Storage key of the guild-wide emoji whitelist (JSON array of emoji
+/// names): the shared baseline every channel's `whitelist` inject mode
+/// falls back to when the channel has no list of its own.
+pub const GUILD_EMOJI_WHITELIST_KEY: &str = "emoji_whitelist";
+
+/// Document key of a channel's own emoji whitelist (JSON array of emoji
+/// names). A non-empty channel list replaces the guild baseline for that
+/// channel; absent or empty falls through.
+pub fn channel_emoji_whitelist_key(channel_id: u64) -> String {
+    format!("channel:{channel_id}:emoji_whitelist")
+}
+
 /// Document key of a channel's chat configuration: `channel:{id}`.
 #[must_use]
 pub fn channel_config_key(channel_id: u64) -> String {
@@ -85,6 +97,35 @@ pub enum CaptureMode {
     BotRelated,
     /// Every non-bot message in the channel enters the history.
     AllMessages,
+}
+
+/// Whether the react tool's prompt appendix lists the server's custom
+/// emojis, and from which source. The injected line carries exact wire
+/// forms, so the model copies working tokens instead of guessing shapes;
+/// it only reaches the model where `react` is also on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmojiInject {
+    /// No emoji list in the prompt (default).
+    #[default]
+    None,
+    /// List every custom emoji of the server.
+    All,
+    /// List only the whitelisted ones: the channel's own list when it has
+    /// one, otherwise the guild-wide list.
+    Whitelist,
+}
+
+impl EmojiInject {
+    /// `/llm_set` grammar - also the dump/status rendering.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::All => "all",
+            Self::Whitelist => "whitelist",
+        }
+    }
 }
 
 /// Sampling/behavior parameters sent with completion requests. Absent fields
@@ -187,6 +228,14 @@ pub struct ChannelConfig {
     /// instruction joins the system prompt only where the feature is on.
     #[serde(default)]
     pub react: bool,
+    /// Server custom emojis offered to the model inside the react tool's
+    /// prompt appendix (exact wire forms; `whitelist` filters by the
+    /// guild/channel emoji whitelist). Setting this does not require
+    /// `react` - the line simply never joins the prompt while `react` is
+    /// off. `none` by default: the injected line costs prompt space and
+    /// invalidates provider caches when the emoji set changes.
+    #[serde(default)]
+    pub react_emoji_inject: EmojiInject,
     /// Chance the bot silently reacts (no reply) to an unrelated captured
     /// message, percent (`0` = off). Independent of `random_chance_percent`
     /// and its own cooldown - the two rolls coexist in parallel.
@@ -231,6 +280,7 @@ impl ChannelConfig {
             image_model: None,
             image_prompt: None,
             react: false,
+            react_emoji_inject: EmojiInject::default(),
             random_react_chance_percent: default_random_react_chance(),
         }
     }
@@ -402,8 +452,10 @@ mod tests {
         assert_eq!(channel_config_key(42), "channel:42");
         assert_eq!(channel_state_key(42), "channel:42:state");
         assert_eq!(channel_stats_key(42), "channel:42:stats");
+        assert_eq!(channel_emoji_whitelist_key(42), "channel:42:emoji_whitelist");
         assert_ne!(channel_config_key(42), channel_state_key(42));
         assert_ne!(channel_state_key(42), channel_stats_key(42));
+        assert_ne!(channel_emoji_whitelist_key(42), GUILD_EMOJI_WHITELIST_KEY);
         // Record namespaces are plugin-prefixed and channel-partitioned.
         assert_eq!(records_namespace(42), "llm:c:42");
         assert_ne!(records_namespace(42), records_namespace(43));

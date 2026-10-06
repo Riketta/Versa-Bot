@@ -19,8 +19,9 @@ use super::chat_engine::ChatEngine;
 use super::conversation::ConversationRecord;
 use super::llm_plugin::ChannelLocks;
 use super::model::{
-    CaptureMode, ChannelConfig, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY,
-    UsageStats, channel_config_key, channel_state_key, channel_state_undo_key, channel_stats_key,
+    CaptureMode, ChannelConfig, ConversationState, EmojiInject, GUILD_EMOJI_WHITELIST_KEY,
+    GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats, channel_config_key,
+    channel_emoji_whitelist_key, channel_state_key, channel_state_undo_key, channel_stats_key,
     default_random_cooldown, records_namespace, unix_now,
 };
 use super::prompts;
@@ -50,6 +51,7 @@ pub(super) const SET_KEYS: &[&str] = &[
     "images",
     "image_model",
     "react",
+    "react_emoji_inject",
     "streaming",
     "random_chance",
     "random_cooldown",
@@ -168,6 +170,22 @@ fn apply_set(
                 })?;
             config.capture_mode = mode;
             Ok(format!("`capture_mode` set to `{value}`."))
+        }
+        "react_emoji_inject" => {
+            let mode: EmojiInject =
+                serde_json::from_value(serde_json::json!(value)).map_err(|_| {
+                    format!("`react_emoji_inject` expects none, all, or whitelist, got `{value}`.")
+                })?;
+            config.react_emoji_inject = mode;
+            let mut reply = format!(
+                "`react_emoji_inject` set to `{value}` (the react tool's prompt lists this server's \
+                 custom emojis)."
+            );
+            if mode != EmojiInject::None && !config.react {
+                reply
+                    .push_str(" Note: `react` is off - enable it for the list to reach the model.");
+            }
+            Ok(reply)
         }
         "model" | "depth" => {
             Err(format!("`{key}` cannot be cleared - assign a value or use `/llm_unassign`."))
@@ -876,14 +894,51 @@ fn images_label(config: &ChannelConfig, settings: &LlmSettings) -> String {
 
 /// `/llm_status` label of the reaction tool state: off, or on with the
 /// silent-react chime chance when it is enabled.
-fn react_label(config: &ChannelConfig) -> String {
-    if !config.react {
-        "off".to_owned()
-    } else if config.random_react_chance_percent > 0.0 {
-        format!("on · {:.1}% silent-react", config.random_react_chance_percent)
-    } else {
-        "on".to_owned()
+fn react_label(config: &ChannelConfig, emoji_inject: Option<&str>) -> String {
+    if !config.react && config.react_emoji_inject == EmojiInject::None {
+        return "off".to_owned();
     }
+    let mut parts = Vec::new();
+    parts.push(if config.react {
+        "on".to_owned()
+    } else {
+        "off (the emoji list would not reach the model)".to_owned()
+    });
+    match config.react_emoji_inject {
+        EmojiInject::None => {}
+        EmojiInject::All => parts.push("emoji inject all".to_owned()),
+        EmojiInject::Whitelist => parts.push(match emoji_inject {
+            Some(detail) => format!("emoji inject whitelist ({detail})"),
+            None => "emoji inject whitelist (no list)".to_owned(),
+        }),
+    }
+    if config.react && config.random_react_chance_percent > 0.0 {
+        parts.push(format!("{:.1}% silent-react", config.random_react_chance_percent));
+    }
+    parts.join(" · ")
+}
+
+/// Effective whitelist source for the status line: which scope's list would
+/// apply (`guild, 3` / `channel, 1`) - the channel's own list when non-empty,
+/// otherwise the guild-wide one. `None` = neither list exists.
+async fn emoji_inject_detail(channel_id: u64, services: &KernelServices) -> Option<String> {
+    let storage = services.guild_storage.as_ref()?;
+    let channel: Option<Vec<String>> = storage
+        .get(NAMESPACE, &channel_emoji_whitelist_key(channel_id))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_value(raw).ok());
+    if let Some(list) = channel.filter(|list| !list.is_empty()) {
+        return Some(format!("channel, {}", list.len()));
+    }
+    let guild: Option<Vec<String>> = storage
+        .get(NAMESPACE, GUILD_EMOJI_WHITELIST_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_value(raw).ok());
+    guild.filter(|list| !list.is_empty()).map(|list| format!("guild, {}", list.len()))
 }
 
 /// `/llm_status` label of the chime-in roll chance and cooldown: the
@@ -1128,7 +1183,8 @@ impl CommandHandler for StatusLlmHandler {
         let context_start = first_link.unwrap_or_else(|| "no messages after the cutoff".to_owned());
         let reasoning = reasoning_label(config.params.reasoning_effort.as_deref());
         let images = images_label(&config, self.engine.settings());
-        let reactions = react_label(&config);
+        let emoji_inject = emoji_inject_detail(event.origin.channel_id.get(), services).await;
+        let reactions = react_label(&config, emoji_inject.as_deref());
         let mut description = format!(
             "Model: `{}`
 Reasoning: {reasoning}
@@ -1234,6 +1290,149 @@ impl CommandHandler for ClearServiceChannelHandler {
         storage.delete(NAMESPACE, SERVICE_CHANNEL_KEY).await?;
 
         services.chat_output.send(command_reply("Service channel cleared.")).await?;
+        Ok(())
+    }
+}
+
+/// `/llm_emoji_whitelist`: manages the emoji names the `whitelist` inject
+/// mode filters against - the `scope` argument picks the guild-wide
+/// baseline or the channel's own override (a non-empty channel list
+/// replaces the baseline for that channel). Names are validated against
+/// the guild's actual custom emojis at add time, so the list only ever
+/// contains reactable entries. Lock-free like `/llm_admin`: rare moderator
+/// writes, last one wins.
+pub(super) struct EmojiWhitelistLlmHandler;
+
+/// Whitelist names as one backticked, comma-separated run.
+fn render_names(list: &[String]) -> String {
+    list.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ")
+}
+
+#[async_trait]
+impl CommandHandler for EmojiWhitelistLlmHandler {
+    async fn invoke(
+        &self,
+        event: &RequestContext,
+        args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
+        const USAGE: &str = "Usage: `/llm_emoji_whitelist action:<add|remove|list|clear> \
+             scope:<guild|channel> name:<emoji>` - `name` is required for add and remove.";
+        let Some(storage) = &services.guild_storage else {
+            services
+                .chat_output
+                .send(command_reply("This command only works inside a server."))
+                .await?;
+            return Ok(());
+        };
+        let (Some(action), Some(scope)) = (args.get("action"), args.get("scope")) else {
+            services.chat_output.send(command_reply(USAGE)).await?;
+            return Ok(());
+        };
+        let key = match scope {
+            "guild" => GUILD_EMOJI_WHITELIST_KEY.to_owned(),
+            "channel" => channel_emoji_whitelist_key(event.origin.channel_id.get()),
+            other => {
+                services
+                    .chat_output
+                    .send(command_reply(format!("Unknown scope `{other}` - use guild or channel.")))
+                    .await?;
+                return Ok(());
+            }
+        };
+        let mut list: Vec<String> = storage
+            .get(NAMESPACE, &key)
+            .await?
+            .and_then(|raw| serde_json::from_value(raw).ok())
+            .unwrap_or_default();
+        match action {
+            "add" | "remove" => {
+                let Some(name) = args.get("name") else {
+                    services.chat_output.send(command_reply(USAGE)).await?;
+                    return Ok(());
+                };
+                if action == "add" {
+                    let known =
+                        services.chat_output_factory.reactable_emojis(&event.origin).list().await;
+                    if !known.iter().any(|emoji| emoji.name == name) {
+                        services
+                            .chat_output
+                            .send(command_reply(format!(
+                                "`{name}` is not a custom emoji of this server - use its exact name."
+                            )))
+                            .await?;
+                        return Ok(());
+                    }
+                    if list.iter().any(|entry| entry == name) {
+                        services
+                            .chat_output
+                            .send(command_reply(format!(
+                                "`{name}` is already on the {scope} whitelist ({} entries).",
+                                list.len()
+                            )))
+                            .await?;
+                        return Ok(());
+                    }
+                    list.push(name.to_owned());
+                    list.sort();
+                    storage.set(NAMESPACE, &key, serde_json::json!(list)).await?;
+                    services
+                        .chat_output
+                        .send(command_reply(format!(
+                            "Added `{name}` - the {scope} whitelist now has {} entries: {}.",
+                            list.len(),
+                            render_names(&list)
+                        )))
+                        .await?;
+                } else {
+                    let Some(position) = list.iter().position(|entry| entry == name) else {
+                        services
+                            .chat_output
+                            .send(command_reply(format!(
+                                "`{name}` is not on the {scope} whitelist."
+                            )))
+                            .await?;
+                        return Ok(());
+                    };
+                    list.remove(position);
+                    storage.set(NAMESPACE, &key, serde_json::json!(list)).await?;
+                    services
+                        .chat_output
+                        .send(command_reply(format!(
+                            "Removed `{name}` - the {scope} whitelist now has {} entries: {}.",
+                            list.len(),
+                            render_names(&list)
+                        )))
+                        .await?;
+                }
+            }
+            "list" => {
+                let rendered =
+                    if list.is_empty() { "empty".to_owned() } else { render_names(&list) };
+                services
+                    .chat_output
+                    .send(command_reply(format!(
+                        "The {scope} emoji whitelist ({} entries): {rendered}",
+                        list.len()
+                    )))
+                    .await?;
+            }
+            "clear" => {
+                storage.delete(NAMESPACE, &key).await?;
+                services
+                    .chat_output
+                    .send(command_reply(format!("The {scope} emoji whitelist cleared.")))
+                    .await?;
+            }
+            other => {
+                services
+                    .chat_output
+                    .send(command_reply(format!(
+                        "Unknown action `{other}` - use add, remove, list, or clear."
+                    )))
+                    .await?;
+            }
+        }
         Ok(())
     }
 }
@@ -1559,6 +1758,7 @@ fn current_value(config: &ChannelConfig, key: &str, settings: &LlmSettings) -> O
         ),
         "streaming" => Some(on_off(config.streaming)),
         "react" => Some(on_off(config.react)),
+        "react_emoji_inject" => Some(config.react_emoji_inject.as_str().to_owned()),
         "capture_mode" => Some(match config.capture_mode {
             CaptureMode::BotRelated => "bot_related".to_owned(),
             CaptureMode::AllMessages => "all_messages".to_owned(),
@@ -2329,6 +2529,78 @@ mod tests {
         assert_eq!(current_value(&config, "react", &settings).as_deref(), Some("on"));
         assert_eq!(current_value(&config, "random_chance", &settings).as_deref(), Some("7.5%"));
         assert_eq!(current_value(&config, "max_length", &settings).as_deref(), Some("500"));
+    }
+
+    /// The `react_emoji_inject` grammar: the three modes apply, `none` is a
+    /// real value (not a clear), garbage claims the key, and setting a mode
+    /// while `react` is off answers with the hint.
+    #[test]
+    fn react_emoji_inject_grammar_and_react_hint() {
+        let mut config = ChannelConfig::assigned("local/gemma".to_owned());
+
+        assert_eq!(
+            apply_set(&mut config, "react_emoji_inject", "all", None).expect("all applies"),
+            "`react_emoji_inject` set to `all` (the react tool's prompt lists this server's \
+             custom emojis). Note: `react` is off - enable it for the list to reach the model."
+        );
+        assert_eq!(config.react_emoji_inject, EmojiInject::All);
+
+        config.react = true;
+        assert_eq!(
+            apply_set(&mut config, "react_emoji_inject", "whitelist", None)
+                .expect("whitelist applies"),
+            "`react_emoji_inject` set to `whitelist` (the react tool's prompt lists this server's \
+             custom emojis)."
+        );
+        assert_eq!(config.react_emoji_inject, EmojiInject::Whitelist);
+        assert!(
+            !apply_set(&mut config, "react_emoji_inject", "none", None)
+                .expect("none applies")
+                .contains("Note:"),
+            "no hint once react is on"
+        );
+        assert_eq!(config.react_emoji_inject, EmojiInject::None);
+
+        assert!(apply_set(&mut config, "react_emoji_inject", "clear", None).is_err());
+        assert!(apply_set(&mut config, "react_emoji_inject", "sometimes", None).is_err());
+    }
+
+    /// The reactions status label: off stays plain, the inject mode shows
+    /// with its effective whitelist source, and a react-off channel with an
+    /// inject set says why nothing lands.
+    #[test]
+    fn react_label_covers_inject_modes() {
+        let mut config = ChannelConfig::assigned("local/gemma".to_owned());
+        assert_eq!(react_label(&config, None), "off");
+
+        config.react_emoji_inject = EmojiInject::All;
+        assert_eq!(
+            react_label(&config, None),
+            "off (the emoji list would not reach the model) · emoji inject all"
+        );
+
+        config.react = true;
+        config.react_emoji_inject = EmojiInject::Whitelist;
+        assert_eq!(
+            react_label(&config, None),
+            "on · emoji inject whitelist (no list) · 10.0% silent-react"
+        );
+        assert_eq!(
+            react_label(&config, Some("guild, 3")),
+            "on · emoji inject whitelist (guild, 3) · 10.0% silent-react"
+        );
+
+        config.random_react_chance_percent = 10.0;
+        assert_eq!(
+            react_label(&config, Some("channel, 1")),
+            "on · emoji inject whitelist (channel, 1) · 10.0% silent-react"
+        );
+        // React off: the silent-react chance is irrelevant and hidden.
+        config.react = false;
+        assert_eq!(
+            react_label(&config, Some("channel, 1")),
+            "off (the emoji list would not reach the model) · emoji inject whitelist (channel, 1)"
+        );
     }
 
     #[test]

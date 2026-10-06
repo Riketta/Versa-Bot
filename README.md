@@ -790,6 +790,15 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   skip silently) and fully qualified (`<:name:id>`; the bracketless
   `:name:id` and trailing-colon `:name:id:` model slips are tolerated)
   forms all work.
+  The react prompt can additionally list the server's own custom emojis
+  as exact, copy-ready forms (`/llm_set react_emoji_inject`): `all`
+  lists every custom emoji of the server, `whitelist` lists only the
+  names on the emoji whitelist (the channel's own list when it has one,
+  otherwise the guild-wide list, managed with `/llm_emoji_whitelist`).
+  Off by default - the list costs prompt space and invalidates provider
+  prompt caches whenever the emoji set or whitelist changes. Setting the
+  mode works without `react`, but the list only reaches the model where
+  the react tool is also on.
   Degradation is per-token: an invalid token drops, valid siblings fire,
   and a failed reaction never touches the answer. An answer that is only
   a marker is answered with just the reaction - no fallback, no phantom
@@ -825,7 +834,8 @@ plugin](#authorization-auth-plugin)).
 | `/llm_dump` | moderator | dump every setting at once in one copy-pasteable code fence (`key = value`, effective values); lines that differ from a fresh `/llm_assign` carry a `*` marker; prompts are not dumped at all - only set-or-not and size, the text is one argument-free `/llm_set_prompt kind` away |
 | `/llm_cutoff` | moderator | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
 | `/llm_cutoff_undo` | moderator | undo this channel's last `/llm_cutoff`: the exact previous context (summary and cutoff position) is restored - stored records were never touched |
-| `/llm_status` | user | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, compaction, image recognition (state, model, prompt length), reactions (state, silent-react chance), capture mode, chime-in chance, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
+| `/llm_emoji_whitelist action:<add\|remove\|list\|clear> scope:<guild\|channel> name:<emoji>` | moderator | manage the emoji whitelist the `react_emoji_inject whitelist` mode filters against; `guild` is the shared baseline, `channel` this channel's own override (a non-empty channel list replaces the baseline); names are validated against the server's actual custom emojis at add time |
+| `/llm_status` | user | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, compaction, image recognition (state, model, prompt length), reactions (state, emoji inject mode with effective whitelist source, silent-react chance), capture mode, chime-in chance, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
 | `/llm_usage` | moderator | this server's LLM token usage: all-time totals (per model) and today's aggregate - chat answers, silent-react chimes, compaction and image recognition all count |
 | `/llm_usage_global` | owner | global LLM token usage across all servers: all-time totals, today, per model and per server (ranked, capped) - the reply is ephemeral, so cross-guild numbers stay between the bot and the invoking owner |
 | `/llm_admin` | moderator | make this channel the guild's service channel for error notices (one per guild, last write wins) |
@@ -856,6 +866,7 @@ uploaded files for long texts.
 | `images` | on / off | off | describe attached images on captured messages via the recognition model; needs an operator `[llm] image_model` |
 | `image_model` | declared model ref | plugin `[llm] image_model` | recognition model override for this channel |
 | `react` | on / off | off | emoji-reaction tool: the model may decorate the message it replies to by emitting a `[[react: ...]]` marker, stripped before the answer is shown |
+| `react_emoji_inject` | none / all / whitelist | none | list the server's custom emojis as exact forms inside the react tool's prompt (`whitelist` filters by `/llm_emoji_whitelist`, channel list over the guild baseline); needs `react` on to reach the model; changes invalidate provider prompt caches |
 | `streaming` | on / off | off | stream the answer live from the provider (SSE): the message appears with the first tokens and is edited at `stream_interval_ms` |
 | `random_chance` | 0-100 (clamped) | 2 | percent chance to chime in on a captured non-trigger message; 0 = off |
 | `random_cooldown` | whole seconds | 5 | minimum seconds between chime-ins - the reply and silent-react rolls each keep their own tracker behind it; 0 = none |

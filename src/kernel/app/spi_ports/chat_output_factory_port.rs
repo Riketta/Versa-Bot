@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
+use super::guild_emoji_port::{GuildEmojiPort, UndeliverableGuildEmojiPort};
 use super::{ChatOutputPort, ChatStreamPort, ReactionPort, UndeliverableReactionPort};
 use crate::kernel::models::{ChannelId, MessageId, Origin};
 
@@ -55,6 +56,17 @@ pub trait ChatOutputFactoryPort: Send + Sync + 'static {
     fn react(&self, origin: &Origin) -> Arc<dyn ReactionPort> {
         let _ = origin;
         Arc::new(UndeliverableReactionPort)
+    }
+
+    /// The custom emojis reactable in the origin's guild, bound to that
+    /// guild - for plugins that offer the emoji set to a model as
+    /// reactable choices. Platforms without custom emojis and origins
+    /// outside any guild yield the undeliverable default. Callers never
+    /// parse the tokens: filtering happens on `name`, rendering on
+    /// `token`.
+    fn reactable_emojis(&self, origin: &Origin) -> Arc<dyn GuildEmojiPort> {
+        let _ = origin;
+        Arc::new(UndeliverableGuildEmojiPort)
     }
 }
 

@@ -1,6 +1,9 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use serenity::all::{
     ChannelId as SerenityChannelId, CreateAttachment, CreateMessage, EditMessage, Emoji, EmojiId,
     GuildId as SerenityGuildId, Http, MessageId as SerenityMessageId, MessageReference,
@@ -12,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 use crate::kernel::{
     models::{ChannelId, Embed, MessageId, Origin, OutboundError, OutboundMessage},
     spi_ports::{
-        ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard, ReactionPort,
-        UndeliverableReactionPort,
+        ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard, GuildEmojiPort,
+        ReactableEmoji, ReactionPort, UndeliverableGuildEmojiPort, UndeliverableReactionPort,
     },
 };
 
@@ -108,6 +111,7 @@ fn denormalize_mention_tags(content: &str) -> String {
 /// of a plain channel message - plugins cannot tell the difference.
 pub struct SerenityChatOutputFactory<T = Http> {
     http: Arc<T>,
+    emoji_cache: Arc<GuildEmojiCache>,
 }
 
 // `new` is deliberately unbounded - the private `ChatApi` bound lives on the
@@ -116,7 +120,7 @@ impl<T> SerenityChatOutputFactory<T> {
     /// Takes the shared REST client: serenity rate limiting is per `Http`,
     /// so every driven Discord caller must share one instance.
     pub fn new(http: Arc<T>) -> Self {
-        Self { http }
+        Self { http, emoji_cache: Arc::new(GuildEmojiCache::new()) }
     }
 }
 
@@ -213,6 +217,20 @@ impl<T: ChatApi> ChatOutputFactoryPort for SerenityChatOutputFactory<T> {
             http: Arc::clone(&self.http),
             channel_id: SerenityChannelId::new(origin.channel_id.get()),
             guild_id: SerenityGuildId::new(guild_id.get()),
+            emoji_cache: Arc::clone(&self.emoji_cache),
+        })
+    }
+
+    /// Guild-bound emoji listing: one cached `get_emojis` per guild per TTL
+    /// window serves both prompt injection and bare-name resolution.
+    fn reactable_emojis(&self, origin: &Origin) -> Arc<dyn GuildEmojiPort> {
+        let Some(guild_id) = origin.guild_id else {
+            return Arc::new(UndeliverableGuildEmojiPort);
+        };
+        Arc::new(SerenityGuildEmojis {
+            http: Arc::clone(&self.http),
+            emoji_cache: Arc::clone(&self.emoji_cache),
+            guild_id: SerenityGuildId::new(guild_id.get()),
         })
     }
 }
@@ -268,12 +286,92 @@ impl ChatOutputPort for UndeliverableChatOutput {
 
 /// Reaction port bound to one origin: applies emoji reactions to messages
 /// in the origin channel. Custom `:name:` tokens resolve against the
-/// guild's current emoji list (one REST fetch per bare-name token -
-/// reactions are rare and capped, and the factory holds no gateway cache).
+/// guild's cached emoji list (shared with prompt injection - see
+/// [`GuildEmojiCache`]).
 struct SerenityReaction<T: ChatApi = Http> {
     http: Arc<T>,
     channel_id: SerenityChannelId,
     guild_id: SerenityGuildId,
+    emoji_cache: Arc<GuildEmojiCache>,
+}
+
+/// Shared, TTL-cached guild emoji catalog: prompt injection and the
+/// bare-name reaction resolver consume one `get_emojis` per guild per TTL
+/// window instead of hammering the REST endpoint. A failed listing is
+/// cached empty under a short TTL - self-heals without hammering a down
+/// endpoint.
+struct GuildEmojiCache {
+    entries: Mutex<HashMap<u64, CachedEmojis>>,
+}
+
+/// Successful listings stay fresh for the full TTL.
+const EMOJI_TTL: Duration = Duration::from_secs(600);
+/// Failed listings are retried after the short one.
+const EMOJI_FAILURE_TTL: Duration = Duration::from_secs(30);
+
+struct CachedEmojis {
+    fetched_at: Instant,
+    emojis: Arc<Vec<Emoji>>,
+    ok: bool,
+}
+
+impl GuildEmojiCache {
+    fn new() -> Self {
+        Self { entries: Mutex::new(HashMap::new()) }
+    }
+
+    async fn emojis<T: ChatApi>(&self, http: &T, guild_id: SerenityGuildId) -> Arc<Vec<Emoji>> {
+        {
+            let entries = self.entries.lock();
+            if let Some(cached) = entries.get(&guild_id.get()) {
+                let ttl = if cached.ok { EMOJI_TTL } else { EMOJI_FAILURE_TTL };
+                if cached.fetched_at.elapsed() < ttl {
+                    return Arc::clone(&cached.emojis);
+                }
+            }
+        }
+        let (emojis, ok) = match http.get_emojis(guild_id).await {
+            Ok(emojis) => (Arc::new(emojis), true),
+            Err(err) => {
+                tracing::warn!(guild = guild_id.get(), error = %err, "guild emoji listing failed");
+                (Arc::new(Vec::new()), false)
+            }
+        };
+        self.entries.lock().insert(
+            guild_id.get(),
+            CachedEmojis { fetched_at: Instant::now(), emojis: Arc::clone(&emojis), ok },
+        );
+        emojis
+    }
+}
+
+/// Guild-bound emoji listing for one origin's guild.
+struct SerenityGuildEmojis<T: ChatApi = Http> {
+    http: Arc<T>,
+    emoji_cache: Arc<GuildEmojiCache>,
+    guild_id: SerenityGuildId,
+}
+
+#[async_trait]
+impl<T: ChatApi> GuildEmojiPort for SerenityGuildEmojis<T> {
+    async fn list(&self) -> Vec<ReactableEmoji> {
+        self.emoji_cache
+            .emojis(self.http.as_ref(), self.guild_id)
+            .await
+            .iter()
+            .filter_map(|emoji| {
+                let name = emoji.name.as_str();
+                if name.is_empty() {
+                    return None;
+                }
+                let brackets = if emoji.animated { ("<a:", ">") } else { ("<:", ">") };
+                Some(ReactableEmoji {
+                    name: name.to_owned(),
+                    token: format!("{}{}:{}{}", brackets.0, name, emoji.id, brackets.1),
+                })
+            })
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -301,15 +399,14 @@ impl<T: ChatApi> SerenityReaction<T> {
                 Ok(custom_reaction(animated, &name, &id))
             }
             ParsedReaction::Name(name) => {
-                let emojis =
-                    self.http.get_emojis(self.guild_id).await.map_err(OutboundError::Reaction)?;
+                let emojis = self.emoji_cache.emojis(self.http.as_ref(), self.guild_id).await;
                 emojis
-                    .into_iter()
+                    .iter()
                     .find(|known| known.name.as_str() == name.as_str())
                     .map(|known| ReactionType::Custom {
                         animated: known.animated,
                         id: known.id,
-                        name: Some(known.name),
+                        name: Some(known.name.clone()),
                     })
                     .ok_or_else(|| {
                         OutboundError::Reaction(format!(
@@ -1183,6 +1280,7 @@ mod tests {
             http: Arc::clone(api),
             channel_id: SerenityChannelId::new(5),
             guild_id: SerenityGuildId::new(7),
+            emoji_cache: Arc::new(GuildEmojiCache::new()),
         }
     }
 
@@ -1325,8 +1423,8 @@ mod tests {
         assert_eq!(body.get("content").and_then(serde_json::Value::as_str), Some("done <@7>"));
     }
 
-    /// A bare `:name:` token resolves through the guild emoji list: the hit
-    /// reacts as that custom emoji, one lookup ahead of it.
+    /// A bare `:name:` token resolves through the cached guild emoji list:
+    /// the hit reacts as that custom emoji, one lookup ahead of it.
     #[tokio::test]
     async fn reaction_bare_name_resolves_through_the_guild_emoji_list() {
         let api =
@@ -1437,16 +1535,55 @@ mod tests {
         }
     }
 
-    /// A failed emoji-list fetch (bare `:name:` resolution) surfaces as the
-    /// port's `Reaction` error - the lookup failing closed, per token.
+    /// A failed emoji-list fetch degrades to an empty list: bare `:name:`
+    /// resolution fails closed per token ("not found"), the transport error
+    /// is warn-logged by the cache, and the failure is cached briefly so a
+    /// down endpoint is not hammered.
     #[tokio::test]
-    async fn emoji_lookup_transport_failure_maps_onto_the_port_error() {
+    async fn emoji_lookup_failure_fails_closed_per_token() {
         let api = failing_api(ApiFailures { emojis: true, ..ApiFailures::default() });
         let reaction = delivery_reaction(&api);
 
         let result = reaction.add_reaction(MessageId(42), ":dorkiS:").await;
 
         assert!(matches!(result, Err(OutboundError::Reaction(_))));
+    }
+
+    /// Bare-name resolution shares one cached guild listing: repeated
+    /// reactions within the TTL window fetch the list exactly once.
+    #[tokio::test]
+    async fn reaction_bare_name_resolution_caches_the_guild_list() {
+        let api = delivery_api(vec![RecordingApi::emoji("dorkiS", 9)]);
+        let reaction = delivery_reaction(&api);
+
+        reaction.add_reaction(MessageId(42), ":dorkiS:").await.expect("first reacts");
+        reaction.add_reaction(MessageId(43), ":dorkiS:").await.expect("second reacts");
+
+        let lookups = api
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, RecordedCall::GetEmojis { .. }))
+            .count();
+        assert_eq!(lookups, 1, "the guild list is fetched once per TTL window");
+    }
+
+    /// The emoji-listing port renders exact wire forms (animated flag kept)
+    /// and is empty for origins outside any guild.
+    #[tokio::test]
+    async fn reactable_emojis_lists_wire_forms_and_defaults_outside_guilds() {
+        let api = delivery_api(vec![RecordingApi::emoji("dorkiS", 9)]);
+        let factory = delivery_factory(&api);
+
+        let listed = factory.reactable_emojis(&origin(Some(7), 5, None)).list().await;
+        assert_eq!(
+            listed,
+            vec![ReactableEmoji { name: "dorkiS".to_owned(), token: "<:dorkiS:9>".to_owned() }]
+        );
+        let fetches = api.calls().len();
+
+        let outside = factory.reactable_emojis(&origin(None, 5, None)).list().await;
+        assert!(outside.is_empty(), "no guild - nothing to list");
+        assert_eq!(api.calls().len(), fetches, "the undeliverable port never fetches");
     }
 
     /// A reply-token origin routes every send onto the interaction followup

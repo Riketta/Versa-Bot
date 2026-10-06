@@ -304,6 +304,7 @@ pub fn assemble_context(
     records: &[ConversationRecord],
     tokens_per_char: f64,
     budget: Option<u64>,
+    emoji_menu: &str,
 ) -> Vec<ChatMessage> {
     let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
     // Undeclared models run the default placement (a separate summary slot)
@@ -320,9 +321,13 @@ pub fn assemble_context(
     // The reactions tool block joins the operator's prompt (constant bytes;
     // appended AFTER the operator text so the prefix before it stays stable,
     // and BEFORE any summary merge so `system_suffix` still appends last).
+    // The server emoji menu rides inside the block's tail: it changes only
+    // when the emoji set or whitelist changes (sorted, exact wire forms),
+    // and the preassembled line arrives empty where the channel opted out.
     if config.react {
         system.push_str("\n\n");
         system.push_str(super::tools::REACT_TOOL_PROMPT);
+        system.push_str(emoji_menu);
     }
     let summary_slot = match &state.summary {
         Some(summary) => format!("Earlier conversation summary:\n{summary}"),
@@ -566,6 +571,7 @@ mod tests {
             &[],
             0.25,
             None,
+            "",
         );
         let system = messages.first().map(|m| m.content.as_str()).unwrap_or_default();
         assert!(system.starts_with("You are TestBot, a helpful chat assistant."));
@@ -581,11 +587,64 @@ mod tests {
             &[],
             0.25,
             None,
+            "",
         );
         assert_eq!(
             messages.first().map(|m| m.content.as_str()),
             Some("You are TestBot, a helpful chat assistant.")
         );
+    }
+
+    /// The preassembled emoji menu rides inside the react block's tail; a
+    /// react-off channel drops it even when one was assembled.
+    #[test]
+    fn emoji_menu_joins_the_react_block_and_never_survives_react_off() {
+        let menu = "\n- Custom emojis of this server (exact forms): <:dorkiS:9>";
+        let mut config = flat_turn_config();
+        config.react = true;
+        let messages = assemble_context(
+            &config,
+            &LlmSettings::default(),
+            &test_vars(),
+            &ConversationState::default(),
+            &[],
+            0.25,
+            None,
+            menu,
+        );
+        let system = messages.first().map(|m| m.content.as_str()).unwrap_or_default();
+        assert!(system.contains("[[tool: reactions]]"));
+        assert!(system.contains("exact forms): <:dorkiS:9>"), "unexpected: {system}");
+        // The menu is the block's tail: nothing follows it inside the system
+        // message except further tool bytes - and the operator text stays
+        // byte-identical to the no-menu case.
+        let without_menu = assemble_context(
+            &config,
+            &LlmSettings::default(),
+            &test_vars(),
+            &ConversationState::default(),
+            &[],
+            0.25,
+            None,
+            "",
+        );
+        let base = without_menu.first().map(|m| m.content.as_str()).unwrap_or_default();
+        assert_eq!(system.strip_suffix(menu), Some(base), "the menu appends verbatim");
+
+        let mut off = flat_turn_config();
+        off.react = false;
+        let messages = assemble_context(
+            &off,
+            &LlmSettings::default(),
+            &test_vars(),
+            &ConversationState::default(),
+            &[],
+            0.25,
+            None,
+            menu,
+        );
+        let system = messages.first().map(|m| m.content.as_str()).unwrap_or_default();
+        assert!(!system.contains("dorkiS"), "unexpected: {system}");
     }
 
     #[test]
@@ -610,7 +669,7 @@ mod tests {
         ];
 
         let messages =
-            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, None);
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, None, "");
 
         // Default placement (SystemTurn): system prompt, always-present
         // summary slot (placeholder without a summary), then the turns.
@@ -651,7 +710,8 @@ mod tests {
             cutoff_at: Some(1_717_000_000),
         };
 
-        let messages = assemble_context(&config, &settings, &test_vars(), &state, &[], 0.25, None);
+        let messages =
+            assemble_context(&config, &settings, &test_vars(), &state, &[], 0.25, None, "");
 
         assert_eq!(messages.first().map(|m| m.content.as_str()), Some("custom prompt"));
         assert_eq!(
@@ -676,7 +736,7 @@ mod tests {
         let records = vec![user_record(10, "alice", "hello")];
 
         let messages =
-            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, None);
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, None, "");
 
         assert_eq!(messages.len(), 2);
         assert_eq!(
@@ -697,6 +757,7 @@ mod tests {
             &records,
             0.25,
             None,
+            "",
         );
         assert_eq!(bare.len(), 2);
         assert_eq!(bare.first().map(|m| m.content.as_str()), Some("custom prompt"));
@@ -717,7 +778,7 @@ mod tests {
         let records = vec![user_record(10, "alice", "hello")];
 
         let with_summary =
-            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, None);
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, None, "");
         assert_eq!(
             with_summary.get(1).map(|m| (m.role, m.content.as_str())),
             Some((ChatRole::System, "Earlier conversation summary:\nthe gist"))
@@ -731,6 +792,7 @@ mod tests {
             &records,
             0.25,
             None,
+            "",
         );
         assert_eq!(
             without_summary.get(1).map(|m| (m.role, m.content.as_str())),
@@ -752,7 +814,7 @@ mod tests {
         let records = vec![user_record(10, "alice", "hello")];
 
         let with_summary =
-            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, None);
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, None, "");
         assert_eq!(
             with_summary.get(1).map(|m| (m.role, m.content.as_str())),
             Some((ChatRole::Assistant, "Earlier conversation summary:\nthe gist"))
@@ -766,6 +828,7 @@ mod tests {
             &records,
             0.25,
             None,
+            "",
         );
         assert_eq!(
             without_summary.get(1).map(|m| (m.role, m.content.as_str())),
@@ -784,7 +847,7 @@ mod tests {
         let records = vec![user_record(10, "alice", "hello")];
 
         let messages =
-            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, None);
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, None, "");
 
         assert_eq!(messages.get(2).map(|m| m.content.as_str()), Some("<alice> hello"));
     }
@@ -801,7 +864,7 @@ mod tests {
         ];
 
         let messages =
-            assemble_context(&config, &settings, &test_vars(), &state, &[record], 0.25, None);
+            assemble_context(&config, &settings, &test_vars(), &state, &[record], 0.25, None, "");
 
         assert_eq!(
             messages.get(2).map(|m| m.content.as_str()),
@@ -824,8 +887,16 @@ mod tests {
 
         // A tight budget drops the image-padded record first - descriptions
         // are real prompt bytes and must not ride for free.
-        let messages =
-            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.25, Some(300));
+        let messages = assemble_context(
+            &config,
+            &settings,
+            &test_vars(),
+            &state,
+            &records,
+            0.25,
+            Some(300),
+            "",
+        );
 
         assert_eq!(messages.len(), 3); // system + placeholder + the newest turn
         assert!(messages.get(2).is_some_and(|m| m.content.ends_with("bob: newest")));
@@ -947,7 +1018,7 @@ mod tests {
         ];
 
         let mut previous =
-            render(&assemble_context(&config, &settings, &test_vars(), &state, &[], 0.0, None));
+            render(&assemble_context(&config, &settings, &test_vars(), &state, &[], 0.0, None, ""));
         for (index, _) in steps.iter().enumerate() {
             let visible = steps.get(..=index).expect("index below steps length");
             let current = render(&assemble_context(
@@ -958,6 +1029,7 @@ mod tests {
                 visible,
                 0.0,
                 None,
+                "",
             ));
             assert!(
                 current.starts_with(previous.as_str()),
@@ -1001,7 +1073,7 @@ mod tests {
         };
 
         let messages =
-            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.0, None);
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.0, None, "");
         assert_eq!(messages.len(), 4, "two fixed slots + two turns");
         assert!(matches!(messages.first().expect("system expected").role, ChatRole::System));
         assert!(matches!(messages.get(1).expect("summary expected").role, ChatRole::System));
@@ -1034,7 +1106,7 @@ mod tests {
         let records = vec![user];
 
         let messages =
-            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.0, None);
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.0, None, "");
         let rendered = render(&messages);
         assert!(rendered.contains("user:[alice](<@42>): hi there\n"), "{rendered}");
         // Metadata beyond the template's parameters stays bookkeeping.
@@ -1077,7 +1149,7 @@ mod tests {
         let records = vec![user, legacy];
 
         let messages =
-            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.0, None);
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 0.0, None, "");
         let rendered = render(&messages);
         assert!(rendered.contains("Crafters / 1735689600: alice (42): hi\n"), "{rendered}");
         assert!(rendered.contains(" / 1735689601: bob (): hello\n"), "{rendered}");
@@ -1103,7 +1175,7 @@ mod tests {
 
         let budget = resolve_budget(&config, &settings, true);
         let messages =
-            assemble_context(&config, &settings, &test_vars(), &state, &records, 1.0, budget);
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 1.0, budget, "");
 
         // 78 fixed + 14 (cccccc) + 10 (bb) = 102 exactly; aaaa would exceed.
         assert_eq!(messages.len(), 4);
@@ -1120,7 +1192,7 @@ mod tests {
 
         let budget = resolve_budget(&config, &settings, true);
         let messages =
-            assemble_context(&config, &settings, &test_vars(), &state, &records, 1.0, budget);
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 1.0, budget, "");
 
         // A reply must at least see what it answers.
         assert_eq!(messages.len(), 3);
@@ -1157,14 +1229,14 @@ mod tests {
 
         let budget = resolve_budget(&config, &settings, true);
         let calibrated =
-            assemble_context(&config, &settings, &test_vars(), &state, &records, 1.0, budget);
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 1.0, budget, "");
         assert_eq!(calibrated.len(), 4, "two fixed slots + two budgeted turns");
 
         // Uncalibrated: no usage data, so filling falls back to the message
         // limit - all four turns are present despite the declared window.
         let budget = resolve_budget(&config, &settings, false);
         let uncalibrated =
-            assemble_context(&config, &settings, &test_vars(), &state, &records, 1.0, budget);
+            assemble_context(&config, &settings, &test_vars(), &state, &records, 1.0, budget, "");
         assert_eq!(uncalibrated.len(), 6);
     }
 

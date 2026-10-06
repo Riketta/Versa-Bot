@@ -30,9 +30,10 @@ use super::completion_port::{
 };
 use super::conversation::{self, ConversationRecord, RecordRole};
 use super::model::{
-    ChannelConfig, ChannelKey, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY,
-    UsageStats, blend_ratio, channel_key, channel_state_key, channel_stats_key, records_namespace,
-    unix_now,
+    ChannelConfig, ChannelKey, ConversationState, EmojiInject, GUILD_EMOJI_WHITELIST_KEY,
+    GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats, blend_ratio,
+    channel_emoji_whitelist_key, channel_key, channel_state_key, channel_stats_key,
+    records_namespace, unix_now,
 };
 use super::prompts::{PromptVars, render_prompt};
 use super::providers::LlmSettings;
@@ -576,6 +577,62 @@ impl ChatEngine {
         )
     }
 
+    /// The react tool's server-emoji menu line: exact wire-form tokens, one
+    /// per custom emoji, sorted by name (byte-stable between emoji-set or
+    /// whitelist changes - the line rides the prompt's cacheable prefix).
+    /// Empty unless the channel opted in and the platform lists emojis;
+    /// every failure on the way degrades to empty (the menu is cosmetic).
+    async fn react_emoji_menu(
+        &self,
+        origin: &Origin,
+        config: &ChannelConfig,
+        services: &KernelServices,
+    ) -> String {
+        if config.react_emoji_inject == EmojiInject::None {
+            return String::new();
+        }
+        let mut emojis = services.chat_output_factory.reactable_emojis(origin).list().await;
+        if config.react_emoji_inject == EmojiInject::Whitelist {
+            let whitelist = self.effective_emoji_whitelist(origin, services).await;
+            emojis.retain(|emoji| whitelist.contains(&emoji.name));
+        }
+        if emojis.is_empty() {
+            return String::new();
+        }
+        let tokens: Vec<String> = emojis.into_iter().map(|emoji| emoji.token).collect();
+        format!("\n- Custom emojis of this server (exact forms): {}", tokens.join(" "))
+    }
+
+    /// The emoji whitelist in effect for this channel: the channel's own
+    /// list when non-empty, otherwise the guild-wide one. Unreadable docs
+    /// degrade to empty - the menu just stays off, by the cosmetic-failure
+    /// rule.
+    async fn effective_emoji_whitelist(
+        &self,
+        origin: &Origin,
+        services: &KernelServices,
+    ) -> std::collections::BTreeSet<String> {
+        let Some(storage) = &services.guild_storage else {
+            return std::collections::BTreeSet::new();
+        };
+        let channel: Option<Vec<String>> = storage
+            .get(NAMESPACE, &channel_emoji_whitelist_key(origin.channel_id.get()))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_value(raw).ok());
+        if let Some(list) = channel.filter(|list| !list.is_empty()) {
+            return list.into_iter().collect();
+        }
+        let guild: Option<Vec<String>> = storage
+            .get(NAMESPACE, GUILD_EMOJI_WHITELIST_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_value(raw).ok());
+        guild.unwrap_or_default().into_iter().collect()
+    }
+
     fn assemble_prompt(
         &self,
         config: &ChannelConfig,
@@ -583,6 +640,7 @@ impl ChatEngine {
         live: &[ConversationRecord],
         usage_stats: &UsageStats,
         vars: &PromptVars,
+        emoji_menu: &str,
     ) -> (CompletionRequest, u64, Option<u64>, usize) {
         let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
         let skip = live.len().saturating_sub(depth);
@@ -597,6 +655,7 @@ impl ChatEngine {
             window,
             usage_stats.tokens_per_char,
             budget,
+            emoji_menu,
         );
         // The endpoint's usage report is measured against exactly this
         // context, so the ratio calibration compares like with like.
@@ -633,8 +692,9 @@ impl ChatEngine {
         let _typing = typing.unwrap_or_else(|| services.chat_output_factory.start_typing(origin));
         let channel_id = origin.channel_id.get();
         let vars = self.prompt_vars(guild_name, &config.model);
+        let emoji_menu = self.react_emoji_menu(origin, config, services).await;
         let (request, context_chars, budget, window_used) =
-            self.assemble_prompt(config, state, live, usage_stats, &vars);
+            self.assemble_prompt(config, state, live, usage_stats, &vars, &emoji_menu);
         let started = Instant::now();
 
         // Streaming channels pull the answer live off the endpoint (SSE
@@ -1100,8 +1160,9 @@ impl ChatEngine {
         let AnswerRequest { config, state, live, usage_stats, guild_name, .. } = request;
         let channel_id = origin.channel_id.get();
         let vars = self.prompt_vars(guild_name, &config.model);
+        let emoji_menu = self.react_emoji_menu(origin, config, services).await;
         let (mut request, context_chars, budget, _) =
-            self.assemble_prompt(config, state, live, usage_stats, &vars);
+            self.assemble_prompt(config, state, live, usage_stats, &vars, &emoji_menu);
         // This invocation is a reaction decision, not a reply: without a
         // dedicated instruction the model answers conversationally, the
         // prose is discarded, and markers stay rare. Appended last so the
@@ -1657,13 +1718,13 @@ mod tests {
         AttachmentPayload, ChannelId, GuildId, MessageId, OutboundError, StorageError, UserId,
     };
     use crate::kernel::spi_ports::{
-        ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard, GuildStorage,
-        ReactionPort, StoragePort, StoredRecord,
+        ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard, GuildEmojiPort,
+        GuildStorage, ReactableEmoji, ReactionPort, StoragePort, StoredRecord,
     };
     use crate::plugins::llm::completion_port::{
         ChatRole, CompletionResponse, LlmError, ResponseTiming, TokenUsage,
     };
-    use crate::plugins::llm::model::{CaptureMode, channel_config_key};
+    use crate::plugins::llm::model::{CaptureMode, EmojiInject, channel_config_key};
     use crate::plugins::llm::rng::RandRandom;
     use crate::test_support::{InMemoryStorage, RecordingChatOutput};
     use async_trait::async_trait;
@@ -1732,6 +1793,8 @@ mod tests {
         output: Arc<RecordingChatOutput>,
         typing_starts: AtomicUsize,
         reactions: Arc<Mutex<Vec<(u64, String)>>>,
+        /// The custom emojis the emoji-listing port serves (default: none).
+        emojis: Vec<ReactableEmoji>,
     }
 
     impl StreamRecordingFactory {
@@ -1777,6 +1840,20 @@ mod tests {
 
         fn react(&self, _origin: &Origin) -> Arc<dyn ReactionPort> {
             Arc::new(RecordingReactionPort { reactions: Arc::clone(&self.reactions) })
+        }
+
+        fn reactable_emojis(&self, _origin: &Origin) -> Arc<dyn GuildEmojiPort> {
+            Arc::new(StaticEmojis(self.emojis.clone()))
+        }
+    }
+
+    /// Serves a fixed emoji list - the prompt-injection source for tests.
+    struct StaticEmojis(Vec<ReactableEmoji>);
+
+    #[async_trait]
+    impl GuildEmojiPort for StaticEmojis {
+        async fn list(&self) -> Vec<ReactableEmoji> {
+            self.0.clone()
         }
     }
 
@@ -2005,6 +2082,7 @@ mod tests {
             output: Arc::clone(&output),
             typing_starts: AtomicUsize::new(0),
             reactions: Arc::new(Mutex::new(Vec::new())),
+            emojis: Vec::new(),
         });
         let services = Arc::new(KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
@@ -2205,6 +2283,18 @@ mod tests {
         responses: Vec<Result<String, LlmError>>,
         describer: Arc<FakeDescriber>,
     ) -> TestCtx {
+        ctx_describer_with_emojis(settings, rng, responses, describer, Vec::new())
+    }
+
+    /// Same fixture with a scripted server emoji list for the react tool's
+    /// prompt injection.
+    fn ctx_describer_with_emojis(
+        settings: LlmSettings,
+        rng: Arc<dyn RandomPort>,
+        responses: Vec<Result<String, LlmError>>,
+        describer: Arc<FakeDescriber>,
+        emojis: Vec<ReactableEmoji>,
+    ) -> TestCtx {
         let settings = Arc::new(settings);
         let fake = Arc::new(FakeCompletion {
             responses: Mutex::new(responses),
@@ -2230,6 +2320,7 @@ mod tests {
             output: Arc::clone(&output),
             typing_starts: AtomicUsize::new(0),
             reactions: Arc::new(Mutex::new(Vec::new())),
+            emojis,
         });
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
@@ -3836,6 +3927,127 @@ mod tests {
 
     fn react_config() -> ChannelConfig {
         ChannelConfig { react: true, ..assigned_config() }
+    }
+
+    fn emoji_menu_emojis() -> Vec<ReactableEmoji> {
+        vec![
+            ReactableEmoji { name: "dorkiS".to_owned(), token: "<:dorkiS:9>".to_owned() },
+            ReactableEmoji { name: "ashuu".to_owned(), token: "<a:ashuu:7>".to_owned() },
+        ]
+    }
+
+    /// `all` inject mode lists every server emoji as exact wire forms inside
+    /// the react tool block of the system prompt.
+    #[tokio::test]
+    async fn react_emoji_menu_injects_server_emojis_into_the_prompt() {
+        let ctx = ctx_describer_with_emojis(
+            LlmSettings::default(),
+            Arc::new(RandRandom),
+            vec![Ok("hi".to_owned())],
+            Arc::new(FakeDescriber::default()),
+            emoji_menu_emojis(),
+        );
+        let config = ChannelConfig {
+            react: true,
+            react_emoji_inject: EmojiInject::All,
+            ..assigned_config()
+        };
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
+
+        let request = ctx.fake.requests().first().expect("one request expected").clone();
+        let system = request.messages.first().expect("system slot expected");
+        assert!(
+            system
+                .content
+                .contains("Custom emojis of this server (exact forms): <:dorkiS:9> <a:ashuu:7>"),
+            "unexpected: {}",
+            system.content
+        );
+    }
+
+    /// `whitelist` inject mode keeps only whitelisted names - the guild-wide
+    /// list when the channel has none of its own; an empty effective list
+    /// injects no menu at all. Off channels never see a menu either way.
+    #[tokio::test]
+    async fn react_emoji_menu_whitelist_filters_by_scope_fallback() {
+        let ctx = ctx_describer_with_emojis(
+            LlmSettings::default(),
+            Arc::new(RandRandom),
+            vec![Ok("hi".to_owned())],
+            Arc::new(FakeDescriber::default()),
+            emoji_menu_emojis(),
+        );
+        let config = ChannelConfig {
+            react: true,
+            react_emoji_inject: EmojiInject::Whitelist,
+            ..assigned_config()
+        };
+        seed_config(&ctx.storage, &config);
+        ctx.storage.seed(
+            "test",
+            GuildId(1),
+            NAMESPACE,
+            GUILD_EMOJI_WHITELIST_KEY,
+            serde_json::json!(["ashuu"]),
+        );
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
+
+        let request = ctx.fake.requests().first().expect("one request expected").clone();
+        let system = request.messages.first().expect("system slot expected");
+        assert!(system.content.contains("<a:ashuu:7>"), "unexpected: {}", system.content);
+        assert!(!system.content.contains("dorkiS"), "unexpected: {}", system.content);
+
+        // A non-empty channel list replaces the guild baseline.
+        ctx.storage.seed(
+            "test",
+            GuildId(1),
+            NAMESPACE,
+            &channel_emoji_whitelist_key(2),
+            serde_json::json!(["dorkiS"]),
+        );
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
+        let request = ctx.fake.requests().last().expect("second request expected").clone();
+        let system = request.messages.first().expect("system slot expected");
+        assert!(system.content.contains("<:dorkiS:9>"), "unexpected: {}", system.content);
+        assert!(!system.content.contains("ashuu"), "unexpected: {}", system.content);
+    }
+
+    /// React-on with the inject off keeps the prompt free of the menu - and
+    /// so does inject-on with react off (the menu rides the react block).
+    #[tokio::test]
+    async fn react_emoji_menu_stays_off_without_opt_in() {
+        let ctx = ctx_describer_with_emojis(
+            LlmSettings::default(),
+            Arc::new(RandRandom),
+            vec![Ok("hi".to_owned())],
+            Arc::new(FakeDescriber::default()),
+            emoji_menu_emojis(),
+        );
+        seed_config(&ctx.storage, &assigned_config());
+
+        ctx.engine
+            .handle_message(
+                &origin(),
+                &payload(true, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
+            .await;
+
+        let request = ctx.fake.requests().first().expect("one request expected").clone();
+        let system = request.messages.first().expect("system slot expected");
+        assert!(!system.content.contains("Custom emojis of this server"));
+        assert!(!system.content.contains("dorkiS"));
     }
 
     /// Markers are stripped from the delivered text and the recorded bot
