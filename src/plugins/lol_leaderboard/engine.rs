@@ -56,7 +56,10 @@ impl ResolvedView {
     }
 }
 
-/// Startup-only engine settings; the display windows are resolved once.
+/// Engine settings: the data window the engine serves. Regions, parse
+/// depth, cache TTL and the display view hot-reload
+/// ([`LeaderboardEngine::update_settings`]); the pacing interval is
+/// boot-frozen with the source adapter's own page pacing.
 #[derive(Debug, Clone)]
 pub struct EngineSettings {
     pub regions: Vec<String>,
@@ -132,7 +135,7 @@ struct CacheState {
 
 pub struct LeaderboardEngine {
     source: Arc<dyn LeaderboardSourcePort>,
-    settings: EngineSettings,
+    settings: Mutex<EngineSettings>,
     cache: Mutex<CacheState>,
     /// Singleflight: concurrent invocations share one refresh cycle - the
     /// second caller waits, then finds everything fresh.
@@ -144,7 +147,7 @@ impl LeaderboardEngine {
     pub fn new(source: Arc<dyn LeaderboardSourcePort>, settings: EngineSettings) -> Self {
         Self {
             source,
-            settings,
+            settings: Mutex::new(settings),
             cache: Mutex::new(CacheState::default()),
             refresh: tokio::sync::Mutex::new(()),
         }
@@ -154,7 +157,30 @@ impl LeaderboardEngine {
     /// command then explains itself instead of parsing nothing.
     #[must_use]
     pub fn is_configured(&self) -> bool {
-        !self.settings.regions.is_empty()
+        !self.settings.lock().regions.is_empty()
+    }
+
+    /// Hot reload: swaps the data window - regions, parse depth, cache TTL,
+    /// display view. The pacing interval is kept: the source adapter's own
+    /// page pacing is built once at boot, and the two cadences must not
+    /// fork. Identical values are a no-op. Cached region data survives the
+    /// swap - fresh entries for re-added regions are reused, removed ones
+    /// idle until the same name returns (bounded by served region names).
+    pub fn update_settings(&self, settings: EngineSettings) {
+        let mut current = self.settings.lock();
+        if current.regions == settings.regions
+            && current.parse_depth == settings.parse_depth
+            && current.cache_ttl == settings.cache_ttl
+            && current.view == settings.view
+        {
+            return;
+        }
+        current.regions = settings.regions;
+        current.parse_depth = settings.parse_depth;
+        current.cache_ttl = settings.cache_ttl;
+        current.view = settings.view;
+        drop(current);
+        tracing::info!("leaderboard data window changed");
     }
 
     /// Returns a snapshot, refreshing stale regions first (under the
@@ -168,14 +194,17 @@ impl LeaderboardEngine {
     pub async fn snapshot(&self) -> Result<Snapshot, SourceError> {
         let _single = self.refresh.lock().await;
         let now = Instant::now();
-        let ttl = self.settings.cache_ttl;
+        // One clone per cycle, before any await - the cell may swap
+        // mid-refresh, and the cycle must run on one coherent window.
+        let settings = self.settings.lock().clone();
+        let ttl = settings.cache_ttl;
 
         // Short cache-lock: decide what is stale. The fetches below run
         // outside the cache lock - but inside the singleflight lock, so a
         // long refresh delays other callers (bounded by the source caps).
         let stale_regions: Vec<String> = {
             let state = self.cache.lock();
-            self.settings
+            settings
                 .regions
                 .iter()
                 .filter(|region| match state.regions.get(*region) {
@@ -215,11 +244,11 @@ impl LeaderboardEngine {
 
         for region in &stale_regions {
             if paced {
-                tokio::time::sleep(self.settings.request_interval).await;
+                tokio::time::sleep(settings.request_interval).await;
             }
             paced = true;
             let started = Instant::now();
-            match self.source.leaderboard(region, self.settings.parse_depth).await {
+            match self.source.leaderboard(region, settings.parse_depth).await {
                 Ok(data) => {
                     tracing::debug!(
                         region = %region,
@@ -245,7 +274,7 @@ impl LeaderboardEngine {
             let state = self.cache.lock();
             let mut regions = Vec::new();
             let mut ages = Vec::new();
-            for region in &self.settings.regions {
+            for region in &settings.regions {
                 if let Some(entry) = state.regions.get(region) {
                     regions.push(entry.data.clone());
                     ages.push(now.duration_since(entry.fetched_at));
@@ -262,13 +291,13 @@ impl LeaderboardEngine {
         let age = ages.iter().copied().max().unwrap_or_default();
         let stale = !failures.is_empty() || age > ttl;
         Ok(Snapshot {
-            requested_players: self.settings.regions.len() * self.settings.parse_depth as usize,
+            requested_players: settings.regions.len() * settings.parse_depth as usize,
             regions,
             champ_names,
             failures,
             stale,
             age,
-            view: self.settings.view.clone(),
+            view: settings.view.clone(),
         })
     }
 }
@@ -475,6 +504,41 @@ mod tests {
         );
         assert_eq!(settings.regions, vec!["kr"]);
         assert_eq!(settings.parse_depth, 1000);
+    }
+
+    /// Hot reload: the data window (regions, depth, TTL, view) swaps, the
+    /// pacing interval stays at its boot value, and an empty regions list
+    /// flips the engine into not-configured mode - the same state a
+    /// degraded section maps to at boot.
+    #[test]
+    fn update_settings_swaps_the_data_window_but_keeps_pacing() {
+        let source = Arc::new(FakeSource::ungated());
+        let engine = engine_with(&source, &["kr", "na"], Duration::from_secs(3600));
+        assert!(engine.is_configured());
+
+        engine.update_settings(EngineSettings {
+            regions: vec!["euw".to_owned()],
+            parse_depth: 50,
+            cache_ttl: Duration::from_secs(60),
+            request_interval: Duration::from_secs(99),
+            view: ResolvedView::resolve(50, &[25], 50, 1),
+        });
+        let settings = engine.settings.lock();
+        assert_eq!(settings.regions, vec!["euw"]);
+        assert_eq!(settings.parse_depth, 50);
+        assert_eq!(settings.cache_ttl, Duration::from_secs(60));
+        assert_eq!(settings.request_interval, Duration::ZERO, "pacing stays boot-frozen");
+        assert_eq!(settings.view.buckets, vec![25]);
+        drop(settings);
+
+        engine.update_settings(EngineSettings {
+            regions: Vec::new(),
+            parse_depth: 50,
+            cache_ttl: Duration::from_secs(60),
+            request_interval: Duration::ZERO,
+            view: ResolvedView::resolve(50, &[], 50, 1),
+        });
+        assert!(!engine.is_configured());
     }
 
     #[tokio::test]

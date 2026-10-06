@@ -58,7 +58,9 @@ impl AnnounceFlags {
     }
 }
 
-/// Engine construction settings (`[lol_store]` config section, startup-only).
+/// Engine construction settings (`[lol_store]` config section). The announce
+/// flags and watch caps hot-reload ([`Self::update_settings`]); the poll
+/// interval is boot-frozen with the scheduled poll job.
 #[derive(Debug, Clone)]
 pub struct EngineSettings {
     pub poll: Duration,
@@ -96,7 +98,7 @@ pub struct StoreEngine<B: EventBusPort> {
     /// (e.g. rows left by a differently-wired storage) are skipped, and it
     /// namespaces every storage binding.
     platform: Arc<dyn PlatformInfoPort>,
-    settings: EngineSettings,
+    settings: Mutex<EngineSettings>,
     state: Mutex<Option<LastSeen>>,
     champions: Mutex<Option<Arc<HashMap<u64, String>>>>,
     /// Last good raw snapshot, one section per source: a source that
@@ -135,7 +137,7 @@ impl<B: EventBusPort> StoreEngine<B> {
             factory,
             bus,
             platform,
-            settings,
+            settings: Mutex::new(settings),
             state: Mutex::new(None),
             champions: Mutex::new(None),
             last_snapshot: Mutex::new(None),
@@ -148,8 +150,29 @@ impl<B: EventBusPort> StoreEngine<B> {
     }
 
     #[must_use]
-    pub fn settings(&self) -> &EngineSettings {
-        &self.settings
+    pub fn settings(&self) -> EngineSettings {
+        self.settings.lock().clone()
+    }
+
+    /// Hot reload: swaps the announce flags and watch caps; the poll
+    /// interval is kept - the poll job's cadence is fixed at schedule time,
+    /// so a runtime change would only fork the cell from the running job
+    /// (enabling or disabling the watcher stays a boot-time decision).
+    /// Identical values are a no-op, so unrelated config edits change
+    /// nothing.
+    pub fn update_settings(&self, settings: EngineSettings) {
+        let mut current = self.settings.lock();
+        if current.flags == settings.flags
+            && current.watch_user_cap == settings.watch_user_cap
+            && current.watch_guild_cap == settings.watch_guild_cap
+        {
+            return;
+        }
+        current.flags = settings.flags;
+        current.watch_user_cap = settings.watch_user_cap;
+        current.watch_guild_cap = settings.watch_guild_cap;
+        drop(current);
+        tracing::info!("lol store announce flags / watch caps changed");
     }
 
     /// One poll cycle. Never fails outward: every failure mode is a logged,
@@ -275,16 +298,17 @@ impl<B: EventBusPort> StoreEngine<B> {
             // The general feed honors the announce flags (stripped copy);
             // personal watches see the full delta below.
             let mut feed = delta.clone();
-            if !self.settings.flags.sales {
+            let flags = self.settings.lock().flags;
+            if !flags.sales {
                 feed.sales.clear();
             }
-            if !self.settings.flags.new_skins {
+            if !flags.new_skins {
                 feed.skins.clear();
             }
-            if !self.settings.flags.mythic_rotation {
+            if !flags.mythic_rotation {
                 feed.rotations.clear();
             }
-            if !self.settings.flags.yourshop {
+            if !flags.yourshop {
                 feed.yourshop = None;
             }
             if !feed.is_empty() {
@@ -819,7 +843,7 @@ impl<B: EventBusPort> StoreEngine<B> {
             }
             None => lines.push("Store state: not captured yet".to_owned()),
         }
-        let flags = &self.settings.flags;
+        let flags = self.settings.lock().flags;
         lines.push(format!(
             "Announce: sales={} skins={} mythic={} yourshop={}",
             on_off(flags.sales),
@@ -1046,6 +1070,44 @@ mod tests {
 
     async fn fixture(lcu: Arc<FakeLcu>) -> Fixture {
         fixture_with(lcu, AnnounceFlags::all_on()).await
+    }
+
+    /// Hot reload: the announce flags and watch caps swap, the poll
+    /// interval stays at its boot value (the scheduled job's cadence).
+    #[test]
+    fn update_settings_swaps_flags_and_caps_but_keeps_poll() {
+        let engine = Arc::new(StoreEngine::new(
+            FakeLcu::online(),
+            Arc::new(InMemoryStorage::new()) as Arc<dyn StoragePort>,
+            RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
+            RecorderBus::default(),
+            crate::test_support::test_platform_info(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: 7,
+                watch_guild_cap: 9,
+            },
+        ));
+
+        engine.update_settings(EngineSettings {
+            poll: Duration::from_secs(1),
+            flags: AnnounceFlags {
+                sales: false,
+                new_skins: true,
+                mythic_rotation: false,
+                yourshop: true,
+            },
+            watch_user_cap: 2,
+            watch_guild_cap: 3,
+        });
+        let settings = engine.settings();
+        assert!(!settings.flags.sales);
+        assert!(settings.flags.new_skins);
+        assert!(!settings.flags.mythic_rotation);
+        assert_eq!(settings.watch_user_cap, 2);
+        assert_eq!(settings.watch_guild_cap, 3);
+        assert_eq!(settings.poll, Duration::from_secs(60), "poll stays boot-frozen");
     }
 
     async fn enable_guild(storage: &InMemoryStorage, guild: u64, channel: Option<&str>) {

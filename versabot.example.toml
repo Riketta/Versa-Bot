@@ -189,9 +189,12 @@ url = "sqlite://versabot.db"
 # Optional: LoL store watcher - announces store events (new sales, new
 # skins, Mythic Shop rotations, Your Shop start) from the locally running
 # League client to a per-guild assigned channel (/lol_store_enable +
-# /lol_store_assign). Startup-only: an absent section, an empty
-# lockfile_path, or poll_secs = 0 keeps the watcher off. Your logged-in
-# account is only the API key - no account data is ever read or announced.
+# /lol_store_assign). Enabling or disabling is startup-only: an absent
+# section, an empty lockfile_path, or poll_secs = 0 keeps the watcher off
+# until a restart. When enabled, the announce_* flags and watch caps
+# hot-reload; lockfile_path, address, and poll_secs stay boot-frozen.
+# Your logged-in account is only the API key - no account data is ever
+# read or announced.
 # [lol_store]
 # lockfile_path = "C:/Riot Games/League of Legends/lockfile"
 # Host the client API listens on; the port always comes from the lockfile.
@@ -207,9 +210,11 @@ url = "sqlite://versabot.db"
 
 # Optional: LoL leaderboard - the on-demand /lol_leaderboard statistics
 # dump (role distributions, most picked champions per role) from a public
-# leaderboard source. Startup-only: an absent section, no regions, or a
-# zero request_interval_secs / parse_depth / cache_ttl_secs keeps the
-# command in "not configured" mode. No per-guild setup - the command
+# leaderboard source. Regions, parse_depth, cache_ttl_secs, and the
+# display knobs hot-reload (a degraded section maps the live engine to
+# "not configured" mode); proxy and request_interval_secs are
+# startup-only. An absent section - or no regions - keeps the command in
+# "not configured" mode. No per-guild setup - the command
 # answers wherever it is invoked. All display windows (buckets, champ
 # pool) are clamped to parse_depth.
 # [lol_leaderboard]

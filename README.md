@@ -68,9 +68,10 @@ commands, permission tiers - lives in [Plugins](#plugins).
 - Fault isolation: a panicking plugin cannot crash the bot - pipeline
   hooks and event-bus subscribers are caught and logged, the event is
   dropped, and the rest of the chain or bus keeps working.
-- Configuration hot reload: hot-reloadable sections apply live
-  (`[status]`, `owners`); startup-only settings (token, storage, Sentry,
-  LLM providers) require a restart.
+- Configuration hot reload: hot-reloadable sections apply live (`[status]`,
+  `owners`, `[lol_store]` announce flags and watch caps, `[lol_leaderboard]`
+  regions/depth/TTL/view); startup-only settings (token, storage, Sentry,
+  LLM providers, poll and pacing intervals) require a restart.
 - Graceful shutdown on Ctrl-C (plugins stop in reverse order).
 
 ## Getting started
@@ -484,9 +485,11 @@ Watch notes:
   just do not resolve). Caps: `watch_user_cap` per member,
   `watch_guild_cap` per guild.
 
-Operator configuration lives in the optional `[lol_store]` section
-(**startup-only** - an absent section, an empty `lockfile_path`, or a
-zero `poll_secs` keep the watcher off):
+Operator configuration lives in the optional `[lol_store]` section. An
+absent section, an empty `lockfile_path`, or a zero `poll_secs` keep the
+watcher off (**startup-only** - enabling or disabling needs a restart);
+when enabled at boot, the announce flags and watch caps hot-reload, while
+`lockfile_path`, `address`, and `poll_secs` stay boot-frozen:
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
@@ -550,8 +553,12 @@ dump.
 | `/lol_leaderboard` | user | post the leaderboard statistics in the current channel (public) |
 
 Operator configuration lives in the optional `[lol_leaderboard]`
-section (**startup-only**; an absent section - or no regions served by
-the source - keeps the command in "not configured" mode):
+section (an absent section - or no regions served by the source - keeps
+the command in "not configured" mode). `regions`, `parse_depth`,
+`cache_ttl_secs`, and the display knobs hot-reload; `proxy` and
+`request_interval_secs` (the source pacing) are **startup-only** and
+need a restart. A section that degrades (absent or a zeroed knob) maps
+the live engine to the same "not configured" mode as at boot:
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|

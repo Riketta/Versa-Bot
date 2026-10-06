@@ -202,10 +202,10 @@ async fn main() -> ExitCode {
     ));
 
     // LoL store watcher: always registered (its commands explain themselves
-    // when the watcher is off). `[lol_store]` is startup-only - the LCU
-    // client and the poll engine are built once here; changes require a
-    // restart. An absent section, an empty lockfile path or a zero poll
-    // keep the watcher disabled.
+    // when the watcher is off). The LCU client and the poll engine are
+    // built once here; enabling or disabling the watcher stays startup-only
+    // (absent section, empty lockfile path, zero poll), while the announce
+    // flags and watch caps hot-reload.
     let lol_settings = lol_store_engine_settings(config.lol_store.as_ref());
     let lcu_client = LcuClient::new(
         config.lol_store.as_ref().map(|store| store.lockfile_path.clone()).unwrap_or_default(),
@@ -227,29 +227,22 @@ async fn main() -> ExitCode {
     ));
 
     // LoL leaderboard: always registered (its command explains itself when
-    // the source is unconfigured). `[lol_leaderboard]` is startup-only -
-    // the HTTP client and engine are built once here; changes require a
-    // restart. The data is world data: no guild storage, no scheduler - the
-    // refresh runs inside the command under the typing indicator.
+    // the source is unconfigured). The HTTP client and engine are built
+    // once here - the proxy and the pacing interval are startup-only - but
+    // the data window (regions, parse depth, cache TTL, display view)
+    // hot-reloads. The data is world data: no guild storage, no scheduler -
+    // the refresh runs inside the command under the typing indicator.
     let leaderboard_interval = Duration::from_secs(
         config.lol_leaderboard.as_ref().map_or(1, |config| config.request_interval_secs).max(1),
     );
     let leaderboard_proxy = config.lol_leaderboard.as_ref().and_then(|c| c.proxy.clone());
-    let leaderboard_source = DeepLolSource::new(leaderboard_proxy.as_deref(), leaderboard_interval)
-        .expect("config [lol_leaderboard] section expected to be valid (proxy parseable)");
-    let leaderboard_engine_settings =
-        leaderboard_settings(config.lol_leaderboard.as_ref(), &leaderboard_source).unwrap_or_else(
-            || {
-                // Section absent or degraded: the engine still boots in
-                // "not configured" mode, derived from the config's own
-                // defaults so the two can never drift.
-                leaderboard_settings(Some(&LolLeaderboardConfig::default()), &leaderboard_source)
-                    .expect("the default leaderboard config is enabled")
-            },
-        );
+    let leaderboard_source: Arc<dyn LeaderboardSourcePort> = Arc::new(
+        DeepLolSource::new(leaderboard_proxy.as_deref(), leaderboard_interval)
+            .expect("config [lol_leaderboard] section expected to be valid (proxy parseable)"),
+    );
     let leaderboard_engine = Arc::new(LeaderboardEngine::new(
-        Arc::new(leaderboard_source) as Arc<dyn LeaderboardSourcePort>,
-        leaderboard_engine_settings,
+        Arc::clone(&leaderboard_source),
+        leaderboard_engine_settings(config.lol_leaderboard.as_ref(), leaderboard_source.as_ref()),
     ));
     let lol_leaderboard = Arc::new(LeaderboardPlugin::new(
         Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
@@ -264,6 +257,11 @@ async fn main() -> ExitCode {
     watcher.seed(config.clone());
     watcher.subscribe(Arc::new(StatusSettingsReloader { plugin: Arc::clone(&status_plugin) }));
     watcher.subscribe(Arc::new(AuthOwnersReloader { plugin: Arc::clone(&auth) }));
+    watcher.subscribe(Arc::new(LolStoreSettingsReloader { engine: Arc::clone(&lol_engine) }));
+    watcher.subscribe(Arc::new(LolLeaderboardSettingsReloader {
+        engine: Arc::clone(&leaderboard_engine),
+        source: Arc::clone(&leaderboard_source),
+    }));
     let config_watch_job = scheduler.schedule(
         "config_watcher",
         Duration::from_secs(5),
@@ -632,6 +630,20 @@ fn leaderboard_settings(
     Some(settings)
 }
 
+/// Maps `[lol_leaderboard]` onto the engine settings, degrading an absent
+/// or invalid section to the not-configured mode the boot path uses -
+/// derived from the config's own defaults so the two can never drift.
+/// Shared by boot and the hot-reload handler.
+fn leaderboard_engine_settings(
+    config: Option<&LolLeaderboardConfig>,
+    source: &dyn LeaderboardSourcePort,
+) -> LeaderboardEngineSettings {
+    leaderboard_settings(config, source).unwrap_or_else(|| {
+        leaderboard_settings(Some(&LolLeaderboardConfig::default()), source)
+            .expect("the default leaderboard config is enabled")
+    })
+}
+
 /// Applies `[status]` changes to the rotator; the plugin itself ignores
 /// identical settings, so unrelated config edits don't reset the rotation.
 struct StatusSettingsReloader {
@@ -654,6 +666,45 @@ struct AuthOwnersReloader {
 impl ConfigChangeHandler<Configuration> for AuthOwnersReloader {
     fn on_change(&self, config: Arc<Configuration>) {
         self.plugin.update_owners(&config.owners);
+    }
+}
+
+/// Applies `[lol_store]` value changes (announce flags, watch caps) to the
+/// poll engine. The poll cadence, lockfile path and LCU address stay
+/// boot-frozen - the poll job is scheduled once and the client is built
+/// once - so enabling or disabling the watcher remains a restart-level
+/// change: a config that maps to disabled leaves the current values
+/// untouched.
+struct LolStoreSettingsReloader {
+    engine: Arc<StoreEngine<InMemoryEventBus>>,
+}
+
+impl ConfigChangeHandler<Configuration> for LolStoreSettingsReloader {
+    fn on_change(&self, config: Arc<Configuration>) {
+        let settings = lol_store_engine_settings(config.lol_store.as_ref());
+        if settings.poll.is_zero() {
+            tracing::debug!("config [lol_store] absent or disabled - current values kept");
+            return;
+        }
+        self.engine.update_settings(settings);
+    }
+}
+
+/// Applies `[lol_leaderboard]` value changes (regions, parse depth, cache
+/// TTL, display view). The proxy and the pacing interval stay boot-frozen
+/// with the source adapter; an absent or invalid section degrades to the
+/// same not-configured mode as at boot - the engine is always live, only
+/// its data window swaps.
+struct LolLeaderboardSettingsReloader {
+    engine: Arc<LeaderboardEngine>,
+    source: Arc<dyn LeaderboardSourcePort>,
+}
+
+impl ConfigChangeHandler<Configuration> for LolLeaderboardSettingsReloader {
+    fn on_change(&self, config: Arc<Configuration>) {
+        let settings =
+            leaderboard_engine_settings(config.lol_leaderboard.as_ref(), self.source.as_ref());
+        self.engine.update_settings(settings);
     }
 }
 
@@ -834,6 +885,21 @@ mod tests {
 
         config.cache_ttl_secs = 3600;
         assert!(leaderboard_settings(Some(&config), source).is_some());
+    }
+
+    /// The reload mapping shares the boot degrade path: an absent or
+    /// invalid section resolves to the not-configured mode (empty served
+    /// regions), never an error.
+    #[test]
+    fn leaderboard_engine_settings_falls_back_to_not_configured() {
+        let source = StubSource;
+        let source: &dyn LeaderboardSourcePort = &source;
+
+        assert!(leaderboard_engine_settings(None, source).regions.is_empty());
+
+        let config =
+            LolLeaderboardConfig { request_interval_secs: 0, ..LolLeaderboardConfig::default() };
+        assert!(leaderboard_engine_settings(Some(&config), source).regions.is_empty());
     }
 
     /// The startup parse-depth cap: an absurd `parse_depth` clamps to the

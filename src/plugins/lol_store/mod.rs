@@ -9,8 +9,9 @@
 //!
 //! Disabled by default at both levels: without a configured `[lol_store]` section
 //! the engine never schedules, and per guild nothing announces until
-//! `/lol_store_enable` + `/lol_store_assign`. The poll cadence and feature
-//! flags are startup-only ([`EngineSettings`]).
+//! `/lol_store_enable` + `/lol_store_assign`. The poll cadence is
+//! startup-only; announce flags and watch caps hot-reload
+//! ([`EngineSettings`], [`StoreEngine::update_settings`]).
 
 mod commands;
 mod diff;

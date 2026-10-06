@@ -32,13 +32,16 @@ pub struct Configuration {
     /// interval and status list are bot-wide, not per-guild.
     pub status: Option<StatusConfig>,
     /// Optional League-client store watcher (`[lol_store]` section).
-    /// Startup-only: absent section - or an empty `lockfile_path` - keeps
-    /// the watcher off.
+    /// Enabling or disabling is startup-only: absent section - or an empty
+    /// `lockfile_path` - keeps the watcher off. When enabled at boot, the
+    /// announce flags and watch caps hot-reload; the poll cadence, lockfile
+    /// path and address stay boot-frozen.
     #[serde(default)]
     pub lol_store: Option<LolStoreConfig>,
-    /// Optional leaderboard command (`[lol_leaderboard]` section).
-    /// Startup-only: an absent section - or an empty `regions` list - keeps
-    /// the command in "not configured" mode.
+    /// Optional leaderboard command (`[lol_leaderboard]` section). The
+    /// proxy and pacing interval are startup-only; regions, parse depth,
+    /// cache TTL and the display view hot-reload - an absent section (or
+    /// one that degrades) keeps the command in "not configured" mode.
     #[serde(default)]
     pub lol_leaderboard: Option<LolLeaderboardConfig>,
     /// Deployment-global bot-owner identities (`owners = ["..."]`):
