@@ -282,6 +282,7 @@ mod tests {
     };
     use async_trait::async_trait;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     /// Minimal registry double capturing descriptors and handlers.
@@ -728,6 +729,289 @@ mod tests {
             args.push(("kinds".to_owned(), kinds.to_owned()));
         }
         CommandArgs(args)
+    }
+
+    /// Storage view whose FIRST document read parks until released; every
+    /// later read is counted. Backs the watch-write lock tests: the parked
+    /// read happens INSIDE the per-guild lock, so it proves both the
+    /// cross-guild independence and the same-guild serialization.
+    struct GatedWatchView {
+        guild: Arc<dyn crate::kernel::spi_ports::GuildStorage>,
+        read_started: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        later_reads: Arc<AtomicUsize>,
+        consumed: AtomicBool,
+    }
+
+    #[async_trait]
+    impl crate::kernel::spi_ports::GuildStorage for GatedWatchView {
+        async fn get(
+            &self,
+            namespace: &str,
+            key: &str,
+        ) -> Result<Option<serde_json::Value>, crate::kernel::models::StorageError> {
+            if !self.consumed.swap(true, Ordering::SeqCst) {
+                self.read_started.store(true, Ordering::SeqCst);
+                while !self.release.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            } else {
+                self.later_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            self.guild.get(namespace, key).await
+        }
+
+        async fn set(
+            &self,
+            namespace: &str,
+            key: &str,
+            value: serde_json::Value,
+        ) -> Result<(), crate::kernel::models::StorageError> {
+            self.guild.set(namespace, key, value).await
+        }
+
+        async fn delete(
+            &self,
+            namespace: &str,
+            key: &str,
+        ) -> Result<(), crate::kernel::models::StorageError> {
+            self.guild.delete(namespace, key).await
+        }
+
+        async fn list_keys(
+            &self,
+            namespace: &str,
+        ) -> Result<Vec<String>, crate::kernel::models::StorageError> {
+            self.guild.list_keys(namespace).await
+        }
+
+        async fn append(
+            &self,
+            namespace: &str,
+            payload: serde_json::Value,
+        ) -> Result<u64, crate::kernel::models::StorageError> {
+            self.guild.append(namespace, payload).await
+        }
+
+        async fn list_after(
+            &self,
+            namespace: &str,
+            after_seq: u64,
+            limit: u32,
+        ) -> Result<Vec<crate::kernel::spi_ports::StoredRecord>, crate::kernel::models::StorageError>
+        {
+            self.guild.list_after(namespace, after_seq, limit).await
+        }
+
+        async fn list_last(
+            &self,
+            namespace: &str,
+            limit: u32,
+        ) -> Result<Vec<crate::kernel::spi_ports::StoredRecord>, crate::kernel::models::StorageError>
+        {
+            self.guild.list_last(namespace, limit).await
+        }
+
+        async fn count_after(
+            &self,
+            namespace: &str,
+            after_seq: u64,
+        ) -> Result<u64, crate::kernel::models::StorageError> {
+            self.guild.count_after(namespace, after_seq).await
+        }
+
+        async fn delete_record(
+            &self,
+            namespace: &str,
+            seq: u64,
+        ) -> Result<u64, crate::kernel::models::StorageError> {
+            self.guild.delete_record(namespace, seq).await
+        }
+    }
+
+    /// A command event for `guild`/`user` - the shape every watch invoke
+    /// tests needs.
+    fn watch_event(guild: u64, user: u64) -> crate::kernel::models::RequestContext {
+        crate::kernel::models::RequestContext {
+            origin: Origin {
+                guild_id: Some(GuildId(guild)),
+                channel_id: crate::kernel::models::ChannelId(555),
+                user_id: UserId(user),
+                message_id: None,
+                reply_token: Some("token".to_owned()),
+            },
+            kind: EventKind::CommandInvoked,
+            payload: EventPayload::Command(CommandPayload {
+                name: "x".to_owned(),
+                args: Vec::new(),
+                author_roles: Vec::new(),
+                author_permissions: 0,
+            }),
+        }
+    }
+
+    /// Services + event for a watch invoke against `storage` under `guild`.
+    fn guild_watch_services(
+        storage: &Arc<InMemoryStorage>,
+        guild: u64,
+    ) -> (KernelServices, crate::kernel::models::RequestContext, Arc<RecordingChatOutput>) {
+        let output = RecordingChatOutput::new();
+        let services = KernelServices {
+            chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
+            chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
+            guild_storage: Some(storage.guild_scoped("test", GuildId(guild))),
+            plugin_storage: crate::test_support::test_plugin_storage(),
+            platform_info: crate::test_support::test_platform_info(),
+        };
+        (services, watch_event(guild, 1), output)
+    }
+
+    /// Services + event whose guild storage IS the gated view (the parked
+    /// read must sit inside the handler's lock).
+    fn gated_services(
+        view: &Arc<GatedWatchView>,
+        guild: u64,
+        user: u64,
+    ) -> (KernelServices, crate::kernel::models::RequestContext) {
+        let output = RecordingChatOutput::new();
+        let services = KernelServices {
+            chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
+            chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
+            guild_storage: Some(Arc::clone(view) as Arc<_>),
+            plugin_storage: crate::test_support::test_plugin_storage(),
+            platform_info: crate::test_support::test_platform_info(),
+        };
+        (services, watch_event(guild, user))
+    }
+
+    /// Engine over the shared storage with a warmed snapshot (search works).
+    async fn search_engine(storage: &Arc<InMemoryStorage>) -> Arc<StoreEngine<RecordingBus>> {
+        let engine = Arc::new(StoreEngine::new(
+            Arc::new(OnlineLcu::new()),
+            Arc::clone(storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
+            RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
+            RecordingBus::default(),
+            crate::test_support::test_platform_info(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: 20,
+                watch_guild_cap: 300,
+            },
+        ));
+        engine.tick().await; // silent baseline: fills the raw snapshot
+        engine
+    }
+
+    /// Per-guild watch-write locks: a subscribe parked mid-read inside one
+    /// guild's lock never delays another guild's subscribe - the whole
+    /// point of keying the registry by guild.
+    #[tokio::test]
+    async fn watch_writes_do_not_serialize_across_guilds() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let engine = search_engine(&storage).await;
+        let view = Arc::new(GatedWatchView {
+            guild: storage.guild_scoped("test", GuildId(42)),
+            read_started: Arc::new(AtomicBool::new(false)),
+            release: Arc::new(AtomicBool::new(false)),
+            later_reads: Arc::new(AtomicUsize::new(0)),
+            consumed: AtomicBool::new(false),
+        });
+        let (services_a, event_a) = gated_services(&view, 42, 1);
+
+        let engine_a = Arc::clone(&engine);
+        let parked = tokio::spawn(async move {
+            WatchHandler { engine: engine_a }
+                .invoke(&event_a, &watch_args("skin", "Foxfire Ahri", None), &services_a)
+                .await
+        });
+        while !view.read_started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        // Guild 77 (plain view) completes while guild 42's read is parked.
+        let (services_b, event_b, _output_b) = guild_watch_services(&storage, 77);
+        let engine_b = Arc::clone(&engine);
+        let other = tokio::spawn(async move {
+            WatchHandler { engine: engine_b }
+                .invoke(&event_b, &watch_args("skin", "Foxfire Ahri", None), &services_b)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), other)
+            .await
+            .expect("guild 77 never waited behind guild 42")
+            .expect("join")
+            .expect("invoke");
+
+        view.release.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), parked)
+            .await
+            .expect("guild 42 completes after the release")
+            .expect("join")
+            .expect("invoke");
+    }
+
+    /// Same guild: a second subscribe waits for the first one's whole
+    /// read-modify-write (its read starts only after the lock releases),
+    /// and no update is lost.
+    #[tokio::test]
+    async fn watch_writes_serialize_within_a_guild() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let engine = search_engine(&storage).await;
+        let view = Arc::new(GatedWatchView {
+            guild: storage.guild_scoped("test", GuildId(100)),
+            read_started: Arc::new(AtomicBool::new(false)),
+            release: Arc::new(AtomicBool::new(false)),
+            later_reads: Arc::new(AtomicUsize::new(0)),
+            consumed: AtomicBool::new(false),
+        });
+        let (services_a, event_a) = gated_services(&view, 100, 1);
+        let (services_b, event_b) = gated_services(&view, 100, 2);
+
+        let engine_a = Arc::clone(&engine);
+        let parked = tokio::spawn(async move {
+            WatchHandler { engine: engine_a }
+                .invoke(&event_a, &watch_args("skin", "Foxfire Ahri", None), &services_a)
+                .await
+        });
+        while !view.read_started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        // The second subscribe (same guild, different user) queues on the
+        // guild's lock: its watch-doc read has not started.
+        let engine_b = Arc::clone(&engine);
+        let queued = tokio::spawn(async move {
+            WatchHandler { engine: engine_b }
+                .invoke(&event_b, &watch_args("skin", "Dynasty Ahri", None), &services_b)
+                .await
+        });
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            view.later_reads.load(Ordering::SeqCst),
+            0,
+            "the second write's read starts only after the lock releases"
+        );
+
+        view.release.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), queued)
+            .await
+            .expect("the queued write completes")
+            .expect("join")
+            .expect("invoke");
+        parked.await.expect("join").expect("invoke");
+
+        // Both read-modify-writes landed - no lost update.
+        let doc = storage
+            .guild_scoped("test", GuildId(100))
+            .get(NAMESPACE, WATCH_KEY)
+            .await
+            .expect("doc read")
+            .expect("doc present");
+        let subs = doc.get("subs").and_then(|subs| subs.as_array()).expect("subs array");
+        assert_eq!(subs.len(), 2, "no lost update");
     }
 
     #[tokio::test]

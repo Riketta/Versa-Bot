@@ -165,6 +165,15 @@ impl PolicyCache {
     /// out-of-band storage edit (a direct DB change) can lag.
     const DEFAULT_TTL: Duration = Duration::from_secs(5);
 
+    /// The current invalidation epoch. Callers capture this BEFORE the
+    /// storage read and hand it to [`Self::put`]: an entry is stored with
+    /// the epoch the read started under, so a write that lands mid-read
+    /// (read old data, epoch already bumped) leaves the entry tagged with
+    /// the pre-write epoch - the next `get` sees the mismatch and misses.
+    fn epoch(&self) -> u64 {
+        self.inner.epoch.load(Ordering::Acquire)
+    }
+
     fn get(&self, platform: &'static str, guild: u64) -> Option<Arc<AuthConfig>> {
         let epoch = self.inner.epoch.load(Ordering::Acquire);
         let entries = self.inner.entries.lock();
@@ -173,12 +182,27 @@ impl PolicyCache {
             .then(|| Arc::clone(&entry.policy))
     }
 
-    fn put(&self, platform: &'static str, guild: u64, policy: AuthConfig) -> Arc<AuthConfig> {
+    /// Stores `policy` under `observed_epoch` - the epoch the caller
+    /// captured before the storage read that produced the policy. Loading
+    /// the epoch HERE instead would be a put-after-invalidate race: the
+    /// storage read awaits, a `/auth` write + bump can land inside that
+    /// window, and a pre-write policy tagged with the post-bump epoch
+    /// would serve as fresh for the whole TTL.
+    fn put(
+        &self,
+        platform: &'static str,
+        guild: u64,
+        policy: AuthConfig,
+        observed_epoch: u64,
+    ) -> Arc<AuthConfig> {
         let policy = Arc::new(policy);
-        let epoch = self.inner.epoch.load(Ordering::Acquire);
         self.inner.entries.lock().insert(
             (platform, guild),
-            CachedPolicy { policy: Arc::clone(&policy), fetched_at: Instant::now(), epoch },
+            CachedPolicy {
+                policy: Arc::clone(&policy),
+                fetched_at: Instant::now(),
+                epoch: observed_epoch,
+            },
         );
         policy
     }
@@ -406,6 +430,10 @@ impl AuthPlugin {
         {
             return Ok(policy);
         }
+        // Captured BEFORE the read: the entry this read produces is stored
+        // under this epoch, so any `/auth` write landing mid-read bumps the
+        // live epoch and the stale entry never serves (see `PolicyCache::put`).
+        let observed_epoch = self.policy_cache.epoch();
         let loaded = match storage.get(NAMESPACE, CONFIG_KEY).await {
             // Unconfigured = the open default policy (default tier `User`).
             Ok(None) => None,
@@ -438,7 +466,9 @@ impl AuthPlugin {
             None => AuthConfig::default(),
         };
         Ok(match key {
-            Some((platform, guild)) => self.policy_cache.put(platform, guild, config),
+            Some((platform, guild)) => {
+                self.policy_cache.put(platform, guild, config, observed_epoch)
+            }
             // Guild-less events never reach the gate's storage arm; the
             // branch keeps the helper total regardless.
             None => Arc::new(config),
@@ -994,6 +1024,199 @@ mod tests {
         // Gate's initial read + the handler's own read_policy + the gate's
         // post-invalidation read.
         assert_eq!(reads.load(Ordering::SeqCst), 3);
+    }
+
+    /// The put-after-invalidate race, pinned at the cache seam: an entry
+    /// produced by a read that started BEFORE a write is stored under the
+    /// pre-write epoch and must never serve afterwards. (Loading the epoch
+    /// at insert time instead would tag this stale entry fresh for the
+    /// whole TTL.)
+    #[test]
+    fn a_read_overlapping_a_write_never_resurrects_the_old_policy() {
+        let cache = PolicyCache::default();
+        let observed = cache.epoch();
+        // The `/auth` write lands while the gate's storage read is in flight.
+        cache.invalidate_all();
+        cache.put("discord", 1, AuthConfig::default(), observed);
+
+        assert!(cache.get("discord", 1).is_none(), "the pre-write entry must not serve");
+    }
+
+    /// Storage view whose FIRST config read captures its value, then parks
+    /// until released: models a gate read that was in flight (holding the
+    /// pre-write snapshot) while a `/auth` write committed and invalidated.
+    struct OverlappingReadView {
+        guild: Arc<dyn crate::kernel::spi_ports::GuildStorage>,
+        read_started: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        consumed: AtomicBool,
+    }
+
+    #[async_trait]
+    impl crate::kernel::spi_ports::GuildStorage for OverlappingReadView {
+        async fn get(
+            &self,
+            namespace: &str,
+            key: &str,
+        ) -> Result<Option<Value>, crate::kernel::models::StorageError> {
+            if !self.consumed.swap(true, Ordering::SeqCst) {
+                self.read_started.store(true, Ordering::SeqCst);
+                let captured = self.guild.get(namespace, key).await?;
+                while !self.release.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                return Ok(captured);
+            }
+            self.guild.get(namespace, key).await
+        }
+
+        async fn set(
+            &self,
+            namespace: &str,
+            key: &str,
+            value: Value,
+        ) -> Result<(), crate::kernel::models::StorageError> {
+            self.guild.set(namespace, key, value).await
+        }
+
+        async fn delete(
+            &self,
+            namespace: &str,
+            key: &str,
+        ) -> Result<(), crate::kernel::models::StorageError> {
+            self.guild.delete(namespace, key).await
+        }
+
+        async fn list_keys(
+            &self,
+            namespace: &str,
+        ) -> Result<Vec<String>, crate::kernel::models::StorageError> {
+            self.guild.list_keys(namespace).await
+        }
+
+        async fn append(
+            &self,
+            namespace: &str,
+            payload: Value,
+        ) -> Result<u64, crate::kernel::models::StorageError> {
+            self.guild.append(namespace, payload).await
+        }
+
+        async fn list_after(
+            &self,
+            namespace: &str,
+            after_seq: u64,
+            limit: u32,
+        ) -> Result<Vec<crate::kernel::spi_ports::StoredRecord>, crate::kernel::models::StorageError>
+        {
+            self.guild.list_after(namespace, after_seq, limit).await
+        }
+
+        async fn list_last(
+            &self,
+            namespace: &str,
+            limit: u32,
+        ) -> Result<Vec<crate::kernel::spi_ports::StoredRecord>, crate::kernel::models::StorageError>
+        {
+            self.guild.list_last(namespace, limit).await
+        }
+
+        async fn count_after(
+            &self,
+            namespace: &str,
+            after_seq: u64,
+        ) -> Result<u64, crate::kernel::models::StorageError> {
+            self.guild.count_after(namespace, after_seq).await
+        }
+
+        async fn delete_record(
+            &self,
+            namespace: &str,
+            seq: u64,
+        ) -> Result<u64, crate::kernel::models::StorageError> {
+            self.guild.delete_record(namespace, seq).await
+        }
+    }
+
+    /// The full interleaving: a gate event's storage read parks holding the
+    /// pre-write policy; a `/auth` write commits and invalidates inside that
+    /// window. The entry the parked read produces must never serve - the
+    /// next event re-reads storage and sees the promotion.
+    #[tokio::test]
+    async fn write_during_an_inflight_read_does_not_resurrect_the_old_policy() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let view = Arc::new(OverlappingReadView {
+            guild: storage.guild_scoped("test", GuildId(1)),
+            read_started: Arc::new(AtomicBool::new(false)),
+            release: Arc::new(AtomicBool::new(false)),
+            consumed: AtomicBool::new(false),
+        });
+        let (gate_services, _gate_output) = services_with(Some(Arc::clone(&view) as Arc<_>));
+        let (admin_services, _admin_output) = services_with(Some(Arc::clone(&view) as Arc<_>));
+        let plugin = Arc::new(test_plugin(&[("assign_tracker", AccessTier::Moderator)]));
+        let handler = AuthCommandHandler::new().with_policy_cache(plugin.policy_cache.clone());
+
+        // The gate event parks mid-read, holding the pre-write default.
+        let gate_plugin = Arc::clone(&plugin);
+        let gate = tokio::spawn(async move {
+            let mut event = command_event(3, "assign_tracker", &[]);
+            gate_plugin.pre(&mut event, &gate_services).await
+        });
+        while !view.read_started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        // The write commits and invalidates while that read is in flight.
+        let mut admin = command_event(9, "auth", &[]);
+        admin.origin.reply_token = Some("token".to_owned());
+        let args = CommandArgs(vec![
+            ("action".to_owned(), "set".to_owned()),
+            ("tier".to_owned(), "moderator".to_owned()),
+            ("user".to_owned(), "3".to_owned()),
+        ]);
+        handler.invoke(&admin, &args, &admin_services).await.expect("set expected to succeed");
+
+        view.release.store(true, Ordering::SeqCst);
+        assert!(
+            matches!(gate.await.expect("gate joins"), Next::Stop),
+            "the parked read's pre-write policy denies, as it must"
+        );
+
+        // The stale entry the parked read produced never serves: the next
+        // event resolves the promotion from live storage.
+        let (check_services, _check_output) = services_with(Some(Arc::clone(&view) as Arc<_>));
+        let mut promoted = command_event(3, "assign_tracker", &[]);
+        assert!(
+            matches!(plugin.pre(&mut promoted, &check_services).await, Next::Continue),
+            "the write landing mid-read must invalidate the entry it produces"
+        );
+    }
+
+    /// Setting the default tier to its current value is a no-op reply, not
+    /// a storage write + cache invalidation (same contract as `set`).
+    #[tokio::test]
+    async fn set_default_same_value_skips_the_write() {
+        let (services, output) = services_with(Some(
+            Arc::new(InMemoryStorage::new()).guild_scoped("test", GuildId(1)) as Arc<_>,
+        ));
+        let handler = AuthCommandHandler::new();
+        let args = CommandArgs(vec![
+            ("action".to_owned(), "default".to_owned()),
+            ("tier".to_owned(), "moderator".to_owned()),
+        ]);
+
+        let mut admin = command_event(9, "auth", &[]);
+        admin.origin.reply_token = Some("token".to_owned());
+        handler.invoke(&admin, &args, &services).await.expect("first invoke");
+        handler.invoke(&admin, &args, &services).await.expect("second invoke");
+
+        let messages = output.messages();
+        assert_eq!(messages.len(), 2, "both invocations replied");
+        let first = messages.first().expect("first reply");
+        let second = messages.get(1).expect("second reply");
+        assert!(first.contains("is now"), "first is a real change: {first}");
+        assert!(second.contains("already"), "same-value reply: {second}");
+        assert!(!second.contains("is now"), "no false success line: {second}");
     }
 
     /// A storage failure is never cached: the denial repeats until storage

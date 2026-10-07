@@ -5,11 +5,12 @@
 //! `GuildStorage` here. Nothing is persisted: after a restart the first
 //! command pays the full parse, which an 18h-class TTL makes irrelevant.
 //!
-//! Refresh is on demand only: a fresh cache answers instantly, a stale
-//! region triggers a re-parse inside the command's interaction window.
-//! Concurrent invocations share one refresh (singleflight); a failing
-//! region keeps its previous data and is reported in the snapshot instead
-//! of failing the whole answer.
+//! Refresh has two drivers sharing one singleflight: the background job
+//! (default) re-parses TTL-expired regions off the user path, while the
+//! command serves cached data as-is and fills only never-fetched regions
+//! inline (on-demand mode re-parses everything stale before replying).
+//! A failing region keeps its previous data and is reported in the
+//! snapshot instead of failing the whole answer.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -154,11 +155,19 @@ struct CachedRegion {
     fetched_at: Instant,
 }
 
+/// How long a failed champion-names fetch suppresses the inline (command
+/// path) retry - without it, a down names endpoint would be re-attempted
+/// by every command in background mode. The background job ignores this
+/// and retries on its own tick cadence.
+const NAMES_FAILURE_RETRY: Duration = Duration::from_secs(30);
+
 #[derive(Default)]
 struct CacheState {
     regions: HashMap<String, CachedRegion>,
     champ_names: HashMap<String, String>,
     names_fetched_at: Option<Instant>,
+    /// Not-before instant of the next inline names retry after a failure.
+    names_retry_not_before: Option<Instant>,
 }
 
 pub struct LeaderboardEngine {
@@ -336,6 +345,8 @@ impl LeaderboardEngine {
     /// always parse; `StaleOrMissing` re-parses TTL-expired entries too
     /// (on-demand mode and the background job), `MissingOnly` leaves
     /// cached data alone however old (the background mode's command path).
+    /// A recently failed names fetch holds the inline (MissingOnly) retry
+    /// back; the job and on-demand commands keep retrying every cycle.
     fn pending_refresh(&self, settings: &EngineSettings, scope: RefreshScope) -> PendingRefresh {
         let now = Instant::now();
         let state = self.cache.lock();
@@ -355,7 +366,12 @@ impl LeaderboardEngine {
             Some(at) => {
                 scope == RefreshScope::StaleOrMissing && now.duration_since(at) > settings.cache_ttl
             }
-            None => true,
+            None => match scope {
+                RefreshScope::StaleOrMissing => true,
+                RefreshScope::MissingOnly => {
+                    state.names_retry_not_before.is_none_or(|not_before| now >= not_before)
+                }
+            },
         };
         PendingRefresh { regions, names }
     }
@@ -363,9 +379,11 @@ impl LeaderboardEngine {
     /// The shared fetch loop: champion names, then each pending region,
     /// paced, each region a complete build-then-swap into the cache
     /// (readers never see a half-walked region). `budget` bounds the wall
-    /// clock (command-path cycles); a region past it is named as a failure
-    /// and keeps whatever data it already has. Returns the failed region
-    /// names and the last error (a source error, or the budget marker).
+    /// clock (command-path cycles): the names fetch is cut off at the
+    /// deadline and a region that would start past it is named as a
+    /// failure, keeping whatever data it already has. Returns the failed
+    /// region names and the last error (a source error, or the budget
+    /// marker).
     async fn run_refresh(
         &self,
         settings: &EngineSettings,
@@ -379,16 +397,36 @@ impl LeaderboardEngine {
 
         if pending.names {
             paced = true;
-            match self.source.champion_names().await {
+            // The names fetch rides the budget like a region: a hung names
+            // endpoint must not park the invoker past the deadline (the
+            // background job runs unbudgeted, per its contract).
+            let attempt = self.source.champion_names();
+            let outcome = match deadline {
+                Some(deadline) => {
+                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), attempt)
+                        .await
+                        .map_err(|_| {
+                            SourceError::Request("inline refresh budget exceeded".to_owned())
+                        })
+                        .and_then(|inner| inner)
+                }
+                None => attempt.await,
+            };
+            match outcome {
                 Ok(names) => {
                     let mut state = self.cache.lock();
                     state.champ_names = names;
                     state.names_fetched_at = Some(Instant::now());
+                    state.names_retry_not_before = None;
                 }
                 Err(err) => {
                     // Old names (if any) keep serving; ids missing from the
-                    // map degrade to placeholders downstream.
+                    // map degrade to placeholders downstream. The failure
+                    // holds the inline retry back for a short window so a
+                    // down endpoint is not re-hit by every command.
                     tracing::warn!(error = %err, "leaderboard champion names refresh failed");
+                    let mut state = self.cache.lock();
+                    state.names_retry_not_before = Some(Instant::now() + NAMES_FAILURE_RETRY);
                 }
             }
         }
@@ -484,6 +522,8 @@ pub(crate) mod test_support {
         pub name_calls: AtomicUsize,
         pub boards: StdMutex<HashMap<String, Vec<LeaderboardPlayer>>>,
         pub failing: StdMutex<Vec<String>>,
+        /// When set, the champion-names fetch fails (names retry backoff).
+        pub failing_names: StdMutex<bool>,
         /// 0 = calls block (yield-spin, race-free on the test runtime);
         /// 1 = calls proceed.
         pub gate_open: AtomicUsize,
@@ -504,6 +544,7 @@ pub(crate) mod test_support {
                 name_calls: AtomicUsize::new(0),
                 boards: StdMutex::new(HashMap::new()),
                 failing: StdMutex::new(Vec::new()),
+                failing_names: StdMutex::new(false),
                 gate_open: AtomicUsize::new(usize::from(!start_closed)),
             })
         }
@@ -518,6 +559,14 @@ pub(crate) mod test_support {
 
         pub fn heal_region(&self, region: &str) {
             self.failing.lock().expect("failing").retain(|key| key != region);
+        }
+
+        pub fn fail_names(&self) {
+            *self.failing_names.lock().expect("failing_names") = true;
+        }
+
+        pub fn heal_names(&self) {
+            *self.failing_names.lock().expect("failing_names") = false;
         }
 
         pub fn leaderboard_calls(&self) -> usize {
@@ -584,6 +633,9 @@ pub(crate) mod test_support {
 
         async fn champion_names(&self) -> Result<HashMap<String, String>, SourceError> {
             self.name_calls.fetch_add(1, Ordering::SeqCst);
+            if *self.failing_names.lock().expect("failing_names") {
+                return Err(SourceError::Request("names endpoint down".to_owned()));
+            }
             let mut names = HashMap::new();
             names.insert("1".to_owned(), "Annie".to_owned());
             Ok(names)
@@ -926,6 +978,143 @@ mod tests {
         assert!(snapshot.stale);
         let na = snapshot.regions.get(1).expect("two served regions");
         assert_eq!(na.region, "na");
+    }
+
+    /// The inline budget also cuts in background mode: never-fetched
+    /// regions past the deadline are named as failures instead of parking
+    /// the invoker - the boot race stays bounded.
+    #[tokio::test]
+    async fn background_mode_inline_budget_cuts_missing_regions() {
+        let source = FakeSource::ungated();
+        // Warm the names table first with an empty-region cycle (same shape
+        // as the on-demand budget test): the region cycle then paces only
+        // between regions - kr parses under the budget, the 40 ms pacing
+        // before euw outlives the 30 ms one.
+        let engine = engine_mode(
+            &source,
+            &[],
+            Duration::from_secs(3600),
+            Duration::from_millis(40),
+            true,
+            Duration::from_millis(30),
+        );
+        assert!(engine.snapshot().await.is_err(), "no regions configured yet");
+        assert_eq!(source.name_calls(), 1);
+
+        engine.update_settings(EngineSettings {
+            regions: vec!["kr".to_owned(), "euw".to_owned()],
+            parse_depth: 1000,
+            cache_ttl: Duration::from_secs(3600),
+            request_interval: Duration::from_millis(40),
+            background_refresh: true,
+            inline_budget: Duration::from_millis(30),
+            view: ResolvedView::resolve(1000, &[300, 1000], 1000, 5),
+        });
+
+        let snapshot = engine.snapshot().await.expect("kr serves within the budget");
+
+        assert_eq!(snapshot.regions.len(), 1, "only kr parsed within the budget");
+        assert_eq!(snapshot.failures, vec!["euw".to_owned()], "euw is named as failed");
+        assert!(snapshot.stale);
+    }
+
+    /// A failed names fetch holds the inline (command-path) retry back: a
+    /// down names endpoint is not re-hit by every background-mode command.
+    /// The next attempt succeeds once the short backoff lapses.
+    #[tokio::test]
+    async fn names_failure_backs_off_inline_retries_in_background_mode() {
+        let source = FakeSource::ungated();
+        source.fail_names();
+        let engine = engine_mode(
+            &source,
+            &["kr"],
+            Duration::from_secs(3600),
+            Duration::ZERO,
+            true,
+            Duration::ZERO,
+        );
+
+        let first = engine.snapshot().await.expect("regions serve despite the names failure");
+        assert_eq!(first.regions.len(), 1);
+        assert!(first.champ_names.is_empty(), "no names were fetched");
+        assert_eq!(source.name_calls(), 1);
+
+        // Within the backoff window the command path does not retry.
+        engine.snapshot().await.expect("cached data serves");
+        assert_eq!(source.name_calls(), 1, "the failure backoff holds the retry");
+
+        // After the window (simulated: the clock is not worth waiting for)
+        // the retry succeeds and the table fills.
+        source.heal_names();
+        engine.cache.lock().names_retry_not_before = None;
+        let healed = engine.snapshot().await.expect("snapshot expected");
+        assert_eq!(source.name_calls(), 2);
+        assert_eq!(healed.champ_names.get("1").map(String::as_str), Some("Annie"));
+    }
+
+    /// Hot reload swaps only the data window: the background mode and the
+    /// inline budget are boot decisions and survive `update_settings`
+    /// unchanged (a boot-time background/budget setup must not be silently
+    /// switched off by a config edit).
+    #[test]
+    fn update_settings_keeps_background_mode_and_budget() {
+        let source = Arc::new(FakeSource::ungated());
+        let engine = engine_mode(
+            &source,
+            &["kr"],
+            Duration::from_secs(3600),
+            Duration::ZERO,
+            true,
+            Duration::from_secs(180),
+        );
+
+        engine.update_settings(EngineSettings {
+            regions: vec!["euw".to_owned()],
+            parse_depth: 1000,
+            cache_ttl: Duration::from_secs(3600),
+            request_interval: Duration::ZERO,
+            background_refresh: false,
+            inline_budget: Duration::ZERO,
+            view: ResolvedView::resolve(1000, &[300, 1000], 1000, 5),
+        });
+
+        let settings = engine.settings();
+        assert_eq!(settings.regions, vec!["euw"], "the data window swapped");
+        assert!(settings.background_refresh, "background mode stays boot-frozen");
+        assert_eq!(settings.inline_budget, Duration::from_secs(180), "budget stays boot-frozen");
+    }
+
+    /// The two refresh drivers share the singleflight: a command landing
+    /// while the background job is mid-cycle waits, then finds the cache
+    /// fresh - never a second parse of the same region.
+    #[tokio::test]
+    async fn job_and_command_share_one_refresh() {
+        let source = FakeSource::new(); // gated: calls block until opened
+        let engine = engine_mode(
+            &source,
+            &["kr"],
+            Duration::from_secs(3600),
+            Duration::ZERO,
+            true,
+            Duration::ZERO,
+        );
+
+        let job_engine = Arc::clone(&engine);
+        let job = tokio::spawn(async move { job_engine.refresh_stale().await });
+        while source.leaderboard_calls() == 0 {
+            tokio::task::yield_now().await;
+        }
+        let cmd_engine = Arc::clone(&engine);
+        let command = tokio::spawn(async move { cmd_engine.snapshot().await });
+        tokio::task::yield_now().await;
+        source.open_gate();
+
+        job.await.expect("job joins");
+        let snapshot = command.await.expect("command joins").expect("snapshot");
+
+        assert_eq!(source.leaderboard_calls(), 1, "the command shared the job's cycle");
+        assert_eq!(snapshot.regions.len(), 1);
+        assert!(snapshot.failures.is_empty());
     }
 
     #[tokio::test]

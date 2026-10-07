@@ -1,7 +1,10 @@
-//! The `/lol_leaderboard` command: refresh-if-stale under the typing
-//! indicator, then post the statistics as public channel messages. Unlike
-//! configuration commands, the dump itself is channel-visible on purpose -
-//! it is a stats artifact, not private state.
+//! The `/lol_leaderboard` command: post the statistics as public channel
+//! messages. Unlike configuration commands, the dump itself is
+//! channel-visible on purpose - it is a stats artifact, not private state.
+//! In the default background mode the cached data serves as-is under a
+//! flash of the typing indicator; on demand (`background_refresh = false`)
+//! a stale cache re-parses first, with the typing indicator held for the
+//! whole parse.
 
 use std::sync::Arc;
 

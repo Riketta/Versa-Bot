@@ -1159,6 +1159,25 @@ mod tests {
         assert_eq!(api.log(), ["create:flags", "delete:placeholder", "create:public"]);
     }
 
+    /// A FAILED ephemeral first reply does not consume the slot (the post
+    /// never landed): the later public reply still runs the placeholder
+    /// dance instead of assuming the slot is gone.
+    #[tokio::test]
+    async fn failed_ephemeral_first_reply_keeps_the_slot_for_the_public_dance() {
+        let api = Arc::new(ScriptedApi::new(true, false));
+        let output = scripted_output(Arc::clone(&api));
+
+        let failed = output.send(OutboundMessage::text("quiet").ephemeral()).await;
+        assert!(failed.is_err(), "the ephemeral post itself fails");
+        output.send(OutboundMessage::text("now public")).await.expect("public delivers");
+
+        assert_eq!(
+            api.log(),
+            ["create:flags", "create:flags", "create:public"],
+            "first entry: the failed ephemeral post; then the dance + content"
+        );
+    }
+
     /// Singleflight: two concurrent cold misses share one `get_emojis` -
     /// the per-guild fetch lock serializes them (never two in flight),
     /// and the loser lands on the freshly filled cache.
@@ -1253,6 +1272,102 @@ mod tests {
         assert_eq!(api.peak.load(Ordering::SeqCst), 1, "never two fetches in flight");
         assert_eq!(left.len(), 1);
         assert_eq!(right.len(), 1);
+    }
+
+    /// The singleflight also shares a FAILED listing: the losers land on the
+    /// short-TTL cached empty set instead of each re-fetching - a down
+    /// endpoint is not hammered by concurrent callers.
+    #[tokio::test]
+    async fn concurrent_emoji_fetches_share_one_failed_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FailingApi {
+            calls: AtomicUsize,
+            in_flight: AtomicUsize,
+            peak: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl InteractionApi for FailingApi {
+            async fn create_followup(
+                &self,
+                _token: &str,
+                _body: &serde_json::Value,
+            ) -> Result<SerenityMessageId, String> {
+                Err("unused in this test".to_owned())
+            }
+
+            async fn delete_followup(
+                &self,
+                _token: &str,
+                _id: SerenityMessageId,
+            ) -> Result<(), String> {
+                Err("unused in this test".to_owned())
+            }
+        }
+
+        #[async_trait]
+        impl ChatApi for FailingApi {
+            async fn send_message(
+                &self,
+                _channel_id: SerenityChannelId,
+                _files: Vec<CreateAttachment>,
+                _builder: &CreateMessage,
+            ) -> Result<SerenityMessageId, String> {
+                Err("unused in this test".to_owned())
+            }
+
+            async fn edit_message(
+                &self,
+                _channel_id: SerenityChannelId,
+                _message_id: SerenityMessageId,
+                _builder: &EditMessage,
+                _new_attachments: Vec<CreateAttachment>,
+            ) -> Result<SerenityMessageId, String> {
+                Err("unused in this test".to_owned())
+            }
+
+            async fn create_reaction(
+                &self,
+                _channel_id: SerenityChannelId,
+                _message_id: SerenityMessageId,
+                _reaction_type: &ReactionType,
+            ) -> Result<(), String> {
+                Err("unused in this test".to_owned())
+            }
+
+            async fn get_emojis(&self, _guild_id: SerenityGuildId) -> Result<Vec<Emoji>, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Err("emoji endpoint down".to_owned())
+            }
+
+            fn run_typing(
+                self: &Arc<Self>,
+                _channel_id: SerenityChannelId,
+                _cancel: tokio_util::sync::CancellationToken,
+            ) {
+            }
+        }
+
+        let api = Arc::new(FailingApi {
+            calls: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let cache = GuildEmojiCache::new();
+        let guild = SerenityGuildId::new(42);
+
+        let (left, right) =
+            tokio::join!(cache.emojis(api.as_ref(), guild), cache.emojis(api.as_ref(), guild));
+
+        assert_eq!(api.calls.load(Ordering::SeqCst), 1, "exactly one REST call");
+        assert_eq!(api.peak.load(Ordering::SeqCst), 1, "never two fetches in flight");
+        assert!(left.is_empty(), "both callers get the cached failure");
+        assert!(right.is_empty());
     }
 
     // --- Delivery half: plain sends, streaming, reactions, factory routing ---

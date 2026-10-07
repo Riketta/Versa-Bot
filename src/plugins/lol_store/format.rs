@@ -96,7 +96,6 @@ impl NameIndex {
     }
 
     /// Empty index: everything degrades to synthetic names.
-    #[cfg(test)]
     #[must_use]
     pub fn empty() -> Self {
         Self {

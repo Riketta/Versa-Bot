@@ -297,6 +297,9 @@ async fn set_default_tier(
         Ok(policy) => policy,
         Err(message) => return reply(services, message).await,
     };
+    if policy.default_tier == tier {
+        return reply(services, text(format!("The default tier is already {tier}."))).await;
+    }
     policy.default_tier = tier;
     storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
     policy_cache.invalidate_all();

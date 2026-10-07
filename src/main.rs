@@ -267,6 +267,7 @@ async fn main() -> ExitCode {
     watcher.subscribe(Arc::new(LolLeaderboardSettingsReloader {
         engine: Arc::clone(&leaderboard_engine),
         source: Arc::clone(&leaderboard_source),
+        plugin: Arc::clone(&lol_leaderboard),
     }));
     let config_watch_job = scheduler.schedule(
         "config_watcher",
@@ -769,17 +770,24 @@ impl ConfigChangeHandler<Configuration> for LolStoreSettingsReloader {
 /// TTL, display view). The proxy and the pacing interval stay boot-frozen
 /// with the source adapter; an absent or invalid section degrades to the
 /// same not-configured mode as at boot - the engine is always live, only
-/// its data window swaps.
+/// its data window swaps. A TTL change reschedules the background job so
+/// its tick cadence never forks from the configured freshness window.
 struct LolLeaderboardSettingsReloader {
     engine: Arc<LeaderboardEngine>,
     source: Arc<dyn LeaderboardSourcePort>,
+    plugin: Arc<LeaderboardPlugin>,
 }
 
 impl ConfigChangeHandler<Configuration> for LolLeaderboardSettingsReloader {
     fn on_change(&self, config: Arc<Configuration>) {
+        let old_ttl = self.engine.settings().cache_ttl;
         let settings =
             leaderboard_engine_settings(config.lol_leaderboard.as_ref(), self.source.as_ref());
+        let new_ttl = settings.cache_ttl;
         self.engine.update_settings(settings);
+        if old_ttl != new_ttl {
+            self.plugin.reschedule(new_ttl);
+        }
     }
 }
 

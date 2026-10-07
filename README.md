@@ -72,10 +72,10 @@ commands, permission tiers - lives in [Plugins](#plugins).
 - Configuration hot reload: hot-reloadable sections apply live (`[status]`,
   `owners`, `[lol_store]` announce flags and watch caps, `[lol_leaderboard]`
   regions/depth/TTL/view); startup-only settings (token, storage, Sentry,
-  LLM providers, poll and pacing intervals, leaderboard background mode)
-  require a restart. Every accepted change is logged per section, with the
-  changed fields at the apply sites - a startup-only edit is explicitly
-  named as kept.
+  LLM providers, poll and pacing intervals, leaderboard background mode
+  and its inline refresh budget) require a restart. Every accepted change
+  is logged per section, with the changed fields at the apply sites - a
+  startup-only edit is explicitly named as kept.
 - Graceful shutdown on Ctrl-C (plugins stop in reverse order).
 
 ## Getting started
@@ -302,7 +302,10 @@ Two resolution rules that surprise people:
 A fresh guild starts open (default tier `user`), so the commands that
 configure the bot are usable on day one. The policy is stored in the
 guild's own storage namespace, so guilds never see each other's
-configuration.
+configuration. Resolved policies are cached per guild for 5 seconds
+(the gate is the hottest path in the system): a successful `/auth` write
+applies on the very next event, and only an out-of-band edit (a direct
+database change) can lag behind for up to that window.
 
 Robustness rules:
 
@@ -541,30 +544,35 @@ process-lifetime for `cache_ttl`.
 
 **Background refresh (default on):** a scheduler job re-parses stale
 regions off the user path - first run at boot (the warm-up starts before
-the gateway even connects), then once per `cache_ttl`. The command
-serves whatever is cached, however old (the dump's `data age` line is
-the honest label) and never waits for a parse; only a region with no
-cached data at all (the boot race) parses inline, under a configurable
-wall-clock budget (`inline_refresh_budget_secs`, default 180 s): regions
-past the budget keep their cached data or are named as failed in the
-dump instead of parking the invoker. With
+the gateway even connects), then once per `cache_ttl` (a TTL hot reload
+reschedules the job). The command serves whatever is cached, however old
+(the dump's `data age` line is the honest label) and never *drives* a
+parse; only a region with no cached data at all (the boot race) parses
+inline, under a configurable wall-clock budget (`inline_refresh_budget_secs`,
+default 180 s): regions past the budget keep their cached data or are
+named as failed in the dump instead of parking the invoker. A command
+landing while the background job is mid-cycle shares that cycle
+(singleflight) instead of starting a second parse; a failed champion-names
+fetch is retried inline at most once per 30 s. With
 `background_refresh = false` the plugin falls back to on-demand mode:
 a stale cache re-parses before the reply (the typing indicator shows
 during the parse; a cold multi-region parse takes tens of seconds),
 under the same budget. Concurrent invocations share any in-flight
-refresh (singleflight) but each gets its own full dump. Mind the
-ceiling either way: a parse walks `parse_depth` / 100 source pages per
-region at the configured request pace - keep the worst case
-comfortably inside the platform's interaction window (about 15 minutes
-on Discord).
+refresh but each gets its own full dump. Mind the ceiling either way: a
+parse walks `parse_depth` / 100 source pages per region at the
+configured request pace - keep the worst case comfortably inside the
+platform's interaction window (about 15 minutes on Discord).
 
 The output
 leads with a coverage line (`Parsed 2941/3000 players from 3 regions ·
 data age 2h`), renders a bucket row only when the parses actually cover
 it, degrades holes (a player without role/champion data leaves that
 table but never breaks the answer), and splits across messages on line
-boundaries. A failing region is named in the dump and served from cache
-when possible; only a total failure replies with an error.
+boundaries. A region whose *command-path* refresh failed is named in the
+dump and served from cache when possible; a region that failed in a
+background cycle is simply absent from the coverage (the age line stays
+honest) and recovers on the next successful cycle. Only a total failure
+replies with an error.
 
 | Command | Tier | Effect |
 |---|---|---|
@@ -572,8 +580,10 @@ when possible; only a total failure replies with an error.
 
 Operator configuration lives in the optional `[lol_leaderboard]`
 section (an absent section - or no regions served by the source - keeps
-the command in "not configured" mode). `regions`, `parse_depth`,
-`cache_ttl_secs`, and the display knobs hot-reload; `proxy`,
+the command in "not configured" mode; the background job is scheduled
+anyway, so regions hot-reloaded in later start warming immediately).
+`regions`, `parse_depth`, `cache_ttl_secs`, and the display knobs
+hot-reload (a TTL change reschedules the job); `proxy`,
 `request_interval_secs` (the source pacing), `background_refresh`, and
 `inline_refresh_budget_secs` are **startup-only** and need a restart. A
 section that degrades (absent or a zeroed knob) maps the live engine to
@@ -583,7 +593,7 @@ the same "not configured" mode as at boot:
 |---|---|---|---|
 | `regions` | string array | *(empty)* | regions to aggregate: `kr`, `euw`, `eun`, `na`, `jp`, `br`, `tr`, `tw`, `vn`, `sea`; empty = plugin off |
 | `request_interval_secs` | integer | `3` | minimum delay between source requests (sequential, rate-limit politeness); `0` disables the plugin |
-| `background_refresh` | boolean | `true` | scheduler job keeps the cache warm (ticks at `cache_ttl_secs`, first run at boot); the command serves cached data as-is and never waits; `false` = on-demand mode where a stale cache re-parses before the reply |
+| `background_refresh` | boolean | `true` | scheduler job keeps the cache warm (ticks at `cache_ttl_secs`, first run at boot, scheduled even with no regions yet); the command serves cached data as-is and never drives a parse itself; `false` = on-demand mode where a stale cache re-parses before the reply |
 | `inline_refresh_budget_secs` | integer | `180` | wall-clock budget for a command-driven (inline) parse: regions past it keep cached data or are named as failed; `0` = unbounded; the background job is not budgeted |
 | `parse_depth` | integer | `1000` | top players parsed per region (clamped to what the source's board has); `0` disables; capped at 10 000 |
 | `display_buckets` | integer array | `[300, 1000]` | player-count rows for the role tables; values are clamped to `parse_depth`, sorted, deduplicated; empty = a single full-depth row |

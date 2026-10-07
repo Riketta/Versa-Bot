@@ -355,7 +355,11 @@ impl<B: EventBusPort> StoreEngine<B> {
             if full.is_some() || changed { self.discover_guilds().await } else { Vec::new() };
 
         // Announce and notify before the state swap: formatting joins
-        // against the freshly fetched catalog.
+        // against the freshly retained catalog (the retention block above
+        // has already absorbed every changed section and bumped the
+        // generation, so the generation-keyed index cache builds from
+        // exactly the data `name_index(&snapshot)` would - without
+        // re-cloning the whole catalog per delta cycle).
         if let Some(delta) = full {
             tracing::debug!(
                 sales = delta.sales.len(),
@@ -365,7 +369,11 @@ impl<B: EventBusPort> StoreEngine<B> {
                 catchup,
                 "store delta detected"
             );
-            let index = self.name_index(&snapshot).await;
+            let index = self.cached_index().await.unwrap_or_else(|| {
+                // Unreachable after the retention block (it materializes a
+                // default snapshot), kept total for the same reason.
+                Arc::new(NameIndex::empty())
+            });
             // Enabled guilds only (channel assigned); announcements and
             // watch pings see the same discovery snapshot.
             let targets: Vec<&DiscoveredGuild> =
@@ -1595,6 +1603,41 @@ mod tests {
         assert!(!log.is_empty(), "healthy guild announced: {log:?}");
         assert!(log.iter().all(|(_, guild, _)| *guild == GUILD), "skipped guild leaked: {log:?}");
         assert_eq!(f.output.sent().len(), 1, "only the healthy guild was messaged");
+    }
+
+    /// A malformed-config guild is skipped by the fan-out but still receives
+    /// catch-up persistence: its `last_seen` copy must stay identical to a
+    /// healthy guild's, so a later fixed config rejoins from current state
+    /// instead of replaying an old delta.
+    #[tokio::test]
+    async fn malformed_config_guild_still_receives_catch_up_persistence() {
+        let f = fixture(FakeLcu::online()).await;
+        enable_guild(&f.storage, GUILD, Some("55")).await;
+        f.storage
+            .guild_scoped("test", GuildId(999))
+            .set(NAMESPACE, CONFIG_KEY, serde_json::json!({ "enabled": "not-a-bool" }))
+            .await
+            .expect("config write expected");
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        f.engine.tick().await; // silent baseline
+
+        *f.lcu.sales.lock() = Some(vec![skin_sale(2, 1031)]);
+        f.engine.tick().await;
+
+        let read = |guild: u64| {
+            let storage = Arc::clone(&f.storage);
+            async move {
+                storage
+                    .guild_scoped("test", GuildId(guild))
+                    .get(NAMESPACE, LAST_SEEN_KEY)
+                    .await
+                    .expect("last_seen read expected")
+            }
+        };
+        let healthy = read(GUILD).await.expect("healthy guild persisted");
+        let malformed = read(999).await.expect("malformed guild persisted too");
+        assert_eq!(healthy, malformed, "the skipped guild's copy stays current");
     }
 
     #[tokio::test]

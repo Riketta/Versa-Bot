@@ -1377,6 +1377,23 @@ mod tests {
         assert_eq!(split_reply("😀", 1), vec!["😀".to_owned()]);
     }
 
+    /// An ODD budget landing inside a surrogate pair floors to the last
+    /// complete scalar (never splits a pair, never overshoots the budget).
+    #[test]
+    fn split_reply_floors_at_the_last_complete_scalar() {
+        // 5 units cannot divide astral pairs cleanly: two chars (4 units)
+        // fit, the third moves whole.
+        let chunks = split_reply("😀😀😀", 5);
+        assert_eq!(chunks, vec!["😀😀", "😀"]);
+        let first = chunks.first().expect("two chunks");
+        assert_eq!(utf16_len(first), 4, "the floor never overshoots into a pair");
+
+        // Mixed BMP + astral: every boundary lands between scalars; the
+        // astral char emits alone (over budget, unbreakable) rather than
+        // split.
+        assert_eq!(split_reply("a😀b", 1), vec!["a", "😀", "b"]);
+    }
+
     #[test]
     fn zero_limit_degrades_to_one() {
         assert_eq!(split_reply("abc", 0), vec!["a", "b", "c"]);

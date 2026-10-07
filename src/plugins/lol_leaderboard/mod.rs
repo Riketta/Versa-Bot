@@ -25,6 +25,7 @@ mod port;
 mod stats;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
@@ -89,24 +90,12 @@ impl PluginPort for LeaderboardPlugin {
             tracing::info!("leaderboard background refresh disabled - on-demand refresh only");
             return Ok(());
         }
-        if !self.engine.is_configured() {
-            tracing::info!("leaderboard has no usable regions - no background refresh job");
-            return Ok(());
-        }
-        // The job ticks at the cache TTL and runs immediately on the first
-        // tick: the boot warm-up happens off the user path, before the
-        // first command can arrive. A slow cycle delays the next tick
-        // (MissedTickBehavior::Delay) - deep configs never pile up.
-        let job = self.scheduler.schedule(
-            "lol_leaderboard_refresh",
-            settings.cache_ttl,
-            Arc::new(engine::RefreshJob { engine: Arc::clone(&self.engine) }),
-        );
-        *self.job.lock() = Some(job);
-        tracing::info!(
-            ttl_secs = settings.cache_ttl.as_secs(),
-            "leaderboard background refresh scheduled"
-        );
+        // Scheduled even with no usable regions yet: a cycle with nothing
+        // pending is a cheap no-op, and a job that exists from boot is what
+        // makes hot-reloaded regions stay warm - without it the command
+        // path (MissingOnly in background mode) would parse each region
+        // once inline and then serve it frozen forever.
+        self.schedule_job(settings.cache_ttl);
         Ok(())
     }
 
@@ -115,6 +104,37 @@ impl PluginPort for LeaderboardPlugin {
             job.cancel();
         }
         Ok(())
+    }
+}
+
+impl LeaderboardPlugin {
+    /// Registers the background job at `interval`. The job ticks at the
+    /// cache TTL and runs immediately on the first tick: the boot warm-up
+    /// happens off the user path, before the first command can arrive. A
+    /// slow cycle delays the next tick (MissedTickBehavior::Delay) - deep
+    /// configs never pile up.
+    fn schedule_job(&self, interval: Duration) {
+        let job = self.scheduler.schedule(
+            "lol_leaderboard_refresh",
+            interval,
+            Arc::new(engine::RefreshJob { engine: Arc::clone(&self.engine) }),
+        );
+        *self.job.lock() = Some(job);
+        tracing::info!(ttl_secs = interval.as_secs(), "leaderboard background refresh scheduled");
+    }
+
+    /// Hot reload of `cache_ttl`: swap the job's tick cadence. No-op when
+    /// background mode was off at boot (no job exists to reschedule) - the
+    /// mode itself stays a boot decision.
+    pub fn reschedule(&self, interval: Duration) {
+        if self.job.lock().is_none() {
+            return;
+        }
+        if let Some(job) = self.job.lock().take() {
+            job.cancel();
+        }
+        self.schedule_job(interval);
+        tracing::info!(ttl_secs = interval.as_secs(), "leaderboard refresh job rescheduled");
     }
 }
 
@@ -236,5 +256,75 @@ mod tests {
         plugin.start().expect("start");
 
         assert!(scheduler.jobs.lock().expect("jobs lock").is_empty());
+    }
+
+    /// The job exists from boot even with no usable regions: a cycle with
+    /// nothing pending is a cheap no-op, and the job is what keeps
+    /// hot-reloaded regions warm afterwards - without it the command path
+    /// (MissingOnly in background mode) would parse each region once inline
+    /// and then serve it frozen forever.
+    #[test]
+    fn start_schedules_the_job_even_without_usable_regions() {
+        let scheduler = Arc::new(RecordingScheduler::default());
+        let source = FakeSource::ungated();
+        // "mars" is not served by the source: normalization drops it and
+        // the engine boots unconfigured.
+        let settings = EngineSettings::new(
+            source.as_ref(),
+            &["mars".to_owned()],
+            1000,
+            Duration::from_secs(3600),
+            Duration::ZERO,
+            true,
+            Duration::ZERO,
+            ResolvedView::resolve(1000, &[300, 1000], 1000, 5),
+        );
+        let plugin = LeaderboardPlugin::new(
+            Arc::new(CapturingCommandRegistry::default()) as Arc<dyn CommandRegistryPort>,
+            Arc::clone(&scheduler) as Arc<dyn SchedulerPort>,
+            Arc::new(LeaderboardEngine::new(source, settings)),
+        );
+        plugin.init().expect("init");
+        assert!(!plugin.engine.is_configured());
+        plugin.start().expect("start");
+
+        assert_eq!(
+            scheduler.jobs.lock().expect("jobs lock").as_slice(),
+            vec![("lol_leaderboard_refresh".to_owned(), Duration::from_secs(3600))],
+            "the job is scheduled regardless of the boot-time region set"
+        );
+    }
+
+    /// A TTL hot reload swaps the job's cadence; with no job (background
+    /// mode off at boot) there is nothing to reschedule.
+    #[test]
+    fn reschedule_swaps_the_job_interval() {
+        let scheduler = Arc::new(RecordingScheduler::default());
+        let plugin = LeaderboardPlugin::new(
+            Arc::new(CapturingCommandRegistry::default()) as Arc<dyn CommandRegistryPort>,
+            Arc::clone(&scheduler) as Arc<dyn SchedulerPort>,
+            mode_engine(true),
+        );
+        plugin.init().expect("init");
+        plugin.start().expect("start");
+        plugin.reschedule(Duration::from_secs(600));
+
+        assert_eq!(
+            scheduler.jobs.lock().expect("jobs lock").as_slice(),
+            vec![
+                ("lol_leaderboard_refresh".to_owned(), Duration::from_secs(3600)),
+                ("lol_leaderboard_refresh".to_owned(), Duration::from_secs(600)),
+            ],
+            "rescheduling replaces the boot cadence"
+        );
+
+        // No job at boot: reschedule stays a no-op instead of minting one.
+        let cold = LeaderboardPlugin::new(
+            Arc::new(CapturingCommandRegistry::default()) as Arc<dyn CommandRegistryPort>,
+            Arc::clone(&scheduler) as Arc<dyn SchedulerPort>,
+            mode_engine(false),
+        );
+        cold.reschedule(Duration::from_secs(600));
+        assert_eq!(scheduler.jobs.lock().expect("jobs lock").len(), 2);
     }
 }

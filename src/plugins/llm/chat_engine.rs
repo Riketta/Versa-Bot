@@ -3385,6 +3385,55 @@ mod tests {
         assert!(survivors.iter().all(|record| record.content == "stays"));
     }
 
+    /// A log that is an EXACT page multiple ends on a full page: the scan
+    /// must fetch one further (empty) page and terminate cleanly instead
+    /// of looping or stopping early. The timeout guard turns a paging
+    /// regression into a test failure, not a hang.
+    #[tokio::test]
+    async fn forget_message_exits_on_an_exact_page_multiple() {
+        let ctx = ctx(vec![]);
+        let storage = ctx.storage.guild_scoped("test", GuildId(1));
+        // Exactly 500 records (one full page), the target at the very end.
+        for seq in 0..499u64 {
+            append_record(&ctx.storage, &user_record(seq + 100, "alice", "stays")).await;
+        }
+        append_record(&ctx.storage, &user_record(7, "alice", "goes")).await;
+
+        let removed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ctx.engine.forget_message(&storage, 2, 7),
+        )
+        .await
+        .expect("the scan terminates")
+        .expect("forget expected to succeed");
+
+        assert_eq!(removed.len(), 1, "the last-record match goes");
+        let survivors = storage
+            .list_after(&records_namespace(2), 0, u32::MAX)
+            .await
+            .expect("records readable")
+            .len();
+        assert_eq!(survivors, 499);
+    }
+
+    /// An empty log terminates with an empty report - the zero-record
+    /// branch of the paged scan.
+    #[tokio::test]
+    async fn forget_message_on_an_empty_log_reports_empty() {
+        let ctx = ctx(vec![]);
+        let storage = ctx.storage.guild_scoped("test", GuildId(1));
+
+        let removed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ctx.engine.forget_message(&storage, 2, 7),
+        )
+        .await
+        .expect("the scan terminates")
+        .expect("forget expected to succeed");
+
+        assert!(removed.is_empty());
+    }
+
     #[tokio::test]
     async fn history_depth_clamps_the_window() {
         let ctx = ctx(vec![Ok("ok".to_owned())]);
