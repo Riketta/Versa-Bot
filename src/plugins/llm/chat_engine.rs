@@ -1313,8 +1313,9 @@ impl ChatEngine {
     /// brake that keeps per-message cost flat even when compaction is off or
     /// failing: a log longer than the window serves its newest part, and the
     /// oldest uncompacted records beyond it stay out of the context
-    /// (debug-logged). Records themselves are never deleted; the cutoff
-    /// still moves only through committed compactions. An unreadable log is
+    /// (debug-logged). Records are otherwise append-only: the cutoff moves
+    /// only through committed compactions, and the single deletion path is
+    /// the moderator's [`Self::forget_message`]. An unreadable log is
     /// an error - the caller must skip the message rather than answer from a
     /// degraded context.
     async fn load_live_records(
@@ -1356,6 +1357,54 @@ impl ChatEngine {
         let payload = serde_json::to_value(record)
             .map_err(|err| crate::kernel::models::StorageError::Serialization(err.to_string()))?;
         storage.append(&records_namespace(channel_id), payload).await
+    }
+
+    /// Moderator removal (`/llm_forget`): deletes every stored record of
+    /// this channel carrying `message_id` and returns their sequence
+    /// numbers (empty = nothing stored under that id). The ONE path that
+    /// removes conversation records - a tombstone would keep the content
+    /// in storage, defeating the moderation purpose. Must run under the
+    /// channel's processing lock like every other state mutation. Records
+    /// already below the compaction cutoff stay deleted from storage, but
+    /// their gist may survive in the committed summary - the caller owns
+    /// that caveat.
+    pub async fn forget_message(
+        &self,
+        storage: &Arc<dyn GuildStorage>,
+        channel_id: u64,
+        message_id: u64,
+    ) -> Result<Vec<u64>, crate::kernel::models::StorageError> {
+        let records_ns = records_namespace(channel_id);
+        // Whole-log scan: removal is a rare moderator action and must find
+        // the message regardless of age, cutoff, or window bounds.
+        let stored = storage.list_after(&records_ns, 0, u32::MAX).await?;
+        let mut seqs = Vec::new();
+        for record in stored {
+            let matches = serde_json::from_value::<ConversationRecord>(record.payload)
+                .inspect_err(|_| tracing::warn!("skipping malformed conversation record"))
+                .ok()
+                .and_then(|parsed| parsed.message_id)
+                .is_some_and(|id| id == message_id);
+            if matches {
+                storage.delete_record(&records_ns, record.seq).await?;
+                seqs.push(record.seq);
+            }
+        }
+        if seqs.is_empty() {
+            tracing::debug!(
+                channel = channel_id,
+                message_id,
+                "forget: no stored record carries the id"
+            );
+        } else {
+            tracing::info!(
+                channel = channel_id,
+                message_id,
+                removed = seqs.len(),
+                "stored conversation records removed by moderator"
+            );
+        }
+        Ok(seqs)
     }
 
     /// Folds the oldest live messages into the summary once the window
@@ -2159,6 +2208,10 @@ mod tests {
         ) -> Result<u64, StorageError> {
             Err(StorageError::Database("records unavailable".to_owned()))
         }
+
+        async fn delete_record(&self, _namespace: &str, _seq: u64) -> Result<u64, StorageError> {
+            Err(StorageError::Database("records unavailable".to_owned()))
+        }
     }
 
     #[async_trait]
@@ -2224,6 +2277,10 @@ mod tests {
 
         async fn count_after(&self, namespace: &str, after_seq: u64) -> Result<u64, StorageError> {
             self.guild.count_after(namespace, after_seq).await
+        }
+
+        async fn delete_record(&self, namespace: &str, seq: u64) -> Result<u64, StorageError> {
+            self.guild.delete_record(namespace, seq).await
         }
     }
 
@@ -3115,6 +3172,39 @@ mod tests {
         // The cutoff moved nothing: all records are still stored
         // (4 seeded + the captured trigger + the assistant turn).
         assert_eq!(stored_records(&ctx).await.len(), 6);
+    }
+
+    /// `/llm_forget` removes every stored record carrying the message id -
+    /// the one deletion path - and leaves neighboring records untouched.
+    #[tokio::test]
+    async fn forget_message_removes_every_record_with_the_message_id() {
+        let ctx = ctx(vec![]);
+        let storage = ctx.storage.guild_scoped("test", GuildId(1));
+        append_record(&ctx.storage, &user_record(11, "alice", "keep me")).await;
+        append_record(&ctx.storage, &user_record(42, "alice", "bad take")).await;
+        append_record(&ctx.storage, &user_record(42, "alice", "dup capture")).await;
+        append_record(&ctx.storage, &user_record(13, "bob", "unrelated")).await;
+
+        let removed =
+            ctx.engine.forget_message(&storage, 2, 42).await.expect("forget expected to succeed");
+        assert_eq!(removed.len(), 2, "every stored record with the id goes");
+
+        let contents: Vec<String> =
+            stored_records_in(&ctx.storage).await.into_iter().map(|r| r.content).collect();
+        assert_eq!(contents, ["keep me", "unrelated"]);
+    }
+
+    /// An unknown id reports empty - nothing deleted, no error.
+    #[tokio::test]
+    async fn forget_message_reports_empty_for_an_unknown_id() {
+        let ctx = ctx(vec![]);
+        let storage = ctx.storage.guild_scoped("test", GuildId(1));
+        append_record(&ctx.storage, &user_record(11, "alice", "stay")).await;
+
+        let removed =
+            ctx.engine.forget_message(&storage, 2, 999).await.expect("forget expected to succeed");
+        assert!(removed.is_empty());
+        assert_eq!(stored_records_in(&ctx.storage).await.len(), 1);
     }
 
     #[tokio::test]

@@ -158,8 +158,10 @@ slug; plugins may sub-partition (the LLM plugin keeps one record log per
 channel). The `guild` namespace is reserved for guild settings -
 enforced: plugin writes/deletes there are rejected with
 `StorageError::Forbidden`. Besides documents, `GuildStorage` exposes an
-append-only record log for high-volume ordered data; records are never
-deleted - cutoffs move.
+append-only record log for high-volume ordered data; records stay
+append-only by discipline - cutoffs move, and the one sanctioned
+deletion path (`GuildStorage::delete_record`, exactly one row per call)
+is reserved for moderation removals (the LLM plugin's `/llm_forget`).
 
 **Observability:** `tracing` IS the observability port - a facade, not
 infrastructure (same exception category as `serde`); there is
@@ -282,8 +284,9 @@ documented in the README; mechanics in rustdoc:
   data (enforced at the command layer).
 - Per-channel config and history: conversation records live in
   per-channel record-log namespaces, are immutable once captured
-  (template fields baked in), and are never deleted; the cutoff moves
-  only through committed compactions.
+  (template fields baked in); the cutoff moves only through committed
+  compactions, and `/llm_forget` (moderator, per Discord message id) is
+  the single record deletion path.
 - Compaction runs after the reply, is chunked, and is never a sliding
   window - prompt prefixes stay byte-stable for provider caches. This
   constraint shapes many rules: constant prompt appendices appended

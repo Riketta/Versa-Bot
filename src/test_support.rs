@@ -459,6 +459,20 @@ impl GuildStorage for ScopedView {
             .get(&(platform, guild_id, namespace.to_owned()))
             .map_or(0, |rows| rows.iter().filter(|(seq, _)| *seq > after_seq).count() as u64))
     }
+
+    async fn delete_record(&self, namespace: &str, seq: u64) -> Result<u64, StorageError> {
+        if namespace == GUILD_SETTINGS {
+            return Err(StorageError::Forbidden("the 'guild' namespace is reserved".to_owned()));
+        }
+        let (platform, guild_id) = self.key_prefix.clone();
+        let mut records = self.records.lock();
+        let Some(rows) = records.get_mut(&(platform, guild_id, namespace.to_owned())) else {
+            return Ok(0);
+        };
+        let before = rows.len();
+        rows.retain(|(row_seq, _)| *row_seq != seq);
+        Ok(u64::try_from(before - rows.len()).unwrap_or(0))
+    }
 }
 
 #[cfg(test)]
@@ -587,6 +601,10 @@ impl GuildStorage for FailingView {
     }
 
     async fn count_after(&self, _namespace: &str, _after_seq: u64) -> Result<u64, StorageError> {
+        Err(StorageError::Database("simulated storage failure".to_owned()))
+    }
+
+    async fn delete_record(&self, _namespace: &str, _seq: u64) -> Result<u64, StorageError> {
         Err(StorageError::Database("simulated storage failure".to_owned()))
     }
 }

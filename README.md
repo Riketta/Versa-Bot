@@ -759,8 +759,8 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   `compaction_keep_tail` (10) records folds into a rolling summary via
   the compaction model. The window is never slid between compactions,
   so the prompt prefix stays byte-stable and provider prompt caches
-  stay warm. Records are never deleted - compaction only moves the
-  cutoff forward.
+  stay warm. Compaction only moves the cutoff forward; the single
+  deletion path is the moderator's `/llm_forget`.
 - **Image recognition** (opt-in per channel, `/llm_set images on`;
   needs an operator-configured `[llm] image_model`): attached images on
   captured messages are described by a vision-capable model at capture
@@ -834,6 +834,7 @@ plugin](#authorization-auth-plugin)).
 | `/llm_dump` | moderator | dump every setting at once in one copy-pasteable code fence (`key = value`, effective values); lines that differ from a fresh `/llm_assign` carry a `*` marker; prompts are not dumped at all - only set-or-not and size, the text is one argument-free `/llm_set_prompt kind` away |
 | `/llm_cutoff` | moderator | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
 | `/llm_cutoff_undo` | moderator | undo this channel's last `/llm_cutoff`: the exact previous context (summary and cutoff position) is restored - stored records were never touched |
+| `/llm_forget message_id:<id>` | moderator | remove every stored history record of this channel carrying the message id (`enable developer mode`, then right-click a message > Copy Message ID); records already folded into the summary leave storage but the summary text still reflects them |
 | `/llm_emoji_whitelist action:<add\|remove\|list\|clear> scope:<guild\|channel> name:<emoji>` | moderator | manage the emoji whitelist the `react_emoji_inject whitelist` mode filters against; `guild` is the shared baseline, `channel` this channel's own override (a non-empty channel list replaces the baseline); names are validated against the server's actual custom emojis at add time |
 | `/llm_status` | user | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, compaction, image recognition (state, model, prompt length), reactions (state, emoji inject mode with effective whitelist source, silent-react chance), capture mode, chime-in chance, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
 | `/llm_usage` | moderator | this server's LLM token usage: all-time totals (per model) and today's aggregate - chat answers, silent-react chimes, compaction and image recognition all count |

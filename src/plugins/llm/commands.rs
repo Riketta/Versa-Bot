@@ -602,10 +602,10 @@ impl CommandHandler for UnassignLlmHandler {
 
 /// `/llm_cutoff`: resets the channel's conversation context - the cutoff
 /// moves past every existing record and the summary clears, so the next
-/// answer starts fresh. Stored history is kept (records are never deleted);
-/// this is a context reset, not a history wipe. The mutation runs under the
-/// channel's processing lock: an in-flight engine run must not commit an
-/// older state (compaction) over the fresh cutoff.
+/// answer starts fresh. Stored history is kept (records only leave storage
+/// through `/llm_forget`); this is a context reset, not a history wipe. The
+/// mutation runs under the channel's processing lock: an in-flight engine
+/// run must not commit an older state (compaction) over the fresh cutoff.
 pub(super) struct CutoffLlmHandler {
     locks: Arc<ChannelLocks>,
 }
@@ -730,6 +730,89 @@ impl CommandHandler for CutoffUndoLlmHandler {
                 "Context restored: the channel is back to its state before the last \
                  /llm_cutoff.",
             ))
+            .await?;
+        Ok(())
+    }
+}
+
+/// `/llm_forget`: removes every stored history record of this channel that
+/// carries the given Discord message id - the one command that truly
+/// deletes history (a cutoff hides, this removes; a tombstone would keep
+/// the content in storage, defeating the moderation purpose). Runs under
+/// the channel's processing lock: no in-flight engine run may hold the
+/// record in its prompt while it goes away.
+pub(super) struct ForgetLlmHandler {
+    locks: Arc<ChannelLocks>,
+    engine: Arc<ChatEngine>,
+}
+
+impl ForgetLlmHandler {
+    pub(super) fn new(locks: Arc<ChannelLocks>, engine: Arc<ChatEngine>) -> Self {
+        Self { locks, engine }
+    }
+}
+
+#[async_trait]
+impl CommandHandler for ForgetLlmHandler {
+    async fn invoke(
+        &self,
+        event: &RequestContext,
+        args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
+        let Some(storage) = &services.guild_storage else {
+            services
+                .chat_output
+                .send(command_reply("This command only works inside a server."))
+                .await?;
+            return Ok(());
+        };
+        let raw = args.get("message_id").unwrap_or_default();
+        let Ok(message_id) = raw.parse::<u64>() else {
+            services
+                .chat_output
+                .send(command_reply(format!(
+                    "\"{raw}\" is not a message id - right-click a message and use \
+                     Copy Message ID."
+                )))
+                .await?;
+            return Ok(());
+        };
+
+        let channel = self.locks.lock_for(services.platform_info.slug(), &event.origin);
+        let _channel = channel.lock().await;
+
+        let channel_id = event.origin.channel_id.get();
+        let seqs = self.engine.forget_message(storage, channel_id, message_id).await?;
+        if seqs.is_empty() {
+            services
+                .chat_output
+                .send(command_reply(format!(
+                    "No stored history entry carries message id {message_id}."
+                )))
+                .await?;
+            return Ok(());
+        }
+        // Honesty caveat: records below the compaction cutoff already fed
+        // the committed summary - deletion cannot unwind that text.
+        let below_cutoff = storage
+            .get(NAMESPACE, &channel_state_key(channel_id))
+            .await?
+            .and_then(|raw| serde_json::from_value::<ConversationState>(raw).ok())
+            .is_some_and(|state| seqs.iter().any(|seq| *seq <= state.cutoff_seq));
+        let caveat = if below_cutoff {
+            " It was already folded into this channel's summary; the summary text still \
+             reflects it."
+        } else {
+            ""
+        };
+        services
+            .chat_output
+            .send(command_reply(format!(
+                "Removed {} stored history entr{} for message id {message_id}.{caveat}",
+                seqs.len(),
+                if seqs.len() == 1 { "y" } else { "ies" },
+            )))
             .await?;
         Ok(())
     }

@@ -82,4 +82,11 @@ pub trait GuildStorage: Send + Sync {
 
     /// Number of records after `after_seq`.
     async fn count_after(&self, namespace: &str, after_seq: u64) -> Result<u64, StorageError>;
+
+    /// Removes one record by sequence number, returning how many rows went
+    /// (0 = no such record in this namespace). The record log is append-only
+    /// by discipline; this is the one sanctioned deletion path, reserved for
+    /// explicit moderation removals (the LLM plugin's `/llm_forget`) - it
+    /// deletes exactly the addressed row, never a range.
+    async fn delete_record(&self, namespace: &str, seq: u64) -> Result<u64, StorageError>;
 }

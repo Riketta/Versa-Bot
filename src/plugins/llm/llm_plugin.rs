@@ -21,9 +21,9 @@ use crate::kernel::{
 use super::chat_engine::ChatEngine;
 use super::commands::{
     AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler, CutoffLlmHandler,
-    CutoffUndoLlmHandler, DumpLlmHandler, EmojiWhitelistLlmHandler, GetLlmHandler,
-    GlobalUsageLlmHandler, ModelsLlmHandler, SET_KEYS, SetLlmHandler, SetPromptLlmHandler,
-    StatusLlmHandler, UnassignLlmHandler, UsageLlmHandler, model_choices,
+    CutoffUndoLlmHandler, DumpLlmHandler, EmojiWhitelistLlmHandler, ForgetLlmHandler,
+    GetLlmHandler, GlobalUsageLlmHandler, ModelsLlmHandler, SET_KEYS, SetLlmHandler,
+    SetPromptLlmHandler, StatusLlmHandler, UnassignLlmHandler, UsageLlmHandler, model_choices,
 };
 use super::conversation::{ConversationRecord, RecordRole};
 use super::model::{
@@ -418,6 +418,25 @@ impl PluginPort for LlmPlugin {
                 AccessTier::Moderator,
             ),
             Arc::new(CutoffUndoLlmHandler::new(Arc::clone(&self.channel_locks))),
+        );
+        self.registry.register(
+            self.descriptor(
+                "llm_forget",
+                "Remove one message by its Discord id from this channel's stored bot history",
+                vec![ArgDescriptor {
+                    name: "message_id".to_owned(),
+                    description: "Message id - right-click a message and use Copy Message ID"
+                        .to_owned(),
+                    required: true,
+                    kind: ArgKind::String,
+                    choices: None,
+                }],
+                AccessTier::Moderator,
+            ),
+            Arc::new(ForgetLlmHandler::new(
+                Arc::clone(&self.channel_locks),
+                Arc::clone(&self.engine),
+            )),
         );
         self.registry.register(
             self.descriptor(
@@ -910,6 +929,7 @@ mod tests {
                 "llm_cutoff_undo",
                 "llm_dump",
                 "llm_emoji_whitelist",
+                "llm_forget",
                 "llm_get",
                 "llm_models",
                 "llm_set",

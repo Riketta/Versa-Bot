@@ -656,6 +656,51 @@ impl GuildStorage for ScopedGuildStorage {
 
         Ok(u64::try_from(count).map_err(|err| StorageError::Database(err.to_string()))?)
     }
+
+    async fn delete_record(&self, namespace: &str, seq: u64) -> Result<u64, StorageError> {
+        // Same reserved-namespace policy as `append`: records never exist
+        // under guild settings, so a delete attempt there is a contract
+        // breach, not a no-op.
+        if namespace == GUILD_SETTINGS {
+            tracing::warn!(
+                namespace = GUILD_SETTINGS,
+                "rejected record delete in the reserved guild namespace"
+            );
+            return Err(StorageError::Forbidden("the 'guild' namespace is reserved".to_owned()));
+        }
+
+        let seq = i64::try_from(seq).map_err(|err| StorageError::Database(err.to_string()))?;
+        // Each backend answers with its own result type - the affected-row
+        // count is lifted inside the arm.
+        let removed: u64 = match &*self.db {
+            Db::Sqlite(pool) => sqlx::query(
+                "DELETE FROM guild_records \
+                 WHERE platform = ? AND guild_id = ? AND namespace = ? AND seq = ?",
+            )
+            .bind(&self.platform)
+            .bind(self.guild_id)
+            .bind(namespace)
+            .bind(seq)
+            .execute(pool)
+            .await
+            .map(|result| result.rows_affected()),
+            Db::Postgres(pool) => sqlx::query(
+                "DELETE FROM guild_records \
+                 WHERE platform = $1 AND guild_id = $2 AND namespace = $3 AND seq = $4",
+            )
+            .bind(&self.platform)
+            .bind(self.guild_id)
+            .bind(namespace)
+            .bind(seq)
+            .execute(pool)
+            .await
+            .map(|result| result.rows_affected()),
+        }
+        .map(u64::from)
+        .map_err(|err| StorageError::Database(err.to_string()))?;
+
+        Ok(removed)
+    }
 }
 
 #[cfg(test)]
@@ -802,6 +847,35 @@ mod tests {
         let tail = records.get(2).expect("three records expected");
         assert_eq!(tail.seq, third);
         assert_eq!(tail.payload, Value::String("c".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn delete_record_removes_one_row_and_reports_the_miss() {
+        let storage = sqlite_storage().await;
+        let guild = storage.guild_scoped("discord", GuildId(1));
+
+        let first = guild.append("llm", Value::from(1)).await.unwrap();
+        let second = guild.append("llm", Value::from(2)).await.unwrap();
+        let third = guild.append("llm", Value::from(3)).await.unwrap();
+
+        // Exactly the addressed row goes; the neighbors and their seqs stay.
+        assert_eq!(guild.delete_record("llm", second).await.unwrap(), 1);
+        let remaining = guild.list_after("llm", 0, 100).await.unwrap();
+        assert_eq!(
+            remaining.iter().map(|record| record.seq).collect::<Vec<_>>(),
+            vec![first, third],
+            "deletion removes one row; sequence numbers of survivors are untouched"
+        );
+
+        // An absent seq is a reported zero, not an error.
+        assert_eq!(guild.delete_record("llm", second).await.unwrap(), 0);
+        assert_eq!(guild.delete_record("llm", 9999).await.unwrap(), 0);
+
+        // The reserved guild namespace stays rejected for records.
+        assert!(matches!(
+            guild.delete_record("guild", first).await,
+            Err(StorageError::Forbidden(_))
+        ));
     }
 
     #[tokio::test]
