@@ -709,7 +709,14 @@ impl<T: InteractionApi> ChatOutputPort for InteractionFollowupOutput<T> {
         // state), later ones carry the flag explicitly. Single post.
         if message.ephemeral {
             let body = followup_body(&message);
-            return self.post(&body).await;
+            let posted = self.post(&body).await;
+            if posted.is_ok() {
+                // The ephemeral post consumed the platform-side slot (it
+                // edited the original); a later public reply must skip the
+                // placeholder dance, not repeat it.
+                self.first_followup_used.store(true, Ordering::Relaxed);
+            }
+            return posted;
         }
         // Public reply. The first followup would edit the deferred ephemeral
         // original and inherit its ephemeral state - public content cannot
@@ -741,6 +748,21 @@ impl<T: InteractionApi> ChatOutputPort for InteractionFollowupOutput<T> {
         // out, like every other Discord send - see `followup_body`.
         let body = followup_body(&message);
         self.post(&body).await
+    }
+
+    /// Consumes the deferred slot silently: a placeholder goes in (editing
+    /// the deferred original) and is deleted immediately - the invoker's
+    /// "thinking" state clears without any content arriving. Nothing to
+    /// do once a real reply already consumed the slot.
+    async fn dismiss(&self) {
+        if !self.first_followup_used.swap(true, Ordering::Relaxed)
+            && let Ok(placeholder) =
+                self.api.create_followup(&self.token, &placeholder_body()).await
+        {
+            if let Err(err) = self.api.delete_followup(&self.token, placeholder).await {
+                tracing::warn!(%err, "failed to clean up the dismissed interaction slot");
+            }
+        }
     }
 }
 
@@ -1049,6 +1071,46 @@ mod tests {
         let output = scripted_output(Arc::clone(&api));
 
         output.send(OutboundMessage::text("hi").ephemeral()).await.expect("ephemeral delivers");
+
+        assert_eq!(api.log(), ["create:flags"]);
+    }
+
+    /// An ephemeral first reply consumes the slot at the platform (it edits
+    /// the original): a later PUBLIC reply must post directly - repeating
+    /// the placeholder dance would burn two calls and flash the invoker.
+    #[tokio::test]
+    async fn ephemeral_first_reply_consumes_the_slot_for_later_public_ones() {
+        let api = Arc::new(ScriptedApi::new(false, false));
+        let output = scripted_output(Arc::clone(&api));
+
+        output.send(OutboundMessage::text("hi").ephemeral()).await.expect("ephemeral delivers");
+        output.send(OutboundMessage::text("now public")).await.expect("public delivers");
+
+        assert_eq!(api.log(), ["create:flags", "create:public"]);
+    }
+
+    /// Dismissing resolves the pending slot silently (placeholder in,
+    /// delete out) and consumes it: a later public reply posts directly.
+    #[tokio::test]
+    async fn dismiss_resolves_the_slot_silently_and_consumes_it() {
+        let api = Arc::new(ScriptedApi::new(false, false));
+        let output = scripted_output(Arc::clone(&api));
+
+        output.dismiss().await;
+        output.send(OutboundMessage::text("late reply")).await.expect("reply delivers");
+
+        assert_eq!(api.log(), ["create:flags", "delete:placeholder", "create:public"]);
+    }
+
+    /// Dismissing after a real reply is a no-op: the slot is gone, and the
+    /// call must not mint a stray placeholder followup.
+    #[tokio::test]
+    async fn dismiss_after_a_real_reply_is_a_no_op() {
+        let api = Arc::new(ScriptedApi::new(false, false));
+        let output = scripted_output(Arc::clone(&api));
+
+        output.send(OutboundMessage::text("hi").ephemeral()).await.expect("ephemeral delivers");
+        output.dismiss().await;
 
         assert_eq!(api.log(), ["create:flags"]);
     }

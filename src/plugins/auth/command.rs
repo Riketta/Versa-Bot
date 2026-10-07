@@ -163,12 +163,12 @@ async fn set_tier(
         Ok(target) => target,
         Err(message) => return reply(services, message).await,
     };
-    // One write at a time: set is a document read-modify-write, and two
-    // concurrent invocations must not lose one update.
-    let _write = policy_writes.lock().await;
     let Ok(tier) = tier_of(services, args).await else {
         return Ok(());
     };
+    // One write at a time: set is a document read-modify-write, and two
+    // concurrent invocations must not lose one update.
+    let _write = policy_writes.lock().await;
 
     let mut policy = match read_policy(storage).await {
         Ok(policy) => policy,

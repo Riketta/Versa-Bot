@@ -1117,6 +1117,61 @@ mod tests {
         }
     }
 
+    /// The documented append contract (see `GuildStorage::append`) on
+    /// SQLite: assignment is atomic - concurrent appends through the
+    /// file-backed pool (five connections, unlike the single-connection
+    /// in-memory fixture) all succeed with unique, contiguous sequences.
+    #[tokio::test]
+    async fn sqlite_record_log_concurrent_append_contract() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_nanos();
+        let path = std::env::temp_dir()
+            .join(format!("versabot-sqlite-append-{}-{nanos}.sqlite", std::process::id()));
+        let url = format!("sqlite://{}", path.to_string_lossy().replace('\\', "/"));
+        let storage =
+            SqlxStorage::connect(&url).await.expect("file-backed sqlite expected to connect");
+        let ns = "records";
+        let guild = storage.guild_scoped("discord", GuildId(1));
+
+        let first = guild.append(ns, Value::String("a".to_owned())).await.unwrap();
+        assert_eq!(guild.append(ns, Value::String("b".to_owned())).await.unwrap(), first + 1);
+
+        let mut handles = Vec::new();
+        for i in 0..8u64 {
+            let guild = storage.guild_scoped("discord", GuildId(1));
+            let ns = ns.to_owned();
+            handles.push(tokio::spawn(async move { guild.append(&ns, Value::from(i)).await }));
+        }
+        let mut seqs = Vec::new();
+        for handle in handles {
+            let seq = handle
+                .await
+                .expect("append task expected to join")
+                .expect("sqlite appends never collide - assignment is atomic");
+            seqs.push(seq);
+        }
+        seqs.sort_unstable();
+        for (index, seq) in seqs.iter().enumerate() {
+            assert_eq!(
+                *seq,
+                first + 2 + u64::try_from(index).expect("index fits u64"),
+                "sequence numbers must stay unique and contiguous: {seqs:?}"
+            );
+        }
+
+        // Close the pool before cleanup so Windows releases the files.
+        if let Db::Sqlite(pool) = &*storage.db {
+            pool.close().await;
+        }
+        drop(storage);
+        let base = path.display().to_string();
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{base}{suffix}"));
+        }
+    }
+
     /// The poll-driven plugins' discovery primitive: distinct (platform,
     /// guild) scopes in stable order, corrupted rows filtered.
     #[tokio::test]
@@ -1153,6 +1208,14 @@ mod tests {
             }
             Db::Postgres(_) => unreachable!("the fixture is sqlite"),
         }
+
+        // Record-log rows alone never surface a guild: discovery is the
+        // documents-only view (mirrored by the test fake).
+        storage
+            .guild_scoped("discord", GuildId(9))
+            .append("llm", Value::String("records only".to_owned()))
+            .await
+            .unwrap();
 
         assert_eq!(
             storage.list_guilds().await.expect("list expected to succeed"),

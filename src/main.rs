@@ -181,7 +181,8 @@ async fn main() -> ExitCode {
     // chain - it reacts to derived events, not to raw inbound ones.
     let audit = Arc::new(AuditLogPlugin::new(event_bus.clone()));
 
-    // Kernel scheduling service + presence: the status rotator's drives.
+    // Presence rides the gateway: queued until the connection is ready
+    // (the nickname adapter below reuses the same context handle).
     let (presence, gateway_context) = SerenityPresence::new();
     let presence = Arc::new(presence);
 
@@ -388,7 +389,9 @@ fn llm_settings_from(
     // Operator knobs clamped to safe ranges, mirroring the command-layer
     // guards. The clamp is announced - a silent correction hides a typo.
     let max_message_length = match message_limit {
-        Some(cap) => config.max_message_length.clamp(1, cap),
+        // `cap.max(1)`: a platform declaring a zero limit degrades to the
+        // same clamp as an absent one, never a boot panic (min > max).
+        Some(cap) => config.max_message_length.clamp(1, cap.max(1)),
         None => config.max_message_length.max(1),
     };
     if config.max_message_length == 0 {

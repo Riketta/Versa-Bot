@@ -137,8 +137,10 @@ fn normalize_owners(raw: &[String]) -> Vec<String> {
 ///   regardless - auth is about who may use the bot, not about what happens
 ///   in the guild. Direct messages pass too: no guild scope to protect.
 /// - Every member has an effective [`AccessTier`] (see [`Self::effective_tier`]).
-///   `Banned` members are dropped silently - messages and commands alike,
-///   without any denial output: bans never announce themselves.
+/// Banned members are dropped silently - messages and commands alike,
+/// without any denial output: bans never announce themselves. An open
+/// transactional slot (a deferred interaction) is dismissed without
+/// content, so the invoker sees the pending state clear, never a reply.
 /// - Commands are tier-gated by their descriptor's `required_tier` (looked
 ///   up in the command registry); a member below the requirement gets an
 ///   ephemeral denial on transactional origins. Unknown commands pass -
@@ -300,6 +302,14 @@ impl MiddlewarePluginPort for AuthPlugin {
 
         if tier == AccessTier::Banned {
             tracing::info!(user = %event.origin.user_id, guild_id = ?event.origin.guild_id, "event denied by auth: banned (ignored silently)");
+            // A transactional origin (a deferred command interaction) owes
+            // the platform a resolution: dismiss the open slot without
+            // content so the invoker is not left on "thinking" until the
+            // token expires. No denial output rides it - bans never
+            // announce themselves. Plain origins have no slot (no-op).
+            if event.origin.reply_token.is_some() {
+                services.chat_output.dismiss().await;
+            }
             return Next::Stop;
         }
 
@@ -659,7 +669,9 @@ mod tests {
     }
 
     /// Banned members are dropped without any output - bans never announce
-    /// themselves, on messages and on commands alike (even transactional).
+    /// themselves, on messages and on commands alike. A transactional
+    /// command still resolves its deferred slot: dismissed once, silently,
+    /// with no content.
     #[tokio::test]
     async fn banned_members_are_dropped_silently() {
         let storage = configured_storage(AccessTier::User, &[("3", AccessTier::Banned)], &[]);
@@ -672,6 +684,9 @@ mod tests {
         assert!(matches!(plugin.pre(&mut message, &services).await, Next::Stop));
         assert!(matches!(plugin.pre(&mut command, &services).await, Next::Stop));
         assert!(output.messages().is_empty());
+        // Only the transactional command dismissed its slot; the plain
+        // message has none and must not touch the output at all.
+        assert_eq!(output.dismissals(), 1);
     }
 
     /// An explicit ban wins over role grants: a banned user holding a

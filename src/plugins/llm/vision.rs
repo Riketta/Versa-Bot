@@ -15,6 +15,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use futures_util::future::join_all;
 
 use super::completion_port::{
     ChatMessage, ChatRole, CompletionRequest, LlmCompletionPort, TokenUsage,
@@ -235,11 +236,11 @@ impl ImageDescriber for VisionService {
         images: Vec<ImageSource>,
         usage: Option<UsageSink<'_>>,
     ) -> Vec<Option<String>> {
-        let mut descriptions = Vec::with_capacity(images.len());
-        for image in &images {
-            descriptions.push(self.describe_one(job, image, usage.as_ref()).await);
-        }
-        descriptions
+        // Concurrent and order-preserving: description runs under the
+        // channel's processing lock, so a slow vision endpoint must cost
+        // one round trip, not `images` sequential ones.
+        let descriptions = images.iter().map(|image| self.describe_one(job, image, usage.as_ref()));
+        join_all(descriptions).await
     }
 }
 

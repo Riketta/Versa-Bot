@@ -8,7 +8,7 @@ use crate::kernel::{
     spi_ports::NicknamePort,
 };
 
-use super::presence_adapter::GatewayContext;
+use super::serenity_presence::GatewayContext;
 
 /// Discord [`NicknamePort`]: renames the bot in one guild via the REST API,
 /// through the gateway context the driving adapter attaches on `ready`.

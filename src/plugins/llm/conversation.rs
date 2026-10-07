@@ -421,7 +421,8 @@ pub fn compaction_input(
 /// Splits a reply into platform-sized chunks on line boundaries: a line
 /// that does not fit the current chunk starts a new one; a single line
 /// longer than the limit is hard-cut (the platform rejects oversized
-/// messages outright). Measured in characters, not bytes.
+/// messages outright). Measured in UTF-16 code units - the unit Discord's
+/// message cap counts (an astral-plane character costs two).
 pub fn split_reply(content: &str, max_length: usize) -> Vec<String> {
     let max = max_length.max(1);
     let mut chunks: Vec<String> = Vec::new();
@@ -429,35 +430,57 @@ pub fn split_reply(content: &str, max_length: usize) -> Vec<String> {
 
     for line in content.split('\n') {
         // An overlong line degrades into limit-sized pieces.
-        let mut rest = line.to_owned();
+        let mut rest = line;
         loop {
-            let line_len = rest.chars().count();
+            let line_len = utf16_len(rest);
             if line_len <= max {
                 let joiner = usize::from(!current.is_empty());
-                if current.chars().count() + joiner + line_len <= max {
+                if utf16_len(&current) + joiner + line_len <= max {
                     if joiner == 1 {
                         current.push('\n');
                     }
-                    current.push_str(&rest);
+                    current.push_str(rest);
                 } else {
                     if !current.is_empty() {
                         chunks.push(std::mem::take(&mut current));
                     }
-                    current = rest;
+                    current.clear();
+                    current.push_str(rest);
                 }
                 break;
             }
             if !current.is_empty() {
                 chunks.push(std::mem::take(&mut current));
             }
-            chunks.push(rest.chars().take(max).collect());
-            rest = rest.chars().skip(max).collect();
+            let (head, tail) = split_utf16_floor(rest, max);
+            chunks.push(head.to_owned());
+            rest = tail;
         }
     }
     if !current.is_empty() {
         chunks.push(current);
     }
     chunks
+}
+
+/// Length in UTF-16 code units - the unit platform message caps count.
+pub(crate) fn utf16_len(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
+}
+
+/// Splits `text` after the longest char-boundary prefix that fits `max`
+/// UTF-16 code units. A first scalar that alone exceeds the budget is
+/// kept whole - an astral character cannot fit a 1-unit budget, and
+/// emitting nothing would stall the caller's loop.
+pub(crate) fn split_utf16_floor(text: &str, max: usize) -> (&str, &str) {
+    let mut units = 0;
+    for (index, ch) in text.char_indices() {
+        units += ch.len_utf16();
+        if units > max {
+            return if index == 0 { text.split_at(ch.len_utf8()) } else { text.split_at(index) };
+        }
+    }
+    (text, "")
 }
 
 #[cfg(test)]
@@ -1327,9 +1350,31 @@ mod tests {
 
     #[test]
     fn multibyte_characters_survive_splitting() {
-        // 6 chars but 12 bytes; measured in characters.
+        // 6 astral chars = 12 UTF-16 units; a 4-unit budget fits exactly
+        // two per chunk (the old scalar counting packed four - over the
+        // platform's real limit).
         let chunks = split_reply("😀😀😀😀😀😀", 4);
-        assert_eq!(chunks, vec!["😀😀😀😀", "😀😀"]);
+        assert_eq!(chunks, vec!["😀😀", "😀😀", "😀😀"]);
+    }
+
+    /// A 30-emoji reply under a 20-unit budget splits into exact-budget
+    /// chunks (not 20-emoji ones) and reassembles losslessly.
+    #[test]
+    fn split_reply_measures_utf16_units() {
+        let content = "😀".repeat(30);
+        let chunks = split_reply(&content, 20);
+        assert_eq!(chunks.len(), 3);
+        for chunk in &chunks {
+            assert_eq!(utf16_len(chunk), 20, "every chunk fits the budget exactly");
+        }
+        assert_eq!(chunks.concat(), content);
+    }
+
+    /// A single astral character against a 1-unit budget still emits
+    /// (once, over budget) instead of stalling on an unbreakable scalar.
+    #[test]
+    fn split_reply_never_stalls_on_an_unfittable_first_character() {
+        assert_eq!(split_reply("😀", 1), vec!["😀".to_owned()]);
     }
 
     #[test]

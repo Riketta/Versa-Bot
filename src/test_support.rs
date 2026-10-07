@@ -317,20 +317,15 @@ impl StoragePort for InMemoryStorage {
         })
     }
 
-    /// Distinct scopes over seeded documents and record logs, ordered - the
-    /// fake mirrors the real adapter's shape so poll-driven plugins test
-    /// their discovery logic.
+    /// Distinct scopes over seeded documents only - mirroring the real
+    /// adapter's documents-only discovery view (record-log rows alone do
+    /// not make a guild discoverable) so poll-driven plugins test their
+    /// discovery logic against production semantics.
     async fn list_guilds(&self) -> Result<Vec<(String, GuildId)>, StorageError> {
-        let mut scopes: Vec<(String, i64)> = Vec::new();
-        {
-            let documents = self.documents.lock();
-            scopes
-                .extend(documents.keys().map(|(platform, guild, _, _)| (platform.clone(), *guild)));
-        }
-        {
-            let records = self.records.lock();
-            scopes.extend(records.keys().map(|(platform, guild, _)| (platform.clone(), *guild)));
-        }
+        let documents = self.documents.lock();
+        let mut scopes: Vec<(String, i64)> =
+            documents.keys().map(|(platform, guild, _, _)| (platform.clone(), *guild)).collect();
+        drop(documents);
         scopes.sort();
         scopes.dedup();
         Ok(scopes
@@ -505,12 +500,31 @@ mod tests {
         let read = guild.get(GUILD_SETTINGS, "language").await.expect("read permitted");
         assert_eq!(read, Some(Value::String("en".to_owned())));
     }
+
+    /// The fake mirrors the real adapter's documents-only discovery: a
+    /// guild whose rows exist only in the record log is invisible to
+    /// `list_guilds` - tests must not rely on record-only guilds being
+    /// discoverable, because production cannot exhibit that.
+    #[tokio::test]
+    async fn list_guilds_sees_documents_only() {
+        let storage = InMemoryStorage::new();
+        storage.guild_scoped("test", GuildId(1)).set("ns", "k", Value::Bool(true)).await.unwrap();
+        storage
+            .guild_scoped("test", GuildId(2))
+            .append("llm", Value::String("record-only".to_owned()))
+            .await
+            .unwrap();
+
+        let scopes = storage.list_guilds().await.unwrap();
+        assert_eq!(scopes, [("test".to_owned(), GuildId(1))]);
+    }
 }
 
 /// [`ChatOutputPort`] that records every send for assertions.
 #[derive(Default)]
 pub struct RecordingChatOutput {
     messages: Mutex<Vec<OutboundMessage>>,
+    dismissals: AtomicUsize,
 }
 
 impl RecordingChatOutput {
@@ -530,6 +544,13 @@ impl RecordingChatOutput {
     #[must_use]
     pub fn sent(&self) -> Vec<OutboundMessage> {
         self.messages.lock().clone()
+    }
+
+    /// How many times the transactional slot was dismissed without content
+    /// (the silent-resolution path - bans).
+    #[must_use]
+    pub fn dismissals(&self) -> usize {
+        self.dismissals.load(Ordering::SeqCst)
     }
 }
 
@@ -552,6 +573,10 @@ impl ChatOutputPort for RecordingChatOutput {
     async fn send(&self, message: OutboundMessage) -> Result<(), OutboundError> {
         self.messages.lock().push(message);
         Ok(())
+    }
+
+    async fn dismiss(&self) {
+        self.dismissals.fetch_add(1, Ordering::SeqCst);
     }
 }
 

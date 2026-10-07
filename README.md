@@ -311,7 +311,8 @@ Robustness rules:
   only, naming the required and the actual tier. Denied plain messages
   are rejected silently - a public "no" would be a spam vector, and
   ephemeral replies are impossible there. Banned members get no answer
-  anywhere.
+  anywhere; a pending slash command's loading state clears silently,
+  with no reply behind it.
 - Commands carry their required tier in their declaration. The Discord
   adapter does not hide tier-gated commands (only `/auth` keeps the
   native Manage Server gate as defense in depth) - enforcement is
@@ -915,10 +916,13 @@ reply to the message that triggered it
 (the mention/reply target, or the message a chime-in fired on); only the
 first message of a split answer carries the reply header, the rest
 continue plainly. Long answers split on line boundaries - a line that
-does not fit moves whole to the next message. With `streaming` on, the
+does not fit moves whole to the next message - measured in UTF-16 code
+units, the unit Discord's message limit counts (astral emoji cost two).
+With `streaming` on, the
 endpoint is asked for a real SSE stream: the message appears with the
-first tokens and is edited in place (throttled by `stream_interval_ms`)
-while the model writes; the final edit carries the exact full text, and
+first tokens and is edited in place (throttled by `stream_interval_ms`;
+live edits are cap-fitting prefixes, never oversized) while the model
+writes; the final edit carries the exact full text, and
 answers longer than one message still split. Providers without SSE
 degrade gracefully: the answer then arrives as one piece (and a
 non-streaming channel always does). Chime-ins are cooldown-guarded

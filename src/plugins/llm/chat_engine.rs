@@ -142,6 +142,11 @@ struct LiveReveal {
     revealing: bool,
     next_edit: Instant,
     interval: Duration,
+    /// Platform message cap: every posted edit is clamped to it, so a
+    /// stream longer than one message never 400s mid-reveal. The reveal is
+    /// a prefix of the answer; `deliver_reply`'s final edit re-pins the
+    /// authoritative first chunk and the overflow rides the plain parts.
+    max_length: usize,
 }
 
 impl LiveReveal {
@@ -150,6 +155,7 @@ impl LiveReveal {
         channel_id: u64,
         reply_to: Option<MessageId>,
         interval: Duration,
+        max_length: usize,
     ) -> Self {
         Self {
             stream,
@@ -160,6 +166,7 @@ impl LiveReveal {
             revealing: true,
             next_edit: Instant::now() + interval,
             interval,
+            max_length: max_length.max(1),
         }
     }
 
@@ -168,10 +175,14 @@ impl LiveReveal {
         if !self.revealing {
             return;
         }
+        // The reveal is always a cap-fitting prefix of the revealed text -
+        // an edit past the platform limit would be rejected outright, and
+        // the final delivery re-pins the authoritative split anyway.
+        let (visible, _) = conversation::split_utf16_floor(&self.revealed, self.max_length);
         if let Some(id) = self.message {
             if Instant::now() >= self.next_edit {
                 self.next_edit = Instant::now() + self.interval;
-                if let Err(err) = self.stream.update(id, self.revealed.clone()).await {
+                if let Err(err) = self.stream.update(id, visible.to_owned()).await {
                     tracing::warn!(
                         channel = self.channel_id,
                         %err,
@@ -180,7 +191,7 @@ impl LiveReveal {
                 }
             }
         } else {
-            let mut begin = OutboundMessage::text(self.revealed.clone());
+            let mut begin = OutboundMessage::text(visible.to_owned());
             if let Some(reply_to) = self.reply_to {
                 begin = begin.replying_to(reply_to);
             }
@@ -697,10 +708,11 @@ impl ChatEngine {
             self.assemble_prompt(config, state, live, usage_stats, &vars, &emoji_menu);
         let started = Instant::now();
 
+        let max_length = config.max_length.unwrap_or(self.settings.max_message_length);
         // Streaming channels pull the answer live off the endpoint (SSE
         // deltas reveal on one message); everything else stays single-shot.
         let (live_id, outcome) = if config.streaming {
-            self.complete_live(origin, request, services).await
+            self.complete_live(origin, request, services, max_length).await
         } else {
             (
                 None,
@@ -845,6 +857,7 @@ impl ChatEngine {
         origin: &Origin,
         request: CompletionRequest,
         services: &KernelServices,
+        max_length: usize,
     ) -> (Option<MessageId>, LiveOutcome) {
         let (tx, mut rx) = mpsc::channel::<String>(32);
         let mut completion = Box::pin(self.completion.complete_streaming(request, tx));
@@ -853,6 +866,7 @@ impl ChatEngine {
             origin.channel_id.get(),
             origin.message_id,
             Duration::from_millis(self.settings.stream_interval_ms.max(1)),
+            max_length,
         );
 
         let outcome = loop {
@@ -999,8 +1013,18 @@ impl ChatEngine {
         };
 
         let delivered_first = usize::from(first_message_id.is_some());
-        for chunk in chunks.iter().skip(delivered_first) {
-            match services.chat_output.send(OutboundMessage::text(chunk.clone())).await {
+        for (index, chunk) in chunks.iter().skip(delivered_first).enumerate() {
+            let mut part = OutboundMessage::text(chunk.clone());
+            // The degradation path keeps the reply anchor: when `begin`
+            // failed, the first plain part carries the reference the
+            // anchored path would have shown.
+            if index == 0
+                && first_message_id.is_none()
+                && let Some(reply_to) = origin.message_id
+            {
+                part = part.replying_to(reply_to);
+            }
+            match services.chat_output.send(part).await {
                 Ok(()) => delivered = true,
                 Err(err) => {
                     tracing::warn!(channel = channel_id, %err, "failed to deliver reply part");
@@ -2002,6 +2026,34 @@ mod tests {
         }
     }
 
+    /// Every posted reveal edit fits the platform cap: the live message is
+    /// always a prefix of the revealed text, never an oversized edit the
+    /// platform would reject (the final delivery splits authoritatively).
+    #[tokio::test]
+    async fn live_reveal_clamps_every_posted_edit_to_the_cap() {
+        let begins = Arc::new(Mutex::new(Vec::new()));
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let stream = Arc::new(RecordingStream {
+            begins: Arc::clone(&begins),
+            updates: Arc::clone(&updates),
+            counter: AtomicU64::new(1),
+        });
+        let mut reveal = LiveReveal::new(stream, 7, None, Duration::from_millis(0), 10);
+
+        reveal.push("0123456789ABCDE").await;
+        reveal.push("FGH").await;
+        reveal.push("\u{1f600}").await;
+
+        let begin = begins.lock().first().expect("begin expected").clone();
+        assert_eq!(begin.content, "0123456789", "the begin is clamped to the cap");
+        let recorded = updates.lock().clone();
+        assert!(!recorded.is_empty(), "at least one edit expected");
+        for edit in &recorded {
+            assert!(conversation::utf16_len(edit) <= 10, "edit over the cap: {edit:?}");
+        }
+        assert_eq!(recorded.last(), Some(&"0123456789".to_owned()));
+    }
+
     /// Deterministic RNG for chime-in tests.
     struct FixedRandom(bool);
 
@@ -2456,6 +2508,79 @@ mod tests {
         ) -> Option<String> {
             None
         }
+    }
+
+    /// Begin-fails stream + recording plain output: the degradation path
+    /// (`begin` fails, every part goes out as a plain send) with observable
+    /// content and reference fields.
+    struct DegradedStreamFactory {
+        output: Arc<RecordingChatOutput>,
+    }
+
+    #[async_trait]
+    impl ChatOutputFactoryPort for DegradedStreamFactory {
+        fn chat_output(&self, _origin: &Origin) -> Arc<dyn ChatOutputPort> {
+            Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
+        }
+
+        fn start_typing(&self, _origin: &Origin) -> ChatTypingGuard {
+            ChatTypingGuard::dead()
+        }
+
+        fn channel_output(
+            &self,
+            _origin: &Origin,
+            _channel_id: ChannelId,
+        ) -> Arc<dyn ChatOutputPort> {
+            Arc::clone(&self.output) as Arc<dyn ChatOutputPort>
+        }
+
+        fn stream_output(&self, _origin: &Origin) -> Arc<dyn ChatStreamPort> {
+            Arc::new(FailingStream)
+        }
+
+        fn react(&self, _origin: &Origin) -> Arc<dyn ReactionPort> {
+            Arc::new(FailingReactionPort)
+        }
+
+        fn message_link(
+            &self,
+            _origin: &Origin,
+            _channel_id: ChannelId,
+            _message_id: MessageId,
+        ) -> Option<String> {
+            None
+        }
+    }
+
+    /// When the streaming `begin` fails, the plain-send fallback keeps the
+    /// reply anchor: the first plain part references the triggering message
+    /// exactly like the anchored begin would have.
+    #[tokio::test]
+    async fn begin_failure_fallback_keeps_the_reply_anchor() {
+        let ctx = ctx(vec![Ok("first part, quite long\nsecond part".to_owned())]);
+        let output = RecordingChatOutput::new();
+        let services = KernelServices {
+            chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
+            chat_output_factory: Arc::new(DegradedStreamFactory { output: Arc::clone(&output) })
+                as Arc<dyn ChatOutputFactoryPort>,
+            guild_storage: Some(ctx.storage.guild_scoped("test", GuildId(1))),
+            plugin_storage: crate::test_support::test_plugin_storage(),
+            platform_info: crate::test_support::test_platform_info(),
+        };
+        let config = ChannelConfig { max_length: Some(12), ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &services, None).await;
+
+        let sent = output.sent();
+        assert!(sent.len() >= 2, "the split answer goes out as plain parts");
+        assert_eq!(sent.first().expect("parts expected").reply_to, Some(MessageId(77)));
+        assert_eq!(
+            sent.iter().skip(1).map(|part| part.reply_to).collect::<Vec<_>>(),
+            vec![None; sent.len() - 1],
+            "only the first part carries the anchor"
+        );
     }
 
     #[tokio::test]
@@ -3949,6 +4074,40 @@ mod tests {
         let last = records.last().expect("bot turn recorded");
         assert_eq!(last.role, RecordRole::Assistant);
         assert_eq!(last.content, "Answer continues");
+    }
+
+    /// A stream longer than one message never edits past the cap: every
+    /// posted reveal is a clamped prefix, and the final edit re-pins the
+    /// authoritative first chunk while the overflow rides plain parts.
+    #[tokio::test]
+    async fn streaming_over_cap_keeps_every_edit_within_the_limit() {
+        let settings = LlmSettings { stream_interval_ms: 1, ..LlmSettings::default() };
+        let ctx = ctx_delta(
+            settings,
+            Arc::new(DeltaCompletion {
+                chunks: vec!["0123456789A".to_owned(), "BCDE".to_owned()],
+                delay_ms: 5,
+                fail_at_start: false,
+                fail_after: None,
+            }),
+        );
+        let config = ChannelConfig { streaming: true, max_length: Some(10), ..assigned_config() };
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
+
+        for begin in ctx.begins.lock().iter() {
+            assert!(conversation::utf16_len(&begin.content) <= 10);
+        }
+        let updates = ctx.updates.lock().clone();
+        assert!(!updates.is_empty());
+        for edit in &updates {
+            assert!(conversation::utf16_len(edit) <= 10, "edit over the cap: {edit:?}");
+        }
+        // The authoritative final edit pins the exact first chunk.
+        assert_eq!(updates.last().map(String::as_str), Some("0123456789"));
     }
 
     /// A stream that fails before the first delta shows nothing: the

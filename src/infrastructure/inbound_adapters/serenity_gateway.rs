@@ -507,10 +507,13 @@ fn interaction_age_ms(id: u64) -> u64 {
 }
 
 /// Flattens Discord's option tree into `name -> value` string pairs.
-/// Subcommand boundaries are flattened away; resolved entities (users,
-/// channels, roles) arrive as their IDs. Attachment options resolve to the
-/// attachment's CDN URL - a pinned trusted host (Discord's CDN), which is
-/// the only network peer an attachment argument may ever name.
+/// Subcommand boundaries are flattened away (group identity is lost:
+/// sibling subcommands sharing an option name yield duplicate pairs in
+/// walk order - no plugin uses subcommands today); resolved entities
+/// (users, channels, roles) arrive as their IDs. Attachment options
+/// resolve to the attachment's CDN URL - a pinned trusted host (Discord's
+/// CDN), which is the only network peer an attachment argument may ever
+/// name.
 fn flatten_options(
     options: &[CommandDataOption],
     resolved: &CommandDataResolved,
@@ -713,6 +716,31 @@ mod tests {
                 ("target".to_owned(), "130000000000000000".to_owned()),
                 ("inner".to_owned(), "value".to_owned()),
             ]
+        );
+    }
+
+    /// Group identity is flattened away: sibling subcommands sharing an
+    /// option name yield duplicate pairs in walk order - pinned so the
+    /// loss stays a conscious, visible contract.
+    #[test]
+    fn sibling_subcommand_options_keep_duplicate_names_in_walk_order() {
+        let options: Vec<CommandDataOption> = serde_json::from_value(serde_json::json!([
+            { "name": "group", "type": 2, "options": [
+                { "name": "add", "type": 1, "options": [
+                    { "name": "name", "type": 3, "value": "one" }
+                ] },
+                { "name": "remove", "type": 1, "options": [
+                    { "name": "name", "type": 3, "value": "two" }
+                ] }
+            ]}
+        ]))
+        .expect("test options expected to deserialize");
+
+        let args = flatten_options(&options, &CommandDataResolved::default());
+
+        assert_eq!(
+            args,
+            vec![("name".to_owned(), "one".to_owned()), ("name".to_owned(), "two".to_owned()),]
         );
     }
 

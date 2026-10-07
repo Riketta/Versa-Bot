@@ -117,9 +117,11 @@ impl MiddlewarePluginPort for CommandPlugin {
             }
         } else {
             // Audit trail: who ran what. User/guild/channel ride in the
-            // kernel span; argument values render only while short (settings
-            // keys, ids, `clear`) - long free text (prompts) is a shape, not
-            // content, so the audit never carries message-sized payloads.
+            // kernel span; argument values render only while short (at
+            // most 64 chars: settings keys, ids, and short admin-set free
+            // text such as a prompt prefix - bounded operator telemetry,
+            // never message-sized payloads); longer values appear as a
+            // shape (their length) only.
             let summary = args
                 .0
                 .iter()
@@ -166,6 +168,21 @@ mod tests {
     };
     use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
     use std::sync::Arc;
+
+    /// The demo command carries the same description discipline as every
+    /// other plugin: self-sufficient docs within Discord's 100-char cap.
+    #[test]
+    fn init_registers_ping_within_discord_limits() {
+        let registry = Arc::new(InMemoryCommandRegistry::new());
+        let plugin = CommandPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>);
+        plugin.init().expect("init expected to succeed");
+
+        let descriptors = registry.descriptors();
+        crate::test_support::assert_descriptions_fit_discord(&descriptors);
+        let descriptor = descriptors.first().expect("one descriptor expected");
+        assert_eq!(descriptor.name, "ping");
+        assert_eq!(descriptor.required_tier, Some(AccessTier::User));
+    }
 
     struct StaticHandler {
         reply: &'static str,

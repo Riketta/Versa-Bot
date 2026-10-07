@@ -10,4 +10,11 @@ use crate::kernel::models::{OutboundError, OutboundMessage};
 #[async_trait]
 pub trait ChatOutputPort: Send + Sync {
     async fn send(&self, message: OutboundMessage) -> Result<(), OutboundError>;
+
+    /// Resolves an open transactional slot (e.g. a deferred interaction)
+    /// without delivering any output: the pending acknowledgment is
+    /// consumed and cleaned up silently. For outputs without a pending
+    /// slot this is a no-op. Never sends content - callers use it instead
+    /// of a denial when silence itself is the policy (bans).
+    async fn dismiss(&self) {}
 }

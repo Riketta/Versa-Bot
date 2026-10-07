@@ -1,13 +1,13 @@
-mod nickname_adapter;
-mod presence_adapter;
 mod serenity_command_registrar;
+mod serenity_nickname;
 mod serenity_outbound;
+mod serenity_presence;
 mod sqlx_storage;
 
-pub use nickname_adapter::SerenityNickname;
-pub use presence_adapter::{GatewayContext, SerenityPresence};
 pub use serenity_command_registrar::DiscordCommandRegistrar;
+pub use serenity_nickname::SerenityNickname;
 pub use serenity_outbound::SerenityChatOutputFactory;
+pub use serenity_presence::{GatewayContext, SerenityPresence};
 pub use sqlx_storage::SqlxStorage;
 
 // The mention-tag wire codec is shared with the gateway adapter, which

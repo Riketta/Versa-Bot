@@ -273,6 +273,10 @@ carries an `ephemeral` hint - honored only on transactional replies;
 plain channel sends are always public, and denied plain messages stay
 silent (a public rejection is a spam vector) - plus an optional
 `reply_to` reference that degrades gracefully to a normal send.
+`ChatOutputPort::dismiss` resolves an open transactional slot (a
+deferred interaction) with no content at all - the auth plugin's ban
+path uses it so a banned invoker's pending loading state clears without
+any reply; for origins without a slot it is a no-op.
 
 **LLM chat plugin** (`src/plugins/llm/`): the first plugin built as its
 own hexagon. Invariants only - behavior, configuration, and commands are
