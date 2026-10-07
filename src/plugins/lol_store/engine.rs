@@ -216,10 +216,12 @@ impl<B: EventBusPort> StoreEngine<B> {
 
         // Boot catch-up: with no in-memory state, adopt the first persisted
         // copy so the diff announces what happened while the bot was down.
+        let mut catchup = false;
         if self.state.lock().is_none() {
             if let Some(persisted) = self.load_persisted_state().await {
                 tracing::debug!("adopting persisted store state for catch-up");
                 *self.state.lock() = Some(persisted);
+                catchup = true;
             }
         }
         let previous = self.state.lock().clone();
@@ -321,9 +323,21 @@ impl<B: EventBusPort> StoreEngine<B> {
         let delta = previous.as_ref().map(|previous| diff::compute(previous, &snapshot));
         let full = delta.as_ref().filter(|delta| !delta.is_empty());
 
+        if previous.is_none() {
+            tracing::debug!("first successful poll - recording silent baseline");
+        }
+
         // Announce and notify before the state swap: formatting joins
         // against the freshly fetched catalog.
         if let Some(delta) = full {
+            tracing::debug!(
+                sales = delta.sales.len(),
+                skins = delta.skins.len(),
+                rotations = delta.rotations.len(),
+                yourshop = delta.yourshop.is_some(),
+                catchup,
+                "store delta detected"
+            );
             let index = self.name_index(&snapshot).await;
             // One fan-out scan per cycle: announcements and watch pings see
             // the same enabled-guild snapshot (a config change landing
@@ -346,14 +360,19 @@ impl<B: EventBusPort> StoreEngine<B> {
                 feed.yourshop = None;
             }
             if !feed.is_empty() {
-                let pages = self.announce(&feed, &index, &targets).await;
+                let pages = self.announce(&feed, &index, &targets, catchup).await;
                 // An empty render announces nothing - storing it would make
                 // `/lol_client_status` report a phantom announcement.
                 if !pages.is_empty() {
                     *self.last_announcement.lock() = Some((Instant::now(), pages));
                 }
+            } else {
+                tracing::debug!(
+                    catchup,
+                    "delta found but announce flags strip every section - watch pings only"
+                );
             }
-            self.notify_subscriptions(delta, &index, &targets).await;
+            self.notify_subscriptions(delta, &index, &targets, catchup).await;
         }
         let delta_found = full.is_some();
 
@@ -367,6 +386,8 @@ impl<B: EventBusPort> StoreEngine<B> {
             skins = current.skins.len(),
             rotations = current.rotations.len(),
             delta_found,
+            persisted = changed,
+            catchup,
             "store poll complete"
         );
     }
@@ -384,6 +405,7 @@ impl<B: EventBusPort> StoreEngine<B> {
         delta: &StoreDelta,
         index: &NameIndex,
         targets: &[(GuildId, ChannelId, Option<String>)],
+        catchup: bool,
     ) -> Vec<String> {
         if index.catalog.is_empty() {
             tracing::warn!(
@@ -481,8 +503,15 @@ impl<B: EventBusPort> StoreEngine<B> {
             }
         }
 
-        // Audit-grade and honest: how many guilds actually got it.
+        // Audit-grade and honest: how many guilds actually got it, and
+        // whether this was a live hit or a boot catch-up for a change that
+        // happened while the bot could not observe the client.
         tracing::info!(
+            catchup,
+            sales = delta.sales.len(),
+            skins = delta.skins.len(),
+            rotations = delta.rotations.len(),
+            yourshop = delta.yourshop.is_some(),
             guilds = targets.len(),
             delivered = delivered_guilds,
             pages = total,
@@ -560,6 +589,7 @@ impl<B: EventBusPort> StoreEngine<B> {
         delta: &StoreDelta,
         index: &NameIndex,
         targets: &[(GuildId, ChannelId, Option<String>)],
+        catchup: bool,
     ) {
         if targets.is_empty() {
             return;
@@ -627,6 +657,7 @@ impl<B: EventBusPort> StoreEngine<B> {
             tracing::info!(
                 guild = guild_id.get(),
                 watchers = notification.watchers,
+                catchup,
                 "store watch notification delivered"
             );
         }
@@ -699,7 +730,10 @@ impl<B: EventBusPort> StoreEngine<B> {
     async fn enabled_guilds(&self) -> Vec<(GuildId, ChannelId, Option<String>)> {
         let mut targets = Vec::new();
         let Ok(guilds) = self.storage.list_guilds().await else {
-            return targets;
+            tracing::warn!(
+                "guild listing failed - no store announcements or watch pings this cycle"
+            );
+            return Vec::new();
         };
         for (row_platform, guild_id) in guilds {
             if row_platform != self.platform.slug() {
