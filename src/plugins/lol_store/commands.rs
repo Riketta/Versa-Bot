@@ -2,7 +2,7 @@
 //! use the event-scoped guild storage; status/dump commands read the
 //! engine's in-memory state, which is why they hold an `Arc` to it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -244,9 +244,20 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for ClientStat
     }
 }
 
-/// Serializes watch-document read-modify-writes (subscribe/unsubscribe).
-/// User-frequency operations, but the same last-write-wins hazard applies.
-static WATCH_WRITE: AsyncMutex<()> = AsyncMutex::const_new(());
+/// Per-guild write locks for the watch document (subscribe/unsubscribe
+/// read-modify-writes). Locking is per guild - user-frequency commands
+/// must not serialize across guilds, so an unrelated guild's storage
+/// round-trip never waits behind another's. Lock entries live for the
+/// process lifetime, bounded by distinct guilds ever served.
+static WATCH_WRITES: std::sync::OnceLock<AsyncMutex<HashMap<u64, Arc<AsyncMutex<()>>>>> =
+    std::sync::OnceLock::new();
+
+/// The guild's watch-write lock from the global registry.
+async fn watch_write_lock(guild_id: u64) -> Arc<AsyncMutex<()>> {
+    let registry = WATCH_WRITES.get_or_init(|| AsyncMutex::new(HashMap::new()));
+    let mut locks = registry.lock().await;
+    Arc::clone(locks.entry(guild_id).or_default())
+}
 
 /// Loads the guild's watch document alongside its raw form when that form
 /// fails to deserialize: mutations move the unreadable raw aside (see
@@ -580,8 +591,12 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for WatchHandl
             }
         };
 
-        // Read-modify-write: caps are enforced between load and save.
-        let _guard = WATCH_WRITE.lock().await;
+        // Read-modify-write: caps are enforced between load and save. The
+        // lock is keyed per guild (a guild-only command) - user-frequency
+        // subscribes never serialize behind another guild's write.
+        let watch_lock =
+            watch_write_lock(event.origin.guild_id.map(|guild| guild.get()).unwrap_or(0)).await;
+        let _guard = watch_lock.lock().await;
         let (mut doc, unreadable) = load_watch_doc(storage.as_ref()).await?;
         let settings = self.engine.settings();
         let user_cap = usize::try_from(settings.watch_user_cap).unwrap_or(usize::MAX);
@@ -653,7 +668,9 @@ impl CommandHandler for UnwatchHandler {
             return Ok(());
         };
 
-        let _guard = WATCH_WRITE.lock().await;
+        let watch_lock =
+            watch_write_lock(event.origin.guild_id.map(|guild| guild.get()).unwrap_or(0)).await;
+        let _guard = watch_lock.lock().await;
         let (mut doc, unreadable) = load_watch_doc(storage.as_ref()).await?;
         let (changed, reply_text) = if what.eq_ignore_ascii_case("all") {
             let removed = doc.remove_all_of(&user_id);

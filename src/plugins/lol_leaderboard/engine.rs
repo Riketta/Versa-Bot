@@ -17,6 +17,10 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
+use async_trait::async_trait;
+
+use crate::kernel::plugin_ports::Job;
+
 use super::port::{LeaderboardSourcePort, RegionLeaderboard, SourceError};
 
 /// Player-count windows resolved from config: buckets clamped to the parse
@@ -66,6 +70,20 @@ pub struct EngineSettings {
     pub parse_depth: u32,
     pub cache_ttl: Duration,
     pub request_interval: Duration,
+    /// Background refresh: a scheduler job re-parses stale regions off the
+    /// user path (ticking at `cache_ttl`, first tick immediate - the boot
+    /// warm-up), and the command serves any cached data as-is, however old
+    /// (age-honest), refreshing inline only what was never fetched.
+    /// `false` = on-demand mode: the command re-parses every stale region
+    /// before replying. Startup-only, like the pacing interval - the job
+    /// is a boot decision.
+    pub background_refresh: bool,
+    /// Wall-clock budget for a command-path (inline) refresh cycle: a
+    /// region past the budget keeps its cached data (or is named as a
+    /// failure when it has none) instead of parking the invoker behind a
+    /// slow source. Zero = unbounded. The background job ignores it -
+    /// a deep config must finish its walk eventually.
+    pub inline_budget: Duration,
     pub view: ResolvedView,
 }
 
@@ -81,6 +99,8 @@ impl EngineSettings {
         parse_depth: u32,
         cache_ttl: Duration,
         request_interval: Duration,
+        background_refresh: bool,
+        inline_budget: Duration,
         view: ResolvedView,
     ) -> Self {
         let known = source.known_regions();
@@ -98,7 +118,15 @@ impl EngineSettings {
                 normalized.push(key);
             }
         }
-        Self { regions: normalized, parse_depth, cache_ttl, request_interval, view }
+        Self {
+            regions: normalized,
+            parse_depth,
+            cache_ttl,
+            request_interval,
+            background_refresh,
+            inline_budget,
+            view,
+        }
     }
 }
 
@@ -160,12 +188,21 @@ impl LeaderboardEngine {
         !self.settings.lock().regions.is_empty()
     }
 
+    /// The current settings (boot-time scheduling reads the TTL and mode
+    /// through this).
+    #[must_use]
+    pub fn settings(&self) -> EngineSettings {
+        self.settings.lock().clone()
+    }
+
     /// Hot reload: swaps the data window - regions, parse depth, cache TTL,
-    /// display view. The pacing interval is kept: the source adapter's own
-    /// page pacing is built once at boot, and the two cadences must not
-    /// fork. Identical values are a no-op. Cached region data survives the
-    /// swap - fresh entries for re-added regions are reused, removed ones
-    /// idle until the same name returns (bounded by served region names).
+    /// display view. The pacing interval, the background-refresh mode, and
+    /// the inline budget are kept: the source adapter's own page pacing is
+    /// built once at boot, and the job is a boot decision - the two
+    /// cadences must not fork. Identical values are a no-op. Cached region
+    /// data survives the swap - fresh entries for re-added regions are
+    /// reused, removed ones idle until the same name returns (bounded by
+    /// served region names).
     pub fn update_settings(&self, settings: EngineSettings) {
         let mut current = self.settings.lock();
         if current.regions == settings.regions
@@ -197,8 +234,12 @@ impl LeaderboardEngine {
         tracing::info!(changes = ?changes, "config lol_leaderboard hot-reloaded");
     }
 
-    /// Returns a snapshot, refreshing stale regions first (under the
-    /// singleflight lock). Errors only when there is no data at all - a
+    /// Returns a snapshot for the command. Background mode serves any
+    /// cached data immediately (zero source calls, age-honest) and
+    /// refreshes inline only what was never fetched - the boot race before
+    /// the background job's first cycle lands. On-demand mode re-parses
+    /// every stale region first. Both drivers share the singleflight and
+    /// the inline budget. Errors only when there is no data at all - a
     /// partially failed cycle serves what it has.
     ///
     /// # Errors
@@ -206,41 +247,137 @@ impl LeaderboardEngine {
     /// this refresh cycle with an empty cache) - the source error of the
     /// last failed region is returned.
     pub async fn snapshot(&self) -> Result<Snapshot, SourceError> {
-        let _single = self.refresh.lock().await;
-        let now = Instant::now();
-        // One clone per cycle, before any await - the cell may swap
-        // mid-refresh, and the cycle must run on one coherent window.
         let settings = self.settings.lock().clone();
-        let ttl = settings.cache_ttl;
-
-        // Short cache-lock: decide what is stale. The fetches below run
-        // outside the cache lock - but inside the singleflight lock, so a
-        // long refresh delays other callers (bounded by the source caps).
-        let stale_regions: Vec<String> = {
-            let state = self.cache.lock();
-            settings
-                .regions
-                .iter()
-                .filter(|region| match state.regions.get(*region) {
-                    Some(entry) => now.duration_since(entry.fetched_at) > ttl,
-                    None => true,
-                })
-                .cloned()
-                .collect()
+        let scope = if settings.background_refresh {
+            RefreshScope::MissingOnly
+        } else {
+            RefreshScope::StaleOrMissing
         };
-        let names_stale = {
-            let state = self.cache.lock();
-            match state.names_fetched_at {
-                Some(at) => now.duration_since(at) > ttl,
-                None => true,
+        let mut failures: Vec<String> = Vec::new();
+        let mut last_error: Option<SourceError> = None;
+        {
+            let pending = self.pending_refresh(&settings, scope);
+            if !pending.regions.is_empty() || pending.names {
+                let _single = self.refresh.lock().await;
+                // Re-decide under the lock: the cycle we waited for may
+                // have filled the cache (singleflight semantics).
+                let pending = self.pending_refresh(&settings, scope);
+                if !pending.regions.is_empty() || pending.names {
+                    // Zero = unbounded (the documented escape hatch).
+                    let budget =
+                        (!settings.inline_budget.is_zero()).then(|| settings.inline_budget);
+                    let (region_failures, error) =
+                        self.run_refresh(&settings, &pending, budget).await;
+                    failures = region_failures;
+                    last_error = error;
+                }
             }
+        }
+
+        // Short lock: build the snapshot from the settled cache.
+        let built_at = Instant::now();
+        let (regions, ages, champ_names) = {
+            let state = self.cache.lock();
+            let mut regions = Vec::new();
+            let mut ages = Vec::new();
+            for region in &settings.regions {
+                if let Some(entry) = state.regions.get(region) {
+                    regions.push(entry.data.clone());
+                    ages.push(built_at.duration_since(entry.fetched_at));
+                }
+            }
+            (regions, ages, state.champ_names.clone())
         };
 
+        if regions.is_empty() {
+            return Err(last_error
+                .unwrap_or(SourceError::Request("no leaderboard data available".to_owned())));
+        }
+
+        let age = ages.iter().copied().max().unwrap_or_default();
+        let stale = !failures.is_empty() || age > settings.cache_ttl;
+        Ok(Snapshot {
+            requested_players: settings.regions.len() * settings.parse_depth as usize,
+            regions,
+            champ_names,
+            failures,
+            stale,
+            age,
+            view: settings.view.clone(),
+        })
+    }
+
+    /// One background refresh cycle (the scheduler job): re-parse every
+    /// region past the TTL, off the user path, under the singleflight,
+    /// WITHOUT the inline budget. A cheap no-op when everything is fresh.
+    pub async fn refresh_stale(&self) {
+        let settings = self.settings.lock().clone();
+        let pending = self.pending_refresh(&settings, RefreshScope::StaleOrMissing);
+        if pending.regions.is_empty() && !pending.names {
+            return;
+        }
+        let _single = self.refresh.lock().await;
+        // Re-decide under the lock: an inline cycle may have filled the
+        // cache while we waited.
+        let pending = self.pending_refresh(&settings, RefreshScope::StaleOrMissing);
+        if pending.regions.is_empty() && !pending.names {
+            return;
+        }
+        let (failures, _) = self.run_refresh(&settings, &pending, None).await;
+        if !failures.is_empty() {
+            tracing::warn!(
+                ?failures,
+                "leaderboard background refresh partially failed - cached data keeps serving"
+            );
+        }
+    }
+
+    /// What a refresh pass still owes right now: never-fetched regions
+    /// always parse; `StaleOrMissing` re-parses TTL-expired entries too
+    /// (on-demand mode and the background job), `MissingOnly` leaves
+    /// cached data alone however old (the background mode's command path).
+    fn pending_refresh(&self, settings: &EngineSettings, scope: RefreshScope) -> PendingRefresh {
+        let now = Instant::now();
+        let state = self.cache.lock();
+        let regions = settings
+            .regions
+            .iter()
+            .filter(|region| match state.regions.get(*region) {
+                Some(entry) => {
+                    scope == RefreshScope::StaleOrMissing
+                        && now.duration_since(entry.fetched_at) > settings.cache_ttl
+                }
+                None => true,
+            })
+            .cloned()
+            .collect();
+        let names = match state.names_fetched_at {
+            Some(at) => {
+                scope == RefreshScope::StaleOrMissing && now.duration_since(at) > settings.cache_ttl
+            }
+            None => true,
+        };
+        PendingRefresh { regions, names }
+    }
+
+    /// The shared fetch loop: champion names, then each pending region,
+    /// paced, each region a complete build-then-swap into the cache
+    /// (readers never see a half-walked region). `budget` bounds the wall
+    /// clock (command-path cycles); a region past it is named as a failure
+    /// and keeps whatever data it already has. Returns the failed region
+    /// names and the last error (a source error, or the budget marker).
+    async fn run_refresh(
+        &self,
+        settings: &EngineSettings,
+        pending: &PendingRefresh,
+        budget: Option<Duration>,
+    ) -> (Vec<String>, Option<SourceError>) {
+        let deadline = budget.map(|budget| Instant::now() + budget);
         let mut failures: Vec<String> = Vec::new();
         let mut last_error: Option<SourceError> = None;
         let mut paced = false;
 
-        if names_stale {
+        if pending.names {
             paced = true;
             match self.source.champion_names().await {
                 Ok(names) => {
@@ -256,11 +393,22 @@ impl LeaderboardEngine {
             }
         }
 
-        for region in &stale_regions {
+        for region in &pending.regions {
             if paced {
                 tokio::time::sleep(settings.request_interval).await;
             }
             paced = true;
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                tracing::warn!(
+                    region = %region,
+                    "leaderboard inline refresh budget exceeded - region keeps its cached data"
+                );
+                failures.push(region.clone());
+                last_error.get_or_insert_with(|| {
+                    SourceError::Request("inline refresh budget exceeded".to_owned())
+                });
+                continue;
+            }
             let started = Instant::now();
             match self.source.leaderboard(region, settings.parse_depth).await {
                 Ok(data) => {
@@ -283,36 +431,36 @@ impl LeaderboardEngine {
             }
         }
 
-        // Short lock: build the snapshot from the settled cache.
-        let (regions, ages, champ_names) = {
-            let state = self.cache.lock();
-            let mut regions = Vec::new();
-            let mut ages = Vec::new();
-            for region in &settings.regions {
-                if let Some(entry) = state.regions.get(region) {
-                    regions.push(entry.data.clone());
-                    ages.push(now.duration_since(entry.fetched_at));
-                }
-            }
-            (regions, ages, state.champ_names.clone())
-        };
+        (failures, last_error)
+    }
+}
 
-        if regions.is_empty() {
-            return Err(last_error
-                .unwrap_or(SourceError::Request("no leaderboard data available".to_owned())));
-        }
+/// What a refresh pass still owes: never-fetched regions always parse;
+/// the scope decides whether TTL-expired ones re-parse too.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefreshScope {
+    /// On-demand mode and the background job: age past the TTL re-parses.
+    StaleOrMissing,
+    /// Background mode's command path: cached data serves however old.
+    MissingOnly,
+}
 
-        let age = ages.iter().copied().max().unwrap_or_default();
-        let stale = !failures.is_empty() || age > ttl;
-        Ok(Snapshot {
-            requested_players: settings.regions.len() * settings.parse_depth as usize,
-            regions,
-            champ_names,
-            failures,
-            stale,
-            age,
-            view: settings.view.clone(),
-        })
+/// Regions and the champion-name table one refresh pass must parse.
+struct PendingRefresh {
+    regions: Vec<String>,
+    names: bool,
+}
+
+/// Scheduler job body: one background refresh per cache-TTL tick (first
+/// tick immediate - the boot warm-up runs before the first user can ask).
+pub struct RefreshJob {
+    pub engine: Arc<LeaderboardEngine>,
+}
+
+#[async_trait]
+impl Job for RefreshJob {
+    async fn run(&self) {
+        self.engine.refresh_stale().await;
     }
 }
 
@@ -461,6 +609,8 @@ mod tests {
             1000,
             ttl,
             Duration::ZERO,
+            false,
+            Duration::ZERO,
             ResolvedView::resolve(1000, &[300, 1000], 1000, 5),
         );
         Arc::new(LeaderboardEngine::new(
@@ -471,6 +621,33 @@ mod tests {
 
     fn engine(source: &Arc<FakeSource>, regions: &[&str]) -> Arc<LeaderboardEngine> {
         engine_with(source, regions, Duration::from_secs(3600))
+    }
+
+    /// Engine with full mode control (pacing, background vs on-demand,
+    /// inline budget) - the shape the background-refresh tests need.
+    fn engine_mode(
+        source: &Arc<FakeSource>,
+        regions: &[&str],
+        ttl: Duration,
+        interval: Duration,
+        background: bool,
+        budget: Duration,
+    ) -> Arc<LeaderboardEngine> {
+        let keys: Vec<String> = regions.iter().map(|key| (*key).to_owned()).collect();
+        let settings = EngineSettings::new(
+            source.as_ref(),
+            &keys,
+            1000,
+            ttl,
+            interval,
+            background,
+            budget,
+            ResolvedView::resolve(1000, &[300, 1000], 1000, 5),
+        );
+        Arc::new(LeaderboardEngine::new(
+            Arc::clone(source) as Arc<dyn LeaderboardSourcePort>,
+            settings,
+        ))
     }
 
     /// A stale region must refetch: without this, the dump would serve
@@ -486,6 +663,148 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(90)).await;
         let _ = engine.snapshot().await.expect("stale snapshot");
         assert_eq!(source.leaderboard_calls(), 2, "TTL expiry must trigger a refetch");
+    }
+
+    /// Background mode serves whatever is cached, however stale (a zero
+    /// TTL makes everything perpetually stale - the job's predicate): a
+    /// warm cache answers with zero source calls, because re-parsing is
+    /// the background job's job, never the command's wait.
+    #[tokio::test]
+    async fn background_mode_serves_stale_cache_without_source_calls() {
+        let source = FakeSource::ungated();
+        let engine = engine_mode(
+            &source,
+            &["kr", "euw"],
+            Duration::ZERO,
+            Duration::ZERO,
+            true,
+            Duration::ZERO,
+        );
+        engine.refresh_stale().await;
+        let calls_after_warmup = source.leaderboard_calls();
+        assert_eq!(calls_after_warmup, 2, "the warm-up parsed both regions");
+
+        let snapshot = engine.snapshot().await.expect("cached data serves however stale");
+
+        assert_eq!(snapshot.regions.len(), 2);
+        assert!(snapshot.failures.is_empty());
+        assert_eq!(source.leaderboard_calls(), calls_after_warmup, "no inline re-parse");
+    }
+
+    /// The boot race: with nothing cached, the background-mode command
+    /// refreshes the never-fetched regions inline (under the singleflight)
+    /// so the first user after boot still gets an answer.
+    #[tokio::test]
+    async fn background_mode_refreshes_never_fetched_regions_inline() {
+        let source = FakeSource::ungated();
+        let engine = engine_mode(
+            &source,
+            &["kr"],
+            Duration::from_secs(3600),
+            Duration::ZERO,
+            true,
+            Duration::ZERO,
+        );
+
+        let snapshot = engine.snapshot().await.expect("inline fill expected");
+
+        assert_eq!(snapshot.regions.len(), 1);
+        assert_eq!(source.leaderboard_calls(), 1, "the missing region parsed inline");
+        assert_eq!(source.name_calls(), 1, "names parsed inline too");
+    }
+
+    /// On-demand mode (`background_refresh = false`) keeps the legacy
+    /// contract: a stale cache re-parses before the reply.
+    #[tokio::test]
+    async fn on_demand_mode_still_re_parses_stale_regions() {
+        let source = FakeSource::ungated();
+        let engine =
+            engine_mode(&source, &["kr"], Duration::ZERO, Duration::ZERO, false, Duration::ZERO);
+
+        engine.snapshot().await.expect("first fill");
+        engine.snapshot().await.expect("second fill");
+
+        assert_eq!(source.leaderboard_calls(), 2, "every stale invocation re-parses");
+    }
+
+    /// The inline budget cuts a slow command-path refresh: regions past
+    /// the deadline keep their cached data or are named as failures - the
+    /// invoker is never parked behind a slow source. Pacing between
+    /// regions consumes the budget here (40 ms pacing vs a 30 ms budget).
+    #[tokio::test]
+    async fn inline_budget_cuts_remaining_regions_and_names_their_failure() {
+        let source = FakeSource::ungated();
+        // An empty-region cycle parses only the champion names (the region
+        // list is empty on purpose), so the names table warms up first.
+        let engine = engine_mode(
+            &source,
+            &[],
+            Duration::from_secs(3600),
+            Duration::from_millis(40),
+            false,
+            Duration::from_millis(30),
+        );
+        assert!(engine.snapshot().await.is_err(), "no regions configured yet");
+        assert_eq!(source.name_calls(), 1);
+
+        // Widen the window to two regions: kr parses instantly (well under
+        // the budget), euw is past the deadline after the 40 ms pacing.
+        engine.update_settings(EngineSettings {
+            regions: vec!["kr".to_owned(), "euw".to_owned()],
+            parse_depth: 1000,
+            cache_ttl: Duration::from_secs(3600),
+            request_interval: Duration::from_millis(40),
+            background_refresh: false,
+            inline_budget: Duration::from_millis(30),
+            view: ResolvedView::resolve(1000, &[300, 1000], 1000, 5),
+        });
+        let snapshot = engine.snapshot().await.expect("kr serves within the budget");
+
+        assert_eq!(snapshot.regions.len(), 1, "only kr parsed within the budget");
+        assert_eq!(snapshot.failures, vec!["euw".to_owned()], "euw is named as failed");
+        assert!(snapshot.stale);
+    }
+
+    /// When the budget kills every region, the command errors with the
+    /// budget marker instead of hanging or silently serving nothing.
+    #[tokio::test]
+    async fn inline_budget_total_cut_errors_with_the_budget_marker() {
+        let source = FakeSource::ungated();
+        // Names parse first; the 40 ms pacing before the only region
+        // outlives the 30 ms budget, so kr is cut and nothing serves.
+        let engine = engine_mode(
+            &source,
+            &["kr"],
+            Duration::from_secs(3600),
+            Duration::from_millis(40),
+            false,
+            Duration::from_millis(30),
+        );
+
+        let err = engine.snapshot().await.expect_err("budget cut expected");
+
+        assert!(err.to_string().contains("budget"), "error: {err}");
+    }
+
+    /// The background job re-parses what the TTL expired and is a cheap
+    /// no-op when everything is fresh.
+    #[tokio::test]
+    async fn refresh_stale_skips_fresh_regions() {
+        let source = FakeSource::ungated();
+        let engine = engine_mode(
+            &source,
+            &["kr"],
+            Duration::from_secs(3600),
+            Duration::ZERO,
+            true,
+            Duration::ZERO,
+        );
+        engine.refresh_stale().await;
+        let calls = source.leaderboard_calls();
+
+        engine.refresh_stale().await;
+
+        assert_eq!(source.leaderboard_calls(), calls, "fresh regions do not re-parse");
     }
 
     #[test]
@@ -514,6 +833,8 @@ mod tests {
             1000,
             Duration::from_secs(3600),
             Duration::ZERO,
+            false,
+            Duration::ZERO,
             ResolvedView::resolve(1000, &[300], 300, 5),
         );
         assert_eq!(settings.regions, vec!["kr"]);
@@ -535,6 +856,8 @@ mod tests {
             parse_depth: 50,
             cache_ttl: Duration::from_secs(60),
             request_interval: Duration::from_secs(99),
+            background_refresh: false,
+            inline_budget: Duration::ZERO,
             view: ResolvedView::resolve(50, &[25], 50, 1),
         });
         let settings = engine.settings.lock();
@@ -550,6 +873,8 @@ mod tests {
             parse_depth: 50,
             cache_ttl: Duration::from_secs(60),
             request_interval: Duration::ZERO,
+            background_refresh: false,
+            inline_budget: Duration::ZERO,
             view: ResolvedView::resolve(50, &[], 50, 1),
         });
         assert!(!engine.is_configured());

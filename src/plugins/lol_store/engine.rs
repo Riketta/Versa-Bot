@@ -23,7 +23,9 @@ use parking_lot::Mutex;
 
 use crate::kernel::models::{ChannelId, Embed, GuildId, Origin, OutboundMessage, UserId};
 use crate::kernel::plugin_ports::{EventBusPort, Job};
-use crate::kernel::spi_ports::{ChatOutputFactoryPort, PlatformInfoPort, StoragePort};
+use crate::kernel::spi_ports::{
+    ChatOutputFactoryPort, GuildStorage, PlatformInfoPort, StoragePort,
+};
 
 use super::diff::{
     self, LastSeen, Snapshot, StoreDelta, YourShopStart, rotation_delta, rotation_stores,
@@ -87,6 +89,19 @@ pub struct GuildConfig {
     pub role_id: Option<String>,
 }
 
+/// One guild discovered for a poll cycle's fan-out: the scoped storage
+/// handle and the tracker config's channel assignment. `channel` is
+/// `Some` only for enabled guilds with an assigned channel (the
+/// announce/watch fan-out); every discovered guild - disabled ones
+/// included - receives catch-up persistence, so the existence of a
+/// config document is the only membership condition.
+struct DiscoveredGuild {
+    guild_id: GuildId,
+    storage: Arc<dyn GuildStorage>,
+    channel: Option<ChannelId>,
+    role_id: Option<String>,
+}
+
 /// The poll engine (see module docs). Generic over the bus like every
 /// bus-publishing plugin.
 pub struct StoreEngine<B: EventBusPort> {
@@ -99,7 +114,7 @@ pub struct StoreEngine<B: EventBusPort> {
     /// namespaces every storage binding.
     platform: Arc<dyn PlatformInfoPort>,
     settings: Mutex<EngineSettings>,
-    state: Mutex<Option<LastSeen>>,
+    state: Mutex<Option<Arc<LastSeen>>>,
     champions: Mutex<Option<Arc<HashMap<u64, String>>>>,
     /// Last good raw snapshot, one section per source: a source that
     /// failed this cycle keeps its previous data. Feeds name joins when a
@@ -220,10 +235,11 @@ impl<B: EventBusPort> StoreEngine<B> {
         if self.state.lock().is_none() {
             if let Some(persisted) = self.load_persisted_state().await {
                 tracing::debug!("adopting persisted store state for catch-up");
-                *self.state.lock() = Some(persisted);
+                *self.state.lock() = Some(Arc::new(persisted));
                 catchup = true;
             }
         }
+        // Refcount bump, not a deep copy: the tracked sets stay put.
         let previous = self.state.lock().clone();
 
         // Fetch every source independently; a source failing keeps its
@@ -288,21 +304,24 @@ impl<B: EventBusPort> StoreEngine<B> {
         {
             let mut retained = self.last_snapshot.lock();
             let slot = retained.get_or_insert_with(Snapshot::default);
+            // Assignment only on change: the unchanged catalog (thousands
+            // of localized items) must not deep-clone every cycle. The
+            // allocation-free deep compare stays - it keys the generation.
             let mut changed = false;
-            if snapshot.sales.is_some() {
-                changed |= slot.sales != snapshot.sales;
+            if snapshot.sales.is_some() && slot.sales != snapshot.sales {
+                changed = true;
                 slot.sales = snapshot.sales.clone();
             }
-            if snapshot.catalog.is_some() {
-                changed |= slot.catalog != snapshot.catalog;
+            if snapshot.catalog.is_some() && slot.catalog != snapshot.catalog {
+                changed = true;
                 slot.catalog = snapshot.catalog.clone();
             }
-            if snapshot.rotations.is_some() {
-                changed |= slot.rotations != snapshot.rotations;
+            if snapshot.rotations.is_some() && slot.rotations != snapshot.rotations {
+                changed = true;
                 slot.rotations = snapshot.rotations.clone();
             }
-            if snapshot.yourshop.is_some() {
-                changed |= slot.yourshop != snapshot.yourshop;
+            if snapshot.yourshop.is_some() && slot.yourshop != snapshot.yourshop {
+                changed = true;
                 slot.yourshop = snapshot.yourshop.clone();
             }
             if changed {
@@ -310,22 +329,30 @@ impl<B: EventBusPort> StoreEngine<B> {
             }
         }
 
-        let current = match &previous {
-            Some(previous) => diff::merge(previous, &snapshot),
+        let current = Arc::new(match previous.as_ref() {
+            Some(previous) => diff::merge(previous.as_ref(), &snapshot),
             // Silent baseline: first successful poll with no persisted state.
             None => diff::merge(&LastSeen::default(), &snapshot),
-        };
-        let changed = previous.as_ref() != Some(&current);
+        });
+        let changed = previous.as_ref().map(Arc::as_ref) != Some(current.as_ref());
 
         // The full delta drives watches; the announce flags then strip the
         // sections the operator disabled for the general feed - watches are
         // personal and stay independent of those flags.
-        let delta = previous.as_ref().map(|previous| diff::compute(previous, &snapshot));
+        let delta = previous.as_ref().map(|previous| diff::compute(previous.as_ref(), &snapshot));
         let full = delta.as_ref().filter(|delta| !delta.is_empty());
 
         if previous.is_none() {
             tracing::debug!("first successful poll - recording silent baseline");
         }
+
+        // One discovery pass per cycle - but only when something needs it:
+        // the fan-out (delta found) or catch-up persistence (state changed).
+        // `list_guilds` plus one config read per guild then serve
+        // announcements, watch pings, and persistence alike (previously two
+        // separate scans per changed cycle).
+        let discovered =
+            if full.is_some() || changed { self.discover_guilds().await } else { Vec::new() };
 
         // Announce and notify before the state swap: formatting joins
         // against the freshly fetched catalog.
@@ -339,10 +366,10 @@ impl<B: EventBusPort> StoreEngine<B> {
                 "store delta detected"
             );
             let index = self.name_index(&snapshot).await;
-            // One fan-out scan per cycle: announcements and watch pings see
-            // the same enabled-guild snapshot (a config change landing
-            // between two scans would split the update).
-            let targets = self.enabled_guilds().await;
+            // Enabled guilds only (channel assigned); announcements and
+            // watch pings see the same discovery snapshot.
+            let targets: Vec<&DiscoveredGuild> =
+                discovered.iter().filter(|guild| guild.channel.is_some()).collect();
             // The general feed honors the announce flags (stripped copy);
             // personal watches see the full delta below.
             let mut feed = delta.clone();
@@ -377,8 +404,8 @@ impl<B: EventBusPort> StoreEngine<B> {
         let delta_found = full.is_some();
 
         if changed {
-            *self.state.lock() = Some(current.clone());
-            self.persist_state(&current).await;
+            *self.state.lock() = Some(Arc::clone(&current));
+            self.persist_state(&current, &discovered).await;
         }
 
         tracing::debug!(
@@ -404,7 +431,7 @@ impl<B: EventBusPort> StoreEngine<B> {
         &self,
         delta: &StoreDelta,
         index: &NameIndex,
-        targets: &[(GuildId, ChannelId, Option<String>)],
+        targets: &[&DiscoveredGuild],
         catchup: bool,
     ) -> Vec<String> {
         if index.catalog.is_empty() {
@@ -455,7 +482,12 @@ impl<B: EventBusPort> StoreEngine<B> {
         let record_text = pages.join("\n\n");
 
         let mut delivered_guilds = 0usize;
-        for &(guild_id, channel_id, ref role_id) in targets {
+        for target in targets {
+            let Some(channel_id) = target.channel else {
+                continue;
+            };
+            let guild_id = target.guild_id;
+            let role_id = &target.role_id;
             let origin = Origin {
                 guild_id: Some(guild_id),
                 channel_id,
@@ -470,7 +502,6 @@ impl<B: EventBusPort> StoreEngine<B> {
                 .as_deref()
                 .and_then(|id| id.parse::<u64>().ok())
                 .map_or(String::new(), |id| format!("<@&{id}>"));
-            let storage = self.storage.guild_scoped(self.platform.slug(), guild_id);
             let output = self.factory.channel_output(&origin, channel_id);
             let mut delivered = true;
             for (n, embed) in embeds.iter().enumerate() {
@@ -489,7 +520,7 @@ impl<B: EventBusPort> StoreEngine<B> {
                 continue;
             }
             delivered_guilds += 1;
-            if let Err(err) = storage
+            if let Err(err) = target.storage
                 .append(
                     NAMESPACE,
                     serde_json::json!({ "kind": "announcement", "text": record_text, "at_unix": at_unix }),
@@ -588,7 +619,7 @@ impl<B: EventBusPort> StoreEngine<B> {
         &self,
         delta: &StoreDelta,
         index: &NameIndex,
-        targets: &[(GuildId, ChannelId, Option<String>)],
+        targets: &[&DiscoveredGuild],
         catchup: bool,
     ) {
         if targets.is_empty() {
@@ -596,8 +627,12 @@ impl<B: EventBusPort> StoreEngine<B> {
         }
         let embed_budget = self.embed_budget();
         let tag_budget = watch::tag_budget(self.platform.message_limit());
-        for &(guild_id, channel_id, _) in targets {
-            let storage = self.storage.guild_scoped(self.platform.slug(), guild_id);
+        for target in targets {
+            let Some(channel_id) = target.channel else {
+                continue;
+            };
+            let guild_id = target.guild_id;
+            let storage = &target.storage;
             let doc = match storage.get(NAMESPACE, watch::WATCH_KEY).await {
                 Ok(Some(raw)) => match serde_json::from_value::<WatchDoc>(raw) {
                     Ok(doc) => doc,
@@ -724,14 +759,16 @@ impl<B: EventBusPort> StoreEngine<B> {
         Some(lines)
     }
 
-    /// Guilds of this deployment's platform with the tracker enabled and a
-    /// channel assigned. Rows of other slugs (storage written by a
+    /// One discovery pass per poll cycle: `list_guilds` plus one config
+    /// read per guild serve announcements, watch pings, and catch-up
+    /// persistence alike. Rows of other slugs (storage written by a
     /// differently-wired deployment) are skipped.
-    async fn enabled_guilds(&self) -> Vec<(GuildId, ChannelId, Option<String>)> {
-        let mut targets = Vec::new();
+    async fn discover_guilds(&self) -> Vec<DiscoveredGuild> {
+        let mut discovered = Vec::new();
         let Ok(guilds) = self.storage.list_guilds().await else {
             tracing::warn!(
-                "guild listing failed - no store announcements or watch pings this cycle"
+                "guild listing failed - no store announcements, watch pings, or catch-up \
+                 persistence this cycle"
             );
             return Vec::new();
         };
@@ -742,6 +779,7 @@ impl<B: EventBusPort> StoreEngine<B> {
             let storage = self.storage.guild_scoped(self.platform.slug(), guild_id);
             let raw = match storage.get(NAMESPACE, CONFIG_KEY).await {
                 Ok(Some(raw)) => raw,
+                // No config document: neither fan-out nor persistence.
                 Ok(None) => continue,
                 Err(err) => {
                     tracing::warn!(
@@ -753,31 +791,51 @@ impl<B: EventBusPort> StoreEngine<B> {
                 }
             };
             let Ok(config) = serde_json::from_value::<GuildConfig>(raw) else {
-                tracing::warn!(guild = guild_id.get(), "store tracker config malformed - skipping");
+                tracing::warn!(
+                    guild = guild_id.get(),
+                    "store tracker config malformed - announce skipped, persistence kept"
+                );
+                // The document exists, so catch-up coverage still applies.
+                discovered.push(DiscoveredGuild {
+                    guild_id,
+                    storage,
+                    channel: None,
+                    role_id: None,
+                });
                 continue;
             };
-            if !config.enabled {
-                continue;
-            }
-            let Some(channel) = config.channel_id.as_deref().and_then(|id| id.parse::<u64>().ok())
-            else {
+            let channel = config
+                .enabled
+                .then(|| {
+                    config
+                        .channel_id
+                        .as_deref()
+                        .and_then(|id| id.parse::<u64>().ok())
+                        .map(ChannelId)
+                })
+                .flatten();
+            if config.enabled && channel.is_none() {
                 tracing::debug!(
                     guild = guild_id.get(),
                     "store tracker enabled but channel missing"
                 );
-                continue;
-            };
-            if let Some(role) = &config.role_id {
-                if role.parse::<u64>().is_err() {
-                    tracing::debug!(
-                        guild = guild_id.get(),
-                        "store tracker announce role is not a role id - pings disabled for this guild"
-                    );
-                }
             }
-            targets.push((guild_id, ChannelId(channel), config.role_id));
+            if let Some(role) = &config.role_id
+                && role.parse::<u64>().is_err()
+            {
+                tracing::debug!(
+                    guild = guild_id.get(),
+                    "store tracker announce role is not a role id - pings disabled for this guild"
+                );
+            }
+            discovered.push(DiscoveredGuild {
+                guild_id,
+                storage,
+                channel,
+                role_id: config.role_id,
+            });
         }
-        targets
+        discovered
     }
 
     /// Cached `NameIndex` over the last retained snapshot, keyed by the
@@ -833,35 +891,18 @@ impl<B: EventBusPort> StoreEngine<B> {
         None
     }
 
-    /// Persists the current state to every guild that has a config document
-    /// (enabled or not, so a re-enable never replays stale events).
-    async fn persist_state(&self, state: &LastSeen) {
+    /// Persists the current state to every discovered guild: a config
+    /// document means catch-up coverage - enabled or not, so a re-enable
+    /// never replays stale events. Reuses the cycle's discovery pass (no
+    /// second `list_guilds` + config scan).
+    async fn persist_state(&self, state: &LastSeen, discovered: &[DiscoveredGuild]) {
         let Ok(value) = serde_json::to_value(state) else {
             tracing::warn!("store state failed to serialize - catch-up persistence skipped");
             return;
         };
-        let Ok(guilds) = self.storage.list_guilds().await else {
-            return;
-        };
-        for (row_platform, guild_id) in guilds {
-            if row_platform != self.platform.slug() {
-                continue;
-            }
-            let storage = self.storage.guild_scoped(self.platform.slug(), guild_id);
-            match storage.get(NAMESPACE, CONFIG_KEY).await {
-                Ok(Some(_)) => {}
-                Ok(None) => continue,
-                Err(err) => {
-                    tracing::warn!(
-                        %err,
-                        guild = guild_id.get(),
-                        "config unreadable - catch-up persistence skipped for this guild"
-                    );
-                    continue;
-                }
-            }
-            if let Err(err) = storage.set(NAMESPACE, LAST_SEEN_KEY, value.clone()).await {
-                tracing::warn!(%err, guild = guild_id.get(), "failed to persist store state");
+        for target in discovered {
+            if let Err(err) = target.storage.set(NAMESPACE, LAST_SEEN_KEY, value.clone()).await {
+                tracing::warn!(%err, guild = target.guild_id.get(), "failed to persist store state");
             }
         }
     }

@@ -1399,20 +1399,35 @@ impl ChatEngine {
         message_id: u64,
     ) -> Result<Vec<u64>, crate::kernel::models::StorageError> {
         let records_ns = records_namespace(channel_id);
-        // Whole-log scan: removal is a rare moderator action and must find
-        // the message regardless of age, cutoff, or window bounds.
-        let stored = storage.list_after(&records_ns, 0, u32::MAX).await?;
+        // Paged whole-log scan: removal is a rare moderator action and must
+        // find the message regardless of age, cutoff, or window bounds -
+        // but materializing the entire log at once would spike memory on a
+        // long-lived channel. Forward pagination is unaffected by the
+        // deletions behind the cursor.
+        const PAGE: u32 = 500;
         let mut seqs = Vec::new();
-        for record in stored {
-            let matches = serde_json::from_value::<ConversationRecord>(record.payload)
-                .inspect_err(|_| tracing::warn!("skipping malformed conversation record"))
-                .ok()
-                .and_then(|parsed| parsed.message_id)
-                .is_some_and(|id| id == message_id);
-            if matches {
-                storage.delete_record(&records_ns, record.seq).await?;
-                seqs.push(record.seq);
+        let mut cursor = 0;
+        loop {
+            let page = storage.list_after(&records_ns, cursor, PAGE).await?;
+            let Some(next) = page.last().map(|record| record.seq) else {
+                break;
+            };
+            let full_page = page.len() >= PAGE as usize;
+            for record in page {
+                let matches = serde_json::from_value::<ConversationRecord>(record.payload)
+                    .inspect_err(|_| tracing::warn!("skipping malformed conversation record"))
+                    .ok()
+                    .and_then(|parsed| parsed.message_id)
+                    .is_some_and(|id| id == message_id);
+                if matches {
+                    storage.delete_record(&records_ns, record.seq).await?;
+                    seqs.push(record.seq);
+                }
             }
+            if !full_page {
+                break;
+            }
+            cursor = next;
         }
         if seqs.is_empty() {
             tracing::debug!(
@@ -3330,6 +3345,44 @@ mod tests {
             ctx.engine.forget_message(&storage, 2, 999).await.expect("forget expected to succeed");
         assert!(removed.is_empty());
         assert_eq!(stored_records_in(&ctx.storage).await.len(), 1);
+    }
+
+    /// The paged scan crosses page boundaries: matches spread far beyond
+    /// one page all go, and pagination never rescans or skips records.
+    #[tokio::test]
+    async fn forget_message_pages_through_long_logs() {
+        let ctx = ctx(vec![]);
+        let storage = ctx.storage.guild_scoped("test", GuildId(1));
+        // 1_200 records - well past the 500-record page - with the target
+        // id sprinkled near each page boundary (including the very ends).
+        // The keepers' ids (100..) never collide with the target id 7.
+        for seq in 0..1200u64 {
+            let target = seq == 0 || seq == 499 || seq == 500 || seq == 999 || seq == 1199;
+            let record = if target {
+                user_record(7, "alice", "goes")
+            } else {
+                user_record(seq + 100, "alice", "stays")
+            };
+            append_record(&ctx.storage, &record).await;
+        }
+
+        let removed =
+            ctx.engine.forget_message(&storage, 2, 7).await.expect("forget expected to succeed");
+
+        assert_eq!(removed.len(), 5, "every match across every page goes");
+        // The whole log, past the helper's 100-record window.
+        let survivors = storage
+            .list_after(&records_namespace(2), 0, u32::MAX)
+            .await
+            .expect("records readable")
+            .into_iter()
+            .map(|stored| {
+                serde_json::from_value::<ConversationRecord>(stored.payload)
+                    .expect("record expected to deserialize")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(survivors.len(), 1195);
+        assert!(survivors.iter().all(|record| record.content == "stays"));
     }
 
     #[tokio::test]

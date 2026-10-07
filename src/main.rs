@@ -248,6 +248,7 @@ async fn main() -> ExitCode {
     ));
     let lol_leaderboard = Arc::new(LeaderboardPlugin::new(
         Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
+        Arc::clone(&scheduler) as Arc<dyn SchedulerPort>,
         Arc::clone(&leaderboard_engine),
     ));
 
@@ -622,6 +623,8 @@ fn leaderboard_settings(
         parse_depth,
         Duration::from_secs(config.cache_ttl_secs),
         Duration::from_secs(config.request_interval_secs),
+        config.background_refresh,
+        Duration::from_secs(config.inline_refresh_budget_secs),
         LeaderboardView::resolve(
             parse_depth,
             &config.display_buckets,

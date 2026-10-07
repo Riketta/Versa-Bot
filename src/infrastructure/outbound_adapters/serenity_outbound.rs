@@ -302,6 +302,10 @@ struct SerenityReaction<T: ChatApi = Http> {
 /// endpoint.
 struct GuildEmojiCache {
     entries: Mutex<HashMap<u64, CachedEmojis>>,
+    /// Per-guild fetch serialization (singleflight): concurrent cold misses
+    /// share one `get_emojis` - the losers queue, then hit the freshly
+    /// filled cache instead of racing duplicate REST calls.
+    fetches: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// Successful listings stay fresh for the full TTL.
@@ -317,18 +321,33 @@ struct CachedEmojis {
 
 impl GuildEmojiCache {
     fn new() -> Self {
-        Self { entries: Mutex::new(HashMap::new()) }
+        Self { entries: Mutex::new(HashMap::new()), fetches: Mutex::new(HashMap::new()) }
+    }
+
+    /// Warm entry under its TTL (successes keep the full window, failures
+    /// the short retry one).
+    fn cached(&self, guild: u64) -> Option<Arc<Vec<Emoji>>> {
+        let entries = self.entries.lock();
+        let cached = entries.get(&guild)?;
+        let ttl = if cached.ok { EMOJI_TTL } else { EMOJI_FAILURE_TTL };
+        (cached.fetched_at.elapsed() < ttl).then(|| Arc::clone(&cached.emojis))
     }
 
     async fn emojis<T: ChatApi>(&self, http: &T, guild_id: SerenityGuildId) -> Arc<Vec<Emoji>> {
-        {
-            let entries = self.entries.lock();
-            if let Some(cached) = entries.get(&guild_id.get()) {
-                let ttl = if cached.ok { EMOJI_TTL } else { EMOJI_FAILURE_TTL };
-                if cached.fetched_at.elapsed() < ttl {
-                    return Arc::clone(&cached.emojis);
-                }
-            }
+        if let Some(emojis) = self.cached(guild_id.get()) {
+            return emojis;
+        }
+        // Singleflight: the per-guild fetch lock makes concurrent cold
+        // misses one REST call plus cache hits.
+        let fetch = {
+            let mut fetches = self.fetches.lock();
+            Arc::clone(fetches.entry(guild_id.get()).or_default())
+        };
+        let _guard = fetch.lock().await;
+        // Re-check under the lock: the fetch we waited for may have just
+        // filled the cache.
+        if let Some(emojis) = self.cached(guild_id.get()) {
+            return emojis;
         }
         let (emojis, ok) = match http.get_emojis(guild_id).await {
             Ok(emojis) => (Arc::new(emojis), true),
@@ -1138,6 +1157,102 @@ mod tests {
         output.send(OutboundMessage::text("hello")).await.expect("delivery expected");
 
         assert_eq!(api.log(), ["create:flags", "delete:placeholder", "create:public"]);
+    }
+
+    /// Singleflight: two concurrent cold misses share one `get_emojis` -
+    /// the per-guild fetch lock serializes them (never two in flight),
+    /// and the loser lands on the freshly filled cache.
+    #[tokio::test]
+    async fn concurrent_emoji_fetches_share_one_rest_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct GatingApi {
+            calls: AtomicUsize,
+            in_flight: AtomicUsize,
+            peak: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl InteractionApi for GatingApi {
+            async fn create_followup(
+                &self,
+                _token: &str,
+                _body: &serde_json::Value,
+            ) -> Result<SerenityMessageId, String> {
+                Err("unused in this test".to_owned())
+            }
+
+            async fn delete_followup(
+                &self,
+                _token: &str,
+                _id: SerenityMessageId,
+            ) -> Result<(), String> {
+                Err("unused in this test".to_owned())
+            }
+        }
+
+        #[async_trait]
+        impl ChatApi for GatingApi {
+            async fn send_message(
+                &self,
+                _channel_id: SerenityChannelId,
+                _files: Vec<CreateAttachment>,
+                _builder: &CreateMessage,
+            ) -> Result<SerenityMessageId, String> {
+                Err("unused in this test".to_owned())
+            }
+
+            async fn edit_message(
+                &self,
+                _channel_id: SerenityChannelId,
+                _message_id: SerenityMessageId,
+                _builder: &EditMessage,
+                _new_attachments: Vec<CreateAttachment>,
+            ) -> Result<SerenityMessageId, String> {
+                Err("unused in this test".to_owned())
+            }
+
+            async fn create_reaction(
+                &self,
+                _channel_id: SerenityChannelId,
+                _message_id: SerenityMessageId,
+                _reaction_type: &ReactionType,
+            ) -> Result<(), String> {
+                Err("unused in this test".to_owned())
+            }
+
+            async fn get_emojis(&self, _guild_id: SerenityGuildId) -> Result<Vec<Emoji>, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(vec![RecordingApi::emoji("dorkiS", 1)])
+            }
+
+            fn run_typing(
+                self: &Arc<Self>,
+                _channel_id: SerenityChannelId,
+                _cancel: tokio_util::sync::CancellationToken,
+            ) {
+            }
+        }
+
+        let api = Arc::new(GatingApi {
+            calls: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let cache = GuildEmojiCache::new();
+        let guild = SerenityGuildId::new(42);
+
+        let (left, right) =
+            tokio::join!(cache.emojis(api.as_ref(), guild), cache.emojis(api.as_ref(), guild));
+
+        assert_eq!(api.calls.load(Ordering::SeqCst), 1, "exactly one REST call");
+        assert_eq!(api.peak.load(Ordering::SeqCst), 1, "never two fetches in flight");
+        assert_eq!(left.len(), 1);
+        assert_eq!(right.len(), 1);
     }
 
     // --- Delivery half: plain sends, streaming, reactions, factory routing ---

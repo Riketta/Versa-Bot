@@ -42,9 +42,10 @@ commands, permission tiers - lives in [Plugins](#plugins).
 - LoL store tracker: watches the locally running League client's store
   (sales, new skins, Mythic Shop rotations, Your Shop start) and announces
   changes to a per-guild assigned channel.
-- LoL leaderboard: on-demand `/lol_leaderboard` dump of aggregated ranked
+- LoL leaderboard: `/lol_leaderboard` dump of aggregated ranked
   leaderboard statistics (role distributions, most picked champions per
-  role) parsed from a pluggable data source, with cache and coverage
+  role) parsed from a pluggable data source, kept warm by a background
+  refresh job and served from cache with coverage and data-age
   reporting.
 - Audit trail: records the bus membership events as structured `audit`
   tracing events.
@@ -71,9 +72,10 @@ commands, permission tiers - lives in [Plugins](#plugins).
 - Configuration hot reload: hot-reloadable sections apply live (`[status]`,
   `owners`, `[lol_store]` announce flags and watch caps, `[lol_leaderboard]`
   regions/depth/TTL/view); startup-only settings (token, storage, Sentry,
-  LLM providers, poll and pacing intervals) require a restart. Every
-  accepted change is logged per section, with the changed fields at the
-  apply sites - a startup-only edit is explicitly named as kept.
+  LLM providers, poll and pacing intervals, leaderboard background mode)
+  require a restart. Every accepted change is logged per section, with the
+  changed fields at the apply sites - a startup-only edit is explicitly
+  named as kept.
 - Graceful shutdown on Ctrl-C (plugins stop in reverse order).
 
 ## Getting started
@@ -535,21 +537,34 @@ per-guild setup**: the command answers wherever it is invoked.
 The bot parses at most `parse_depth` players per configured region,
 sequentially and rate-limited; the champion tables pool each region's
 highest-ranked `champ_pool_depth` players. Results are cached
-process-lifetime for `cache_ttl` - a fresh cache answers instantly, a
-stale one triggers a re-parse first (the typing indicator shows during
-the parse; a cold multi-region parse takes tens of seconds). Mind the
-ceiling: a cold parse walks `parse_depth` / 100 source pages per region
-at the configured request pace - keep the worst case comfortably inside
-the platform's interaction window (about 15 minutes on Discord), or the
-invocation's "thinking" state expires before the answer lands. The output
+process-lifetime for `cache_ttl`.
+
+**Background refresh (default on):** a scheduler job re-parses stale
+regions off the user path - first run at boot (the warm-up starts before
+the gateway even connects), then once per `cache_ttl`. The command
+serves whatever is cached, however old (the dump's `data age` line is
+the honest label) and never waits for a parse; only a region with no
+cached data at all (the boot race) parses inline, under a configurable
+wall-clock budget (`inline_refresh_budget_secs`, default 180 s): regions
+past the budget keep their cached data or are named as failed in the
+dump instead of parking the invoker. With
+`background_refresh = false` the plugin falls back to on-demand mode:
+a stale cache re-parses before the reply (the typing indicator shows
+during the parse; a cold multi-region parse takes tens of seconds),
+under the same budget. Concurrent invocations share any in-flight
+refresh (singleflight) but each gets its own full dump. Mind the
+ceiling either way: a parse walks `parse_depth` / 100 source pages per
+region at the configured request pace - keep the worst case
+comfortably inside the platform's interaction window (about 15 minutes
+on Discord).
+
+The output
 leads with a coverage line (`Parsed 2941/3000 players from 3 regions ·
 data age 2h`), renders a bucket row only when the parses actually cover
 it, degrades holes (a player without role/champion data leaves that
 table but never breaks the answer), and splits across messages on line
 boundaries. A failing region is named in the dump and served from cache
-when possible; only a total failure replies with an error. Concurrent
-invocations share the refresh (singleflight) but each gets its own full
-dump.
+when possible; only a total failure replies with an error.
 
 | Command | Tier | Effect |
 |---|---|---|
@@ -558,15 +573,18 @@ dump.
 Operator configuration lives in the optional `[lol_leaderboard]`
 section (an absent section - or no regions served by the source - keeps
 the command in "not configured" mode). `regions`, `parse_depth`,
-`cache_ttl_secs`, and the display knobs hot-reload; `proxy` and
-`request_interval_secs` (the source pacing) are **startup-only** and
-need a restart. A section that degrades (absent or a zeroed knob) maps
-the live engine to the same "not configured" mode as at boot:
+`cache_ttl_secs`, and the display knobs hot-reload; `proxy`,
+`request_interval_secs` (the source pacing), `background_refresh`, and
+`inline_refresh_budget_secs` are **startup-only** and need a restart. A
+section that degrades (absent or a zeroed knob) maps the live engine to
+the same "not configured" mode as at boot:
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `regions` | string array | *(empty)* | regions to aggregate: `kr`, `euw`, `eun`, `na`, `jp`, `br`, `tr`, `tw`, `vn`, `sea`; empty = plugin off |
-| `request_interval_secs` | integer | `1` | minimum delay between source requests (sequential, rate-limit politeness); `0` disables the plugin |
+| `request_interval_secs` | integer | `3` | minimum delay between source requests (sequential, rate-limit politeness); `0` disables the plugin |
+| `background_refresh` | boolean | `true` | scheduler job keeps the cache warm (ticks at `cache_ttl_secs`, first run at boot); the command serves cached data as-is and never waits; `false` = on-demand mode where a stale cache re-parses before the reply |
+| `inline_refresh_budget_secs` | integer | `180` | wall-clock budget for a command-driven (inline) parse: regions past it keep cached data or are named as failed; `0` = unbounded; the background job is not budgeted |
 | `parse_depth` | integer | `1000` | top players parsed per region (clamped to what the source's board has); `0` disables; capped at 10 000 |
 | `display_buckets` | integer array | `[300, 1000]` | player-count rows for the role tables; values are clamped to `parse_depth`, sorted, deduplicated; empty = a single full-depth row |
 | `champ_pool_depth` | integer | `1000` | per-region player pool (highest ranked first) behind the champion tables; clamped to `parse_depth` |

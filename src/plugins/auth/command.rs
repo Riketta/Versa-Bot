@@ -15,7 +15,7 @@ use crate::kernel::{
     spi_ports::GuildStorage,
 };
 
-use super::{AuthConfig, CONFIG_KEY, NAMESPACE, OwnerList};
+use super::{AuthConfig, CONFIG_KEY, NAMESPACE, OwnerList, PolicyCache};
 
 /// `/auth action:[show|set|clear|default] [tier] [user] [role]` - manage the
 /// guild's tier policy. Runs through the pipeline like every command, so the
@@ -27,12 +27,20 @@ use super::{AuthConfig, CONFIG_KEY, NAMESPACE, OwnerList};
 pub struct AuthCommandHandler {
     policy_writes: Arc<AsyncMutex<()>>,
     owners: OwnerList,
+    /// The gate's policy cache, shared so a successful write invalidates
+    /// immediately - same "one policy source" the two halves already
+    /// share through the storage document.
+    policy_cache: PolicyCache,
 }
 
 impl AuthCommandHandler {
     #[must_use]
     pub fn new() -> Self {
-        Self { policy_writes: Arc::new(AsyncMutex::new(())), owners: OwnerList::default() }
+        Self {
+            policy_writes: Arc::new(AsyncMutex::new(())),
+            owners: OwnerList::default(),
+            policy_cache: PolicyCache::default(),
+        }
     }
 
     /// Wires the deployment-global owner list (production path; the default
@@ -40,6 +48,14 @@ impl AuthCommandHandler {
     #[must_use]
     pub fn with_owners(mut self, owners: OwnerList) -> Self {
         self.owners = owners;
+        self
+    }
+
+    /// Shares the gate's policy cache: every successful write drops the
+    /// cached policies so the next event resolves the fresh document.
+    #[must_use]
+    pub fn with_policy_cache(mut self, cache: PolicyCache) -> Self {
+        self.policy_cache = cache;
         self
     }
 }
@@ -86,10 +102,23 @@ impl CommandHandler for AuthCommandHandler {
                 let caller_is_owner = self.owners.contains(&event.origin.user_id.get().to_string());
                 show_policy(&**storage, services, caller_is_owner).await
             }
-            Some("set") => set_tier(&**storage, &self.policy_writes, event, services, args).await,
-            Some("clear") => clear_target(&**storage, &self.policy_writes, services, args).await,
+            Some("set") => {
+                set_tier(&**storage, &self.policy_writes, &self.policy_cache, event, services, args)
+                    .await
+            }
+            Some("clear") => {
+                clear_target(&**storage, &self.policy_writes, &self.policy_cache, services, args)
+                    .await
+            }
             Some("default") => {
-                set_default_tier(&**storage, &self.policy_writes, services, args).await
+                set_default_tier(
+                    &**storage,
+                    &self.policy_writes,
+                    &self.policy_cache,
+                    services,
+                    args,
+                )
+                .await
             }
             _ => reply(services, usage()).await,
         }
@@ -153,6 +182,7 @@ async fn tier_of(services: &KernelServices, args: &CommandArgs) -> Result<Access
 async fn set_tier(
     storage: &dyn GuildStorage,
     policy_writes: &AsyncMutex<()>,
+    policy_cache: &PolicyCache,
     event: &RequestContext,
     services: &KernelServices,
     args: &CommandArgs,
@@ -188,6 +218,7 @@ async fn set_tier(
     } else {
         map.insert(id, tier);
         storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
+        policy_cache.invalidate_all();
         match &target {
             Target::User(_) => format!("✅ User {mention} is now {tier}."),
             Target::Role(_) => format!("✅ Role {mention} now grants {tier}."),
@@ -212,6 +243,7 @@ async fn set_tier(
 async fn clear_target(
     storage: &dyn GuildStorage,
     policy_writes: &AsyncMutex<()>,
+    policy_cache: &PolicyCache,
     services: &KernelServices,
     args: &CommandArgs,
 ) -> anyhow::Result<()> {
@@ -240,6 +272,7 @@ async fn clear_target(
 
     let answer = if map.remove(&id).is_some() {
         storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
+        policy_cache.invalidate_all();
         format!("✅ Removed the tier assignment for {mention}.")
     } else {
         format!("{mention} has no tier assignment.")
@@ -251,6 +284,7 @@ async fn clear_target(
 async fn set_default_tier(
     storage: &dyn GuildStorage,
     policy_writes: &AsyncMutex<()>,
+    policy_cache: &PolicyCache,
     services: &KernelServices,
     args: &CommandArgs,
 ) -> anyhow::Result<()> {
@@ -265,6 +299,7 @@ async fn set_default_tier(
     };
     policy.default_tier = tier;
     storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
+    policy_cache.invalidate_all();
 
     // Legal but destructive settings get an explicit consequence line: the
     // reply is ephemeral, so the warning costs nothing but an oversight.

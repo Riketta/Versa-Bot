@@ -1,8 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::kernel::{
@@ -12,6 +14,7 @@ use crate::kernel::{
         MiddlewarePluginPort, Next, Permission, PluginPort,
     },
     services::KernelServices,
+    spi_ports::GuildStorage,
 };
 
 mod command;
@@ -129,6 +132,75 @@ fn normalize_owners(raw: &[String]) -> Vec<String> {
     ids
 }
 
+/// Per-guild policy cache for the gate's hot path: every inbound message
+/// and command resolves a tier policy, and a storage round-trip per event
+/// is the most frequent query in the system. Entries serve for at most
+/// `ttl` and die wholesale on every `/auth` write (an epoch bump -
+/// precise per-guild invalidation would save only a handful of reads per
+/// admin-frequency write, and a global epoch is immune to keying
+/// mistakes). Only successful reads are cached: storage failures and
+/// malformed documents always observe live storage, so the fail-closed
+/// paths gain no staleness.
+#[derive(Clone)]
+pub(crate) struct PolicyCache {
+    inner: Arc<PolicyCacheInner>,
+    /// Test seam: the production value is [`Self::DEFAULT_TTL`].
+    pub(crate) ttl: Duration,
+}
+
+struct PolicyCacheInner {
+    epoch: AtomicU64,
+    entries: Mutex<HashMap<(&'static str, u64), CachedPolicy>>,
+}
+
+struct CachedPolicy {
+    policy: Arc<AuthConfig>,
+    fetched_at: Instant,
+    epoch: u64,
+}
+
+impl PolicyCache {
+    /// How long a cached policy serves without a storage re-read. `/auth`
+    /// writes invalidate immediately; the TTL only bounds how long an
+    /// out-of-band storage edit (a direct DB change) can lag.
+    const DEFAULT_TTL: Duration = Duration::from_secs(5);
+
+    fn get(&self, platform: &'static str, guild: u64) -> Option<Arc<AuthConfig>> {
+        let epoch = self.inner.epoch.load(Ordering::Acquire);
+        let entries = self.inner.entries.lock();
+        let entry = entries.get(&(platform, guild))?;
+        (entry.epoch == epoch && entry.fetched_at.elapsed() < self.ttl)
+            .then(|| Arc::clone(&entry.policy))
+    }
+
+    fn put(&self, platform: &'static str, guild: u64, policy: AuthConfig) -> Arc<AuthConfig> {
+        let policy = Arc::new(policy);
+        let epoch = self.inner.epoch.load(Ordering::Acquire);
+        self.inner.entries.lock().insert(
+            (platform, guild),
+            CachedPolicy { policy: Arc::clone(&policy), fetched_at: Instant::now(), epoch },
+        );
+        policy
+    }
+
+    /// Any policy write drops every guild's entry at once.
+    fn invalidate_all(&self) {
+        self.inner.epoch.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl Default for PolicyCache {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(PolicyCacheInner {
+                epoch: AtomicU64::new(0),
+                entries: Mutex::new(HashMap::new()),
+            }),
+            ttl: Self::DEFAULT_TTL,
+        }
+    }
+}
+
 /// Per-guild bot access control - the first short-circuiting middleware.
 ///
 /// Policy:
@@ -157,12 +229,13 @@ fn normalize_owners(raw: &[String]) -> Vec<String> {
 pub struct AuthPlugin {
     registry: Arc<dyn CommandRegistryPort>,
     owners: OwnerList,
+    policy_cache: PolicyCache,
 }
 
 impl AuthPlugin {
     #[must_use]
     pub fn new(registry: Arc<dyn CommandRegistryPort>, owners: OwnerList) -> Self {
-        Self { registry, owners }
+        Self { registry, owners, policy_cache: PolicyCache::default() }
     }
 
     /// Hot reload: swaps the owner list. Identical content is a no-op.
@@ -239,7 +312,11 @@ impl PluginPort for AuthPlugin {
                 required_tier: Some(AccessTier::Admin),
                 guild_only: true,
             },
-            Arc::new(AuthCommandHandler::new().with_owners(self.owners.clone())),
+            Arc::new(
+                AuthCommandHandler::new()
+                    .with_owners(self.owners.clone())
+                    .with_policy_cache(self.policy_cache.clone()),
+            ),
         );
         Ok(())
     }
@@ -257,45 +334,15 @@ impl MiddlewarePluginPort for AuthPlugin {
             return Next::Continue;
         };
 
-        let loaded = match storage.get(NAMESPACE, CONFIG_KEY).await {
-            // Unconfigured = the open default policy (default tier `User`).
-            Ok(None) => None,
-            Ok(Some(raw)) => Some(serde_json::from_value::<AuthConfig>(raw)),
-            // Unreadable = fail closed, same as a malformed policy: a storage
-            // failure must never widen access, for any guild.
-            Err(err) => {
-                tracing::error!(namespace = NAMESPACE, %err, "auth config unreadable - failing closed");
-                self.answer_denial(
-                    services,
-                    event,
-                    Self::policy_unavailable_embed(
-                        event,
-                        "temporarily unavailable (storage error)",
-                        "Try again in a moment.",
-                    ),
-                )
-                .await;
+        // Hot path: the sanitized policy comes through the per-guild cache;
+        // a storage round-trip per event would be the system's most
+        // frequent query. Failures never enter the cache.
+        let config = match self.cached_policy(services, event, storage).await {
+            Ok(config) => config,
+            Err(embed) => {
+                self.answer_denial(services, event, embed).await;
                 return Next::Stop;
             }
-        };
-
-        let config = match loaded {
-            Some(Ok(config)) => config.sanitized(),
-            Some(Err(_)) => {
-                tracing::warn!(namespace = NAMESPACE, "auth config is malformed - failing closed");
-                self.answer_denial(
-                    services,
-                    event,
-                    Self::policy_unavailable_embed(
-                        event,
-                        "unreadable (malformed)",
-                        "Ask a guild admin to fix the bot configuration.",
-                    ),
-                )
-                .await;
-                return Next::Stop;
-            }
-            None => AuthConfig::default(),
         };
 
         let tier = Self::effective_tier(&config, &self.owners, event);
@@ -340,6 +387,64 @@ impl MiddlewarePluginPort for AuthPlugin {
 }
 
 impl AuthPlugin {
+    /// Resolves the sanitized guild policy through the per-guild cache.
+    /// Hits skip the storage round-trip; misses read, sanitize, and cache
+    /// (an unconfigured guild caches the open default - the `/auth` write
+    /// path invalidates it the moment a policy appears). Failures return
+    /// the denial embed and never enter the cache: the fail-closed paths
+    /// always observe live storage.
+    async fn cached_policy(
+        &self,
+        services: &KernelServices,
+        event: &RequestContext,
+        storage: &Arc<dyn GuildStorage>,
+    ) -> Result<Arc<AuthConfig>, Embed> {
+        let platform = services.platform_info.slug();
+        let key = event.origin.guild_id.map(|guild| (platform, guild.get()));
+        if let Some((platform, guild)) = key
+            && let Some(policy) = self.policy_cache.get(platform, guild)
+        {
+            return Ok(policy);
+        }
+        let loaded = match storage.get(NAMESPACE, CONFIG_KEY).await {
+            // Unconfigured = the open default policy (default tier `User`).
+            Ok(None) => None,
+            Ok(Some(raw)) => Some(serde_json::from_value::<AuthConfig>(raw)),
+            // Unreadable = fail closed, same as a malformed policy: a storage
+            // failure must never widen access, for any guild.
+            Err(err) => {
+                tracing::error!(
+                    namespace = NAMESPACE,
+                    %err,
+                    "auth config unreadable - failing closed"
+                );
+                return Err(Self::policy_unavailable_embed(
+                    event,
+                    "temporarily unavailable (storage error)",
+                    "Try again in a moment.",
+                ));
+            }
+        };
+        let config = match loaded {
+            Some(Ok(config)) => config.sanitized(),
+            Some(Err(_)) => {
+                tracing::warn!(namespace = NAMESPACE, "auth config is malformed - failing closed");
+                return Err(Self::policy_unavailable_embed(
+                    event,
+                    "unreadable (malformed)",
+                    "Ask a guild admin to fix the bot configuration.",
+                ));
+            }
+            None => AuthConfig::default(),
+        };
+        Ok(match key {
+            Some((platform, guild)) => self.policy_cache.put(platform, guild, config),
+            // Guild-less events never reach the gate's storage arm; the
+            // branch keeps the helper total regardless.
+            None => Arc::new(config),
+        })
+    }
+
     /// Effective tier of the event's author:
     /// - A configured bot owner is [`AccessTier::Owner`], above every
     ///   guild-side rank: bans, explicit assignments, and the Discord
@@ -440,8 +545,10 @@ mod tests {
         spi_ports::{GUILD_SETTINGS, StoragePort},
     };
     use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
 
     /// Registry fixture carrying the descriptors the gate looks up. The
     /// `/auth` handler tests live in `command.rs`; handlers here are no-ops.
@@ -548,11 +655,17 @@ mod tests {
     }
 
     fn test_services(storage: &InMemoryStorage) -> (KernelServices, Arc<RecordingChatOutput>) {
+        services_with(Some(storage.guild_scoped("test", GuildId(1))))
+    }
+
+    fn services_with(
+        guild: Option<Arc<dyn crate::kernel::spi_ports::GuildStorage>>,
+    ) -> (KernelServices, Arc<RecordingChatOutput>) {
         let output = RecordingChatOutput::new();
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn crate::kernel::spi_ports::ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
-            guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
+            guild_storage: guild,
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
@@ -579,6 +692,338 @@ mod tests {
             }),
         );
         Arc::new(storage)
+    }
+
+    /// Storage wrapper counting document reads - proves the policy cache
+    /// serves repeated events without touching storage.
+    struct CountingStorage {
+        inner: Arc<InMemoryStorage>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    struct CountingView {
+        guild: Arc<dyn crate::kernel::spi_ports::GuildStorage>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::kernel::spi_ports::GuildStorage for CountingView {
+        async fn get(
+            &self,
+            namespace: &str,
+            key: &str,
+        ) -> Result<Option<Value>, crate::kernel::models::StorageError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.guild.get(namespace, key).await
+        }
+
+        async fn set(
+            &self,
+            namespace: &str,
+            key: &str,
+            value: Value,
+        ) -> Result<(), crate::kernel::models::StorageError> {
+            self.guild.set(namespace, key, value).await
+        }
+
+        async fn delete(
+            &self,
+            namespace: &str,
+            key: &str,
+        ) -> Result<(), crate::kernel::models::StorageError> {
+            self.guild.delete(namespace, key).await
+        }
+
+        async fn list_keys(
+            &self,
+            namespace: &str,
+        ) -> Result<Vec<String>, crate::kernel::models::StorageError> {
+            self.guild.list_keys(namespace).await
+        }
+
+        async fn append(
+            &self,
+            namespace: &str,
+            payload: Value,
+        ) -> Result<u64, crate::kernel::models::StorageError> {
+            self.guild.append(namespace, payload).await
+        }
+
+        async fn list_after(
+            &self,
+            namespace: &str,
+            after_seq: u64,
+            limit: u32,
+        ) -> Result<Vec<crate::kernel::spi_ports::StoredRecord>, crate::kernel::models::StorageError>
+        {
+            self.guild.list_after(namespace, after_seq, limit).await
+        }
+
+        async fn list_last(
+            &self,
+            namespace: &str,
+            limit: u32,
+        ) -> Result<Vec<crate::kernel::spi_ports::StoredRecord>, crate::kernel::models::StorageError>
+        {
+            self.guild.list_last(namespace, limit).await
+        }
+
+        async fn count_after(
+            &self,
+            namespace: &str,
+            after_seq: u64,
+        ) -> Result<u64, crate::kernel::models::StorageError> {
+            self.guild.count_after(namespace, after_seq).await
+        }
+
+        async fn delete_record(
+            &self,
+            namespace: &str,
+            seq: u64,
+        ) -> Result<u64, crate::kernel::models::StorageError> {
+            self.guild.delete_record(namespace, seq).await
+        }
+    }
+
+    #[async_trait]
+    impl crate::kernel::spi_ports::StoragePort for CountingStorage {
+        fn guild_scoped(
+            &self,
+            platform: &str,
+            guild_id: GuildId,
+        ) -> Arc<dyn crate::kernel::spi_ports::GuildStorage> {
+            Arc::new(CountingView {
+                guild: self.inner.guild_scoped(platform, guild_id),
+                reads: Arc::clone(&self.reads),
+            })
+        }
+
+        async fn list_guilds(
+            &self,
+        ) -> Result<Vec<(String, GuildId)>, crate::kernel::models::StorageError> {
+            self.inner.list_guilds().await
+        }
+    }
+
+    /// Storage whose first document read fails, then delegates: proves the
+    /// fail-closed path never caches a failure.
+    struct FlakyStorage {
+        inner: Arc<InMemoryStorage>,
+        fail: Arc<AtomicBool>,
+    }
+
+    struct FlakyView {
+        guild: Arc<dyn crate::kernel::spi_ports::GuildStorage>,
+        fail: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl crate::kernel::spi_ports::GuildStorage for FlakyView {
+        async fn get(
+            &self,
+            namespace: &str,
+            key: &str,
+        ) -> Result<Option<Value>, crate::kernel::models::StorageError> {
+            if self.fail.swap(false, Ordering::SeqCst) {
+                return Err(crate::kernel::models::StorageError::Database(
+                    "simulated transient failure".to_owned(),
+                ));
+            }
+            self.guild.get(namespace, key).await
+        }
+
+        async fn set(
+            &self,
+            namespace: &str,
+            key: &str,
+            value: Value,
+        ) -> Result<(), crate::kernel::models::StorageError> {
+            self.guild.set(namespace, key, value).await
+        }
+
+        async fn delete(
+            &self,
+            namespace: &str,
+            key: &str,
+        ) -> Result<(), crate::kernel::models::StorageError> {
+            self.guild.delete(namespace, key).await
+        }
+
+        async fn list_keys(
+            &self,
+            namespace: &str,
+        ) -> Result<Vec<String>, crate::kernel::models::StorageError> {
+            self.guild.list_keys(namespace).await
+        }
+
+        async fn append(
+            &self,
+            namespace: &str,
+            payload: Value,
+        ) -> Result<u64, crate::kernel::models::StorageError> {
+            self.guild.append(namespace, payload).await
+        }
+
+        async fn list_after(
+            &self,
+            namespace: &str,
+            after_seq: u64,
+            limit: u32,
+        ) -> Result<Vec<crate::kernel::spi_ports::StoredRecord>, crate::kernel::models::StorageError>
+        {
+            self.guild.list_after(namespace, after_seq, limit).await
+        }
+
+        async fn list_last(
+            &self,
+            namespace: &str,
+            limit: u32,
+        ) -> Result<Vec<crate::kernel::spi_ports::StoredRecord>, crate::kernel::models::StorageError>
+        {
+            self.guild.list_last(namespace, limit).await
+        }
+
+        async fn count_after(
+            &self,
+            namespace: &str,
+            after_seq: u64,
+        ) -> Result<u64, crate::kernel::models::StorageError> {
+            self.guild.count_after(namespace, after_seq).await
+        }
+
+        async fn delete_record(
+            &self,
+            namespace: &str,
+            seq: u64,
+        ) -> Result<u64, crate::kernel::models::StorageError> {
+            self.guild.delete_record(namespace, seq).await
+        }
+    }
+
+    #[async_trait]
+    impl crate::kernel::spi_ports::StoragePort for FlakyStorage {
+        fn guild_scoped(
+            &self,
+            platform: &str,
+            guild_id: GuildId,
+        ) -> Arc<dyn crate::kernel::spi_ports::GuildStorage> {
+            Arc::new(FlakyView {
+                guild: self.inner.guild_scoped(platform, guild_id),
+                fail: Arc::clone(&self.fail),
+            })
+        }
+
+        async fn list_guilds(
+            &self,
+        ) -> Result<Vec<(String, GuildId)>, crate::kernel::models::StorageError> {
+            self.inner.list_guilds().await
+        }
+    }
+
+    /// Repeated events within the TTL resolve from the cache: one storage
+    /// read serves the whole burst, tiers included - the gate is the
+    /// system's hottest path.
+    #[tokio::test]
+    async fn policy_cache_serves_repeated_events_without_storage_reads() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let storage =
+            CountingStorage { inner: Arc::new(InMemoryStorage::new()), reads: Arc::clone(&reads) };
+        let (services, output) = services_with(Some(storage.guild_scoped("test", GuildId(1))));
+        let plugin = test_plugin(&[("assign_tracker", AccessTier::Moderator)]);
+
+        for _ in 0..3 {
+            let mut event = command_event(3, "assign_tracker", &[]);
+            assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
+        }
+
+        // One read served all three events (default tier User denies the
+        // moderator command every time - the cached policy is applied, not
+        // just counted).
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(output.messages().len(), 0);
+    }
+
+    /// A zero TTL expires instantly: every event re-reads storage.
+    #[tokio::test]
+    async fn policy_cache_expires_after_the_ttl() {
+        let mut plugin = test_plugin(&[]);
+        plugin.policy_cache.ttl = Duration::ZERO;
+        let reads = Arc::new(AtomicUsize::new(0));
+        let storage =
+            CountingStorage { inner: Arc::new(InMemoryStorage::new()), reads: Arc::clone(&reads) };
+        let (services, _output) = services_with(Some(storage.guild_scoped("test", GuildId(1))));
+
+        for _ in 0..2 {
+            let mut event = message_event(3, &[]);
+            assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+        }
+
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
+
+    /// A successful `/auth` write invalidates immediately: the very next
+    /// event resolves the fresh policy, with no TTL wait.
+    #[tokio::test]
+    async fn auth_write_invalidates_the_policy_cache_immediately() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let storage =
+            CountingStorage { inner: Arc::new(InMemoryStorage::new()), reads: Arc::clone(&reads) };
+        let (services, output) = services_with(Some(storage.guild_scoped("test", GuildId(1))));
+        let plugin = test_plugin(&[("assign_tracker", AccessTier::Moderator)]);
+        let handler = AuthCommandHandler::new().with_policy_cache(plugin.policy_cache.clone());
+
+        let mut denied = command_event(3, "assign_tracker", &[]);
+        denied.origin.reply_token = Some("token".to_owned());
+        assert!(matches!(plugin.pre(&mut denied, &services).await, Next::Stop));
+        assert!(output.messages().len() == 1, "default tier User denies the moderator command");
+
+        let mut admin = command_event(9, "auth", &[]);
+        admin.origin.reply_token = Some("token".to_owned());
+        let args = CommandArgs(vec![
+            ("action".to_owned(), "set".to_owned()),
+            ("tier".to_owned(), "moderator".to_owned()),
+            ("user".to_owned(), "3".to_owned()),
+        ]);
+        handler.invoke(&admin, &args, &services).await.expect("set expected to succeed");
+
+        let mut promoted = command_event(3, "assign_tracker", &[]);
+        assert!(
+            matches!(plugin.pre(&mut promoted, &services).await, Next::Continue),
+            "the promotion applies on the very next event"
+        );
+        // Gate's initial read + the handler's own read_policy + the gate's
+        // post-invalidation read.
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+    }
+
+    /// A storage failure is never cached: the denial repeats until storage
+    /// genuinely answers - the fail-closed path always observes live
+    /// storage.
+    #[tokio::test]
+    async fn policy_storage_failures_are_never_cached() {
+        let fail = Arc::new(AtomicBool::new(true));
+        let storage =
+            FlakyStorage { inner: Arc::new(InMemoryStorage::new()), fail: Arc::clone(&fail) };
+        let (services, output) = services_with(Some(storage.guild_scoped("test", GuildId(1))));
+        let plugin = test_plugin(&[("ping", AccessTier::User)]);
+
+        let mut first = command_event(3, "ping", &[]);
+        first.origin.reply_token = Some("token".to_owned());
+        assert!(matches!(plugin.pre(&mut first, &services).await, Next::Stop));
+        assert!(
+            output
+                .messages()
+                .into_iter()
+                .next()
+                .expect("denial expected")
+                .contains("temporarily unavailable")
+        );
+
+        let mut second = command_event(3, "ping", &[]);
+        assert!(
+            matches!(plugin.pre(&mut second, &services).await, Next::Continue),
+            "the transient failure was not cached - the retry reads storage"
+        );
     }
 
     #[tokio::test]

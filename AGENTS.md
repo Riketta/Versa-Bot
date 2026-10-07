@@ -33,8 +33,10 @@ tracker (poll-driven: watches the local League client's store, plus
 per-user skin/champion watch subscriptions; the one case of a plugin
 with NO inbound events - it discovers subscribers via
 `StoragePort::list_guilds` instead of an event origin), LoL leaderboard
-(command-driven `/lol_leaderboard`: world-data statistics over a
-pluggable source port, in-process TTL cache, no storage), LLM chat bot
+(`/lol_leaderboard`: world-data statistics over a pluggable source
+port; in-process TTL cache warmed by a background scheduler job by
+default - the command serves cached data as-is - or re-parsed on
+demand; no storage), LLM chat bot
 (per-channel identity, config, and history; plain `reqwest` against
 OpenAI-compatible endpoints - no `rig`). A generic message-history plugin
 is deferred until a real consumer appears.

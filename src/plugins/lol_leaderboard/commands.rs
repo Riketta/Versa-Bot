@@ -97,6 +97,8 @@ mod tests {
             100,
             ttl,
             Duration::ZERO,
+            false,
+            Duration::ZERO,
             ResolvedView::resolve(100, &[300], 300, 2),
         );
         Arc::new(LeaderboardEngine::new(source, settings))
