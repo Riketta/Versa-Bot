@@ -73,6 +73,9 @@ url = "sqlite://versabot.db"
 # time_offset_minutes = 0
 # default_system_prompt = "You are {{bot}}, a helpful chat assistant."
 # default_compaction_prompt = "You are {{bot}}. Summarize the conversation above, preserving facts, decisions, names and open questions. Be concise."
+# Compaction model fallback (`provider/model`); absent = compact with the
+# channel's chat model.
+# compaction_model = "zai/glm-5.3-flash"
 # Live messages kept after each compaction (minimum 1 - zero would make
 # compaction unreachable).
 # compaction_keep_tail = 10
@@ -191,10 +194,10 @@ url = "sqlite://versabot.db"
 # League client to a per-guild assigned channel (/lol_store_enable +
 # /lol_store_assign). Enabling or disabling is startup-only: an absent
 # section, an empty lockfile_path, or poll_secs = 0 keeps the watcher off
-# until a restart. When enabled, the announce_* flags and watch caps
-# hot-reload; lockfile_path, address, and poll_secs stay boot-frozen.
-# Your logged-in account is only the API key - no account data is ever
-# read or announced.
+# until a restart. When enabled, the announce_* flags, watch caps, and
+# history_days hot-reload; lockfile_path, address, and poll_secs stay
+# boot-frozen. Your logged-in account is only the API key - no account
+# data is ever read or announced.
 # [lol_store]
 # lockfile_path = "C:/Riot Games/League of Legends/lockfile"
 # Host the client API listens on; the port always comes from the lockfile.
@@ -207,21 +210,38 @@ url = "sqlite://versabot.db"
 # Per-user / per-guild caps on /lol_store_watch subscriptions.
 # watch_user_cap = 20
 # watch_guild_cap = 300
+# Days of store history kept for /lol_store_history (today counted);
+# 0 disables recording. Hot-reloadable.
+# history_days = 90
 
-# Optional: LoL leaderboard - the on-demand /lol_leaderboard statistics
-# dump (role distributions, most picked champions per role) from a public
-# leaderboard source. Regions, parse_depth, cache_ttl_secs, and the
-# display knobs hot-reload (a degraded section maps the live engine to
-# "not configured" mode); proxy and request_interval_secs are
-# startup-only. An absent section - or no regions - keeps the command in
-# "not configured" mode. No per-guild setup - the command
-# answers wherever it is invoked. All display windows (buckets, champ
-# pool) are clamped to parse_depth.
+# Optional: LoL leaderboard - /lol_leaderboard aggregates ranked-
+# leaderboard statistics (role distributions, most picked champions per
+# role) from a public leaderboard source. By default a background job
+# keeps the cache warm (first run at boot, refreshed every cache_ttl_secs)
+# and the command serves whatever is cached, however old, never waiting
+# for a parse. Regions, parse_depth, cache_ttl_secs, and the display
+# knobs hot-reload (a degraded section maps the live engine to "not
+# configured" mode); proxy, request_interval_secs, background_refresh,
+# and inline_refresh_budget_secs are startup-only. An absent section -
+# or no regions - keeps the command in "not configured" mode. No
+# per-guild setup - the command answers wherever it is invoked. All
+# display windows (buckets, champ pool) are clamped to parse_depth.
 # [lol_leaderboard]
 # Regions (servers) to aggregate - empty = plugin off.
 # regions = ["kr", "euw", "na"]
-# Minimum delay in seconds between source requests (sequential).
-# request_interval_secs = 1
+# Minimum delay in seconds between source requests (sequential,
+# rate-limit politeness).
+# request_interval_secs = 3
+# Keep the cache warm with a background job (ticks at cache_ttl_secs,
+# first run at boot); the command then answers from the cache as-is.
+# false = on-demand mode: a stale cache re-parses before the reply.
+# Startup-only.
+# background_refresh = true
+# Wall-clock budget in seconds for a command-driven (inline) refresh in
+# on-demand mode: regions past it keep cached data or are named as
+# failed instead of parking the invoker behind a slow source. 0 =
+# unbounded. The background job ignores it. Startup-only.
+# inline_refresh_budget_secs = 180
 # Top players parsed per region.
 # parse_depth = 1000
 # Player-count rows for the role-distribution tables.
