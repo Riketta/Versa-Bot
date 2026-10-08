@@ -138,17 +138,20 @@ pub enum CaptureMode {
 /// Whether the react tool's prompt appendix lists the server's custom
 /// emojis, and from which source. The injected line carries exact wire
 /// forms, so the model copies working tokens instead of guessing shapes;
-/// it only reaches the model where `react` is also on.
+/// it only reaches the model where `react` is also on. The default mode
+/// is a no-op while the whitelist is empty: nothing to inject means no
+/// prompt change at all.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EmojiInject {
-    /// No emoji list in the prompt (default).
-    #[default]
+    /// No emoji list in the prompt.
     None,
     /// List every custom emoji of the server.
     All,
     /// List only the whitelisted ones: the channel's own list when it has
-    /// one, otherwise the guild-wide list.
+    /// one, otherwise the guild-wide list. The default - inert until the
+    /// whitelist gains entries, so the whitelist itself is the opt-in.
+    #[default]
     Whitelist,
 }
 
@@ -268,8 +271,11 @@ pub struct ChannelConfig {
     /// prompt appendix (exact wire forms; `whitelist` filters by the
     /// guild/channel emoji whitelist). Setting this does not require
     /// `react` - the line simply never joins the prompt while `react` is
-    /// off. `none` by default: the injected line costs prompt space and
-    /// invalidates provider caches when the emoji set changes.
+    /// off. `whitelist` by default: a no-op while the effective whitelist
+    /// is empty (nothing to inject, prompt byte-identical to `none`), so
+    /// filling the whitelist is the opt-in - and once entries exist the
+    /// line costs prompt space and invalidates provider caches when the
+    /// emoji set or whitelist changes.
     #[serde(default)]
     pub react_emoji_inject: EmojiInject,
     /// Chance the bot silently reacts (no reply) to an unrelated captured
@@ -469,6 +475,7 @@ mod tests {
         assert!(!config.images);
         assert_eq!(config.image_model, None);
         assert!(!config.react);
+        assert_eq!(config.react_emoji_inject, EmojiInject::Whitelist);
         assert!((config.random_react_chance_percent - 10.0).abs() < f64::EPSILON);
     }
 
@@ -488,6 +495,9 @@ mod tests {
         assert_eq!(config.max_length, None);
         // Stored before the feature existed: serde defaults keep it loadable.
         assert!(!config.react);
+        // Stored before whitelist became the default: the empty-whitelist
+        // no-op makes that migration behavior-free.
+        assert_eq!(config.react_emoji_inject, EmojiInject::Whitelist);
         assert!((config.random_react_chance_percent - 10.0).abs() < f64::EPSILON);
     }
 

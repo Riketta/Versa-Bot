@@ -846,9 +846,12 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   `add`'s `description` argument or the `desc` action; entries without
   one stay bare, and a whitelist without any description keeps the
   compact single-line menu.
-  Descriptions never appear in `all` mode. Off by default - the list
-  costs prompt space and invalidates provider prompt caches whenever the
-  emoji set, the whitelist, or a description changes. Setting the mode
+  Descriptions never appear in `all` mode. `whitelist` is the default
+  and is a no-op while the effective whitelist is empty - nothing is
+  injected and the prompt stays byte-identical to `none`, so filling the
+  whitelist is the opt-in; once entries exist the list costs prompt
+  space and invalidates provider prompt caches whenever the emoji set,
+  the whitelist, or a description changes. Setting the mode
   works without `react`, but the list only reaches the model where the
   react tool is also on.
   Degradation is per-token: an invalid token drops, valid siblings fire,
@@ -919,7 +922,7 @@ uploaded files for long texts.
 | `images` | on / off | off | describe attached images on captured messages via the recognition model; needs an operator `[llm] image_model` |
 | `image_model` | declared model ref | plugin `[llm] image_model` | recognition model override for this channel |
 | `react` | on / off | off | emoji-reaction tool: the model may decorate the message it replies to by emitting a `[[react: ...]]` marker, stripped before the answer is shown |
-| `react_emoji_inject` | none / all / whitelist | none | list the server's custom emojis as exact forms inside the react tool's prompt (`whitelist` filters by `/llm_emoji_whitelist`, channel list over the guild baseline); needs `react` on to reach the model; changes invalidate provider prompt caches |
+| `react_emoji_inject` | none / all / whitelist | whitelist | list the server's custom emojis as exact forms inside the react tool's prompt (`whitelist` filters by `/llm_emoji_whitelist`, channel list over the guild baseline); an empty whitelist injects nothing - the no-op default, filling it is the opt-in; needs `react` on to reach the model; changes invalidate provider prompt caches |
 | `streaming` | on / off | off | stream the answer live from the provider (SSE): the message appears with the first tokens and is edited at `stream_interval_ms` |
 | `random_chance` | 0-100 (clamped) | 2 | percent chance to chime in on a captured non-trigger message; 0 = off |
 | `random_cooldown` | whole seconds | 5 | minimum seconds between chime-ins - the reply and silent-react rolls each keep their own tracker behind it; 0 = none |

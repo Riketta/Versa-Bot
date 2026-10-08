@@ -595,9 +595,11 @@ impl ChatEngine {
     /// byte-stable between emoji-set or whitelist changes - the menu rides
     /// the prompt's cacheable prefix. Entries with a description render as
     /// sub-lines; a whitelist without descriptions keeps the plain single
-    /// line. Empty unless the channel opted in and the platform lists
-    /// emojis; every failure on the way degrades to empty (the menu is
-    /// cosmetic).
+    /// line. Empty unless something would actually be injected: `none`
+    /// never, `all` only while the platform lists emojis, `whitelist` only
+    /// while the effective list matches a server emoji - the default mode
+    /// is a no-op while its list is empty, byte-identical to `none`. Every
+    /// failure on the way degrades to empty (the menu is cosmetic).
     async fn react_emoji_menu(
         &self,
         origin: &Origin,
@@ -4603,6 +4605,33 @@ mod tests {
         let system = request.messages.first().expect("system slot expected");
         assert!(!system.content.contains("Custom emojis of this server"));
         assert!(!system.content.contains("dorkiS"));
+    }
+
+    /// The default `whitelist` mode is a no-op while the effective
+    /// whitelist is empty: no menu at all, byte-identical to `none` - the
+    /// whitelist itself is the opt-in.
+    #[tokio::test]
+    async fn react_emoji_menu_default_whitelist_with_empty_list_is_a_no_op() {
+        let ctx = ctx_describer_with_emojis(
+            LlmSettings::default(),
+            Arc::new(RandRandom),
+            vec![Ok("hi".to_owned())],
+            Arc::new(FakeDescriber::default()),
+            emoji_menu_emojis(),
+        );
+        let config = ChannelConfig {
+            react: true,
+            react_emoji_inject: EmojiInject::default(),
+            ..assigned_config()
+        };
+        assert_eq!(config.react_emoji_inject, EmojiInject::Whitelist);
+
+        let menu = ctx.engine.react_emoji_menu(&origin(), &config, &ctx.services).await;
+        assert!(menu.is_empty(), "empty whitelist injects nothing: {menu}");
+
+        let none = ChannelConfig { react_emoji_inject: EmojiInject::None, ..config };
+        let none_menu = ctx.engine.react_emoji_menu(&origin(), &none, &ctx.services).await;
+        assert_eq!(menu, none_menu, "default mode must match `none` byte-for-byte");
     }
 
     /// Markers are stripped from the delivered text and the recorded bot

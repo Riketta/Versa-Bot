@@ -2788,11 +2788,22 @@ mod tests {
 
     /// The reactions status label: off stays plain, the inject mode shows
     /// with its effective whitelist source, and a react-off channel with an
-    /// inject set says why nothing lands.
+    /// inject set says why nothing lands (the `whitelist` default included -
+    /// its empty-list no-op is visible as "(no list)").
     #[test]
     fn react_label_covers_inject_modes() {
         let mut config = ChannelConfig::assigned("local/gemma".to_owned());
+        config.react_emoji_inject = EmojiInject::None;
         assert_eq!(react_label(&config, None), "off");
+
+        // The storage default: whitelist with no list anywhere - inert, but
+        // the status still names the mode so admins can see it.
+        let defaulted = ChannelConfig::assigned("local/gemma".to_owned());
+        assert_eq!(defaulted.react_emoji_inject, EmojiInject::Whitelist);
+        assert_eq!(
+            react_label(&defaulted, None),
+            "off (the emoji list would not reach the model) · emoji inject whitelist (no list)"
+        );
 
         config.react_emoji_inject = EmojiInject::All;
         assert_eq!(
