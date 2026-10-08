@@ -70,7 +70,11 @@ where
             let total_page = rank_page.total_page.max(page);
             let board_ended = rank_page.players.is_empty();
             entries.extend(rank_page.players);
-            if entries.len() >= depth || page >= total_page || board_ended || page >= page_cap {
+            if entries.len() >= depth || page >= total_page || board_ended {
+                break;
+            }
+            if page >= page_cap {
+                tracing::debug!(page, "page walk stopped at the page cap - board may be truncated");
                 break;
             }
             page += 1;

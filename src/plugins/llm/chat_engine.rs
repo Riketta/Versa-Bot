@@ -658,22 +658,36 @@ impl ChatEngine {
         let Some(storage) = &services.guild_storage else {
             return Vec::new();
         };
-        let channel = storage
+        let channel = match storage
             .get(NAMESPACE, &channel_emoji_whitelist_key(origin.channel_id.get()))
             .await
-            .ok()
-            .flatten()
-            .map(parse_whitelist);
+        {
+            Ok(Some(raw)) => Some(parse_whitelist(raw)),
+            Ok(None) => None,
+            Err(err) => {
+                tracing::debug!(
+                    channel = origin.channel_id.get(),
+                    %err,
+                    "channel emoji whitelist unreadable - menu stays off"
+                );
+                None
+            }
+        };
         if let Some(list) = channel.filter(|list| !list.is_empty()) {
             return list;
         }
-        storage
-            .get(NAMESPACE, GUILD_EMOJI_WHITELIST_KEY)
-            .await
-            .ok()
-            .flatten()
-            .map(parse_whitelist)
-            .unwrap_or_default()
+        match storage.get(NAMESPACE, GUILD_EMOJI_WHITELIST_KEY).await {
+            Ok(Some(raw)) => parse_whitelist(raw),
+            Ok(None) => Vec::new(),
+            Err(err) => {
+                tracing::debug!(
+                    channel = origin.channel_id.get(),
+                    %err,
+                    "guild emoji whitelist unreadable - menu stays off"
+                );
+                Vec::new()
+            }
+        }
     }
 
     fn assemble_prompt(
@@ -857,6 +871,12 @@ impl ChatEngine {
             // (nothing textual was shown). Without reactions this is the
             // no-answer path and the caller's fallback applies.
             if reactions.is_empty() {
+                tracing::warn!(
+                    channel = channel_id,
+                    model = %config.model,
+                    trigger,
+                    "completion produced no deliverable content - falling back"
+                );
                 return false;
             }
             tracing::debug!(
@@ -1174,6 +1194,8 @@ impl ChatEngine {
                 rolled = reply_fire,
                 "chime roll"
             );
+        } else if config.random_chance_percent > 0.0 {
+            tracing::debug!(channel = origin.channel_id.get(), "chime roll suppressed by cooldown");
         }
         let mut react_fire = false;
         if react_allowed {
@@ -1183,6 +1205,11 @@ impl ChatEngine {
                 chance = config.random_react_chance_percent,
                 rolled = react_fire,
                 "react chime roll"
+            );
+        } else if config.react && config.random_react_chance_percent > 0.0 {
+            tracing::debug!(
+                channel = origin.channel_id.get(),
+                "react chime roll suppressed by cooldown"
             );
         }
 
@@ -1389,7 +1416,13 @@ impl ChatEngine {
             .filter(|record| record.seq > after_seq)
             .filter_map(|record| {
                 serde_json::from_value::<ConversationRecord>(record.payload)
-                    .inspect_err(|_| tracing::warn!("skipping malformed conversation record"))
+                    .inspect_err(|err| {
+                        tracing::warn!(
+                            channel = channel_id,
+                            %err,
+                            "skipping malformed conversation record"
+                        );
+                    })
                     .ok()
                     .map(|parsed| (record.seq, parsed))
             })
@@ -1447,7 +1480,13 @@ impl ChatEngine {
             let full_page = page.len() >= PAGE as usize;
             for record in page {
                 let matches = serde_json::from_value::<ConversationRecord>(record.payload)
-                    .inspect_err(|_| tracing::warn!("skipping malformed conversation record"))
+                    .inspect_err(|err| {
+                        tracing::warn!(
+                            channel = channel_id,
+                            %err,
+                            "skipping malformed conversation record"
+                        );
+                    })
                     .ok()
                     .and_then(|parsed| parsed.message_id)
                     .is_some_and(|id| id == message_id);
@@ -1729,7 +1768,13 @@ impl ChatEngine {
         let key = channel_key(self.platform_info.slug(), origin.guild_id, service_channel);
         let mut notices = self.notices.lock();
         match notices.get(&key) {
-            Some(last) if last.elapsed() < NOTICE_COOLDOWN => false,
+            Some(last) if last.elapsed() < NOTICE_COOLDOWN => {
+                tracing::debug!(
+                    channel = origin.channel_id.get(),
+                    "error notice suppressed by cooldown"
+                );
+                false
+            }
             _ => {
                 notices.insert(key, Instant::now());
                 true
@@ -1821,13 +1866,25 @@ impl ChatEngine {
     /// The channel's calibration state; unreadable stats fall back to the
     /// default ratio (stats are observability, never reply-blocking).
     async fn load_stats(&self, storage: &Arc<dyn GuildStorage>, channel_id: u64) -> UsageStats {
-        storage
-            .get(NAMESPACE, &channel_stats_key(channel_id))
-            .await
-            .ok()
-            .flatten()
-            .and_then(|raw| serde_json::from_value(raw).ok())
-            .unwrap_or_default()
+        match storage.get(NAMESPACE, &channel_stats_key(channel_id)).await {
+            Ok(Some(raw)) => serde_json::from_value(raw).unwrap_or_else(|err| {
+                tracing::debug!(
+                    channel = channel_id,
+                    %err,
+                    "usage stats malformed - default estimate applies"
+                );
+                UsageStats::default()
+            }),
+            Ok(None) => UsageStats::default(),
+            Err(err) => {
+                tracing::debug!(
+                    channel = channel_id,
+                    %err,
+                    "usage stats unreadable - default estimate applies"
+                );
+                UsageStats::default()
+            }
+        }
     }
 }
 

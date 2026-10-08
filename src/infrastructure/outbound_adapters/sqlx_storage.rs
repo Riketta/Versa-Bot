@@ -149,13 +149,21 @@ impl StoragePort for SqlxStorage {
         }
         .map_err(|err| StorageError::Database(err.to_string()))?;
 
-        Ok(rows
+        let guilds = rows
             .into_iter()
-            .filter_map(|(platform, guild_id)| {
-                let guild_id = u64::try_from(guild_id).ok()?;
-                Some((platform, GuildId(guild_id)))
+            .filter_map(|(platform, guild_id)| match u64::try_from(guild_id) {
+                Ok(guild_id) => Some((platform, GuildId(guild_id))),
+                Err(_) => {
+                    tracing::debug!(
+                        platform,
+                        guild_id,
+                        "storage row with out-of-range guild id skipped"
+                    );
+                    None
+                }
             })
-            .collect())
+            .collect();
+        Ok(guilds)
     }
 }
 

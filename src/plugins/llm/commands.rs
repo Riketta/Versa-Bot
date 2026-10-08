@@ -659,6 +659,11 @@ impl CommandHandler for CutoffLlmHandler {
         storage
             .set(NAMESPACE, &channel_state_key(channel_id), serde_json::to_value(&state)?)
             .await?;
+        tracing::info!(
+            channel = channel_id,
+            cutoff = newest,
+            "conversation context reset by moderator"
+        );
 
         services
             .chat_output
@@ -723,6 +728,7 @@ impl CommandHandler for CutoffUndoLlmHandler {
             storage.set(NAMESPACE, &channel_state_key(channel_id), previous).await?;
         }
         storage.delete(NAMESPACE, &channel_state_undo_key(channel_id)).await?;
+        tracing::debug!(channel = channel_id, "llm cutoff undone - previous context restored");
 
         services
             .chat_output
@@ -857,17 +863,31 @@ async fn usage_lines(
     let limit = u32::try_from(window.max(1)).unwrap_or(u32::MAX);
     let mut context_chars = 0u64;
     let mut counted = 0u64;
-    for stored in storage.list_last(records_ns, limit).await.unwrap_or_default() {
+    let mut skipped = 0u64;
+    let stored = match storage.list_last(records_ns, limit).await {
+        Ok(stored) => stored,
+        Err(err) => {
+            tracing::debug!(%err, "usage estimate degraded - record log unreadable");
+            Vec::new()
+        }
+    };
+    for stored in stored {
         if stored.seq <= state.cutoff_seq {
             continue;
         }
-        if let Ok(record) = serde_json::from_value::<ConversationRecord>(stored.payload) {
-            // estimator: precision loss is fine
-            #[allow(clippy::cast_precision_loss)]
-            let chars = record.content.chars().count() as u64;
-            context_chars += chars;
-            counted += 1;
+        match serde_json::from_value::<ConversationRecord>(stored.payload) {
+            Ok(record) => {
+                // estimator: precision loss is fine
+                #[allow(clippy::cast_precision_loss)]
+                let chars = record.content.chars().count() as u64;
+                context_chars += chars;
+                counted += 1;
+            }
+            Err(_) => skipped += 1,
         }
+    }
+    if skipped > 0 {
+        tracing::debug!(skipped, "usage estimate skipped malformed records");
     }
     // estimator: precision loss is fine
     #[allow(clippy::cast_precision_loss)]

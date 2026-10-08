@@ -75,6 +75,7 @@ pub(crate) fn extract_tool_calls(content: &str) -> (String, Vec<ToolCall>) {
     let mut calls: Vec<ToolCall> = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut cursor = 0usize;
+    let mut capped = false;
     while let Some(found) = content.get(cursor..).and_then(|rest| rest.find("[[")) {
         let abs = cursor + found;
         let candidate = content.get(abs..).unwrap_or("");
@@ -86,6 +87,8 @@ pub(crate) fn extract_tool_calls(content: &str) -> (String, Vec<ToolCall>) {
                     // beyond it are consumed but not recorded.
                     if calls.len() < MAX_TOOL_CALLS {
                         calls.push(call);
+                    } else {
+                        capped = true;
                     }
                     spans.push((abs, end));
                 }
@@ -97,6 +100,12 @@ pub(crate) fn extract_tool_calls(content: &str) -> (String, Vec<ToolCall>) {
                 cursor = abs + 2;
             }
         }
+    }
+    if capped {
+        tracing::debug!(
+            cap = MAX_TOOL_CALLS,
+            "tool marker cap reached - excess markers consumed unrecorded"
+        );
     }
     if spans.is_empty() {
         return (content.to_owned(), calls);
@@ -352,6 +361,10 @@ impl MarkerHold {
             return;
         }
         if self.held.chars().count() >= MARKER_HOLD_LIMIT {
+            tracing::debug!(
+                limit = MARKER_HOLD_LIMIT,
+                "marker hold limit hit - candidate released as text"
+            );
             self.release(out);
         }
     }

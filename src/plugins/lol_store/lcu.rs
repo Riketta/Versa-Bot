@@ -539,11 +539,20 @@ impl LcuPort for LcuClient {
         // The table opens with a bare `-1` sentinel element, not an object,
         // and one degenerate entry must not blank the whole table - non-
         // object elements and entries without a usable name are skipped.
-        let champions = entries
-            .into_iter()
-            .filter_map(|entry| serde_json::from_value::<ChampionEntry>(entry).ok())
-            .filter(|entry| entry.name.as_deref().is_some_and(|name| !name.is_empty()))
-            .collect();
+        let mut champions = Vec::new();
+        let mut skipped = 0usize;
+        for entry in entries {
+            match serde_json::from_value::<ChampionEntry>(entry) {
+                Ok(entry) if entry.name.as_deref().is_some_and(|name| !name.is_empty()) => {
+                    champions.push(entry);
+                }
+                _ => skipped += 1,
+            }
+        }
+        if skipped > 0 {
+            // The sentinel alone accounts for one skip - debug, not warn.
+            tracing::debug!(path = %path, skipped, "champion summary entries skipped");
+        }
         Ok(champions)
     }
 }

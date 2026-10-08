@@ -113,8 +113,13 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        let kind = interaction.kind();
         let Some(command) = interaction.command() else {
-            return; // components/autocomplete/modal: no taxonomy kind yet
+            tracing::debug!(
+                kind = ?kind,
+                "non-command interaction ignored - no taxonomy kind yet"
+            );
+            return; // components/autocomplete/modal
         };
 
         // Interaction responses owe Discord an answer within ~3 seconds.

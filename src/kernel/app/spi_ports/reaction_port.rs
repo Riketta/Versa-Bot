@@ -30,11 +30,9 @@ pub struct UndeliverableReactionPort;
 
 #[async_trait]
 impl ReactionPort for UndeliverableReactionPort {
-    async fn add_reaction(
-        &self,
-        _message_id: MessageId,
-        _emoji: &str,
-    ) -> Result<(), OutboundError> {
+    async fn add_reaction(&self, message_id: MessageId, emoji: &str) -> Result<(), OutboundError> {
+        // The doc contract above: every failure is visible in debug logs.
+        tracing::debug!(?message_id, emoji, "reaction dropped - origin has no reactable message");
         Err(OutboundError::Reaction("this origin has no reactable message".to_owned()))
     }
 }

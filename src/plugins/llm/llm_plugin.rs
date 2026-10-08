@@ -191,25 +191,61 @@ impl LlmPlugin {
             .saturating_add(usize::try_from(keep_tail).unwrap_or(usize::MAX))
             .max(1);
         let limit = u32::try_from(window).unwrap_or(u32::MAX);
-        let cutoff = storage
-            .get(NAMESPACE, &channel_state_key(channel_id))
-            .await
-            .ok()
-            .flatten()
-            .and_then(|raw| serde_json::from_value::<ConversationState>(raw).ok())
-            .map_or(0, |state| state.cutoff_seq);
-        match storage.list_last(&records_namespace(channel_id), limit).await {
-            Ok(stored) => stored
-                .into_iter()
-                .filter(|record| record.seq > cutoff)
-                .filter_map(|record| {
-                    serde_json::from_value::<ConversationRecord>(record.payload).ok()
-                })
-                .any(|record| {
-                    record.role == RecordRole::Assistant && record.message_id == Some(reply_to)
-                }),
+        let cutoff = match storage.get(NAMESPACE, &channel_state_key(channel_id)).await {
+            Ok(Some(raw)) => match serde_json::from_value::<ConversationState>(raw) {
+                Ok(state) => state.cutoff_seq,
+                Err(err) => {
+                    tracing::debug!(
+                        channel = channel_id,
+                        %err,
+                        "conversation state unreadable in trigger check - cutoff treated as 0"
+                    );
+                    0
+                }
+            },
+            Ok(None) => 0,
             Err(err) => {
-                tracing::warn!(channel = channel_id, %err, "reply-trigger check failed after engine panic");
+                tracing::debug!(
+                    channel = channel_id,
+                    %err,
+                    "conversation state read failed in trigger check - cutoff treated as 0"
+                );
+                0
+            }
+        };
+        match storage.list_last(&records_namespace(channel_id), limit).await {
+            Ok(stored) => {
+                let mut skipped = 0usize;
+                let found = stored
+                    .into_iter()
+                    .filter(|record| record.seq > cutoff)
+                    .filter_map(|record| {
+                        match serde_json::from_value::<ConversationRecord>(record.payload) {
+                            Ok(parsed) => Some(parsed),
+                            Err(_) => {
+                                skipped += 1;
+                                None
+                            }
+                        }
+                    })
+                    .any(|record| {
+                        record.role == RecordRole::Assistant && record.message_id == Some(reply_to)
+                    });
+                if skipped > 0 {
+                    tracing::debug!(
+                        channel = channel_id,
+                        skipped,
+                        "malformed records skipped in trigger check"
+                    );
+                }
+                found
+            }
+            Err(err) => {
+                tracing::warn!(
+                    channel = channel_id,
+                    %err,
+                    "reply-trigger check failed after engine panic"
+                );
                 false
             }
         }
@@ -601,6 +637,7 @@ impl PluginPort for LlmPlugin {
         // runtime drops right after `main` returns, killing the task).
         // The composition root awaits [`Self::flush_usage_totals`]
         // (bounded) after the kernel shutdown instead.
+        tracing::debug!("llm plugin stopped - admission gate closed, usage flush job cancelled");
         Ok(())
     }
 }

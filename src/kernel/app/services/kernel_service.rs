@@ -119,7 +119,14 @@ impl<E: EventBusPort> KernelService<E> {
         let plugins = self.validated_plugins()?;
 
         for plugin in &plugins {
-            plugin.init()?;
+            if let Err(err) = plugin.init() {
+                tracing::error!(
+                    plugin = plugin.name(),
+                    %err,
+                    "plugin init failed - aborting boot"
+                );
+                return Err(err);
+            }
         }
 
         let mut started: Vec<Arc<dyn PluginPort>> = Vec::new();
@@ -127,6 +134,11 @@ impl<E: EventBusPort> KernelService<E> {
             match plugin.start() {
                 Ok(()) => started.push(Arc::clone(plugin)),
                 Err(err) => {
+                    tracing::error!(
+                        plugin = plugin.name(),
+                        %err,
+                        "plugin start failed - aborting boot"
+                    );
                     Self::rollback_started(&started);
                     return Err(err);
                 }
@@ -241,6 +253,7 @@ impl<E: EventBusPort> KernelService<E> {
         for plugin in started.iter().rev() {
             Self::stop_quietly(plugin);
         }
+        tracing::debug!(plugins = started.len(), "kernel shutdown complete");
     }
 
     /// Event-scoped service context: outbound ports and storage bound to the

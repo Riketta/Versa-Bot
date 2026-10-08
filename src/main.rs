@@ -351,7 +351,12 @@ async fn main() -> ExitCode {
     // The usage flush cannot run inside the plugin's sync `stop` (it would
     // race process exit as a detached task) - the composition root awaits
     // it here, bounded: a graceful restart must not hang on observability.
-    let _timeout = tokio::time::timeout(Duration::from_secs(3), llm.flush_usage_totals()).await;
+    match tokio::time::timeout(Duration::from_secs(3), llm.flush_usage_totals()).await {
+        Ok(()) => tracing::debug!("final usage flush completed"),
+        Err(_) => {
+            tracing::warn!("final usage flush timed out after 3s - pending usage totals lost");
+        }
+    }
     gateway_exit_code(start_result)
 }
 

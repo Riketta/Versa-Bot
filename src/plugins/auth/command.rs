@@ -160,20 +160,24 @@ fn target_of(args: &CommandArgs) -> Result<Target, OutboundMessage> {
 /// The `tier` argument, required by `set` and `default`.
 async fn tier_of(services: &KernelServices, args: &CommandArgs) -> Result<AccessTier, ()> {
     let Some(raw) = args.get("tier") else {
-        reply(services, text("Specify a `tier`: banned, guest, user, moderator, admin."))
-            .await
-            .ok();
+        if let Err(err) =
+            reply(services, text("Specify a `tier`: banned, guest, user, moderator, admin.")).await
+        {
+            tracing::warn!(%err, "failed to deliver /auth usage notice");
+        }
         return Err(());
     };
     let Some(tier) = parse_tier(raw) else {
-        reply(
+        if let Err(err) = reply(
             services,
             text(format!(
                 "Unknown tier `{raw}`. Use one of: banned, guest, user, moderator, admin."
             )),
         )
         .await
-        .ok();
+        {
+            tracing::warn!(%err, "failed to deliver /auth usage notice");
+        }
         return Err(());
     };
     Ok(tier)
@@ -356,9 +360,26 @@ async fn read_policy(storage: &dyn GuildStorage) -> Result<AuthConfig, OutboundM
     let value = match storage.get(NAMESPACE, CONFIG_KEY).await {
         Ok(None) => return Ok(AuthConfig::default()),
         Ok(Some(value)) => value,
-        Err(_) => return Err(unavailable()),
+        Err(err) => {
+            tracing::warn!(
+                namespace = NAMESPACE,
+                %err,
+                "auth policy unreadable on the command path"
+            );
+            return Err(unavailable());
+        }
     };
-    serde_json::from_value(value).map_err(|_| unavailable())
+    match serde_json::from_value(value) {
+        Ok(policy) => Ok(policy),
+        Err(err) => {
+            tracing::warn!(
+                namespace = NAMESPACE,
+                %err,
+                "auth policy malformed on the command path"
+            );
+            Err(unavailable())
+        }
+    }
 }
 
 /// Assignments rendered per embed section. Discord caps one embed's
