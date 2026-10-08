@@ -150,9 +150,24 @@ impl NameIndex {
         Self::item_champion_id(item)
     }
 
-    fn original_price(&self, item_id: u64) -> Option<u64> {
+    /// The catalog's original RP price of an item - the sale-percentage
+    /// base shared by announcements and the history digests.
+    pub(crate) fn original_price(&self, item_id: u64) -> Option<u64> {
         self.catalog.get(&item_id).and_then(|item| rp_price(&item.prices))
     }
+}
+
+/// Percent off against the original price, rounded to the nearest whole
+/// percent; `None` unless there is a real discount. `u128` intermediates:
+/// catalog prices are untrusted LCU data, and `original * 200` would
+/// overflow `u64` on corrupted values.
+pub(crate) fn percent_off(original: u64, cost: u64) -> Option<u64> {
+    if original == 0 || cost >= original {
+        return None;
+    }
+    let percent =
+        (u128::from(original - cost) * 200 + u128::from(original)) / (u128::from(original) * 2);
+    u64::try_from(percent).ok()
 }
 
 /// One renderable announcement block: a bold title and optional body
@@ -435,11 +450,7 @@ pub(crate) fn sale_line(sale: &super::lcu::Sale, index: &NameIndex, with_date: b
     // Percentage off, computed against the catalog's original price (the
     // payload's own `discount` field is dead - always 0.0).
     if let (Some(original), Some(cost)) = (index.original_price(item_id), sale_price) {
-        if original > cost && original > 0 {
-            // u128 intermediates: catalog prices are untrusted LCU data, and
-            // `original * 200` would overflow u64 on corrupted values.
-            let percent = (u128::from(original - cost) * 200 + u128::from(original))
-                / (u128::from(original) * 2);
+        if let Some(percent) = percent_off(original, cost) {
             line.push_str(&format!(" \u{2212}{percent}%"));
         }
     }

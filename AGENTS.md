@@ -109,9 +109,8 @@ Dockerfile, and local dev.
   exposes to plugins. One active adapter, one instance per kernel, owned by
   the kernel, wired at the composition root, shared with plugins via
   injection. `PluginStoragePort` is the one deliberately NOT
-  guild-partitioned view: plugin-global documents for operator-side
-  aggregates and settings (counters, ids, keys) - user content (message
-  text, prompts) must never land there.
+  guild-partitioned view: plugin-global documents (counters, caches,
+  dumps, aggregates) - plugins use it as they see fit.
 - Plugin-facing ports (`PluginPort`, `MiddlewarePluginPort`): contracts
   plugins implement - many adapters, one per participating plugin.
   `PluginPort` is the full implementation surface: identity + lifecycle

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Failure modes of the local League client link. `Offline` is the expected
@@ -30,7 +30,7 @@ pub enum LcuError {
 }
 
 /// One store price entry (`cost` in `currency`, RP for everything tracked).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Price {
     #[serde(default)]
     pub cost: Option<u64>,
@@ -39,7 +39,7 @@ pub struct Price {
 }
 
 /// A pointer to a store item (`inventoryType` + numeric `itemId`).
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ItemRef {
     #[serde(default)]
@@ -49,7 +49,7 @@ pub struct ItemRef {
 }
 
 /// Localized store text; the catalog carries one entry per client locale.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LocalizedText {
     #[serde(default)]
     pub name: Option<String>,
@@ -70,7 +70,7 @@ where
 /// One full-catalog entry (`GET /lol-store/v1/catalog`). Only the fields the
 /// trackers consume are modeled; everything else is ignored, so Riot-side
 /// additions stay harmless.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogItem {
     #[serde(default)]
@@ -88,7 +88,7 @@ pub struct CatalogItem {
 /// One active sale (`GET /lol-store/v1/catalog/sales`). The payload's
 /// `discount` field is dead (always `0.0` in practice) - the percentage is
 /// computed against the catalog's original price instead.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Sale {
     #[serde(default)]
@@ -99,7 +99,7 @@ pub struct Sale {
     pub sale: SaleInfo,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SaleInfo {
     #[serde(default)]
@@ -111,7 +111,7 @@ pub struct SaleInfo {
 }
 
 /// Shoppefront metadata nested inside a store's `displayMetadata`.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ShoppefrontMeta {
     #[serde(default)]
     pub id: Option<String>,
@@ -119,14 +119,14 @@ pub struct ShoppefrontMeta {
     pub categories: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DisplayMetadata {
     #[serde(default)]
     pub shoppefront: Option<ShoppefrontMeta>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RotatingMetadata {
     #[serde(default)]
@@ -139,7 +139,7 @@ pub struct RotatingMetadata {
 
 /// One structured payment option of a store entry; the Mythic Essence price
 /// lives in the payment named `lol_mythic_essence`.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Payment {
     #[serde(default)]
@@ -148,7 +148,7 @@ pub struct Payment {
     pub final_delta: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PaymentOption {
     #[serde(default)]
@@ -157,14 +157,14 @@ pub struct PaymentOption {
 
 /// What a purchased store entry grants; its `name` is the display name
 /// (e.g. `Prestige Ocean Song Seraphine`).
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Fulfillment {
     #[serde(default)]
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PurchaseUnit {
     #[serde(default)]
@@ -174,7 +174,7 @@ pub struct PurchaseUnit {
 }
 
 /// One catalog entry of a Shoppefront store (one rotation slot).
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct StoreEntry {
     #[serde(default)]
@@ -189,7 +189,7 @@ pub struct StoreEntry {
 
 /// One Shoppefront store (`GET /lol-shoppefront/v1/stores`). Rotation stores
 /// (Mythic Shop) carry `rotatingStoreMetadata` with a cadence.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RotationStore {
     #[serde(default)]
@@ -225,7 +225,7 @@ impl RotationStore {
 }
 
 /// Your Shop event state (`GET /lol-yourshop/v1/status`).
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct YourShopStatus {
     #[serde(default)]

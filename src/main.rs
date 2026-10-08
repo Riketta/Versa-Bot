@@ -39,8 +39,8 @@ use versa_bot::plugins::lol_leaderboard::{
     LeaderboardPlugin, LeaderboardSourcePort, ResolvedView as LeaderboardView,
 };
 use versa_bot::plugins::lol_store::{
-    AnnounceFlags, DEFAULT_GUILD_CAP, DEFAULT_USER_CAP, EngineSettings, LcuClient, LolStorePlugin,
-    StoreEngine,
+    AnnounceFlags, DEFAULT_GUILD_CAP, DEFAULT_HISTORY_DAYS, DEFAULT_USER_CAP, EngineSettings,
+    LcuClient, LolStorePlugin, StoreEngine,
 };
 use versa_bot::plugins::nickname::NicknamePlugin;
 use versa_bot::plugins::status::{StatusRotatorPlugin, StatusSettings};
@@ -207,7 +207,9 @@ async fn main() -> ExitCode {
     // when the watcher is off). The LCU client and the poll engine are
     // built once here; enabling or disabling the watcher stays startup-only
     // (absent section, empty lockfile path, zero poll), while the announce
-    // flags and watch caps hot-reload.
+    // flags, watch caps, and history retention hot-reload. The store state
+    // and history are deployment-wide: they persist in plugin-global
+    // storage, not guild storage.
     let lol_settings = lol_store_engine_settings(config.lol_store.as_ref());
     let lcu_client = LcuClient::new(
         config.lol_store.as_ref().map(|store| store.lockfile_path.clone()).unwrap_or_default(),
@@ -217,6 +219,7 @@ async fn main() -> ExitCode {
     let lol_engine = Arc::new(StoreEngine::new(
         Arc::new(lcu_client) as Arc<dyn versa_bot::plugins::lol_store::lcu::LcuPort>,
         Arc::clone(&storage) as Arc<dyn StoragePort>,
+        storage.plugin_scoped(platform_info.slug()),
         Arc::clone(&chat_factory),
         event_bus.clone(),
         Arc::clone(&platform_info),
@@ -558,6 +561,7 @@ fn lol_store_engine_settings(lol_store: Option<&LolStoreConfig>) -> EngineSettin
         flags: AnnounceFlags::all_on(),
         watch_user_cap: DEFAULT_USER_CAP,
         watch_guild_cap: DEFAULT_GUILD_CAP,
+        history_days: DEFAULT_HISTORY_DAYS,
     };
     let Some(lol_store) = lol_store else { return disabled };
     if lol_store.lockfile_path.is_empty() {
@@ -578,6 +582,7 @@ fn lol_store_engine_settings(lol_store: Option<&LolStoreConfig>) -> EngineSettin
         },
         watch_user_cap: lol_store.watch_user_cap,
         watch_guild_cap: lol_store.watch_guild_cap,
+        history_days: lol_store.history_days,
     }
 }
 
@@ -745,8 +750,9 @@ impl ConfigChangeHandler<Configuration> for AuthOwnersReloader {
     }
 }
 
-/// Applies `[lol_store]` value changes (announce flags, watch caps) to the
-/// poll engine. The poll cadence, lockfile path and LCU address stay
+/// Applies `[lol_store]` value changes (announce flags, watch caps, history
+/// retention) to the poll engine. The poll cadence, lockfile path and LCU
+/// address stay
 /// boot-frozen - the poll job is scheduled once and the client is built
 /// once - so enabling or disabling the watcher remains a restart-level
 /// change: a config that maps to disabled leaves the current values

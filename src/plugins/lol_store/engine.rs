@@ -3,13 +3,16 @@
 //! every guild that enabled the tracker; watch subscriptions are matched
 //! against the same delta (independent of the announce flags).
 //!
-//! State layering: the live `last_seen` is in-memory (one store per bot -
-//! the League client is local). A compacted copy is persisted per enabled
-//! guild (`last_seen` doc in the plugin namespace) purely for boot catch-up:
-//! after a restart the engine loads the first persisted copy and announces
-//! what changed while it was down; with no persisted copy the first
-//! successful poll is a silent baseline. The last raw snapshot is kept
-//! in-memory per source (subscribe-time watch status, name-join fallback).
+//! State layering: the live `last_seen` and the last raw snapshot are
+//! in-memory (one store per bot - the League client is local). Both are
+//! persisted together in the plugin-global `store_dump` document
+//! ([`PluginStorage`], not guild storage - the store is deployment-wide)
+//! whenever anything changed: after a restart the engine adopts the
+//! document and announces what changed while it was down; with no document
+//! the first successful poll is a silent baseline. A deployment upgraded
+//! from the old per-guild `last_seen` copies migrates once on boot (adopt,
+//! write the document, delete the copies). Per-UTC-day history digests
+//! (`history.<day>`, see [`super::history`]) ride the same change gate.
 //! The per-guild record log receives every announcement and watch ping -
 //! user-facing history, never consulted for detection.
 
@@ -24,7 +27,7 @@ use parking_lot::Mutex;
 use crate::kernel::models::{ChannelId, Embed, GuildId, Origin, OutboundMessage, UserId};
 use crate::kernel::plugin_ports::{EventBusPort, Job};
 use crate::kernel::spi_ports::{
-    ChatOutputFactoryPort, GuildStorage, PlatformInfoPort, StoragePort,
+    ChatOutputFactoryPort, GuildStorage, PlatformInfoPort, PluginStorage, StoragePort,
 };
 
 use super::diff::{
@@ -32,6 +35,7 @@ use super::diff::{
 };
 use super::events::{LolStoreAnnounced, StoreEventKind};
 use super::format::{NameIndex, announce_pages, champion_map};
+use super::history::{self, DayDigest};
 use super::lcu::LcuPort;
 use super::watch::{self, StoreSearch, WatchDoc, WatchTarget};
 
@@ -39,8 +43,18 @@ use super::watch::{self, StoreSearch, WatchDoc, WatchTarget};
 pub const NAMESPACE: &str = "lol_store";
 /// Guild config document: enabled flag + announcement channel.
 pub const CONFIG_KEY: &str = "config";
-/// Boot catch-up document: the compacted last-seen store state.
+/// Plugin-global document: the compacted last-seen state plus the last raw
+/// snapshot, written whenever either changed - boot catch-up source and the
+/// `/lol_store_dump` fallback.
+pub const STORE_DUMP_KEY: &str = "store_dump";
+/// Legacy boot catch-up document (pre-consolidation: a compacted copy per
+/// enabled guild). Migrated into [`STORE_DUMP_KEY`] on first boot and then
+/// deleted; never written again.
 pub const LAST_SEEN_KEY: &str = "last_seen";
+/// Schema version of the [`STORE_DUMP_KEY`] document.
+pub(crate) const STORE_SCHEMA: u32 = 1;
+/// Days of store history retained by default (`history_days`).
+pub const DEFAULT_HISTORY_DAYS: u32 = 90;
 
 /// Which trackers announce. Unannounced trackers still update the state, so
 /// re-enabling never replays old events.
@@ -61,8 +75,9 @@ impl AnnounceFlags {
 }
 
 /// Engine construction settings (`[lol_store]` config section). The announce
-/// flags and watch caps hot-reload ([`Self::update_settings`]); the poll
-/// interval is boot-frozen with the scheduled poll job.
+/// flags, watch caps, and the history retention hot-reload
+/// ([`Self::update_settings`]); the poll interval is boot-frozen with the
+/// scheduled poll job.
 #[derive(Debug, Clone)]
 pub struct EngineSettings {
     pub poll: Duration,
@@ -72,6 +87,39 @@ pub struct EngineSettings {
     pub watch_user_cap: u32,
     /// Maximum watches per guild.
     pub watch_guild_cap: u32,
+    /// Days of store history retained (`history_days`); `0` disables
+    /// recording. Older day digests are pruned on the next write.
+    pub history_days: u32,
+}
+
+/// The plugin-global store document (`store_dump` key): the compacted
+/// catch-up state plus the last raw snapshot in one atomically-written
+/// value. Restored wholesale on boot; written whenever either half changed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PersistedStore {
+    pub(crate) schema: u32,
+    pub(crate) saved_at_unix: u64,
+    #[serde(default)]
+    pub(crate) last_seen: LastSeen,
+    #[serde(default)]
+    pub(crate) snapshot: Snapshot,
+}
+
+/// Does the snapshot carry at least one fetched section? The restore and
+/// history paths must not act on an all-empty snapshot (a migration adopt
+/// or a write-less cycle).
+pub(crate) fn has_store_data(snapshot: &Snapshot) -> bool {
+    snapshot.sales.is_some()
+        || snapshot.catalog.is_some()
+        || snapshot.rotations.is_some()
+        || snapshot.yourshop.is_some()
+}
+
+/// Does the snapshot carry at least one section the current-state dump
+/// renders (sales, rotations, Your Shop)? The catalog alone renders
+/// nothing there.
+fn has_renderable_data(snapshot: &Snapshot) -> bool {
+    snapshot.sales.is_some() || snapshot.rotations.is_some() || snapshot.yourshop.is_some()
 }
 
 /// Per-guild config document shape.
@@ -90,15 +138,13 @@ pub struct GuildConfig {
 }
 
 /// One guild discovered for a poll cycle's fan-out: the scoped storage
-/// handle and the tracker config's channel assignment. `channel` is
-/// `Some` only for enabled guilds with an assigned channel (the
-/// announce/watch fan-out); every discovered guild - disabled ones
-/// included - receives catch-up persistence, so the existence of a
-/// config document is the only membership condition.
+/// handle plus the tracker config's channel assignment. Only guilds that
+/// enabled the tracker AND assigned a channel are discovered - the fan-out
+/// audience; catch-up persistence is plugin-global and needs no guilds.
 struct DiscoveredGuild {
     guild_id: GuildId,
     storage: Arc<dyn GuildStorage>,
-    channel: Option<ChannelId>,
+    channel: ChannelId,
     role_id: Option<String>,
 }
 
@@ -107,6 +153,10 @@ struct DiscoveredGuild {
 pub struct StoreEngine<B: EventBusPort> {
     lcu: Arc<dyn LcuPort>,
     storage: Arc<dyn StoragePort>,
+    /// Plugin-global documents: the consolidated `store_dump` catch-up
+    /// document and the per-day history digests live here (the store is
+    /// deployment-wide - it must not fan out into guild storage).
+    plugin_storage: Arc<dyn PluginStorage>,
     factory: Arc<dyn ChatOutputFactoryPort>,
     bus: B,
     /// The deployment's platform identity - subscriptions of other slugs
@@ -119,8 +169,8 @@ pub struct StoreEngine<B: EventBusPort> {
     /// Last good raw snapshot, one section per source: a source that
     /// failed this cycle keeps its previous data. Feeds name joins when a
     /// source fails mid-cycle (instead of synthetic ids frozen into the
-    /// permanent record) and subscribe-time watch status. In-memory only -
-    /// the compacted `LastSeen` is the persisted catch-up state.
+    /// permanent record), subscribe-time watch status, and the current-
+    /// state dump. Restored from the persisted document at boot.
     last_snapshot: Mutex<Option<Snapshot>>,
     /// Bumped whenever the retention block above writes; keys the cached
     /// name index (see [`StoreEngine::cached_index`]).
@@ -141,6 +191,7 @@ impl<B: EventBusPort> StoreEngine<B> {
     pub fn new(
         lcu: Arc<dyn LcuPort>,
         storage: Arc<dyn StoragePort>,
+        plugin_storage: Arc<dyn PluginStorage>,
         factory: Arc<dyn ChatOutputFactoryPort>,
         bus: B,
         platform: Arc<dyn PlatformInfoPort>,
@@ -149,6 +200,7 @@ impl<B: EventBusPort> StoreEngine<B> {
         Self {
             lcu,
             storage,
+            plugin_storage,
             factory,
             bus,
             platform,
@@ -169,17 +221,18 @@ impl<B: EventBusPort> StoreEngine<B> {
         self.settings.lock().clone()
     }
 
-    /// Hot reload: swaps the announce flags and watch caps; the poll
-    /// interval is kept - the poll job's cadence is fixed at schedule time,
-    /// so a runtime change would only fork the cell from the running job
-    /// (enabling or disabling the watcher stays a boot-time decision).
-    /// Identical values are a no-op, so unrelated config edits change
-    /// nothing.
+    /// Hot reload: swaps the announce flags, watch caps, and the history
+    /// retention; the poll interval is kept - the poll job's cadence is
+    /// fixed at schedule time, so a runtime change would only fork the cell
+    /// from the running job (enabling or disabling the watcher stays a
+    /// boot-time decision). Identical values are a no-op, so unrelated
+    /// config edits change nothing.
     pub fn update_settings(&self, settings: EngineSettings) {
         let mut current = self.settings.lock();
         if current.flags == settings.flags
             && current.watch_user_cap == settings.watch_user_cap
             && current.watch_guild_cap == settings.watch_guild_cap
+            && current.history_days == settings.history_days
         {
             return;
         }
@@ -217,9 +270,16 @@ impl<B: EventBusPort> StoreEngine<B> {
                 current.watch_guild_cap, settings.watch_guild_cap
             ));
         }
+        if current.history_days != settings.history_days {
+            changes.push(format!(
+                "history_days {} -> {}",
+                current.history_days, settings.history_days
+            ));
+        }
         current.flags = settings.flags;
         current.watch_user_cap = settings.watch_user_cap;
         current.watch_guild_cap = settings.watch_guild_cap;
+        current.history_days = settings.history_days;
         drop(current);
         tracing::info!(changes = ?changes, "config lol_store hot-reloaded");
     }
@@ -229,14 +289,26 @@ impl<B: EventBusPort> StoreEngine<B> {
     pub async fn tick(&self) {
         *self.last_poll.lock() = Some(Instant::now());
 
-        // Boot catch-up: with no in-memory state, adopt the first persisted
-        // copy so the diff announces what happened while the bot was down.
+        // Boot catch-up: with no in-memory state, adopt the persisted
+        // document so the diff announces what happened while the bot was
+        // down. The document's raw snapshot also re-arms the name joins,
+        // watch subscribe-status, and the current-state dump before the
+        // first successful poll (e.g. the client is still offline).
         let mut catchup = false;
+        let mut migrated = false;
         if self.state.lock().is_none() {
-            if let Some(persisted) = self.load_persisted_state().await {
+            if let Some((persisted, from_legacy)) = self.load_persisted().await {
                 tracing::debug!("adopting persisted store state for catch-up");
-                *self.state.lock() = Some(Arc::new(persisted));
+                *self.state.lock() = Some(Arc::new(persisted.last_seen));
+                {
+                    let mut retained = self.last_snapshot.lock();
+                    if retained.is_none() && has_store_data(&persisted.snapshot) {
+                        *retained = Some(persisted.snapshot);
+                        self.snapshot_generation.fetch_add(1, Ordering::Release);
+                    }
+                }
                 catchup = true;
+                migrated = from_legacy;
             }
         }
         // Refcount bump, not a deep copy: the tracked sets stay put.
@@ -294,37 +366,39 @@ impl<B: EventBusPort> StoreEngine<B> {
             );
         }
 
-        // Retain the raw snapshot per successful source (name-join fallback
-        // and subscribe-time watch status); failed sections keep their
-        // previous data. Cached at fetch time: the fallback must exist even
-        // for cycles where a source failed and nothing announces. The
-        // generation keys the name-index cache - it bumps only when a
-        // retained section actually changed, so an unchanged store does not
-        // force a full-catalog rebuild for the next watch command.
+        // Retain the raw snapshot per successful source (name-join fallback,
+        // subscribe-time watch status, the current-state dump, and the dump
+        // document's raw half); failed sections keep their previous data.
+        // Cached at fetch time: the fallback must exist even for cycles
+        // where a source failed and nothing announces. The generation keys
+        // the name-index cache - it bumps only when a retained section
+        // actually changed, so an unchanged store does not force a
+        // full-catalog rebuild for the next watch command. The same flag
+        // gates the persistence write below.
+        let mut raw_changed = false;
         {
             let mut retained = self.last_snapshot.lock();
             let slot = retained.get_or_insert_with(Snapshot::default);
             // Assignment only on change: the unchanged catalog (thousands
             // of localized items) must not deep-clone every cycle. The
             // allocation-free deep compare stays - it keys the generation.
-            let mut changed = false;
             if snapshot.sales.is_some() && slot.sales != snapshot.sales {
-                changed = true;
+                raw_changed = true;
                 slot.sales = snapshot.sales.clone();
             }
             if snapshot.catalog.is_some() && slot.catalog != snapshot.catalog {
-                changed = true;
+                raw_changed = true;
                 slot.catalog = snapshot.catalog.clone();
             }
             if snapshot.rotations.is_some() && slot.rotations != snapshot.rotations {
-                changed = true;
+                raw_changed = true;
                 slot.rotations = snapshot.rotations.clone();
             }
             if snapshot.yourshop.is_some() && slot.yourshop != snapshot.yourshop {
-                changed = true;
+                raw_changed = true;
                 slot.yourshop = snapshot.yourshop.clone();
             }
-            if changed {
+            if raw_changed {
                 self.snapshot_generation.fetch_add(1, Ordering::Release);
             }
         }
@@ -347,12 +421,10 @@ impl<B: EventBusPort> StoreEngine<B> {
         }
 
         // One discovery pass per cycle - but only when something needs it:
-        // the fan-out (delta found) or catch-up persistence (state changed).
-        // `list_guilds` plus one config read per guild then serve
-        // announcements, watch pings, and persistence alike (previously two
-        // separate scans per changed cycle).
-        let discovered =
-            if full.is_some() || changed { self.discover_guilds().await } else { Vec::new() };
+        // the fan-out (delta found). Persistence no longer needs guilds -
+        // the store document and history digests live plugin-globally - so
+        // `list_guilds` runs only for announcements and watch pings.
+        let discovered = if full.is_some() { self.discover_guilds().await } else { Vec::new() };
 
         // Announce and notify before the state swap: formatting joins
         // against the freshly retained catalog (the retention block above
@@ -374,10 +446,9 @@ impl<B: EventBusPort> StoreEngine<B> {
                 // default snapshot), kept total for the same reason.
                 Arc::new(NameIndex::empty())
             });
-            // Enabled guilds only (channel assigned); announcements and
-            // watch pings see the same discovery snapshot.
-            let targets: Vec<&DiscoveredGuild> =
-                discovered.iter().filter(|guild| guild.channel.is_some()).collect();
+            // Every discovered guild enabled the tracker with a channel -
+            // announcements and watch pings see the same discovery snapshot.
+            let targets: Vec<&DiscoveredGuild> = discovered.iter().collect();
             // The general feed honors the announce flags (stripped copy);
             // personal watches see the full delta below.
             let mut feed = delta.clone();
@@ -411,9 +482,20 @@ impl<B: EventBusPort> StoreEngine<B> {
         }
         let delta_found = full.is_some();
 
-        if changed {
-            *self.state.lock() = Some(Arc::clone(&current));
-            self.persist_state(&current, &discovered).await;
+        // Persist when anything the plugin-global document carries changed:
+        // the compacted state (`changed`), any raw section (`raw_changed` -
+        // the dump and the day digest ride the same write), or the one-time
+        // legacy migration. Guild storage is no longer touched here.
+        let mut history_written = false;
+        if changed || raw_changed || migrated {
+            if changed {
+                *self.state.lock() = Some(Arc::clone(&current));
+            }
+            self.persist_store(&current).await;
+            if migrated {
+                self.cleanup_legacy_state().await;
+            }
+            history_written = self.write_history_digest().await;
         }
 
         tracing::debug!(
@@ -421,7 +503,8 @@ impl<B: EventBusPort> StoreEngine<B> {
             skins = current.skins.len(),
             rotations = current.rotations.len(),
             delta_found,
-            persisted = changed,
+            persisted = changed || raw_changed || migrated,
+            history = history_written,
             catchup,
             "store poll complete"
         );
@@ -485,15 +568,12 @@ impl<B: EventBusPort> StoreEngine<B> {
                 description: page.clone(),
             })
             .collect();
-        let at_unix =
-            SystemTime::now().duration_since(UNIX_EPOCH).map(|since| since.as_secs()).unwrap_or(0);
+        let at_unix = unix_now();
         let record_text = pages.join("\n\n");
 
         let mut delivered_guilds = 0usize;
         for target in targets {
-            let Some(channel_id) = target.channel else {
-                continue;
-            };
+            let channel_id = target.channel;
             let guild_id = target.guild_id;
             let role_id = &target.role_id;
             let origin = Origin {
@@ -636,9 +716,7 @@ impl<B: EventBusPort> StoreEngine<B> {
         let embed_budget = self.embed_budget();
         let tag_budget = watch::tag_budget(self.platform.message_limit());
         for target in targets {
-            let Some(channel_id) = target.channel else {
-                continue;
-            };
+            let channel_id = target.channel;
             let guild_id = target.guild_id;
             let storage = &target.storage;
             let doc = match storage.get(NAMESPACE, watch::WATCH_KEY).await {
@@ -680,10 +758,7 @@ impl<B: EventBusPort> StoreEngine<B> {
                 tracing::warn!(%err, guild = guild_id.get(), "failed to deliver store watch notification");
                 continue;
             }
-            let at_unix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|since| since.as_secs())
-                .unwrap_or(0);
+            let at_unix = unix_now();
             if let Err(err) = storage
                 .append(
                     NAMESPACE,
@@ -767,16 +842,16 @@ impl<B: EventBusPort> StoreEngine<B> {
         Some(lines)
     }
 
-    /// One discovery pass per poll cycle: `list_guilds` plus one config
-    /// read per guild serve announcements, watch pings, and catch-up
-    /// persistence alike. Rows of other slugs (storage written by a
-    /// differently-wired deployment) are skipped.
+    /// One discovery pass per fan-out cycle: `list_guilds` plus one config
+    /// read per enabled guild serve announcements and watch pings. Rows of
+    /// other slugs (storage written by a differently-wired deployment) are
+    /// skipped; a guild without a readable config has no announcement
+    /// target and is skipped too.
     async fn discover_guilds(&self) -> Vec<DiscoveredGuild> {
         let mut discovered = Vec::new();
         let Ok(guilds) = self.storage.list_guilds().await else {
             tracing::warn!(
-                "guild listing failed - no store announcements, watch pings, or catch-up \
-                 persistence this cycle"
+                "guild listing failed - no store announcements or watch pings this cycle"
             );
             return Vec::new();
         };
@@ -787,7 +862,7 @@ impl<B: EventBusPort> StoreEngine<B> {
             let storage = self.storage.guild_scoped(self.platform.slug(), guild_id);
             let raw = match storage.get(NAMESPACE, CONFIG_KEY).await {
                 Ok(Some(raw)) => raw,
-                // No config document: neither fan-out nor persistence.
+                // No config document: nothing to fan out to.
                 Ok(None) => continue,
                 Err(err) => {
                     tracing::warn!(
@@ -801,15 +876,8 @@ impl<B: EventBusPort> StoreEngine<B> {
             let Ok(config) = serde_json::from_value::<GuildConfig>(raw) else {
                 tracing::warn!(
                     guild = guild_id.get(),
-                    "store tracker config malformed - announce skipped, persistence kept"
+                    "store tracker config malformed - announcements skipped for this guild"
                 );
-                // The document exists, so catch-up coverage still applies.
-                discovered.push(DiscoveredGuild {
-                    guild_id,
-                    storage,
-                    channel: None,
-                    role_id: None,
-                });
                 continue;
             };
             let channel = config
@@ -822,12 +890,15 @@ impl<B: EventBusPort> StoreEngine<B> {
                         .map(ChannelId)
                 })
                 .flatten();
-            if config.enabled && channel.is_none() {
-                tracing::debug!(
-                    guild = guild_id.get(),
-                    "store tracker enabled but channel missing"
-                );
-            }
+            let Some(channel) = channel else {
+                if config.enabled {
+                    tracing::debug!(
+                        guild = guild_id.get(),
+                        "store tracker enabled but channel missing"
+                    );
+                }
+                continue;
+            };
             if let Some(role) = &config.role_id
                 && role.parse::<u64>().is_err()
             {
@@ -867,12 +938,55 @@ impl<B: EventBusPort> StoreEngine<B> {
         Some(index)
     }
 
-    /// Boot catch-up source: the first persisted `last_seen` among known
-    /// guilds (the copies are identical by construction; a guild whose
-    /// persist failed keeps a stale copy, and the first readable one wins
-    /// - bounded by at-most-once delivery, so the skew costs at most one
-    /// replayed or missed delta after a restart).
-    async fn load_persisted_state(&self) -> Option<LastSeen> {
+    /// Boot catch-up source: the plugin-global store document, or - for a
+    /// deployment upgrading from the per-guild layout - the first legacy
+    /// `last_seen` copy among known guilds (the copies are identical by
+    /// construction; a guild whose persist failed keeps a stale copy, and
+    /// the first readable one wins - bounded by at-most-once delivery, so
+    /// the skew costs at most one replayed or missed delta after a
+    /// restart). The `bool` marks the legacy path: the caller force-writes
+    /// the new document and deletes the copies.
+    async fn load_persisted(&self) -> Option<(PersistedStore, bool)> {
+        if let Some(doc) = self.load_persisted_doc().await {
+            return Some((doc, false));
+        }
+        let legacy = self.load_legacy_state().await?;
+        tracing::info!(
+            "migrating the per-guild store state copy into the plugin-global store document"
+        );
+        Some((
+            PersistedStore {
+                schema: STORE_SCHEMA,
+                saved_at_unix: unix_now(),
+                last_seen: legacy,
+                snapshot: Snapshot::default(),
+            },
+            true,
+        ))
+    }
+
+    /// Reads and parses the plugin-global store document. A malformed or
+    /// unreadable document starts fresh (silent baseline) - detection
+    /// state must never block a poll cycle.
+    async fn load_persisted_doc(&self) -> Option<PersistedStore> {
+        match self.plugin_storage.get(NAMESPACE, STORE_DUMP_KEY).await {
+            Ok(Some(raw)) => match serde_json::from_value::<PersistedStore>(raw) {
+                Ok(doc) => Some(doc),
+                Err(err) => {
+                    tracing::warn!(%err, "persisted store document malformed - starting fresh");
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!(%err, "persisted store document unreadable - starting fresh");
+                None
+            }
+        }
+    }
+
+    /// The legacy per-guild catch-up source (see [`Self::load_persisted`]).
+    async fn load_legacy_state(&self) -> Option<LastSeen> {
         let guilds = self.storage.list_guilds().await.ok()?;
         for (row_platform, guild_id) in guilds {
             if row_platform != self.platform.slug() {
@@ -899,18 +1013,92 @@ impl<B: EventBusPort> StoreEngine<B> {
         None
     }
 
-    /// Persists the current state to every discovered guild: a config
-    /// document means catch-up coverage - enabled or not, so a re-enable
-    /// never replays stale events. Reuses the cycle's discovery pass (no
-    /// second `list_guilds` + config scan).
-    async fn persist_state(&self, state: &LastSeen, discovered: &[DiscoveredGuild]) {
-        let Ok(value) = serde_json::to_value(state) else {
-            tracing::warn!("store state failed to serialize - catch-up persistence skipped");
+    /// Removes the legacy per-guild copies after a successful migration.
+    /// Fire-and-forget: a failed delete leaves a stale (ignored) copy.
+    async fn cleanup_legacy_state(&self) {
+        let Ok(guilds) = self.storage.list_guilds().await else {
+            tracing::warn!("guild listing failed - legacy store state copies kept");
             return;
         };
-        for target in discovered {
-            if let Err(err) = target.storage.set(NAMESPACE, LAST_SEEN_KEY, value.clone()).await {
-                tracing::warn!(%err, guild = target.guild_id.get(), "failed to persist store state");
+        for (row_platform, guild_id) in guilds {
+            if row_platform != self.platform.slug() {
+                continue;
+            }
+            let storage = self.storage.guild_scoped(self.platform.slug(), guild_id);
+            if let Err(err) = storage.delete(NAMESPACE, LAST_SEEN_KEY).await {
+                tracing::warn!(
+                    %err,
+                    guild = guild_id.get(),
+                    "failed to delete the legacy per-guild store state copy"
+                );
+            }
+        }
+    }
+
+    /// Writes the plugin-global store document: the compacted state plus
+    /// the retained raw snapshot in one value. A failure is a log line -
+    /// the in-memory state still advanced, so the next change rewrites
+    /// everything (bounded by at-most-once delivery, like the announces).
+    async fn persist_store(&self, state: &LastSeen) {
+        let doc = PersistedStore {
+            schema: STORE_SCHEMA,
+            saved_at_unix: unix_now(),
+            last_seen: state.clone(),
+            snapshot: self.last_snapshot.lock().clone().unwrap_or_default(),
+        };
+        let Ok(value) = serde_json::to_value(&doc) else {
+            tracing::warn!("store document failed to serialize - persistence skipped");
+            return;
+        };
+        if let Err(err) = self.plugin_storage.set(NAMESPACE, STORE_DUMP_KEY, value).await {
+            tracing::warn!(%err, "failed to persist the store document");
+        }
+    }
+
+    /// Writes today's history digest (and prunes beyond the retention
+    /// window) after a cycle where the raw store changed. Returns whether
+    /// a digest was written. `history_days = 0` disables recording; a
+    /// cycle without raw data (migration adopt) writes nothing - an empty
+    /// digest must never overwrite a real day.
+    async fn write_history_digest(&self) -> bool {
+        let history_days = self.settings.lock().history_days;
+        if history_days == 0 {
+            return false;
+        }
+        let snapshot = self.last_snapshot.lock().clone();
+        let Some(snapshot) = snapshot.filter(has_store_data) else { return false };
+        let index = self.name_index(&snapshot).await;
+        let now = unix_now();
+        let day = history::day_key(now);
+        let digest = history::capture(&day, &snapshot, &index);
+        let Ok(value) = serde_json::to_value(&digest) else {
+            tracing::warn!("store history digest failed to serialize - day skipped");
+            return false;
+        };
+        let key = format!("{}{day}", history::HISTORY_PREFIX);
+        if let Err(err) = self.plugin_storage.set(NAMESPACE, &key, value).await {
+            tracing::warn!(%err, day = %day, "failed to persist the store history digest");
+            return false;
+        }
+        self.prune_history(now, history_days).await;
+        true
+    }
+
+    /// Deletes day digests older than the retention window. Failures are
+    /// logged and retried on the next write - pruning is best-effort
+    /// housekeeping, never a correctness path.
+    async fn prune_history(&self, now_unix: u64, history_days: u32) {
+        let cutoff = history::day_key_before(now_unix, u64::from(history_days));
+        let Ok(keys) = self.plugin_storage.list_keys(NAMESPACE).await else {
+            tracing::warn!("store history listing failed - pruning skipped");
+            return;
+        };
+        for key in keys {
+            let Some(day) = key.strip_prefix(history::HISTORY_PREFIX) else { continue };
+            if day < cutoff.as_str()
+                && let Err(err) = self.plugin_storage.delete(NAMESPACE, &key).await
+            {
+                tracing::warn!(%err, key = %key, "failed to prune an old store history digest");
             }
         }
     }
@@ -971,25 +1159,36 @@ impl<B: EventBusPort> StoreEngine<B> {
         lines.join("\n")
     }
 
-    /// The announcement as delivered - one entry per embed page (first
-    /// `/lol_store_dump` choice; the command falls back to
-    /// [`Self::current_store_pages`]).
+    /// The announcement as delivered - one entry per embed page (the
+    /// `/lol_client_status` "last update rendered" memory).
     #[must_use]
     pub fn last_announcement_pages(&self) -> Vec<String> {
         self.last_announcement.lock().as_ref().map_or_else(Vec::new, |(_, pages)| pages.clone())
     }
 
     /// Renders the retained raw snapshot as a full "current store" dump -
-    /// the `/lol_store_dump` fallback for a fresh launch, before any delta
-    /// has been announced. Sales, mythic rotations and an active Your Shop
-    /// show their current contents; skins are omitted because "new in
-    /// store" is a diff concept a lone snapshot cannot provide (the
-    /// alternative would print the whole catalog). Empty while nothing
-    /// renderable has been fetched (no poll yet, client offline, or all
-    /// sections empty).
+    /// what `/lol_store_dump` posts: all current deals (sales, mythic
+    /// rotations, an active Your Shop), not the last delta. Skins are
+    /// omitted because "new in store" is a diff concept a lone snapshot
+    /// cannot provide (the alternative would print the whole catalog).
     pub async fn current_store_pages(&self) -> Vec<String> {
         let Some(snapshot) = self.last_snapshot.lock().clone() else { return Vec::new() };
-        if snapshot.sales.is_none() && snapshot.rotations.is_none() && snapshot.yourshop.is_none() {
+        self.render_current(&snapshot).await
+    }
+
+    /// `/lol_store_dump`'s fallback: renders the persisted store document
+    /// when this process has not captured a snapshot yet (fresh boot, the
+    /// client still offline). Champion names degrade to the synthetic
+    /// fallback when the champion table is unreachable - same as a failed
+    /// in-cycle fetch.
+    pub async fn persisted_store_pages(&self) -> Vec<String> {
+        let Some(doc) = self.load_persisted_doc().await else { return Vec::new() };
+        self.render_current(&doc.snapshot).await
+    }
+
+    /// The shared current-state renderer (see [`Self::current_store_pages`]).
+    async fn render_current(&self, snapshot: &Snapshot) -> Vec<String> {
+        if !has_renderable_data(snapshot) {
             return Vec::new();
         }
         if snapshot.catalog.is_none() {
@@ -998,7 +1197,7 @@ impl<B: EventBusPort> StoreEngine<B> {
                  (check the 'some store sources failed' warnings)"
             );
         }
-        let index = self.name_index(&snapshot).await;
+        let index = self.name_index(snapshot).await;
         let mut delta = StoreDelta::default();
         if let Some(sales) = &snapshot.sales {
             delta.sales = sales.clone();
@@ -1021,15 +1220,58 @@ impl<B: EventBusPort> StoreEngine<B> {
         announce_pages(&delta, &index, self.embed_budget())
     }
 
+    /// The recorded deal history for a watch-shaped target: one row per
+    /// observed deal, consecutive recorded days grouped into windows, most
+    /// recent first. Bounded by the retention window; empty when nothing
+    /// was recorded for it.
+    pub(crate) async fn deal_history(&self, target: &WatchTarget) -> Vec<history::HistoryRow> {
+        let Ok(keys) = self.plugin_storage.list_keys(NAMESPACE).await else {
+            tracing::warn!("store history listing failed - history unavailable");
+            return Vec::new();
+        };
+        let mut days: Vec<&str> =
+            keys.iter().filter_map(|key| key.strip_prefix(history::HISTORY_PREFIX)).collect();
+        days.sort_unstable(); // ISO dates sort lexicographically
+        let mut rows = Vec::new();
+        for day in days {
+            let key = format!("{}{day}", history::HISTORY_PREFIX);
+            let raw = match self.plugin_storage.get(NAMESPACE, &key).await {
+                Ok(Some(raw)) => raw,
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(%err, day, "store history digest unreadable - day skipped");
+                    continue;
+                }
+            };
+            match serde_json::from_value::<DayDigest>(raw) {
+                Ok(digest) => history::extend_rows(&mut rows, &digest, day, target),
+                Err(err) => {
+                    tracing::warn!(%err, day, "store history digest malformed - day skipped")
+                }
+            }
+        }
+        history::finalize_rows(rows)
+    }
+
     /// Byte budget for one announcement embed, derived from the
     /// deployment's platform embed cap.
     fn embed_budget(&self) -> usize {
         super::format::embed_budget(self.platform.embed_limit())
     }
+
+    /// The deployment's outbound message cap - the budget currency for the
+    /// ephemeral history reply (plain content, not an embed).
+    pub fn message_limit(&self) -> Option<usize> {
+        self.platform.message_limit()
+    }
 }
 
 fn on_off(flag: bool) -> &'static str {
     if flag { "on" } else { "off" }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|since| since.as_secs()).unwrap_or(0)
 }
 
 /// Scheduler adapter: one poll tick.
@@ -1048,13 +1290,14 @@ impl<B: EventBusPort> Job for PollJob<B> {
 mod tests {
     use super::*;
     use crate::kernel::plugin_ports::EventHandler;
+    use crate::kernel::spi_ports::PluginStoragePort;
     use crate::plugins::lol_store::lcu::{
         CatalogItem, ChampionEntry, ItemRef, LcuError, LocalizedText, Price, RotationStore, Sale,
         SaleInfo, StoreEntry, YourShopStatus,
     };
     use crate::test_support::{
-        ChannelRecordingFactory, FailingChatOutputFactory, InMemoryStorage, RecordingChatOutput,
-        RecordingChatOutputFactory,
+        ChannelRecordingFactory, FailingChatOutputFactory, InMemoryPluginStorage, InMemoryStorage,
+        RecordingChatOutput, RecordingChatOutputFactory,
     };
     use parking_lot::Mutex as PLMutex;
     use std::collections::BTreeMap;
@@ -1155,8 +1398,14 @@ mod tests {
 
     const GUILD: u64 = 700;
 
+    fn plugin_store() -> Arc<dyn PluginStorage> {
+        Arc::new(InMemoryPluginStorage::new())
+            .plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG)
+    }
+
     struct Fixture {
         storage: Arc<InMemoryStorage>,
+        plugin: Arc<InMemoryPluginStorage>,
         output: Arc<RecordingChatOutput>,
         bus: RecorderBus,
         lcu: Arc<FakeLcu>,
@@ -1164,7 +1413,22 @@ mod tests {
     }
 
     async fn fixture_with(lcu: Arc<FakeLcu>, flags: AnnounceFlags) -> Fixture {
+        fixture_with_settings(
+            lcu,
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags,
+                watch_user_cap: watch::DEFAULT_USER_CAP,
+                watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
+            },
+        )
+        .await
+    }
+
+    async fn fixture_with_settings(lcu: Arc<FakeLcu>, settings: EngineSettings) -> Fixture {
         let storage = Arc::new(InMemoryStorage::new());
+        let plugin = Arc::new(InMemoryPluginStorage::new());
         let output = RecordingChatOutput::new();
         let factory = RecordingChatOutputFactory::new(Arc::clone(&output)).boxed();
         let bus = RecorderBus::default();
@@ -1172,30 +1436,29 @@ mod tests {
         let engine = Arc::new(StoreEngine::new(
             port,
             Arc::clone(&storage) as Arc<dyn StoragePort>,
+            plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG),
             factory,
             bus.clone(),
             crate::test_support::test_platform_info(),
-            EngineSettings {
-                poll: Duration::from_secs(60),
-                flags,
-                watch_user_cap: watch::DEFAULT_USER_CAP,
-                watch_guild_cap: watch::DEFAULT_GUILD_CAP,
-            },
+            settings,
         ));
-        Fixture { storage, output, bus, lcu, engine }
+        Fixture { storage, plugin, output, bus, lcu, engine }
     }
 
     async fn fixture(lcu: Arc<FakeLcu>) -> Fixture {
         fixture_with(lcu, AnnounceFlags::all_on()).await
     }
 
-    /// Hot reload: the announce flags and watch caps swap, the poll
-    /// interval stays at its boot value (the scheduled job's cadence).
+    /// Hot reload: the announce flags, watch caps, and the history retention
+    /// swap; the poll interval stays at its boot value (the scheduled job's
+    /// cadence).
     #[test]
-    fn update_settings_swaps_flags_and_caps_but_keeps_poll() {
+    fn update_settings_swaps_flags_caps_and_history_but_keeps_poll() {
+        let plugin = Arc::new(InMemoryPluginStorage::new());
         let engine = Arc::new(StoreEngine::new(
             FakeLcu::online(),
             Arc::new(InMemoryStorage::new()) as Arc<dyn StoragePort>,
+            plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG),
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecorderBus::default(),
             crate::test_support::test_platform_info(),
@@ -1204,6 +1467,7 @@ mod tests {
                 flags: AnnounceFlags::all_on(),
                 watch_user_cap: 7,
                 watch_guild_cap: 9,
+                history_days: 30,
             },
         ));
 
@@ -1217,6 +1481,7 @@ mod tests {
             },
             watch_user_cap: 2,
             watch_guild_cap: 3,
+            history_days: 7,
         });
         let settings = engine.settings();
         assert!(!settings.flags.sales);
@@ -1224,6 +1489,7 @@ mod tests {
         assert!(!settings.flags.mythic_rotation);
         assert_eq!(settings.watch_user_cap, 2);
         assert_eq!(settings.watch_guild_cap, 3);
+        assert_eq!(settings.history_days, 7);
         assert_eq!(settings.poll, Duration::from_secs(60), "poll stays boot-frozen");
     }
 
@@ -1350,7 +1616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_poll_is_a_silent_baseline_but_persists_state() {
+    async fn first_poll_is_a_silent_baseline_but_persists_the_store_document() {
         let f = fixture(FakeLcu::online()).await;
         enable_guild(&f.storage, GUILD, Some("55")).await;
         // Champion sales are dropped at ingestion - only the skin sale enters
@@ -1363,18 +1629,23 @@ mod tests {
         assert!(f.output.messages().is_empty(), "baseline must stay silent");
         assert!(f.bus.log().is_empty());
         let persisted = f
-            .storage
-            .guild_scoped("test", GuildId(GUILD))
-            .get(NAMESPACE, LAST_SEEN_KEY)
+            .plugin
+            .plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG)
+            .get(NAMESPACE, STORE_DUMP_KEY)
             .await
             .expect("read expected")
-            .expect("last_seen must be persisted for boot catch-up");
+            .expect("the store document must be persisted for boot catch-up");
+        let last_seen = persisted.get("last_seen").expect("last_seen half expected");
         assert_eq!(
-            persisted.get("sales"),
+            last_seen.get("sales"),
             Some(&serde_json::json!([1])),
-            "only skin sales enter the baseline: {persisted}"
+            "only skin sales enter the baseline: {last_seen}"
         );
-        assert_eq!(persisted.get("skins"), Some(&serde_json::json!([1031])));
+        assert_eq!(last_seen.get("skins"), Some(&serde_json::json!([1031])));
+        // The dump half carries the raw sections.
+        let snapshot = persisted.get("snapshot").expect("snapshot half expected");
+        assert!(snapshot.get("sales").is_some(), "raw sales persisted: {snapshot}");
+        assert!(snapshot.get("catalog").is_some(), "raw catalog persisted: {snapshot}");
     }
 
     /// A fresh launch has no announcement to dump - the dump falls back to
@@ -1605,12 +1876,12 @@ mod tests {
         assert_eq!(f.output.sent().len(), 1, "only the healthy guild was messaged");
     }
 
-    /// A malformed-config guild is skipped by the fan-out but still receives
-    /// catch-up persistence: its `last_seen` copy must stay identical to a
-    /// healthy guild's, so a later fixed config rejoins from current state
-    /// instead of replaying an old delta.
+    /// Persistence is plugin-global now - a malformed-config guild no
+    /// longer participates in anything store-side. The consolidated
+    /// document stays current regardless: a later fixed config rejoins
+    /// from current state instead of replaying an old delta.
     #[tokio::test]
-    async fn malformed_config_guild_still_receives_catch_up_persistence() {
+    async fn malformed_config_guild_is_skipped_entirely_but_state_stays_current() {
         let f = fixture(FakeLcu::online()).await;
         enable_guild(&f.storage, GUILD, Some("55")).await;
         f.storage
@@ -1625,19 +1896,23 @@ mod tests {
         *f.lcu.sales.lock() = Some(vec![skin_sale(2, 1031)]);
         f.engine.tick().await;
 
-        let read = |guild: u64| {
-            let storage = Arc::clone(&f.storage);
-            async move {
-                storage
-                    .guild_scoped("test", GuildId(guild))
-                    .get(NAMESPACE, LAST_SEEN_KEY)
-                    .await
-                    .expect("last_seen read expected")
-            }
-        };
-        let healthy = read(GUILD).await.expect("healthy guild persisted");
-        let malformed = read(999).await.expect("malformed guild persisted too");
-        assert_eq!(healthy, malformed, "the skipped guild's copy stays current");
+        // The healthy guild announced; the malformed one is absent from the
+        // bus trail entirely.
+        let log = f.bus.log();
+        assert!(!log.is_empty(), "healthy guild announced: {log:?}");
+        assert!(log.iter().all(|(_, guild, _)| *guild == GUILD), "skipped guild leaked: {log:?}");
+        assert_eq!(f.output.sent().len(), 1, "only the healthy guild was messaged");
+        // No legacy per-guild copies exist anymore - the consolidated
+        // document is the only persistence site.
+        for guild in [GUILD, 999] {
+            let copy = f
+                .storage
+                .guild_scoped("test", GuildId(guild))
+                .get(NAMESPACE, LAST_SEEN_KEY)
+                .await
+                .expect("last_seen read expected");
+            assert!(copy.is_none(), "guild {guild} must not hold a legacy copy");
+        }
     }
 
     #[tokio::test]
@@ -1656,25 +1931,18 @@ mod tests {
         *f.lcu.rotations.lock() = Some(vec![rotation_store("WEEKLY_V1", &["a"])]);
         f.engine.tick().await; // boot 1 baseline
 
-        // Boot 2 over a copy of the same storage: the rotation swapped while
-        // the bot was "down".
-        let storage2 = Arc::new(InMemoryStorage::new());
-        {
-            let from = f.storage.guild_scoped("test", GuildId(GUILD));
-            let to = storage2.guild_scoped("test", GuildId(GUILD));
-            for key in [CONFIG_KEY, LAST_SEEN_KEY] {
-                if let Some(value) = from.get(NAMESPACE, key).await.expect("read expected") {
-                    to.set(NAMESPACE, key, value).await.expect("copy expected");
-                }
-            }
-        }
+        // Boot 2 shares the plugin-global document store (the storage the
+        // boot-1 engine persisted into) and the guild's config document,
+        // but starts with empty in-memory state - the rotation swapped
+        // while the bot was "down".
         let bus2 = RecorderBus::default();
         let lcu2 = FakeLcu::online();
         *lcu2.rotations.lock() = Some(vec![rotation_store("WEEKLY_V1", &["b"])]);
         let factory2 = RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed();
         let engine2 = Arc::new(StoreEngine::new(
             lcu2,
-            Arc::clone(&storage2) as Arc<dyn StoragePort>,
+            Arc::clone(&f.storage) as Arc<dyn StoragePort>,
+            f.plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG),
             factory2,
             bus2.clone(),
             crate::test_support::test_platform_info(),
@@ -1683,6 +1951,7 @@ mod tests {
                 flags: AnnounceFlags::all_on(),
                 watch_user_cap: watch::DEFAULT_USER_CAP,
                 watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
             },
         ));
         engine2.tick().await;
@@ -1691,6 +1960,225 @@ mod tests {
             bus2.log().iter().any(|(_, _, kind)| *kind == "mythic_rotation"),
             "catch-up must announce the rotation change"
         );
+    }
+
+    /// The persisted store document re-arms the raw snapshot side before
+    /// the first successful poll: the current-state dump renders from the
+    /// document even while the client is offline, and after the first
+    /// (offline) tick the restored snapshot lives in memory.
+    #[tokio::test]
+    async fn boot_restores_the_raw_snapshot_from_the_store_document() {
+        let f = fixture(FakeLcu::online()).await;
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        f.engine.tick().await; // baseline + persist
+
+        let lcu2 = FakeLcu::offline();
+        let engine2 = Arc::new(StoreEngine::new(
+            lcu2,
+            Arc::new(InMemoryStorage::new()) as Arc<dyn StoragePort>,
+            f.plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG),
+            RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
+            RecorderBus::default(),
+            crate::test_support::test_platform_info(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: watch::DEFAULT_USER_CAP,
+                watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
+            },
+        ));
+
+        // Before any poll: the document fallback renders the last dump.
+        let from_doc = engine2.persisted_store_pages().await.join("\n");
+        assert!(from_doc.contains("Foxfire Ahri"), "document fallback renders: {from_doc}");
+        assert!(engine2.current_store_pages().await.is_empty(), "nothing in memory yet");
+
+        // The offline tick still adopts + restores (the catch-up runs
+        // before the fetch).
+        engine2.tick().await;
+        let restored = engine2.current_store_pages().await.join("\n");
+        assert!(restored.contains("Foxfire Ahri"), "restored snapshot renders: {restored}");
+        // Name search works off the restored catalog.
+        let search = engine2.search_store("Foxfire").await.expect("search expected");
+        assert_eq!(search.skins.len(), 1, "the restored catalog backs the search");
+    }
+
+    /// A deployment upgrading from the per-guild layout: the legacy copy is
+    /// adopted, the consolidated document written, the copies deleted.
+    #[tokio::test]
+    async fn legacy_per_guild_copy_migrates_into_the_store_document() {
+        let f = fixture(FakeLcu::online()).await;
+        enable_guild(&f.storage, GUILD, Some("55")).await;
+        f.storage
+            .guild_scoped("test", GuildId(GUILD))
+            .set(NAMESPACE, LAST_SEEN_KEY, serde_json::json!({ "sales": [1], "skins": [1031] }))
+            .await
+            .expect("legacy write expected");
+
+        // The store kept selling the same sale while down: no delta, but
+        // the raw data changed, so the migration write still fires.
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        f.engine.tick().await;
+
+        let doc = f
+            .plugin
+            .plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG)
+            .get(NAMESPACE, STORE_DUMP_KEY)
+            .await
+            .expect("read expected")
+            .expect("the consolidated document must exist after migration");
+        assert_eq!(
+            doc.get("last_seen").and_then(|seen| seen.get("sales")),
+            Some(&serde_json::json!([1])),
+            "adopted state: {doc}"
+        );
+        let copy = f
+            .storage
+            .guild_scoped("test", GuildId(GUILD))
+            .get(NAMESPACE, LAST_SEEN_KEY)
+            .await
+            .expect("read expected");
+        assert!(copy.is_none(), "the legacy copy must be deleted after migration");
+    }
+
+    /// History recording: today's digest is written with capture-time
+    /// joins (names, champion ids, prices) on every raw change.
+    #[tokio::test]
+    async fn history_digest_written_with_baked_names() {
+        let f = fixture(FakeLcu::online()).await;
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        *f.lcu.catalog.lock() = Some(vec![skin_item_named(1031, 975, "Foxfire Ahri")]);
+        f.engine.tick().await;
+
+        let key = format!("{}{}", history::HISTORY_PREFIX, history::day_key(unix_now()));
+        let raw = f
+            .plugin
+            .plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG)
+            .get(NAMESPACE, &key)
+            .await
+            .expect("read expected")
+            .expect("today's digest must exist");
+        let digest: DayDigest = serde_json::from_value(raw).expect("digest shape expected");
+        let [record] = digest.sales.as_slice() else { panic!("one sale expected: {digest:?}") };
+        assert_eq!(record.sale_id, 1);
+        assert_eq!(record.champion_id, Some(103));
+        assert_eq!(record.label, "Ahri \u{2014} Foxfire Ahri");
+        assert_eq!(record.sale_price, Some(607));
+        assert_eq!(record.original_price, Some(975));
+    }
+
+    /// Retention: days older than `history_days` are pruned on the next
+    /// write; today's document survives.
+    #[tokio::test]
+    async fn history_prunes_days_beyond_retention() {
+        let f = fixture(FakeLcu::online()).await;
+        let plugin = f.plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG);
+        plugin
+            .set(
+                NAMESPACE,
+                "history.2000-01-01",
+                serde_json::json!({ "schema": 1, "day": "2000-01-01" }),
+            )
+            .await
+            .expect("seed write expected");
+
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        f.engine.tick().await;
+
+        let keys = plugin.list_keys(NAMESPACE).await.expect("list expected");
+        assert!(!keys.iter().any(|key| key == "history.2000-01-01"), "stale day pruned: {keys:?}");
+        assert!(
+            keys.iter().any(|key| key.starts_with(history::HISTORY_PREFIX)),
+            "today's digest kept: {keys:?}"
+        );
+    }
+
+    /// `history_days = 0` disables recording entirely - no digest, no prune.
+    #[tokio::test]
+    async fn history_disabled_writes_nothing() {
+        let f = fixture_with_settings(
+            FakeLcu::online(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: watch::DEFAULT_USER_CAP,
+                watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+                history_days: 0,
+            },
+        )
+        .await;
+        let plugin = f.plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG);
+        plugin
+            .set(
+                NAMESPACE,
+                "history.2000-01-01",
+                serde_json::json!({ "schema": 1, "day": "2000-01-01" }),
+            )
+            .await
+            .expect("seed write expected");
+
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        f.engine.tick().await;
+
+        let keys = plugin.list_keys(NAMESPACE).await.expect("list expected");
+        let history_days: Vec<_> =
+            keys.iter().filter(|key| key.starts_with(history::HISTORY_PREFIX)).collect();
+        assert_eq!(
+            history_days,
+            vec!["history.2000-01-01"],
+            "only the pre-existing seed doc remains - recording wrote nothing"
+        );
+    }
+
+    /// The history query path: day documents fold into per-deal windows,
+    /// most recent first, across the engine's storage handle.
+    #[tokio::test]
+    async fn deal_history_folds_days_into_windows() {
+        let f = fixture(FakeLcu::online()).await;
+        let plugin = f.plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG);
+        let digest_for = |day: &str, sale_id: u64| DayDigest {
+            schema: history::DIGEST_SCHEMA,
+            day: day.to_owned(),
+            sales: vec![history::SaleRecord {
+                sale_id,
+                item_id: 1031,
+                champion_id: Some(103),
+                label: "Ahri \u{2014} Foxfire Ahri".to_owned(),
+                sale_price: Some(607),
+                original_price: Some(975),
+                start: None,
+                end: None,
+            }],
+            mythic: Vec::new(),
+        };
+        for (day, sale_id) in [("2026-09-01", 7u64), ("2026-09-02", 7), ("2026-09-04", 8)] {
+            plugin
+                .set(
+                    NAMESPACE,
+                    &format!("{}{day}", history::HISTORY_PREFIX),
+                    serde_json::to_value(digest_for(day, sale_id)).expect("serialize expected"),
+                )
+                .await
+                .expect("digest write expected");
+        }
+
+        let target = WatchTarget::Skin {
+            item_id: 1031,
+            champion: "Ahri".to_owned(),
+            skin: "Foxfire Ahri".to_owned(),
+        };
+        let rows = f.engine.deal_history(&target).await;
+        assert_eq!(rows.len(), 2, "one window per sale id: {rows:?}");
+        let (recent, older) = (rows.first().expect("recent row"), rows.get(1).expect("older row"));
+        assert_eq!(recent.kind, "sale");
+        assert_eq!(recent.last_day, "2026-09-04", "most recent first");
+        assert_eq!(older.first_day, "2026-09-01");
+        assert_eq!(older.last_day, "2026-09-02");
     }
 
     #[tokio::test]
@@ -1720,6 +2208,7 @@ mod tests {
         let engine2 = Arc::new(StoreEngine::new(
             FakeLcu::online(),
             Arc::clone(&f.storage) as Arc<dyn StoragePort>,
+            f.plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG),
             factory2,
             f.bus.clone(),
             crate::test_support::test_platform_info(),
@@ -1728,6 +2217,7 @@ mod tests {
                 flags: AnnounceFlags::all_on(),
                 watch_user_cap: watch::DEFAULT_USER_CAP,
                 watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
             },
         ));
         engine2.tick().await;
@@ -1884,6 +2374,7 @@ mod tests {
         let engine = Arc::new(StoreEngine::new(
             lcu.clone(),
             Arc::clone(&storage) as Arc<dyn StoragePort>,
+            plugin_store(),
             Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
             RecorderBus::default(),
             crate::test_support::test_platform_info(),
@@ -1892,6 +2383,7 @@ mod tests {
                 flags: AnnounceFlags::all_on(),
                 watch_user_cap: watch::DEFAULT_USER_CAP,
                 watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
             },
         ));
         enable_guild(&storage, GUILD, Some("55")).await;
@@ -1921,6 +2413,7 @@ mod tests {
         let engine = Arc::new(StoreEngine::new(
             lcu.clone(),
             Arc::clone(&storage) as Arc<dyn StoragePort>,
+            plugin_store(),
             Arc::new(FailingChatOutputFactory) as Arc<dyn ChatOutputFactoryPort>,
             bus.clone(),
             crate::test_support::test_platform_info(),
@@ -1929,6 +2422,7 @@ mod tests {
                 flags: AnnounceFlags::all_on(),
                 watch_user_cap: watch::DEFAULT_USER_CAP,
                 watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
             },
         ));
         enable_guild(&storage, GUILD, Some("55")).await;
@@ -1959,6 +2453,7 @@ mod tests {
         let engine = Arc::new(StoreEngine::new(
             lcu.clone(),
             Arc::clone(&storage) as Arc<dyn StoragePort>,
+            plugin_store(),
             Arc::new(FailingChatOutputFactory) as Arc<dyn ChatOutputFactoryPort>,
             bus.clone(),
             crate::test_support::test_platform_info(),
@@ -1967,6 +2462,7 @@ mod tests {
                 flags: AnnounceFlags::all_on(),
                 watch_user_cap: watch::DEFAULT_USER_CAP,
                 watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
             },
         ));
         enable_guild(&storage, GUILD, Some("55")).await;
@@ -1998,6 +2494,7 @@ mod tests {
         let engine = Arc::new(StoreEngine::new(
             lcu.clone(),
             Arc::clone(&storage) as Arc<dyn StoragePort>,
+            plugin_store(),
             Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
             RecorderBus::default(),
             crate::test_support::test_platform_info(),
@@ -2006,6 +2503,7 @@ mod tests {
                 flags: AnnounceFlags::all_on(),
                 watch_user_cap: watch::DEFAULT_USER_CAP,
                 watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
             },
         ));
         enable_guild(&storage, 700, Some("55")).await;

@@ -495,6 +495,78 @@ fn candidate_lines(lines: Vec<String>, by_id: bool) -> Resolved {
     Resolved::Candidates { lines, by_id }
 }
 
+/// The validated `target` dropdown value, shared by the watch and history
+/// commands. Sends the invalid-value reply itself; `None` = invocation over.
+async fn parse_target_kind(
+    args: &CommandArgs,
+    services: &KernelServices,
+) -> anyhow::Result<Option<TargetKind>> {
+    let kind = match args.get("target") {
+        Some("skin") => TargetKind::Skin,
+        Some("champion") => TargetKind::Champion,
+        _ => {
+            services
+                .chat_output
+                .send(command_reply("target must be `skin` or `champion`."))
+                .await?;
+            return Ok(None);
+        }
+    };
+    Ok(Some(kind))
+}
+
+/// Shared name resolution for `/lol_store_watch` and `/lol_store_history`:
+/// resolves the query against the last good store snapshot, sending the
+/// no-data, no-match, and candidate replies itself. `Ok(None)` = the
+/// invocation is over (a reply was sent).
+async fn resolve_target<B: crate::kernel::plugin_ports::EventBusPort>(
+    engine: &StoreEngine<B>,
+    query: &str,
+    target_kind: TargetKind,
+    command: &str,
+    services: &KernelServices,
+) -> anyhow::Result<Option<WatchTarget>> {
+    let Some(search) = engine.search_store(query).await else {
+        services
+            .chat_output
+            .send(command_reply(
+                "No store data yet - the League client has not been reachable since \
+                 startup (see `/lol_client_status`).",
+            ))
+            .await?;
+        return Ok(None);
+    };
+    let resolved = match target_kind {
+        TargetKind::Skin => resolve_skin(query, &search.skins),
+        TargetKind::Champion => resolve_champion(query, &search.champions, &search.store_backed),
+    };
+    let target = match resolved {
+        Resolved::Hit(target) => Some(target),
+        Resolved::Nothing => {
+            services
+                .chat_output
+                .send(command_reply(format!(
+                    "Nothing matching \"{query}\" in the store catalog - check the \
+                     spelling, or try again once the League client is online."
+                )))
+                .await?;
+            None
+        }
+        Resolved::Candidates { lines, by_id } => {
+            let hint = if by_id { "the exact name or a listed id" } else { "the exact name" };
+            services
+                .chat_output
+                .send(command_reply(format!(
+                    "Several matches - run `/{command}` again with {hint}:\n{}",
+                    lines.join("\n")
+                )))
+                .await?;
+            None
+        }
+    };
+    Ok(target)
+}
+
 /// `/lol_store_watch`: subscribe to a skin or a champion's whole skin line
 /// (user, ephemeral). Watch matching runs on the full delta, independent
 /// of the guild's announce flags.
@@ -530,16 +602,8 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for WatchHandl
             },
             None => WatchKind::All,
         };
-        let target_kind = match args.get("target") {
-            Some("skin") => TargetKind::Skin,
-            Some("champion") => TargetKind::Champion,
-            _ => {
-                services
-                    .chat_output
-                    .send(command_reply("target must be `skin` or `champion`."))
-                    .await?;
-                return Ok(());
-            }
+        let Some(target_kind) = parse_target_kind(args, services).await? else {
+            return Ok(());
         };
         let Some(query) = args.get("name").map(str::trim).filter(|name| !name.is_empty()) else {
             services
@@ -550,45 +614,11 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for WatchHandl
         };
 
         // Resolve the name against the last good store snapshot.
-        let Some(search) = self.engine.search_store(query).await else {
-            services
-                .chat_output
-                .send(command_reply(
-                    "No store data yet - the League client has not been reachable since \
-                     startup (see `/lol_client_status`).",
-                ))
-                .await?;
+        let Some(target) =
+            resolve_target(self.engine.as_ref(), query, target_kind, "lol_store_watch", services)
+                .await?
+        else {
             return Ok(());
-        };
-        let resolved = match target_kind {
-            TargetKind::Skin => resolve_skin(query, &search.skins),
-            TargetKind::Champion => {
-                resolve_champion(query, &search.champions, &search.store_backed)
-            }
-        };
-        let target = match resolved {
-            Resolved::Hit(target) => target,
-            Resolved::Nothing => {
-                services
-                    .chat_output
-                    .send(command_reply(format!(
-                        "Nothing matching \"{query}\" in the store catalog - check the \
-                         spelling, or try again once the League client is online."
-                    )))
-                    .await?;
-                return Ok(());
-            }
-            Resolved::Candidates { lines, by_id } => {
-                let hint = if by_id { "the exact name or a listed id" } else { "the exact name" };
-                services
-                    .chat_output
-                    .send(command_reply(format!(
-                        "Several matches - run `/lol_store_watch` again with {hint}:\n{}",
-                        lines.join("\n")
-                    )))
-                    .await?;
-                return Ok(());
-            }
         };
 
         // Read-modify-write: caps are enforced between load and save. The
@@ -747,10 +777,11 @@ impl CommandHandler for WatchlistHandler {
     }
 }
 
-/// `/lol_store_dump`: force-post the latest store update summary into the
-/// invoking channel (moderator, public - a dump is meant to be seen). With
-/// no update announced yet (fresh launch), the current store is dumped
-/// instead; with no snapshot either, an ephemeral placeholder explains it.
+/// `/lol_store_dump`: post all current store deals into the invoking
+/// channel (moderator, public - a dump is meant to be seen). Rendered from
+/// the retained snapshot; falls back to the persisted store document when
+/// this process has not polled yet (fresh boot, client offline); an
+/// ephemeral placeholder explains it when neither has data.
 pub struct DumpHandler<B: crate::kernel::plugin_ports::EventBusPort> {
     pub engine: Arc<StoreEngine<B>>,
 }
@@ -768,18 +799,17 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for DumpHandle
         if services.guild_storage.is_none() {
             return reply_guild_only(services).await;
         }
-        let mut pages = self.engine.last_announcement_pages();
-        let mut title = "LoL Store - latest update";
+        let title = "LoL Store - current state";
+        let mut pages = self.engine.current_store_pages().await;
         if pages.is_empty() {
-            pages = self.engine.current_store_pages().await;
-            title = "LoL Store - current state";
+            pages = self.engine.persisted_store_pages().await;
         }
         if pages.is_empty() {
             services
                 .chat_output
                 .send(command_reply(
-                    "No store update has been announced yet, and no store snapshot is \
-                     available yet (the client may not have been polled).",
+                    "No store snapshot is available yet - the League client has not been \
+                     polled successfully since startup (see `/lol_client_status`).",
                 ))
                 .await?;
             return Ok(());
@@ -799,6 +829,85 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for DumpHandle
                 }))
                 .await?;
         }
+        Ok(())
+    }
+}
+
+/// `/lol_store_history`: the recorded deal history for a skin or champion
+/// (user, ephemeral). Sales and Mythic Shop rotations only - Your Shop is
+/// the operator's personal shop, not shareable history.
+pub struct HistoryHandler<B: crate::kernel::plugin_ports::EventBusPort> {
+    pub engine: Arc<StoreEngine<B>>,
+}
+
+#[async_trait]
+impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for HistoryHandler<B> {
+    async fn invoke(
+        &self,
+        _event: &RequestContext,
+        args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
+        if services.guild_storage.is_none() {
+            return reply_guild_only(services).await;
+        }
+        let Some(target_kind) = parse_target_kind(args, services).await? else {
+            return Ok(());
+        };
+        let Some(query) = args.get("name").map(str::trim).filter(|name| !name.is_empty()) else {
+            services
+                .chat_output
+                .send(command_reply("Give a name to look up - a skin or a champion."))
+                .await?;
+            return Ok(());
+        };
+        let Some(target) =
+            resolve_target(self.engine.as_ref(), query, target_kind, "lol_store_history", services)
+                .await?
+        else {
+            return Ok(());
+        };
+
+        let rows = self.engine.deal_history(&target).await;
+        let reply_text = if rows.is_empty() {
+            let days = self.engine.settings().history_days;
+            if days == 0 {
+                format!(
+                    "No history for {} - store history recording is disabled \
+                     (`history_days = 0`).",
+                    target.label()
+                )
+            } else {
+                format!(
+                    "No recorded deals for {} within the {days}-day history window.",
+                    target.label()
+                )
+            }
+        } else {
+            let mut sections = Vec::new();
+            let mut sales = Vec::new();
+            let mut mythic = Vec::new();
+            for row in &rows {
+                let line = if row.first_day == row.last_day {
+                    format!("- {}: {} {}", row.first_day, row.label, row.detail)
+                } else {
+                    format!(
+                        "- {} \u{2192} {}: {} {}",
+                        row.first_day, row.last_day, row.label, row.detail
+                    )
+                };
+                match row.kind {
+                    "sale" => sales.push(line),
+                    _ => mythic.push(line),
+                }
+            }
+            super::format::push_section(&mut sections, "Sales", &sales);
+            super::format::push_section(&mut sections, "Mythic rotation", &mythic);
+            let budget = super::watch::tag_budget(self.engine.message_limit());
+            super::format::fit(sections, budget)
+                .unwrap_or_else(|| "History too large to render.".to_owned())
+        };
+        services.chat_output.send(command_reply(&reply_text)).await?;
         Ok(())
     }
 }

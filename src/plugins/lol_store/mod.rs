@@ -18,6 +18,7 @@ mod diff;
 mod engine;
 mod events;
 mod format;
+mod history;
 pub mod lcu;
 pub mod watch;
 
@@ -34,11 +35,14 @@ use crate::kernel::{
 };
 
 pub use commands::{
-    AssignHandler, ClientStatusHandler, DisableHandler, DumpHandler, EnableHandler, RoleHandler,
-    UnassignHandler, UnwatchHandler, WatchHandler, WatchlistHandler,
+    AssignHandler, ClientStatusHandler, DisableHandler, DumpHandler, EnableHandler, HistoryHandler,
+    RoleHandler, UnassignHandler, UnwatchHandler, WatchHandler, WatchlistHandler,
 };
 pub use diff::LastSeen;
-pub use engine::{AnnounceFlags, CONFIG_KEY, EngineSettings, GuildConfig, NAMESPACE, StoreEngine};
+pub use engine::{
+    AnnounceFlags, CONFIG_KEY, DEFAULT_HISTORY_DAYS, EngineSettings, GuildConfig, NAMESPACE,
+    STORE_DUMP_KEY, StoreEngine,
+};
 pub use lcu::{LcuClient, LcuPort};
 pub use watch::{DEFAULT_GUILD_CAP, DEFAULT_USER_CAP, WATCH_KEY};
 
@@ -157,15 +161,43 @@ impl<B: EventBusPort> PluginPort for LolStorePlugin<B> {
             CommandDescriptor {
                 plugin_id: self.name().to_owned(),
                 name: "lol_store_dump".to_owned(),
-                description:
-                    "Post the latest store update, or the current store state, in this channel"
-                        .to_owned(),
+                description: "Post the current LoL store deals in this channel".to_owned(),
                 arguments: Vec::new(),
                 required_permission: None,
                 required_tier: Some(AccessTier::Moderator),
                 guild_only: true,
             },
             Arc::new(DumpHandler { engine: Arc::clone(&self.engine) }),
+        );
+        register(
+            CommandDescriptor {
+                plugin_id: self.name().to_owned(),
+                name: "lol_store_history".to_owned(),
+                description: "Show past sales and Mythic Shop rotations for a skin or champion"
+                    .to_owned(),
+                arguments: vec![
+                    ArgDescriptor {
+                        name: "target".to_owned(),
+                        description: "History of one skin or a champion's whole skin line"
+                            .to_owned(),
+                        required: true,
+                        kind: ArgKind::String,
+                        choices: Some(vec!["skin".to_owned(), "champion".to_owned()]),
+                    },
+                    ArgDescriptor {
+                        name: "name".to_owned(),
+                        description: "Skin name (e.g. Blood Moon Evelynn) or champion name"
+                            .to_owned(),
+                        required: true,
+                        kind: ArgKind::String,
+                        choices: None,
+                    },
+                ],
+                required_permission: None,
+                required_tier: Some(AccessTier::User),
+                guild_only: true,
+            },
+            Arc::new(HistoryHandler { engine: Arc::clone(&self.engine) }),
         );
         register(
             CommandDescriptor {
@@ -275,7 +307,7 @@ mod tests {
     use crate::kernel::models::{CommandPayload, EventKind, EventPayload, GuildId, Origin, UserId};
     use crate::kernel::plugin_ports::{CommandArgs, CommandHandler, Job};
     use crate::kernel::services::KernelServices;
-    use crate::kernel::spi_ports::{ChatOutputPort, StoragePort};
+    use crate::kernel::spi_ports::{ChatOutputPort, PluginStoragePort, StoragePort};
     use crate::test_support::{
         InMemoryStorage, NoopScheduler, RecordingChatOutput, RecordingChatOutputFactory,
         assert_descriptions_fit_discord,
@@ -317,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn init_registers_the_ten_commands_within_discord_limits() {
+    fn init_registers_the_eleven_commands_within_discord_limits() {
         let registry = Arc::new(CapturingRegistry::default());
         let plugin = LolStorePlugin::new(
             Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
@@ -337,6 +369,7 @@ mod tests {
                 "lol_store_unassign",
                 "lol_store_role",
                 "lol_store_dump",
+                "lol_store_history",
                 "lol_store_watch",
                 "lol_store_unwatch",
                 "lol_store_watchlist",
@@ -362,15 +395,23 @@ mod tests {
         ] {
             assert_eq!(tier_of(moderator), Some(AccessTier::Moderator), "{moderator}");
         }
-        for user in ["lol_store_watch", "lol_store_unwatch", "lol_store_watchlist"] {
+        for user in
+            ["lol_store_history", "lol_store_watch", "lol_store_unwatch", "lol_store_watchlist"]
+        {
             assert_eq!(tier_of(user), Some(AccessTier::User), "{user}");
         }
+    }
+
+    fn plugin_store() -> Arc<dyn crate::kernel::spi_ports::PluginStorage> {
+        let storage = Arc::new(crate::test_support::InMemoryPluginStorage::new());
+        storage.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG)
     }
 
     fn disabled_engine() -> Arc<StoreEngine<RecordingBus>> {
         Arc::new(StoreEngine::new(
             Arc::new(OfflineLcu),
             Arc::new(InMemoryStorage::new()) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
+            plugin_store(),
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecordingBus::default(),
             crate::test_support::test_platform_info(),
@@ -379,6 +420,7 @@ mod tests {
                 flags: AnnounceFlags::all_on(),
                 watch_user_cap: DEFAULT_USER_CAP,
                 watch_guild_cap: DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
             },
         ))
     }
@@ -404,6 +446,7 @@ mod tests {
         let engine = Arc::new(StoreEngine::new(
             Arc::new(OfflineLcu),
             Arc::new(InMemoryStorage::new()) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
+            plugin_store(),
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecordingBus::default(),
             crate::test_support::test_platform_info(),
@@ -412,6 +455,7 @@ mod tests {
                 flags: AnnounceFlags::all_on(),
                 watch_user_cap: DEFAULT_USER_CAP,
                 watch_guild_cap: DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
             },
         ));
         let plugin = LolStorePlugin::new(
@@ -627,6 +671,7 @@ mod tests {
         let engine = Arc::new(StoreEngine::new(
             Arc::new(OnlineLcu::new()),
             Arc::clone(&storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
+            plugin_store(),
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecordingBus::default(),
             crate::test_support::test_platform_info(),
@@ -635,6 +680,7 @@ mod tests {
                 flags: AnnounceFlags::all_on(),
                 watch_user_cap: user_cap,
                 watch_guild_cap: guild_cap,
+                history_days: DEFAULT_HISTORY_DAYS,
             },
         ));
         engine.tick().await; // silent baseline: fills the raw snapshot
@@ -889,6 +935,7 @@ mod tests {
         let engine = Arc::new(StoreEngine::new(
             Arc::new(OnlineLcu::new()),
             Arc::clone(storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
+            plugin_store(),
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecordingBus::default(),
             crate::test_support::test_platform_info(),
@@ -897,6 +944,7 @@ mod tests {
                 flags: AnnounceFlags::all_on(),
                 watch_user_cap: 20,
                 watch_guild_cap: 300,
+                history_days: DEFAULT_HISTORY_DAYS,
             },
         ));
         engine.tick().await; // silent baseline: fills the raw snapshot
@@ -1285,6 +1333,7 @@ mod tests {
         let engine = Arc::new(StoreEngine::new(
             Arc::new(lcu),
             Arc::clone(&storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
+            plugin_store(),
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecordingBus::default(),
             crate::test_support::test_platform_info(),
@@ -1293,6 +1342,7 @@ mod tests {
                 flags: AnnounceFlags::all_on(),
                 watch_user_cap: DEFAULT_USER_CAP,
                 watch_guild_cap: DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
             },
         ));
         engine.tick().await; // baseline captures the active sale
@@ -1304,6 +1354,69 @@ mod tests {
         let reply = f.output.messages().first().expect("reply expected").clone();
         assert!(reply.contains("Watch #1 added"), "reply: {reply}");
         assert!(reply.contains("- currently on sale"), "reply: {reply}");
+    }
+
+    /// `/lol_store_history` resolves the name like the watch command, folds
+    /// the recorded day documents into per-deal windows, and replies
+    /// ephemerally - sales and mythic rotations grouped, most recent first.
+    #[tokio::test]
+    async fn history_command_lists_grouped_windows() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let f = command_fixture_with(true, Arc::clone(&storage)).await;
+        let plugin = Arc::new(crate::test_support::InMemoryPluginStorage::new());
+        let engine = Arc::new(StoreEngine::new(
+            Arc::new(OnlineLcu::new()),
+            Arc::clone(&storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
+            plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG),
+            RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
+            RecordingBus::default(),
+            crate::test_support::test_platform_info(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: DEFAULT_USER_CAP,
+                watch_guild_cap: DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
+            },
+        ));
+        engine.tick().await; // baseline so the name search resolves
+
+        let digest = |day: &str, sale_id: u64| {
+            serde_json::json!({
+                "schema": 1, "day": day,
+                "sales": [{
+                    "sale_id": sale_id, "item_id": 1031, "champion_id": 103,
+                    "label": "Ahri \u{2014} Foxfire Ahri",
+                    "sale_price": 607, "original_price": 975
+                }],
+                "mythic": [{
+                    "rotation": "DAILY", "item_id": 1031, "champion_id": 103,
+                    "label": "Foxfire Ahri", "mythic_price": 100
+                }]
+            })
+        };
+        let scoped = plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG);
+        for (day, sale_id) in [("2026-09-01", 7u64), ("2026-09-02", 7), ("2026-09-04", 8)] {
+            scoped
+                .set(NAMESPACE, &format!("history.{day}"), digest(day, sale_id))
+                .await
+                .expect("digest write expected");
+        }
+
+        let args = CommandArgs(vec![
+            ("target".to_owned(), "skin".to_owned()),
+            ("name".to_owned(), "Foxfire Ahri".to_owned()),
+        ]);
+        HistoryHandler { engine }.invoke(&f.event, &args, &f.services).await.expect("invoke");
+        let reply = f.output.messages().first().expect("reply expected").clone();
+        assert!(reply.contains("**Sales**"), "reply: {reply}");
+        assert!(reply.contains("**Mythic rotation**"), "reply: {reply}");
+        // Sale 7 spans two recorded days -> one window; sale 4 stands alone;
+        // most recent first.
+        assert!(reply.contains("2026-09-04"), "reply: {reply}");
+        assert!(reply.contains("2026-09-01 \u{2192} 2026-09-02"), "reply: {reply}");
+        assert!(reply.contains("\u{2212}38%"), "percent off rendered: {reply}");
+        assert!(reply.contains("100 ME"), "mythic price rendered: {reply}");
     }
 
     #[tokio::test]
@@ -1319,7 +1432,7 @@ mod tests {
                 .messages()
                 .first()
                 .expect("reply expected")
-                .contains("no store snapshot is available")
+                .contains("No store snapshot is available")
         );
     }
 
@@ -1334,6 +1447,7 @@ mod tests {
         let engine = Arc::new(StoreEngine::new(
             Arc::new(lcu),
             Arc::clone(&storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
+            plugin_store(),
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecordingBus::default(),
             crate::test_support::test_platform_info(),
@@ -1342,6 +1456,7 @@ mod tests {
                 flags: AnnounceFlags::all_on(),
                 watch_user_cap: DEFAULT_USER_CAP,
                 watch_guild_cap: DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
             },
         ));
         engine.tick().await; // silent baseline
@@ -1355,10 +1470,11 @@ mod tests {
         assert!(reply.contains("New sales"), "reply: {reply}");
     }
 
-    /// Once an update has been announced, the dump replays that
-    /// announcement - the current-store fallback must not shadow it.
+    /// The dump always renders the CURRENT deals - even a fresh delta
+    /// announcement must not shadow them (the announcement itself already
+    /// landed in the channel history).
     #[tokio::test]
-    async fn dump_prefers_the_last_announcement_over_the_current_store() {
+    async fn dump_posts_the_current_store_even_after_an_announcement() {
         let storage = Arc::new(InMemoryStorage::new());
         let f = command_fixture_with(true, Arc::clone(&storage)).await;
         let lcu = Arc::new(OnlineLcu::new());
@@ -1366,6 +1482,7 @@ mod tests {
         let engine = Arc::new(StoreEngine::new(
             Arc::clone(&lcu) as Arc<dyn crate::plugins::lol_store::lcu::LcuPort>,
             Arc::clone(&storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
+            plugin_store(),
             RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
             RecordingBus::default(),
             crate::test_support::test_platform_info(),
@@ -1374,6 +1491,7 @@ mod tests {
                 flags: AnnounceFlags::all_on(),
                 watch_user_cap: DEFAULT_USER_CAP,
                 watch_guild_cap: DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
             },
         ));
         engine.tick().await; // silent baseline
@@ -1399,8 +1517,10 @@ mod tests {
             .await
             .expect("invoke");
         let reply = f.output.messages().last().expect("reply expected").clone();
-        assert!(reply.contains("LoL Store - latest update"), "reply: {reply}");
-        assert!(!reply.contains("LoL Store - current state"), "reply: {reply}");
+        assert!(reply.contains("LoL Store - current state"), "reply: {reply}");
+        // Both sales show - the full current set, not the delta.
+        assert!(reply.contains("Foxfire Ahri"), "reply: {reply}");
+        assert!(reply.contains("Dynasty Ahri"), "reply: {reply}");
     }
 
     #[tokio::test]

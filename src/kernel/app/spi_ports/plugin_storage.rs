@@ -5,13 +5,12 @@ use serde_json::Value;
 
 use crate::kernel::models::StorageError;
 
-/// Driven port: plugin-global document storage - operator-side aggregates
-/// and settings that deliberately cross guild boundaries (token counters,
-/// plugin-wide state). This is NOT a second user-data store: user content
-/// (message text, prompts) must never land here - the guild-partitioned
-/// [`StoragePort`](super::StoragePort) exists precisely so such data cannot
-/// cross guilds. The kernel trusts this store like its own telemetry:
-/// counters, ids, and settings keys are fine, message-sized payloads are not.
+/// Driven port: plugin-global document storage. The one store that
+/// deliberately crosses guild boundaries: whatever a plugin sees
+/// deployment-wide (counters, caches, dumps, aggregates) lives here, one
+/// platform-scoped document space per plugin namespace. Guild-partitioned
+/// user data belongs in [`StoragePort`](super::StoragePort) instead, so it
+/// can never cross guilds.
 #[async_trait]
 pub trait PluginStoragePort: Send + Sync {
     /// `platform` is the deployment's stable slug (see `PlatformInfoPort`) -

@@ -36,6 +36,9 @@ pub struct LolStoreConfig {
     pub watch_user_cap: u32,
     /// Maximum store watches per guild.
     pub watch_guild_cap: u32,
+    /// Days of store history retained (`/lol_store_history`); `0` disables
+    /// recording. Hot-reloadable alongside the announce flags and caps.
+    pub history_days: u32,
 }
 
 impl Default for LolStoreConfig {
@@ -50,6 +53,7 @@ impl Default for LolStoreConfig {
             announce_yourshop: true,
             watch_user_cap: 20,
             watch_guild_cap: 300,
+            history_days: 90,
         }
     }
 }
@@ -71,9 +75,11 @@ mod tests {
         assert!(config.announce_yourshop);
         assert_eq!(config.watch_user_cap, 20);
         assert_eq!(config.watch_guild_cap, 300);
+        assert_eq!(config.history_days, 90);
         // The documented defaults must not drift from the plugin's own.
         assert_eq!(config.watch_user_cap, crate::plugins::lol_store::DEFAULT_USER_CAP);
         assert_eq!(config.watch_guild_cap, crate::plugins::lol_store::DEFAULT_GUILD_CAP);
+        assert_eq!(config.history_days, crate::plugins::lol_store::DEFAULT_HISTORY_DAYS);
     }
 
     #[test]
@@ -85,7 +91,8 @@ mod tests {
                 "poll_secs": 60,
                 "announce_sales": false,
                 "watch_user_cap": 5,
-                "watch_guild_cap": 50
+                "watch_guild_cap": 50,
+                "history_days": 14
             }"#,
         )
         .expect("section expected to deserialize");
@@ -98,5 +105,6 @@ mod tests {
         assert!(config.announce_yourshop);
         assert_eq!(config.watch_user_cap, 5);
         assert_eq!(config.watch_guild_cap, 50);
+        assert_eq!(config.history_days, 14);
     }
 }

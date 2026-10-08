@@ -70,12 +70,12 @@ commands, permission tiers - lives in [Plugins](#plugins).
   hooks and event-bus subscribers are caught and logged, the event is
   dropped, and the rest of the chain or bus keeps working.
 - Configuration hot reload: hot-reloadable sections apply live (`[status]`,
-  `owners`, `[lol_store]` announce flags and watch caps, `[lol_leaderboard]`
-  regions/depth/TTL/view); startup-only settings (token, storage, Sentry,
-  LLM providers, poll and pacing intervals, leaderboard background mode
-  and its inline refresh budget) require a restart. Every accepted change
-  is logged per section, with the changed fields at the apply sites - a
-  startup-only edit is explicitly named as kept.
+  `owners`, `[lol_store]` announce flags, watch caps and history retention,
+  `[lol_leaderboard]` regions/depth/TTL/view); startup-only settings (token,
+  storage, Sentry, LLM providers, poll and pacing intervals, leaderboard
+  background mode and its inline refresh budget) require a restart. Every
+  accepted change is logged per section, with the changed fields at the
+  apply sites - a startup-only edit is explicitly named as kept.
 - Graceful shutdown on Ctrl-C (plugins stop in reverse order).
 
 ## Getting started
@@ -435,9 +435,20 @@ a replay - the poll state still advances so nothing is announced twice.
 `/lol_store_dump` and
 `/lol_client_status` show the bot-global watcher state (there is one
 League client per bot), which may differ from what an individual guild
-received. A dump before the first announced update renders the current
-store (sales, Mythic rotations, Your Shop) instead - "new skins" needs
-history, so that section only appears once updates have been announced.
+received.
+
+**Persistence and history.** The watcher's state and the last raw store
+snapshot live in one plugin-global store document, written whenever
+anything changed - so a restart catches up on what it missed, and
+`/lol_store_dump` renders **all current deals** even before the first
+poll of a fresh boot (e.g. the client is still offline). On top of that,
+each UTC day's observed deal set is kept as a per-day digest (names and
+prices frozen at capture time, retention `history_days`, `0` disables
+recording), and `/lol_store_history` answers "when was skin X or
+champion Y on sale / in the Mythic rotation" by folding those days into
+deal windows. Days the bot could not observe (client offline) simply
+have no record; Your Shop is deliberately absent from history - its
+offers are the operator's personal shop, not shareable store state.
 
 | Command | Tier | Effect |
 |---|---|---|
@@ -447,7 +458,8 @@ history, so that section only appears once updates have been announced.
 | `/lol_store_assign` | moderator | post store events in this channel (run it in the target channel) |
 | `/lol_store_unassign` | moderator | stop posting store events in this guild |
 | `/lol_store_role` | moderator | tag this role on store announcements - the subscription role (run without the argument to clear) |
-| `/lol_store_dump` | moderator | force-post the latest store update summary in the current channel; on a fresh launch (nothing announced yet), the current store instead (public, no role tag) |
+| `/lol_store_dump` | moderator | force-post all current store deals (sales, Mythic rotations, Your Shop) in the current channel - the live state, not the last update (public, no role tag) |
+| `/lol_store_history` | user | show when a skin or champion was on sale / in the Mythic Shop rotation, grouped into deal windows over the retention window (ephemeral) |
 | `/lol_store_watch` | user | watch a skin or a champion for sales, Mythic Shop rotations, new releases (ephemeral) |
 | `/lol_store_unwatch` | user | remove one own watch by its list id, or every own watch with `all` (ephemeral) |
 | `/lol_store_watchlist` | user | list your own watches (private, ephemeral) |
@@ -496,8 +508,9 @@ Watch notes:
 Operator configuration lives in the optional `[lol_store]` section. An
 absent section, an empty `lockfile_path`, or a zero `poll_secs` keep the
 watcher off (**startup-only** - enabling or disabling needs a restart);
-when enabled at boot, the announce flags and watch caps hot-reload, while
-`lockfile_path`, `address`, and `poll_secs` stay boot-frozen:
+when enabled at boot, the announce flags, watch caps, and `history_days`
+hot-reload, while `lockfile_path`, `address`, and `poll_secs` stay
+boot-frozen:
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
@@ -510,6 +523,7 @@ when enabled at boot, the announce flags and watch caps hot-reload, while
 | `announce_yourshop` | bool | `true` | announce Your Shop starts (start and end times) |
 | `watch_user_cap` | integer | `20` | maximum `/lol_store_watch` subscriptions per member per guild |
 | `watch_guild_cap` | integer | `300` | maximum `/lol_store_watch` subscriptions per guild |
+| `history_days` | integer | `90` | days of store history retained for `/lol_store_history`; `0` disables recording (hot-reloadable) |
 
 Announced trackers that are toggled off still update the watcher's
 state, so re-enabling never replays old events. The watcher publishes

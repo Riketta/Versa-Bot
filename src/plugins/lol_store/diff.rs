@@ -1,7 +1,8 @@
 //! Store watchers' state and change detection. Pure logic: no I/O, no
 //! channels - [`LastSeen`] is the compacted "what the store looked like last
-//! time" (persisted per guild for boot catch-up), [`StoreDelta`] is what a
-//! diff announces.
+//! time" (persisted in the plugin-global store document for boot catch-up),
+//! [`Snapshot`] is one poll cycle's raw data (the same document's dump
+//! half), [`StoreDelta`] is what a diff announces.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -102,8 +103,10 @@ impl StoreDelta {
 }
 
 /// The store data of one successful poll cycle (any part may be absent when
-/// that source failed).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// that source failed). Serializable: it is the raw half of the persisted
+/// plugin-global store document (boot restore, `/lol_store_dump` fallback,
+/// history digests).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Snapshot {
     pub sales: Option<Vec<Sale>>,
     pub catalog: Option<Vec<CatalogItem>>,
