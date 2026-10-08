@@ -30,10 +30,10 @@ use super::completion_port::{
 };
 use super::conversation::{self, ConversationRecord, RecordRole};
 use super::model::{
-    ChannelConfig, ChannelKey, ConversationState, EmojiInject, GUILD_EMOJI_WHITELIST_KEY,
-    GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats, blend_ratio,
+    ChannelConfig, ChannelKey, ConversationState, EmojiInject, EmojiWhitelistEntry,
+    GUILD_EMOJI_WHITELIST_KEY, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats, blend_ratio,
     channel_emoji_whitelist_key, channel_key, channel_state_key, channel_stats_key,
-    records_namespace, unix_now,
+    parse_whitelist, records_namespace, unix_now,
 };
 use super::prompts::{PromptVars, render_prompt};
 use super::providers::LlmSettings;
@@ -588,11 +588,13 @@ impl ChatEngine {
         )
     }
 
-    /// The react tool's server-emoji menu line: exact wire-form tokens, one
-    /// per custom emoji, sorted by name (byte-stable between emoji-set or
-    /// whitelist changes - the line rides the prompt's cacheable prefix).
-    /// Empty unless the channel opted in and the platform lists emojis;
-    /// every failure on the way degrades to empty (the menu is cosmetic).
+    /// The react tool's server-emoji menu: exact wire-form tokens, one per
+    /// custom emoji, sorted by name (byte-stable between emoji-set or
+    /// whitelist changes - the menu rides the prompt's cacheable prefix).
+    /// Entries with a description render as sub-lines under the header; a
+    /// whitelist without descriptions keeps the plain single line. Empty
+    /// unless the channel opted in and the platform lists emojis; every
+    /// failure on the way degrades to empty (the menu is cosmetic).
     async fn react_emoji_menu(
         &self,
         origin: &Origin,
@@ -603,15 +605,35 @@ impl ChatEngine {
             return String::new();
         }
         let mut emojis = services.chat_output_factory.reactable_emojis(origin).list().await;
+        let mut described: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
         if config.react_emoji_inject == EmojiInject::Whitelist {
             let whitelist = self.effective_emoji_whitelist(origin, services).await;
-            emojis.retain(|emoji| whitelist.contains(&emoji.name));
+            emojis.retain(|emoji| whitelist.iter().any(|entry| entry.name == emoji.name));
+            described = whitelist
+                .into_iter()
+                .filter_map(|entry| {
+                    let description = entry.description.filter(|text| !text.is_empty())?;
+                    Some((entry.name, description))
+                })
+                .collect();
         }
         if emojis.is_empty() {
             return String::new();
         }
-        let tokens: Vec<String> = emojis.into_iter().map(|emoji| emoji.token).collect();
-        format!("\n- Custom emojis of this server (exact forms): {}", tokens.join(" "))
+        if described.is_empty() {
+            let tokens: Vec<String> = emojis.into_iter().map(|emoji| emoji.token).collect();
+            return format!("\n- Custom emojis of this server (exact forms): {}", tokens.join(" "));
+        }
+        emojis.sort_by(|a, b| a.name.cmp(&b.name));
+        let lines: Vec<String> = emojis
+            .iter()
+            .map(|emoji| match described.get(&emoji.name) {
+                Some(description) => format!("  {} \u{2014} {description}", emoji.token),
+                None => format!("  {}", emoji.token),
+            })
+            .collect();
+        format!("\n- Custom emojis of this server (exact forms):\n{}", lines.join("\n"))
     }
 
     /// The emoji whitelist in effect for this channel: the channel's own
@@ -622,26 +644,26 @@ impl ChatEngine {
         &self,
         origin: &Origin,
         services: &KernelServices,
-    ) -> std::collections::BTreeSet<String> {
+    ) -> Vec<EmojiWhitelistEntry> {
         let Some(storage) = &services.guild_storage else {
-            return std::collections::BTreeSet::new();
+            return Vec::new();
         };
-        let channel: Option<Vec<String>> = storage
+        let channel = storage
             .get(NAMESPACE, &channel_emoji_whitelist_key(origin.channel_id.get()))
             .await
             .ok()
             .flatten()
-            .and_then(|raw| serde_json::from_value(raw).ok());
+            .map(parse_whitelist);
         if let Some(list) = channel.filter(|list| !list.is_empty()) {
-            return list.into_iter().collect();
+            return list;
         }
-        let guild: Option<Vec<String>> = storage
+        storage
             .get(NAMESPACE, GUILD_EMOJI_WHITELIST_KEY)
             .await
             .ok()
             .flatten()
-            .and_then(|raw| serde_json::from_value(raw).ok());
-        guild.unwrap_or_default().into_iter().collect()
+            .map(parse_whitelist)
+            .unwrap_or_default()
     }
 
     fn assemble_prompt(
@@ -4370,6 +4392,128 @@ mod tests {
         let system = request.messages.first().expect("system slot expected");
         assert!(system.content.contains("<:dorkiS:9>"), "unexpected: {}", system.content);
         assert!(!system.content.contains("ashuu"), "unexpected: {}", system.content);
+    }
+
+    /// Described whitelist entries render as sorted sub-lines under the
+    /// header; undescribed entries stay bare tokens.
+    #[tokio::test]
+    async fn react_emoji_menu_renders_descriptions_as_sub_lines() {
+        let ctx = ctx_describer_with_emojis(
+            LlmSettings::default(),
+            Arc::new(RandRandom),
+            vec![Ok("hi".to_owned())],
+            Arc::new(FakeDescriber::default()),
+            emoji_menu_emojis(),
+        );
+        let config = ChannelConfig {
+            react: true,
+            react_emoji_inject: EmojiInject::Whitelist,
+            ..assigned_config()
+        };
+        seed_config(&ctx.storage, &config);
+        ctx.storage.seed(
+            "test",
+            GuildId(1),
+            NAMESPACE,
+            GUILD_EMOJI_WHITELIST_KEY,
+            serde_json::json!([
+                { "name": "ashuu" },
+                { "name": "dorkiS", "description": "smug face, for mockery" }
+            ]),
+        );
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
+
+        let request = ctx.fake.requests().first().expect("one request expected").clone();
+        let system = request.messages.first().expect("system slot expected");
+        assert!(
+            system.content.contains(
+                "Custom emojis of this server (exact forms):\n  <a:ashuu:7>\
+                 \n  <:dorkiS:9> \u{2014} smug face, for mockery"
+            ),
+            "byte-exact sub-lines in name order: {}",
+            system.content
+        );
+    }
+
+    /// A whitelist without any description keeps the historical single
+    /// line - the byte-stable shape provider caches were keyed on.
+    #[tokio::test]
+    async fn react_emoji_menu_without_descriptions_stays_one_line() {
+        let ctx = ctx_describer_with_emojis(
+            LlmSettings::default(),
+            Arc::new(RandRandom),
+            vec![Ok("hi".to_owned())],
+            Arc::new(FakeDescriber::default()),
+            emoji_menu_emojis(),
+        );
+        let config = ChannelConfig {
+            react: true,
+            react_emoji_inject: EmojiInject::Whitelist,
+            ..assigned_config()
+        };
+        seed_config(&ctx.storage, &config);
+        ctx.storage.seed(
+            "test",
+            GuildId(1),
+            NAMESPACE,
+            GUILD_EMOJI_WHITELIST_KEY,
+            serde_json::json!([{ "name": "ashuu" }]),
+        );
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
+
+        let request = ctx.fake.requests().first().expect("one request expected").clone();
+        let system = request.messages.first().expect("system slot expected");
+        assert!(
+            system.content.contains("Custom emojis of this server (exact forms): <a:ashuu:7>"),
+            "single line kept: {}",
+            system.content
+        );
+        assert!(!system.content.contains("exact forms):\n"), "no sub-lines: {}", system.content);
+    }
+
+    /// `all` mode serves the raw platform listing - whitelist descriptions
+    /// never leak into it.
+    #[tokio::test]
+    async fn react_emoji_menu_all_mode_ignores_descriptions() {
+        let ctx = ctx_describer_with_emojis(
+            LlmSettings::default(),
+            Arc::new(RandRandom),
+            vec![Ok("hi".to_owned())],
+            Arc::new(FakeDescriber::default()),
+            emoji_menu_emojis(),
+        );
+        let config = ChannelConfig {
+            react: true,
+            react_emoji_inject: EmojiInject::All,
+            ..assigned_config()
+        };
+        seed_config(&ctx.storage, &config);
+        ctx.storage.seed(
+            "test",
+            GuildId(1),
+            NAMESPACE,
+            GUILD_EMOJI_WHITELIST_KEY,
+            serde_json::json!([{ "name": "dorkiS", "description": "smug face" }]),
+        );
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
+
+        let request = ctx.fake.requests().first().expect("one request expected").clone();
+        let system = request.messages.first().expect("system slot expected");
+        assert!(
+            system.content.contains("Custom emojis of this server (exact forms): <:dorkiS:9>"),
+            "unexpected: {}",
+            system.content
+        );
+        assert!(!system.content.contains("smug face"), "no descriptions in all mode");
     }
 
     /// React-on with the inject off keeps the prompt free of the menu - and

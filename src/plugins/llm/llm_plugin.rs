@@ -445,11 +445,12 @@ impl PluginPort for LlmPlugin {
                 vec![
                     ArgDescriptor {
                         name: "action".to_owned(),
-                        description: "Whitelist action - add, remove, list, or clear".to_owned(),
+                        description: "Whitelist action - add, remove, list, clear, or desc"
+                            .to_owned(),
                         required: true,
                         kind: ArgKind::String,
                         choices: Some(
-                            ["add", "remove", "list", "clear"]
+                            ["add", "remove", "list", "clear", "desc"]
                                 .iter()
                                 .map(|action| (*action).to_owned())
                                 .collect(),
@@ -468,7 +469,15 @@ impl PluginPort for LlmPlugin {
                     },
                     ArgDescriptor {
                         name: "name".to_owned(),
-                        description: "Custom emoji name to add or remove (exact, e.g. dorkiS)"
+                        description: "Custom emoji name (exact, e.g. dorkiS)".to_owned(),
+                        required: false,
+                        kind: ArgKind::String,
+                        choices: None,
+                    },
+                    ArgDescriptor {
+                        name: "description".to_owned(),
+                        description: "Optional short hint for the model (up to 100 characters); \
+                             empty clears it"
                             .to_owned(),
                         required: false,
                         kind: ArgKind::String,
@@ -753,11 +762,14 @@ mod tests {
         },
         plugin_ports::{CommandArgs, CommandHandler},
         services::KernelServices,
-        spi_ports::{ChatOutputPort, GUILD_SETTINGS, StoragePort},
+        spi_ports::{
+            ChatOutputFactoryPort, ChatOutputPort, GUILD_SETTINGS, ReactableEmoji, StoragePort,
+        },
     };
     use crate::plugins::llm::model::{
-        ChannelConfig, ConversationState, NAMESPACE, SERVICE_CHANNEL_KEY, channel_config_key,
-        channel_state_key, channel_state_undo_key, records_namespace,
+        ChannelConfig, ConversationState, GUILD_EMOJI_WHITELIST_KEY, NAMESPACE,
+        SERVICE_CHANNEL_KEY, channel_config_key, channel_state_key, channel_state_undo_key,
+        records_namespace,
     };
     use crate::plugins::llm::providers::ModelSettings;
     use crate::plugins::llm::{
@@ -868,13 +880,30 @@ mod tests {
     }
 
     fn fixture() -> (LlmPlugin, Fixture) {
+        let output = RecordingChatOutput::new();
+        fixture_with_factory(RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(), output)
+    }
+
+    /// A fixture whose factory serves custom emojis from `reactable_emojis`
+    /// - the source the whitelist command validates names against.
+    fn fixture_with_emojis(emojis: Vec<ReactableEmoji>) -> (LlmPlugin, Fixture) {
+        let output = RecordingChatOutput::new();
+        fixture_with_factory(
+            RecordingChatOutputFactory::with_emojis(Arc::clone(&output), emojis).boxed(),
+            output,
+        )
+    }
+
+    fn fixture_with_factory(
+        factory: Arc<dyn ChatOutputFactoryPort>,
+        output: Arc<RecordingChatOutput>,
+    ) -> (LlmPlugin, Fixture) {
         let registry = Arc::new(InMemoryCommandRegistry::new());
         let storage = Arc::new(InMemoryStorage::new());
-        let output = RecordingChatOutput::new();
         let plugin_storage = Arc::new(crate::test_support::InMemoryPluginStorage::new());
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
-            chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
+            chat_output_factory: factory,
             guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
@@ -908,6 +937,166 @@ mod tests {
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         }
+    }
+
+    /// `/llm_emoji_whitelist` with descriptions: `add` persists the entry
+    /// shape (trimmed), `desc` updates and clears, an oversized hint is
+    /// rejected before any write, and `list` renders descriptions.
+    #[tokio::test]
+    async fn emoji_whitelist_descriptions_add_update_clear_and_cap() {
+        let (_, f) = fixture_with_emojis(vec![
+            ReactableEmoji { name: "dorkiS".to_owned(), token: "<:dorkiS:9>".to_owned() },
+            ReactableEmoji { name: "ashuu".to_owned(), token: "<a:ashuu:7>".to_owned() },
+        ]);
+        let args = |pairs: &[(&str, &str)]| {
+            CommandArgs(
+                pairs.iter().map(|(key, value)| ((*key).to_owned(), (*value).to_owned())).collect(),
+            )
+        };
+        let doc = || async {
+            f.storage
+                .guild_scoped("test", GuildId(1))
+                .get(NAMESPACE, GUILD_EMOJI_WHITELIST_KEY)
+                .await
+                .expect("read expected")
+        };
+
+        EmojiWhitelistLlmHandler
+            .invoke(
+                &command_event(Some(1)),
+                &args(&[
+                    ("action", "add"),
+                    ("scope", "guild"),
+                    ("name", "dorkiS"),
+                    ("description", "  smug face  "),
+                ]),
+                &f.services,
+            )
+            .await
+            .expect("invoke");
+        let reply = f.output.messages().first().expect("reply expected").clone();
+        assert!(reply.contains("Added `dorkiS`"), "{reply}");
+        assert!(reply.contains("description: smug face"), "{reply}");
+        assert_eq!(
+            doc().await,
+            Some(serde_json::json!([{ "name": "dorkiS", "description": "smug face" }])),
+            "trimmed description persisted"
+        );
+
+        // `desc` with a new text overwrites; without one it clears.
+        EmojiWhitelistLlmHandler
+            .invoke(
+                &command_event(Some(1)),
+                &args(&[
+                    ("action", "desc"),
+                    ("scope", "guild"),
+                    ("name", "dorkiS"),
+                    ("description", "new hint"),
+                ]),
+                &f.services,
+            )
+            .await
+            .expect("invoke");
+        assert!(
+            f.output
+                .messages()
+                .last()
+                .expect("reply expected")
+                .contains("Updated the description of `dorkiS`: new hint"),
+            "{}",
+            f.output.messages().last().expect("reply expected")
+        );
+        EmojiWhitelistLlmHandler
+            .invoke(
+                &command_event(Some(1)),
+                &args(&[("action", "desc"), ("scope", "guild"), ("name", "dorkiS")]),
+                &f.services,
+            )
+            .await
+            .expect("invoke");
+        assert!(
+            f.output
+                .messages()
+                .last()
+                .expect("reply expected")
+                .contains("Cleared the description of `dorkiS`"),
+            "{}",
+            f.output.messages().last().expect("reply expected")
+        );
+        assert_eq!(doc().await, Some(serde_json::json!([{ "name": "dorkiS" }])));
+
+        // A description change for an unlisted emoji is refused.
+        EmojiWhitelistLlmHandler
+            .invoke(
+                &command_event(Some(1)),
+                &args(&[
+                    ("action", "desc"),
+                    ("scope", "guild"),
+                    ("name", "ashuu"),
+                    ("description", "hint"),
+                ]),
+                &f.services,
+            )
+            .await
+            .expect("invoke");
+        assert!(
+            f.output
+                .messages()
+                .last()
+                .expect("reply expected")
+                .contains("`ashuu` is not on the guild whitelist"),
+            "{}",
+            f.output.messages().last().expect("reply expected")
+        );
+
+        // An oversized hint is rejected before any write.
+        let oversized = "x".repeat(101);
+        EmojiWhitelistLlmHandler
+            .invoke(
+                &command_event(Some(1)),
+                &args(&[
+                    ("action", "desc"),
+                    ("scope", "guild"),
+                    ("name", "dorkiS"),
+                    ("description", oversized.as_str()),
+                ]),
+                &f.services,
+            )
+            .await
+            .expect("invoke");
+        assert!(
+            f.output.messages().last().expect("reply expected").contains("too long"),
+            "{}",
+            f.output.messages().last().expect("reply expected")
+        );
+        assert_eq!(doc().await, Some(serde_json::json!([{ "name": "dorkiS" }])));
+
+        // `list` renders one line per entry.
+        EmojiWhitelistLlmHandler
+            .invoke(
+                &command_event(Some(1)),
+                &args(&[
+                    ("action", "add"),
+                    ("scope", "guild"),
+                    ("name", "ashuu"),
+                    ("description", "celebratory wave"),
+                ]),
+                &f.services,
+            )
+            .await
+            .expect("invoke");
+        EmojiWhitelistLlmHandler
+            .invoke(
+                &command_event(Some(1)),
+                &args(&[("action", "list"), ("scope", "guild")]),
+                &f.services,
+            )
+            .await
+            .expect("invoke");
+        let reply = f.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("The guild emoji whitelist (2 entries):"), "{reply}");
+        assert!(reply.contains("- `ashuu` \u{2014} celebratory wave"), "{reply}");
+        assert!(reply.contains("- `dorkiS`"), "{reply}");
     }
 
     #[test]

@@ -805,12 +805,25 @@ impl ChatOutputFactoryPort for FailingChatOutputFactory {
 pub struct RecordingChatOutputFactory {
     output: Arc<RecordingChatOutput>,
     typing_starts: AtomicUsize,
+    /// Custom emojis `reactable_emojis` serves (default: none) - the
+    /// prompt-injection and add-validation source for emoji tests.
+    emojis: Vec<crate::kernel::spi_ports::ReactableEmoji>,
 }
 
 impl RecordingChatOutputFactory {
     #[must_use]
     pub fn new(output: Arc<RecordingChatOutput>) -> Self {
-        Self { output, typing_starts: AtomicUsize::new(0) }
+        Self { output, typing_starts: AtomicUsize::new(0), emojis: Vec::new() }
+    }
+
+    /// Serves custom emojis from `reactable_emojis` (exact wire forms - the
+    /// same shape the real adapter builds).
+    #[must_use]
+    pub fn with_emojis(
+        output: Arc<RecordingChatOutput>,
+        emojis: Vec<crate::kernel::spi_ports::ReactableEmoji>,
+    ) -> Self {
+        Self { output, typing_starts: AtomicUsize::new(0), emojis }
     }
 
     /// How many times the typing indicator was started (the Discord adapter
@@ -860,6 +873,24 @@ impl ChatOutputFactoryPort for RecordingChatOutputFactory {
         _message_id: crate::kernel::models::MessageId,
     ) -> Option<String> {
         None
+    }
+
+    fn reactable_emojis(
+        &self,
+        _origin: &crate::kernel::models::Origin,
+    ) -> Arc<dyn crate::kernel::spi_ports::GuildEmojiPort> {
+        Arc::new(StaticGuildEmojis(self.emojis.clone()))
+    }
+}
+
+/// Serves the fixed emoji list a [`RecordingChatOutputFactory`] was built
+/// with (empty by default - no emojis, like a guild without any).
+struct StaticGuildEmojis(Vec<crate::kernel::spi_ports::ReactableEmoji>);
+
+#[async_trait::async_trait]
+impl crate::kernel::spi_ports::GuildEmojiPort for StaticGuildEmojis {
+    async fn list(&self) -> Vec<crate::kernel::spi_ports::ReactableEmoji> {
+        self.0.clone()
     }
 }
 

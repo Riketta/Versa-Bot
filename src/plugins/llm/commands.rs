@@ -19,10 +19,10 @@ use super::chat_engine::ChatEngine;
 use super::conversation::ConversationRecord;
 use super::llm_plugin::ChannelLocks;
 use super::model::{
-    CaptureMode, ChannelConfig, ConversationState, EmojiInject, GUILD_EMOJI_WHITELIST_KEY,
-    GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats, channel_config_key,
-    channel_emoji_whitelist_key, channel_state_key, channel_state_undo_key, channel_stats_key,
-    default_random_cooldown, records_namespace, unix_now,
+    CaptureMode, ChannelConfig, ConversationState, EmojiInject, EmojiWhitelistEntry,
+    GUILD_EMOJI_WHITELIST_KEY, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats,
+    channel_config_key, channel_emoji_whitelist_key, channel_state_key, channel_state_undo_key,
+    channel_stats_key, default_random_cooldown, parse_whitelist, records_namespace, unix_now,
 };
 use super::prompts;
 use super::providers::{LlmSettings, ModelSettings};
@@ -1006,21 +1006,17 @@ fn react_label(config: &ChannelConfig, emoji_inject: Option<&str>) -> String {
 /// otherwise the guild-wide one. `None` = neither list exists.
 async fn emoji_inject_detail(channel_id: u64, services: &KernelServices) -> Option<String> {
     let storage = services.guild_storage.as_ref()?;
-    let channel: Option<Vec<String>> = storage
+    let channel = storage
         .get(NAMESPACE, &channel_emoji_whitelist_key(channel_id))
         .await
         .ok()
         .flatten()
-        .and_then(|raw| serde_json::from_value(raw).ok());
+        .map(parse_whitelist);
     if let Some(list) = channel.filter(|list| !list.is_empty()) {
         return Some(format!("channel, {}", list.len()));
     }
-    let guild: Option<Vec<String>> = storage
-        .get(NAMESPACE, GUILD_EMOJI_WHITELIST_KEY)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_value(raw).ok());
+    let guild =
+        storage.get(NAMESPACE, GUILD_EMOJI_WHITELIST_KEY).await.ok().flatten().map(parse_whitelist);
     guild.filter(|list| !list.is_empty()).map(|list| format!("guild, {}", list.len()))
 }
 
@@ -1377,18 +1373,52 @@ impl CommandHandler for ClearServiceChannelHandler {
     }
 }
 
-/// `/llm_emoji_whitelist`: manages the emoji names the `whitelist` inject
-/// mode filters against - the `scope` argument picks the guild-wide
-/// baseline or the channel's own override (a non-empty channel list
-/// replaces the baseline for that channel). Names are validated against
-/// the guild's actual custom emojis at add time, so the list only ever
-/// contains reactable entries. Lock-free like `/llm_admin`: rare moderator
-/// writes, last one wins.
+/// `/llm_emoji_whitelist`: manages the emoji entries the `whitelist` inject
+/// mode filters against - the `scope` argument picks the guild-wide baseline
+/// or the channel's own override (a non-empty channel list replaces the
+/// baseline for that channel). Names are validated against the guild's
+/// actual custom emojis at add time, so the list only ever contains
+/// reactable entries; each entry may carry a short description the menu
+/// renders next to the emoji's wire form (`desc` sets, updates, or clears
+/// it). Lock-free like `/llm_admin`: rare moderator writes, last one wins.
 pub(super) struct EmojiWhitelistLlmHandler;
 
+/// Longest accepted emoji description, in characters: a short hint for the
+/// model, not documentation.
+const EMOJI_DESCRIPTION_LIMIT: usize = 100;
+
+/// The optional `description` argument, trimmed; `None` = empty or absent.
+/// `Err` carries the rejection notice when over the cap.
+fn normalize_description(raw: Option<&str>) -> Result<Option<String>, String> {
+    match raw.map(str::trim).filter(|text| !text.is_empty()) {
+        None => Ok(None),
+        Some(text) if text.chars().count() > EMOJI_DESCRIPTION_LIMIT => Err(format!(
+            "`description` is too long ({} characters, the maximum is {EMOJI_DESCRIPTION_LIMIT}).",
+            text.chars().count()
+        )),
+        Some(text) => Ok(Some(text.to_owned())),
+    }
+}
+
 /// Whitelist names as one backticked, comma-separated run.
-fn render_names(list: &[String]) -> String {
-    list.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ")
+fn render_names(list: &[EmojiWhitelistEntry]) -> String {
+    list.iter().map(|entry| format!("`{}`", entry.name)).collect::<Vec<_>>().join(", ")
+}
+
+/// The `list` reply: one line per entry, the description (if any) after an
+/// em dash.
+fn whitelist_list_reply(scope: &str, list: &[EmojiWhitelistEntry]) -> String {
+    if list.is_empty() {
+        return format!("The {scope} emoji whitelist is empty.");
+    }
+    let lines: Vec<String> = list
+        .iter()
+        .map(|entry| match &entry.description {
+            Some(description) => format!("- `{}` \u{2014} {description}", entry.name),
+            None => format!("- `{}`", entry.name),
+        })
+        .collect();
+    format!("The {scope} emoji whitelist ({} entries):\n{}", list.len(), lines.join("\n"))
 }
 
 #[async_trait]
@@ -1399,8 +1429,10 @@ impl CommandHandler for EmojiWhitelistLlmHandler {
         args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
-        const USAGE: &str = "Usage: `/llm_emoji_whitelist action:<add|remove|list|clear> \
-             scope:<guild|channel> name:<emoji>` - `name` is required for add and remove.";
+        const USAGE: &str = "Usage: `/llm_emoji_whitelist action:<add|remove|list|clear|desc> \
+             scope:<guild|channel> name:<emoji> [description:<text>]` - `name` is required for \
+             add, remove, and desc; `description` (up to 100 characters) sets or updates the \
+             hint, empty clears it.";
         let Some(storage) = &services.guild_storage else {
             services
                 .chat_output
@@ -1423,11 +1455,8 @@ impl CommandHandler for EmojiWhitelistLlmHandler {
                 return Ok(());
             }
         };
-        let mut list: Vec<String> = storage
-            .get(NAMESPACE, &key)
-            .await?
-            .and_then(|raw| serde_json::from_value(raw).ok())
-            .unwrap_or_default();
+        let mut list: Vec<EmojiWhitelistEntry> =
+            storage.get(NAMESPACE, &key).await?.map(parse_whitelist).unwrap_or_default();
         match action {
             "add" | "remove" => {
                 let Some(name) = args.get("name") else {
@@ -1435,6 +1464,13 @@ impl CommandHandler for EmojiWhitelistLlmHandler {
                     return Ok(());
                 };
                 if action == "add" {
+                    let description = match normalize_description(args.get("description")) {
+                        Ok(description) => description,
+                        Err(notice) => {
+                            services.chat_output.send(command_reply(notice)).await?;
+                            return Ok(());
+                        }
+                    };
                     let known =
                         services.chat_output_factory.reactable_emojis(&event.origin).list().await;
                     if !known.iter().any(|emoji| emoji.name == name) {
@@ -1446,7 +1482,7 @@ impl CommandHandler for EmojiWhitelistLlmHandler {
                             .await?;
                         return Ok(());
                     }
-                    if list.iter().any(|entry| entry == name) {
+                    if list.iter().any(|entry| entry.name == name) {
                         services
                             .chat_output
                             .send(command_reply(format!(
@@ -1456,19 +1492,24 @@ impl CommandHandler for EmojiWhitelistLlmHandler {
                             .await?;
                         return Ok(());
                     }
-                    list.push(name.to_owned());
-                    list.sort();
+                    list.push(EmojiWhitelistEntry { name: name.to_owned(), description });
+                    list.sort_by(|a, b| a.name.cmp(&b.name));
                     storage.set(NAMESPACE, &key, serde_json::json!(list)).await?;
-                    services
-                        .chat_output
-                        .send(command_reply(format!(
-                            "Added `{name}` - the {scope} whitelist now has {} entries: {}.",
-                            list.len(),
-                            render_names(&list)
-                        )))
-                        .await?;
+                    let mut reply = format!(
+                        "Added `{name}` - the {scope} whitelist now has {} entries: {}.",
+                        list.len(),
+                        render_names(&list)
+                    );
+                    if let Some(stored) = list
+                        .iter()
+                        .find(|entry| entry.name == name)
+                        .and_then(|entry| entry.description.clone())
+                    {
+                        reply.push_str(&format!("\n`{name}` description: {stored}"));
+                    }
+                    services.chat_output.send(command_reply(reply)).await?;
                 } else {
-                    let Some(position) = list.iter().position(|entry| entry == name) else {
+                    let Some(position) = list.iter().position(|entry| entry.name == name) else {
                         services
                             .chat_output
                             .send(command_reply(format!(
@@ -1489,15 +1530,60 @@ impl CommandHandler for EmojiWhitelistLlmHandler {
                         .await?;
                 }
             }
+            "desc" => {
+                let Some(name) = args.get("name") else {
+                    services.chat_output.send(command_reply(USAGE)).await?;
+                    return Ok(());
+                };
+                let description = match normalize_description(args.get("description")) {
+                    Ok(description) => description,
+                    Err(notice) => {
+                        services.chat_output.send(command_reply(notice)).await?;
+                        return Ok(());
+                    }
+                };
+                let Some(entry) = list.iter_mut().find(|entry| entry.name == name) else {
+                    services
+                        .chat_output
+                        .send(command_reply(format!("`{name}` is not on the {scope} whitelist.")))
+                        .await?;
+                    return Ok(());
+                };
+                match description {
+                    Some(text) => {
+                        entry.description = Some(text.clone());
+                        storage.set(NAMESPACE, &key, serde_json::json!(list)).await?;
+                        services
+                            .chat_output
+                            .send(command_reply(format!(
+                                "Updated the description of `{name}`: {text}"
+                            )))
+                            .await?;
+                    }
+                    None => {
+                        if entry.description.take().is_some() {
+                            storage.set(NAMESPACE, &key, serde_json::json!(list)).await?;
+                            services
+                                .chat_output
+                                .send(command_reply(format!(
+                                    "Cleared the description of `{name}`."
+                                )))
+                                .await?;
+                        } else {
+                            services
+                                .chat_output
+                                .send(command_reply(format!(
+                                    "`{name}` has no description to clear."
+                                )))
+                                .await?;
+                        }
+                    }
+                }
+            }
             "list" => {
-                let rendered =
-                    if list.is_empty() { "empty".to_owned() } else { render_names(&list) };
                 services
                     .chat_output
-                    .send(command_reply(format!(
-                        "The {scope} emoji whitelist ({} entries): {rendered}",
-                        list.len()
-                    )))
+                    .send(command_reply(whitelist_list_reply(scope, &list)))
                     .await?;
             }
             "clear" => {
@@ -1511,7 +1597,7 @@ impl CommandHandler for EmojiWhitelistLlmHandler {
                 services
                     .chat_output
                     .send(command_reply(format!(
-                        "Unknown action `{other}` - use add, remove, list, or clear."
+                        "Unknown action `{other}` - use add, remove, list, clear, or desc."
                     )))
                     .await?;
             }
@@ -2311,6 +2397,44 @@ mod tests {
         let _ = server.await;
 
         assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    /// Description normalization trims, clears on empty/absent, and
+    /// enforces the character cap (100, boundary inclusive).
+    #[test]
+    fn description_normalization_trims_caps_and_clears() {
+        assert_eq!(normalize_description(None).ok().flatten(), None);
+        assert_eq!(normalize_description(Some("  ")).ok().flatten(), None);
+        assert_eq!(
+            normalize_description(Some("  smug face ")).ok().flatten(),
+            Some("smug face".to_owned())
+        );
+        let oversized = "x".repeat(EMOJI_DESCRIPTION_LIMIT + 1);
+        assert!(normalize_description(Some(&oversized)).is_err(), "over the cap is rejected");
+        let at_cap = "x".repeat(EMOJI_DESCRIPTION_LIMIT);
+        assert_eq!(
+            normalize_description(Some(&at_cap)).ok().flatten(),
+            Some(at_cap),
+            "exactly at the cap passes"
+        );
+    }
+
+    /// The `list` reply renders descriptions after an em dash and stays
+    /// one-per-line; the empty whitelist has its own wording.
+    #[test]
+    fn whitelist_list_reply_renders_descriptions_and_empty_scope() {
+        assert_eq!(whitelist_list_reply("guild", &[]), "The guild emoji whitelist is empty.");
+        let list = vec![
+            EmojiWhitelistEntry {
+                name: "dorkiS".to_owned(),
+                description: Some("smug face".to_owned()),
+            },
+            EmojiWhitelistEntry { name: "ashuu".to_owned(), description: None },
+        ];
+        let reply = whitelist_list_reply("channel", &list);
+        assert!(reply.contains("The channel emoji whitelist (2 entries):"), "{reply}");
+        assert!(reply.contains("- `dorkiS` \u{2014} smug face"), "{reply}");
+        assert!(reply.contains("- `ashuu`"), "{reply}");
     }
 
     /// All three prompt kinds share the set/clear grammar: text stores,

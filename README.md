@@ -840,10 +840,16 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   lists every custom emoji of the server, `whitelist` lists only the
   names on the emoji whitelist (the channel's own list when it has one,
   otherwise the guild-wide list, managed with `/llm_emoji_whitelist`).
-  Off by default - the list costs prompt space and invalidates provider
-  prompt caches whenever the emoji set or whitelist changes. Setting the
-  mode works without `react`, but the list only reaches the model where
-  the react tool is also on.
+  Whitelist entries may carry an optional short description (up to 100
+  characters) the menu renders under the emoji's wire form, so the model
+  knows what the emoji is for - set it with `add`'s `description`
+  argument or the `desc` action; entries without one stay bare, and a
+  whitelist without any description keeps the compact single-line menu.
+  Descriptions never appear in `all` mode. Off by default - the list
+  costs prompt space and invalidates provider prompt caches whenever the
+  emoji set, the whitelist, or a description changes. Setting the mode
+  works without `react`, but the list only reaches the model where the
+  react tool is also on.
   Degradation is per-token: an invalid token drops, valid siblings fire,
   and a failed reaction never touches the answer. An answer that is only
   a marker is answered with just the reaction - no fallback, no phantom
@@ -880,7 +886,7 @@ plugin](#authorization-auth-plugin)).
 | `/llm_cutoff` | moderator | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
 | `/llm_cutoff_undo` | moderator | undo this channel's last `/llm_cutoff`: the exact previous context (summary and cutoff position) is restored - stored records were never touched |
 | `/llm_forget message_id:<id>` | moderator | remove every stored history record of this channel carrying the message id (`enable developer mode`, then right-click a message > Copy Message ID); records already folded into the summary leave storage but the summary text still reflects them |
-| `/llm_emoji_whitelist action:<add\|remove\|list\|clear> scope:<guild\|channel> name:<emoji>` | moderator | manage the emoji whitelist the `react_emoji_inject whitelist` mode filters against; `guild` is the shared baseline, `channel` this channel's own override (a non-empty channel list replaces the baseline); names are validated against the server's actual custom emojis at add time |
+| `/llm_emoji_whitelist action:<add\|remove\|list\|clear\|desc> scope:<guild\|channel> name:<emoji> [description:<text>]` | moderator | manage the emoji whitelist the `react_emoji_inject whitelist` mode filters against; `guild` is the shared baseline, `channel` this channel's own override (a non-empty channel list replaces the baseline); names are validated against the server's actual custom emojis at add time; an optional `description` (up to 100 characters) is a short hint shown to the model next to the emoji - `desc` updates it, empty clears it |
 | `/llm_status` | user | report: active system prompt (override or plugin default, char count, fingerprint, head preview), model, reasoning setting, window usage, compaction, image recognition (state, model, prompt length), reactions (state, emoji inject mode with effective whitelist source, silent-react chance), capture mode, chime-in chance, summary preview, link to the context start, last-request token stats (incl. reasoning tokens when reported), last response time (endpoint-reported or measured) |
 | `/llm_usage` | moderator | this server's LLM token usage: all-time totals (per model) and today's aggregate - chat answers, silent-react chimes, compaction and image recognition all count |
 | `/llm_usage_global` | owner | global LLM token usage across all servers: all-time totals, today, per model and per server (ranked, capped) - the reply is ephemeral, so cross-guild numbers stay between the bot and the invoking owner |

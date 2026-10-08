@@ -14,16 +14,52 @@ pub const NAMESPACE: &str = "llm";
 /// LLM errors and service notices are reported. Absent = tracing only.
 pub const SERVICE_CHANNEL_KEY: &str = "service_channel";
 
-/// Storage key of the guild-wide emoji whitelist (JSON array of emoji
-/// names): the shared baseline every channel's `whitelist` inject mode
-/// falls back to when the channel has no list of its own.
+/// Storage key of the guild-wide emoji whitelist (JSON array of
+/// [`EmojiWhitelistEntry`] objects): the shared baseline every channel's
+/// `whitelist` inject mode falls back to when the channel has no list of
+/// its own.
 pub const GUILD_EMOJI_WHITELIST_KEY: &str = "emoji_whitelist";
 
-/// Document key of a channel's own emoji whitelist (JSON array of emoji
-/// names). A non-empty channel list replaces the guild baseline for that
-/// channel; absent or empty falls through.
+/// Document key of a channel's own emoji whitelist (same entry shape). A
+/// non-empty channel list replaces the guild baseline for that channel;
+/// absent or empty falls through.
 pub fn channel_emoji_whitelist_key(channel_id: u64) -> String {
     format!("channel:{channel_id}:emoji_whitelist")
+}
+
+/// One emoji whitelist entry: the emoji name plus an optional short
+/// description the `whitelist` inject mode renders next to the emoji's
+/// wire form, so the model knows what the emoji is for. Authored by
+/// moderators (platforms do not carry emoji descriptions).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmojiWhitelistEntry {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// The whitelist document shapes: the current entry array and the legacy
+/// plain-name array (read transparently - entries simply have no
+/// description).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawWhitelist {
+    Entries(Vec<EmojiWhitelistEntry>),
+    Names(Vec<String>),
+}
+
+/// Parses a whitelist document in either shape; a malformed document
+/// degrades to an empty list - the menu just stays off, by the
+/// cosmetic-failure rule.
+#[must_use]
+pub fn parse_whitelist(raw: serde_json::Value) -> Vec<EmojiWhitelistEntry> {
+    match serde_json::from_value::<RawWhitelist>(raw) {
+        Ok(RawWhitelist::Entries(entries)) => entries,
+        Ok(RawWhitelist::Names(names)) => {
+            names.into_iter().map(|name| EmojiWhitelistEntry { name, description: None }).collect()
+        }
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Document key of a channel's chat configuration: `channel:{id}`.
@@ -383,6 +419,34 @@ pub(crate) fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whitelist_parses_both_document_shapes() {
+        // Legacy plain-name array: entries without a description.
+        let legacy = parse_whitelist(serde_json::json!(["dorkiS", "ashuu"]));
+        assert_eq!(
+            legacy,
+            vec![
+                EmojiWhitelistEntry { name: "dorkiS".to_owned(), description: None },
+                EmojiWhitelistEntry { name: "ashuu".to_owned(), description: None },
+            ]
+        );
+
+        // Current shape round-trips; absent descriptions stay absent.
+        let entries = vec![
+            EmojiWhitelistEntry {
+                name: "dorkiS".to_owned(),
+                description: Some("smug face".to_owned()),
+            },
+            EmojiWhitelistEntry { name: "ashuu".to_owned(), description: None },
+        ];
+        let parsed = parse_whitelist(serde_json::to_value(&entries).expect("serialize expected"));
+        assert_eq!(parsed, entries);
+
+        // Malformed documents degrade to empty (cosmetic-failure rule).
+        assert!(parse_whitelist(serde_json::json!("junk")).is_empty());
+        assert!(parse_whitelist(serde_json::json!({ "name": "dorkiS" })).is_empty());
+    }
 
     #[test]
     fn assigned_config_survives_storage_roundtrip_with_defaults() {
