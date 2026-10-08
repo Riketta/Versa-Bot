@@ -1436,6 +1436,103 @@ mod tests {
         );
     }
 
+    /// Before the first poll, `/lol_store_dump` falls back to the persisted
+    /// store document - command-level, not just the engine helper.
+    #[tokio::test]
+    async fn dump_falls_back_to_the_persisted_document() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let f = command_fixture_with(true, Arc::clone(&storage)).await;
+        let plugin = Arc::new(crate::test_support::InMemoryPluginStorage::new());
+        let engine = Arc::new(StoreEngine::new(
+            Arc::new(OfflineLcu),
+            Arc::clone(&storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
+            plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG),
+            RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
+            RecordingBus::default(),
+            crate::test_support::test_platform_info(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: DEFAULT_USER_CAP,
+                watch_guild_cap: DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
+            },
+        ));
+        let skin = |item_id: u64, name: &str| lcu::CatalogItem {
+            item_id,
+            inventory_type: Some("CHAMPION_SKIN".to_owned()),
+            prices: vec![lcu::Price { cost: Some(975), currency: Some("RP".to_owned()) }],
+            localizations: std::collections::BTreeMap::from([(
+                "en_US".to_owned(),
+                lcu::LocalizedText { name: Some(name.to_owned()) },
+            )]),
+            item_requirements: Vec::new(),
+        };
+        let doc = crate::plugins::lol_store::engine::PersistedStore {
+            schema: crate::plugins::lol_store::engine::STORE_SCHEMA,
+            saved_at_unix: 0,
+            last_seen: Default::default(),
+            snapshot: crate::plugins::lol_store::diff::Snapshot {
+                sales: Some(vec![OnlineLcu::skin_sale(1031)]),
+                catalog: Some(vec![skin(1031, "Foxfire Ahri")]),
+                rotations: None,
+                yourshop: None,
+            },
+        };
+        plugin
+            .plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG)
+            .set(
+                crate::plugins::lol_store::NAMESPACE,
+                STORE_DUMP_KEY,
+                serde_json::to_value(doc).expect("serialize expected"),
+            )
+            .await
+            .expect("seed write expected");
+
+        DumpHandler { engine }
+            .invoke(&f.event, &Default::default(), &f.services)
+            .await
+            .expect("invoke");
+        let reply = f.output.messages().first().expect("reply expected").clone();
+        assert!(reply.contains("Foxfire Ahri"), "persisted snapshot rendered: {reply}");
+        assert!(!reply.contains("No store snapshot is available"), "not the placeholder: {reply}");
+    }
+
+    /// A history listing failure answers with a transient notice instead
+    /// of claiming "no recorded deals".
+    #[tokio::test]
+    async fn history_command_reports_unreadable_storage() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let f = command_fixture_with(true, Arc::clone(&storage)).await;
+        let lcu = OnlineLcu::new();
+        *lcu.sales.lock() = vec![OnlineLcu::skin_sale(1031)];
+        let failing = crate::test_support::FailingPluginStorage::new();
+        let engine = Arc::new(StoreEngine::new(
+            Arc::new(lcu),
+            Arc::clone(&storage) as Arc<dyn crate::kernel::spi_ports::StoragePort>,
+            failing.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG),
+            RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
+            RecordingBus::default(),
+            crate::test_support::test_platform_info(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: DEFAULT_USER_CAP,
+                watch_guild_cap: DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
+            },
+        ));
+        engine.tick().await; // baseline arms the snapshot so the name resolves
+
+        let args = CommandArgs(vec![
+            ("target".to_owned(), "skin".to_owned()),
+            ("name".to_owned(), "Foxfire Ahri".to_owned()),
+        ]);
+        HistoryHandler { engine }.invoke(&f.event, &args, &f.services).await.expect("invoke");
+        let reply = f.output.messages().first().expect("reply expected").clone();
+        assert!(reply.contains("temporarily unreadable"), "reply: {reply}");
+    }
+
     /// A fresh launch has announced nothing yet - the dump falls back to
     /// the current store snapshot instead of the placeholder.
     #[tokio::test]

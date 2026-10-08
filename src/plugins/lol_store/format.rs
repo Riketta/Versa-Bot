@@ -424,12 +424,14 @@ pub(crate) fn push_section(sections: &mut Vec<String>, title: &str, lines: &[Str
     sections.push(format!("**{title}**\n{body}"));
 }
 
-/// Best display name of a catalog item (any localization wins over a
-/// synthetic placeholder).
+/// Best display name of a catalog item: the `en_US` localization when it
+/// names the item, else the alphabetically first named locale (the map is
+/// keyed by locale), else the synthetic `Skin {id}` placeholder.
 pub(crate) fn localized_name(item: &CatalogItem) -> String {
     item.localizations
-        .values()
-        .find_map(|text| text.name.clone())
+        .get("en_US")
+        .and_then(|text| text.name.clone())
+        .or_else(|| item.localizations.values().find_map(|text| text.name.clone()))
         .unwrap_or_else(|| format!("Skin {}", item.item_id))
 }
 
@@ -541,6 +543,36 @@ mod tests {
 
     fn skin_sale(cost: u64, end: Option<&str>) -> super::super::lcu::Sale {
         skin_sale_named(1, 1031, cost, end)
+    }
+
+    #[test]
+    fn localized_name_prefers_english_and_falls_back_gracefully() {
+        let named = |localizations: BTreeMap<String, LocalizedText>| CatalogItem {
+            item_id: 1031,
+            inventory_type: Some("CHAMPION_SKIN".to_owned()),
+            prices: Vec::new(),
+            localizations,
+            item_requirements: Vec::new(),
+        };
+        let text = |name: &str| LocalizedText { name: Some(name.to_owned()) };
+        // en_US wins over the alphabetically first locale.
+        let item = named(BTreeMap::from([
+            ("cs_CZ".to_owned(), text("Foxfire Ahri (cs)")),
+            ("en_US".to_owned(), text("Foxfire Ahri")),
+        ]));
+        assert_eq!(localized_name(&item), "Foxfire Ahri");
+        // No en_US: any named locale beats the placeholder.
+        let item = named(BTreeMap::from([("cs_CZ".to_owned(), text("Foxfire Ahri (cs)"))]));
+        assert_eq!(localized_name(&item), "Foxfire Ahri (cs)");
+        // en_US present but nameless: another locale still wins.
+        let item = named(BTreeMap::from([
+            ("cs_CZ".to_owned(), text("Foxfire Ahri (cs)")),
+            ("en_US".to_owned(), LocalizedText { name: None }),
+        ]));
+        assert_eq!(localized_name(&item), "Foxfire Ahri (cs)");
+        // Nothing names the item: the synthetic placeholder.
+        let item = named(BTreeMap::new());
+        assert_eq!(localized_name(&item), "Skin 1031");
     }
 
     fn skin_sale_named(

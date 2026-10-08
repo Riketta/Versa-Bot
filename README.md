@@ -442,13 +442,15 @@ snapshot live in one plugin-global store document, written whenever
 anything changed - so a restart catches up on what it missed, and
 `/lol_store_dump` renders **all current deals** even before the first
 poll of a fresh boot (e.g. the client is still offline). On top of that,
-each UTC day's observed deal set is kept as a per-day digest (names and
-prices frozen at capture time, retention `history_days`, `0` disables
-recording), and `/lol_store_history` answers "when was skin X or
-champion Y on sale / in the Mythic rotation" by folding those days into
-deal windows. Days the bot could not observe (client offline) simply
-have no record; Your Shop is deliberately absent from history - its
-offers are the operator's personal shop, not shareable store state.
+each observed UTC day's deal set is kept as a per-day digest (names and
+prices frozen at capture time - English names preferred - retention
+`history_days` counting today, `0` disables recording), and
+`/lol_store_history` answers "when was skin X or champion Y on sale / in
+the Mythic rotation" by folding those days into deal windows: windows
+merge across days the bot could not observe (client offline) and close
+on the first recorded day the deal was absent from. Your Shop is
+deliberately absent from history - its offers are the operator's
+personal shop, not shareable store state.
 
 | Command | Tier | Effect |
 |---|---|---|
@@ -523,7 +525,7 @@ boot-frozen:
 | `announce_yourshop` | bool | `true` | announce Your Shop starts (start and end times) |
 | `watch_user_cap` | integer | `20` | maximum `/lol_store_watch` subscriptions per member per guild |
 | `watch_guild_cap` | integer | `300` | maximum `/lol_store_watch` subscriptions per guild |
-| `history_days` | integer | `90` | days of store history retained for `/lol_store_history`; `0` disables recording (hot-reloadable) |
+| `history_days` | integer | `90` | days of store history retained for `/lol_store_history` (today included); `0` disables recording (hot-reloadable) |
 
 Announced trackers that are toggled off still update the watcher's
 state, so re-enabling never replays old events. The watcher publishes

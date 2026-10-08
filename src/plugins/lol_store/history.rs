@@ -3,12 +3,17 @@
 //! (plugin namespace). Each document holds that day's FULL observed deal
 //! state - not a delta - with display names joined at capture time, so a
 //! digest stays self-contained even after items leave the store catalog
-//! later. `/lol_store_history` groups the days into per-deal windows.
+//! later. `/lol_store_history` groups the days into per-deal windows: a
+//! window merges across days the bot could not observe (no document, or
+//! the section absent from the digest) and closes on the first recorded
+//! day that observed the section without the deal.
 //!
 //! Your Shop is deliberately absent: its offers are the logged-in
 //! operator's personal shop, not guild-shareable store state. Days the bot
 //! could not observe (client offline) simply have no document - history is
 //! "as observed".
+
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -79,13 +84,17 @@ pub(crate) struct DayDigest {
 pub(crate) struct HistoryRow {
     /// `"sale"` or `"mythic"` - the reply groups on it.
     pub(crate) kind: &'static str,
-    /// Kind-specific grouping identity (sale id; rotation + slot).
+    /// Kind-specific grouping identity (sale id; rotation + item id, or
+    /// rotation + captured label for name-only slots).
     identity: String,
     pub(crate) label: String,
     /// Rendered price/detail tail (percent, RP cost; rotation, ME price).
     pub(crate) detail: String,
     pub(crate) first_day: String,
     pub(crate) last_day: String,
+    /// A recorded day observed the section without this deal - the window
+    /// ended there; a later sighting opens a fresh row.
+    closed: bool,
 }
 
 /// Today's UTC date as the day documents' `YYYY-MM-DD` key. UTC on purpose:
@@ -95,12 +104,21 @@ pub(crate) fn day_key(unix_secs: u64) -> String {
 }
 
 /// The UTC date `days` before `unix_secs`, same format - the retention
-/// cutoff (documents older than it are pruned).
+/// cutoff (documents older than it are pruned). Saturating on purpose: an
+/// absurd retention (a config typo) floors at the lowest representable
+/// date instead of panicking the poll job, which reads as "prune
+/// everything".
 pub(crate) fn day_key_before(unix_secs: u64, days: u64) -> String {
     let Ok(at) = OffsetDateTime::from_unix_timestamp(i64::try_from(unix_secs).unwrap_or(0)) else {
         return "1970-01-01".to_owned();
     };
-    let date = at.date() - time::Duration::days(i64::try_from(days).unwrap_or(i64::MAX));
+    // 100M days outspan every representable `time` date many times over,
+    // so the subtract saturates via `checked_sub` long before the
+    // `Duration` multiplication could overflow.
+    let date = at
+        .date()
+        .checked_sub(time::Duration::days(i64::try_from(days.min(100_000_000)).unwrap_or(0)))
+        .unwrap_or(time::Date::MIN);
     format!("{:04}-{:02}-{:02}", date.year(), u8::from(date.month()), date.day())
 }
 
@@ -188,30 +206,44 @@ fn matches(record_item: Option<u64>, record_champion: Option<u64>, target: &Watc
 }
 
 /// Folds one day's matching records into the row set (days arrive in
-/// ascending order): a known identity just extends its window.
+/// ascending order). A day that observed the relevant section without a
+/// deal closes that deal's window - a later sighting opens a new one -
+/// while days without any record of the section merge across. Matchable
+/// mythic slots group by item id, so capture-time label drift cannot
+/// split a window.
 pub(crate) fn extend_rows(
     rows: &mut Vec<HistoryRow>,
     digest: &DayDigest,
     day: &str,
     target: &WatchTarget,
 ) {
+    let mut sales_today: Vec<HistoryRow> = Vec::new();
     for record in &digest.sales {
         if !matches(Some(record.item_id), record.champion_id, target) {
             continue;
         }
         let detail = sale_detail(record);
-        upsert(
-            rows,
-            HistoryRow {
-                kind: "sale",
-                identity: format!("sale:{}", record.sale_id),
-                label: record.label.clone(),
-                detail,
-                first_day: day.to_owned(),
-                last_day: day.to_owned(),
-            },
-        );
+        sales_today.push(HistoryRow {
+            kind: "sale",
+            identity: format!("sale:{}", record.sale_id),
+            label: record.label.clone(),
+            detail,
+            first_day: day.to_owned(),
+            last_day: day.to_owned(),
+            closed: false,
+        });
     }
+    // A day with any recorded sale observed the sales list: every open
+    // window absent from it is over. An empty list is indistinguishable
+    // from "never observed" and merges across - the conservative reading.
+    if !digest.sales.is_empty() {
+        close_absent(rows, "sale", &sales_today);
+    }
+    for row in sales_today {
+        upsert(rows, row);
+    }
+
+    let mut mythic_today: Vec<HistoryRow> = Vec::new();
     for record in &digest.mythic {
         if !matches(record.item_id, record.champion_id, target) {
             continue;
@@ -220,22 +252,72 @@ pub(crate) fn extend_rows(
             Some(price) => format!("{} \u{b7} {price} ME", record.rotation),
             None => record.rotation.clone(),
         };
-        upsert(
-            rows,
-            HistoryRow {
-                kind: "mythic",
-                identity: format!("mythic:{}:{}", record.rotation, record.label),
-                label: record.label.clone(),
-                detail,
-                first_day: day.to_owned(),
-                last_day: day.to_owned(),
-            },
-        );
+        mythic_today.push(HistoryRow {
+            kind: "mythic",
+            identity: mythic_identity(record),
+            label: record.label.clone(),
+            detail,
+            first_day: day.to_owned(),
+            last_day: day.to_owned(),
+            closed: false,
+        });
+    }
+    // Per rotation: a day recording any slot of that rotation observed it.
+    // Rotations absent from the digest were simply not recorded.
+    let observed: BTreeSet<&str> =
+        digest.mythic.iter().map(|record| record.rotation.as_str()).collect();
+    if !observed.is_empty() {
+        close_mythic_absent(rows, &observed, &mythic_today);
+    }
+    for row in mythic_today {
+        upsert(rows, row);
     }
 }
 
+/// Closes every open window of `kind` that today's observed records do not
+/// contain (by identity).
+fn close_absent(rows: &mut Vec<HistoryRow>, kind: &str, today: &[HistoryRow]) {
+    for row in rows.iter_mut().filter(|row| row.kind == kind && !row.closed) {
+        if !today.iter().any(|fresh| fresh.identity == row.identity) {
+            row.closed = true;
+        }
+    }
+}
+
+/// Mythic variant of [`close_absent`]: only windows whose rotation was
+/// observed today can close. The rotation is the identity's second
+/// segment (`mythic:{rotation}:...`); rotation names never carry colons.
+fn close_mythic_absent(
+    rows: &mut Vec<HistoryRow>,
+    observed_rotations: &BTreeSet<&str>,
+    today: &[HistoryRow],
+) {
+    for row in rows.iter_mut().filter(|row| row.kind == "mythic" && !row.closed) {
+        let Some(rotation) = row.identity.split(':').nth(1) else { continue };
+        if observed_rotations.contains(rotation)
+            && !today.iter().any(|fresh| fresh.identity == row.identity)
+        {
+            row.closed = true;
+        }
+    }
+}
+
+/// Matchable slots group by item id (stable across capture-time label
+/// drift); name-only slots fall back to their captured label.
+fn mythic_identity(record: &MythicRecord) -> String {
+    match record.item_id {
+        Some(item_id) => format!("mythic:{}:id:{item_id}", record.rotation),
+        None => format!("mythic:{}:label:{}", record.rotation, record.label),
+    }
+}
+
+/// Extends the open window with this identity to `row.last_day`, or opens
+/// a new one. A closed window with the same identity stays closed - the
+/// new row is a separate presence.
 fn upsert(rows: &mut Vec<HistoryRow>, row: HistoryRow) {
-    if let Some(existing) = rows.iter_mut().find(|existing| existing.identity == row.identity) {
+    if let Some(existing) =
+        rows.iter_mut().find(|existing| existing.identity == row.identity && !existing.closed)
+    {
         existing.last_day = row.last_day;
     } else {
         rows.push(row);
@@ -473,5 +555,105 @@ mod tests {
         extend_rows(&mut rows, &digest, "2026-09-01", &skin_target(1031));
         extend_rows(&mut rows, &digest, "2026-09-01", &champion_target(103));
         assert!(rows.is_empty(), "a name-only slot has no matchable ids");
+    }
+
+    #[test]
+    fn capture_joins_matchable_mythic_slots_by_entry_id() {
+        let digest = capture(
+            "2026-10-07",
+            &snapshot_with(
+                vec![],
+                vec![rotation_store("DAILY", vec![rotation_entry("1031", "Blood Moon Ahri")])],
+            ),
+            &index(),
+        );
+        let [slot] = digest.mythic.as_slice() else { panic!("one mythic slot expected") };
+        assert_eq!(slot.rotation, "DAILY");
+        assert_eq!(slot.item_id, Some(1031), "the entry id joins the catalog");
+        assert_eq!(slot.champion_id, Some(103));
+        assert_eq!(slot.label, "Ahri \u{2014} Foxfire Ahri", "the label is the joined name");
+        assert_eq!(slot.mythic_price, None);
+    }
+
+    #[test]
+    fn observed_absence_closes_a_sale_window_and_a_later_sighting_reopens() {
+        let target = skin_target(1031);
+        let mut rows = Vec::new();
+        extend_rows(
+            &mut rows,
+            &digest_with_sales(vec![sale_record(7, 1031, Some(103))]),
+            "2026-09-01",
+            &target,
+        );
+        // The sales list was observed today - without sale 7. Window over.
+        extend_rows(
+            &mut rows,
+            &digest_with_sales(vec![sale_record(8, 1032, Some(103))]),
+            "2026-09-02",
+            &target,
+        );
+        extend_rows(
+            &mut rows,
+            &digest_with_sales(vec![sale_record(7, 1031, Some(103))]),
+            "2026-09-03",
+            &target,
+        );
+        let rows = finalize_rows(rows);
+        assert_eq!(rows.len(), 2, "the re-sighting is a separate presence");
+        let (recent, older) = (rows.first().expect("recent row"), rows.get(1).expect("older row"));
+        assert_eq!(
+            (recent.first_day.as_str(), recent.last_day.as_str()),
+            ("2026-09-03", "2026-09-03")
+        );
+        assert_eq!(
+            (older.first_day.as_str(), older.last_day.as_str()),
+            ("2026-09-01", "2026-09-01")
+        );
+    }
+
+    #[test]
+    fn unobserved_days_merge_but_observed_absence_splits_mythic_windows() {
+        let target = skin_target(1031);
+        let slot = |item_id: u64| MythicRecord {
+            rotation: "DAILY".to_owned(),
+            item_id: Some(item_id),
+            champion_id: Some(103),
+            label: "Ahri \u{2014} Foxfire Ahri".to_owned(),
+            mythic_price: Some(100),
+        };
+        let day_with = |slots: Vec<MythicRecord>| DayDigest {
+            schema: DIGEST_SCHEMA,
+            day: String::new(),
+            sales: Vec::new(),
+            mythic: slots,
+        };
+        let mut rows = Vec::new();
+        extend_rows(&mut rows, &day_with(vec![slot(1031)]), "2026-09-01", &target);
+        // The rotation was observed, but the slot was not in it: closed.
+        extend_rows(&mut rows, &day_with(vec![slot(1032)]), "2026-09-02", &target);
+        extend_rows(&mut rows, &day_with(vec![slot(1031)]), "2026-09-03", &target);
+        // No mythic records at all - unobserved, merges across (nothing
+        // left open to close anyway; the window that re-opened stays).
+        extend_rows(&mut rows, &day_with(vec![]), "2026-09-04", &target);
+        extend_rows(&mut rows, &day_with(vec![slot(1031)]), "2026-09-05", &target);
+        let rows = finalize_rows(rows);
+        assert_eq!(rows.len(), 2, "absence split, unobserved gap merged");
+        let (recent, older) = (rows.first().expect("recent row"), rows.get(1).expect("older row"));
+        assert_eq!(
+            (recent.first_day.as_str(), recent.last_day.as_str()),
+            ("2026-09-03", "2026-09-05")
+        );
+        assert_eq!(
+            (older.first_day.as_str(), older.last_day.as_str()),
+            ("2026-09-01", "2026-09-01")
+        );
+    }
+
+    #[test]
+    fn absurd_retention_saturates_instead_of_panicking() {
+        // 2026-10-07T01:10:52Z; `u64::MAX` days must floor at the lowest
+        // representable date, not panic the poll job. (The pinned `time`
+        // build has no `large-dates`, so the floor is year -9999.)
+        assert_eq!(day_key_before(1_791_335_452, u64::MAX), "-9999-01-01");
     }
 }

@@ -36,8 +36,9 @@ pub struct LolStoreConfig {
     pub watch_user_cap: u32,
     /// Maximum store watches per guild.
     pub watch_guild_cap: u32,
-    /// Days of store history retained (`/lol_store_history`); `0` disables
-    /// recording. Hot-reloadable alongside the announce flags and caps.
+    /// Days of store history retained (`/lol_store_history`, today
+    /// included); `0` disables recording. Hot-reloadable alongside the
+    /// announce flags and caps.
     pub history_days: u32,
 }
 

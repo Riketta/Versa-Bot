@@ -87,8 +87,9 @@ pub struct EngineSettings {
     pub watch_user_cap: u32,
     /// Maximum watches per guild.
     pub watch_guild_cap: u32,
-    /// Days of store history retained (`history_days`); `0` disables
-    /// recording. Older day digests are pruned on the next write.
+    /// Days of store history retained (`history_days`, today included);
+    /// `0` disables recording. Older day digests are pruned on the next
+    /// write.
     pub history_days: u32,
 }
 
@@ -181,6 +182,10 @@ pub struct StoreEngine<B: EventBusPort> {
     name_index_cache: Mutex<Option<(u64, Arc<NameIndex>)>>,
     online: AtomicBool,
     last_poll: Mutex<Option<Instant>>,
+    /// The last UTC day a history digest was written for. Quiet observed
+    /// cycles consult it so a day the store did not change still gets its
+    /// digest exactly once (when the UTC day flips), not once per poll.
+    last_history_day: Mutex<Option<String>>,
     /// The announcement as delivered: one entry per embed page. Process
     /// lifetime - a fresh launch has none until the first delta renders.
     last_announcement: Mutex<Option<(Instant, Vec<String>)>>,
@@ -212,6 +217,7 @@ impl<B: EventBusPort> StoreEngine<B> {
             name_index_cache: Mutex::new(None),
             online: AtomicBool::new(false),
             last_poll: Mutex::new(None),
+            last_history_day: Mutex::new(None),
             last_announcement: Mutex::new(None),
         }
     }
@@ -295,10 +301,18 @@ impl<B: EventBusPort> StoreEngine<B> {
         // watch subscribe-status, and the current-state dump before the
         // first successful poll (e.g. the client is still offline).
         let mut catchup = false;
-        let mut migrated = false;
         if self.state.lock().is_none() {
             if let Some((persisted, from_legacy)) = self.load_persisted().await {
                 tracing::debug!("adopting persisted store state for catch-up");
+                if from_legacy {
+                    // The migration completes here, not in the persist gate
+                    // below: a fully-offline cycle returns early, and state
+                    // is no longer `None` on any later tick, so the cleanup
+                    // would never run again. Both writes are idempotent;
+                    // the poll below rewrites the document when it changed.
+                    self.persist_store(&persisted.last_seen).await;
+                    self.cleanup_legacy_state().await;
+                }
                 *self.state.lock() = Some(Arc::new(persisted.last_seen));
                 {
                     let mut retained = self.last_snapshot.lock();
@@ -308,7 +322,6 @@ impl<B: EventBusPort> StoreEngine<B> {
                     }
                 }
                 catchup = true;
-                migrated = from_legacy;
             }
         }
         // Refcount bump, not a deep copy: the tracked sets stay put.
@@ -483,27 +496,29 @@ impl<B: EventBusPort> StoreEngine<B> {
         let delta_found = full.is_some();
 
         // Persist when anything the plugin-global document carries changed:
-        // the compacted state (`changed`), any raw section (`raw_changed` -
-        // the dump and the day digest ride the same write), or the one-time
-        // legacy migration. Guild storage is no longer touched here.
-        let mut history_written = false;
-        if changed || raw_changed || migrated {
+        // the compacted state (`changed`) or any raw section (`raw_changed`
+        // - the dump and the day digest ride the same write). Guild storage
+        // is no longer touched here.
+        let history_written = if changed || raw_changed {
             if changed {
                 *self.state.lock() = Some(Arc::clone(&current));
             }
             self.persist_store(&current).await;
-            if migrated {
-                self.cleanup_legacy_state().await;
-            }
-            history_written = self.write_history_digest().await;
-        }
+            self.write_history_digest(true).await
+        } else {
+            // Quiet observed cycle: the store answered but nothing changed.
+            // The day's digest is still owed - write it once, when the UTC
+            // day flips, so every observed day has a document (not just the
+            // days the store changed).
+            self.write_history_digest(false).await
+        };
 
         tracing::debug!(
             sales = current.sales.len(),
             skins = current.skins.len(),
             rotations = current.rotations.len(),
             delta_found,
-            persisted = changed || raw_changed || migrated,
+            persisted = changed || raw_changed,
             history = history_written,
             catchup,
             "store poll complete"
@@ -971,7 +986,15 @@ impl<B: EventBusPort> StoreEngine<B> {
     async fn load_persisted_doc(&self) -> Option<PersistedStore> {
         match self.plugin_storage.get(NAMESPACE, STORE_DUMP_KEY).await {
             Ok(Some(raw)) => match serde_json::from_value::<PersistedStore>(raw) {
-                Ok(doc) => Some(doc),
+                Ok(doc) if doc.schema == STORE_SCHEMA => Some(doc),
+                Ok(doc) => {
+                    tracing::warn!(
+                        found = doc.schema,
+                        expected = STORE_SCHEMA,
+                        "persisted store document has an unknown schema - starting fresh"
+                    );
+                    None
+                }
                 Err(err) => {
                     tracing::warn!(%err, "persisted store document malformed - starting fresh");
                     None
@@ -1056,20 +1079,34 @@ impl<B: EventBusPort> StoreEngine<B> {
     }
 
     /// Writes today's history digest (and prunes beyond the retention
-    /// window) after a cycle where the raw store changed. Returns whether
-    /// a digest was written. `history_days = 0` disables recording; a
-    /// cycle without raw data (migration adopt) writes nothing - an empty
-    /// digest must never overwrite a real day.
-    async fn write_history_digest(&self) -> bool {
+    /// window). `refresh` marks a cycle where the state or a raw section
+    /// changed - the digest is always rewritten. A quiet cycle passes
+    /// `false` and writes only when the UTC day flipped (tracked in
+    /// [`Self::last_history_day`]), so every observed day has a document
+    /// without rewriting it once per poll. `history_days = 0` disables
+    /// recording; a cycle without raw data (migration adopt) writes
+    /// nothing - an empty digest must never overwrite a real day.
+    async fn write_history_digest(&self, refresh: bool) -> bool {
         let history_days = self.settings.lock().history_days;
         if history_days == 0 {
             return false;
         }
         let snapshot = self.last_snapshot.lock().clone();
         let Some(snapshot) = snapshot.filter(has_store_data) else { return false };
-        let index = self.name_index(&snapshot).await;
         let now = unix_now();
         let day = history::day_key(now);
+        if !refresh && self.last_history_day.lock().as_deref() == Some(day.as_str()) {
+            return false;
+        }
+        // The retention block has already absorbed every changed section
+        // and bumped the generation, so the generation-keyed index cache
+        // serves (and warms) exactly the data a fresh build would use -
+        // without re-cloning the whole catalog per cycle.
+        let index = self.cached_index().await.unwrap_or_else(|| {
+            // Unreachable after the retention block (it materializes a
+            // default snapshot), kept total for the same reason.
+            Arc::new(NameIndex::empty())
+        });
         let digest = history::capture(&day, &snapshot, &index);
         let Ok(value) = serde_json::to_value(&digest) else {
             tracing::warn!("store history digest failed to serialize - day skipped");
@@ -1080,15 +1117,17 @@ impl<B: EventBusPort> StoreEngine<B> {
             tracing::warn!(%err, day = %day, "failed to persist the store history digest");
             return false;
         }
+        *self.last_history_day.lock() = Some(day);
         self.prune_history(now, history_days).await;
         true
     }
 
-    /// Deletes day digests older than the retention window. Failures are
+    /// Deletes day digests older than the retention window: the newest
+    /// `history_days` UTC days (today included) survive. Failures are
     /// logged and retried on the next write - pruning is best-effort
     /// housekeeping, never a correctness path.
     async fn prune_history(&self, now_unix: u64, history_days: u32) {
-        let cutoff = history::day_key_before(now_unix, u64::from(history_days));
+        let cutoff = history::day_key_before(now_unix, u64::from(history_days).saturating_sub(1));
         let Ok(keys) = self.plugin_storage.list_keys(NAMESPACE).await else {
             tracing::warn!("store history listing failed - pruning skipped");
             return;
@@ -1221,13 +1260,22 @@ impl<B: EventBusPort> StoreEngine<B> {
     }
 
     /// The recorded deal history for a watch-shaped target: one row per
-    /// observed deal, consecutive recorded days grouped into windows, most
-    /// recent first. Bounded by the retention window; empty when nothing
-    /// was recorded for it.
-    pub(crate) async fn deal_history(&self, target: &WatchTarget) -> Vec<history::HistoryRow> {
-        let Ok(keys) = self.plugin_storage.list_keys(NAMESPACE).await else {
-            tracing::warn!("store history listing failed - history unavailable");
-            return Vec::new();
+    /// observed deal, windows folded by identity - an observed day without
+    /// the deal closes its window, unobserved days merge across, most
+    /// recent window first. Bounded by the retention window; an empty
+    /// `Some` = nothing recorded, `None` = the history listing failed
+    /// (transient - the caller says so instead of claiming an empty
+    /// history).
+    pub(crate) async fn deal_history(
+        &self,
+        target: &WatchTarget,
+    ) -> Option<Vec<history::HistoryRow>> {
+        let keys = match self.plugin_storage.list_keys(NAMESPACE).await {
+            Ok(keys) => keys,
+            Err(err) => {
+                tracing::warn!(%err, "store history listing failed - history unavailable");
+                return None;
+            }
         };
         let mut days: Vec<&str> =
             keys.iter().filter_map(|key| key.strip_prefix(history::HISTORY_PREFIX)).collect();
@@ -1244,13 +1292,20 @@ impl<B: EventBusPort> StoreEngine<B> {
                 }
             };
             match serde_json::from_value::<DayDigest>(raw) {
-                Ok(digest) => history::extend_rows(&mut rows, &digest, day, target),
+                Ok(digest) if digest.schema == history::DIGEST_SCHEMA => {
+                    history::extend_rows(&mut rows, &digest, day, target);
+                }
+                Ok(digest) => tracing::warn!(
+                    day,
+                    found = digest.schema,
+                    "store history digest has an unknown schema - day skipped"
+                ),
                 Err(err) => {
                     tracing::warn!(%err, day, "store history digest malformed - day skipped")
                 }
             }
         }
-        history::finalize_rows(rows)
+        Some(history::finalize_rows(rows))
     }
 
     /// Byte budget for one announcement embed, derived from the
@@ -1850,32 +1905,6 @@ mod tests {
         assert!(text.contains("Champion 103 \u{2014} Foxfire Ahri"), "degraded line: {text}");
     }
 
-    /// A guild whose tracker config is malformed is skipped for the cycle -
-    /// it must not poison the fan-out for healthy guilds.
-    #[tokio::test]
-    async fn malformed_config_skips_only_that_guild() {
-        let f = fixture(FakeLcu::online()).await;
-        enable_guild(&f.storage, GUILD, Some("55")).await;
-        f.storage
-            .guild_scoped("test", GuildId(999))
-            .set(NAMESPACE, CONFIG_KEY, serde_json::json!({ "enabled": "not-a-bool" }))
-            .await
-            .expect("config write expected");
-        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
-        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
-        f.engine.tick().await; // silent baseline
-
-        *f.lcu.sales.lock() = Some(vec![skin_sale(2, 1031)]);
-        f.engine.tick().await;
-
-        // The healthy guild announced; the malformed one is absent from the
-        // bus trail entirely.
-        let log = f.bus.log();
-        assert!(!log.is_empty(), "healthy guild announced: {log:?}");
-        assert!(log.iter().all(|(_, guild, _)| *guild == GUILD), "skipped guild leaked: {log:?}");
-        assert_eq!(f.output.sent().len(), 1, "only the healthy guild was messaged");
-    }
-
     /// Persistence is plugin-global now - a malformed-config guild no
     /// longer participates in anything store-side. The consolidated
     /// document stays current regardless: a later fixed config rejoins
@@ -2172,13 +2201,234 @@ mod tests {
             champion: "Ahri".to_owned(),
             skin: "Foxfire Ahri".to_owned(),
         };
-        let rows = f.engine.deal_history(&target).await;
+        let rows = f.engine.deal_history(&target).await.expect("history listing expected");
         assert_eq!(rows.len(), 2, "one window per sale id: {rows:?}");
         let (recent, older) = (rows.first().expect("recent row"), rows.get(1).expect("older row"));
         assert_eq!(recent.kind, "sale");
         assert_eq!(recent.last_day, "2026-09-04", "most recent first");
         assert_eq!(older.first_day, "2026-09-01");
         assert_eq!(older.last_day, "2026-09-02");
+    }
+
+    /// A `store_dump` document from another schema version (or half-written
+    /// by a future format) must baseline silently: deserializing it as an
+    /// empty state would replay every active deal as a fresh delta.
+    #[tokio::test]
+    async fn unknown_schema_store_document_baselines_instead_of_replaying() {
+        let f = fixture(FakeLcu::online()).await;
+        enable_guild(&f.storage, GUILD, Some("55")).await;
+        let plugin = f.plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG);
+        plugin
+            .set(NAMESPACE, STORE_DUMP_KEY, serde_json::json!({ "schema": 99, "saved_at_unix": 0 }))
+            .await
+            .expect("seed write expected");
+
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        f.engine.tick().await;
+
+        assert!(
+            f.output.sent().is_empty(),
+            "unknown schema must baseline, not replay: {:?}",
+            f.output.sent()
+        );
+        let raw = plugin
+            .get(NAMESPACE, STORE_DUMP_KEY)
+            .await
+            .expect("read expected")
+            .expect("document rewritten");
+        assert_eq!(
+            raw.get("schema"),
+            Some(&serde_json::json!(1)),
+            "rewritten at the current schema"
+        );
+
+        *f.lcu.sales.lock() = Some(vec![skin_sale(2, 1031)]);
+        f.engine.tick().await;
+        assert_eq!(f.output.sent().len(), 1, "the next delta announces normally");
+    }
+
+    /// The migration completes even when the migrating tick is fully
+    /// offline: adoption writes the document and deletes the legacy copies
+    /// before the poll - which returns early - can skip them.
+    #[tokio::test]
+    async fn offline_migrating_tick_still_completes_the_migration() {
+        let f = fixture(FakeLcu::offline()).await;
+        enable_guild(&f.storage, GUILD, Some("55")).await;
+        f.storage
+            .guild_scoped("test", GuildId(GUILD))
+            .set(NAMESPACE, LAST_SEEN_KEY, serde_json::json!({ "sales": [1], "skins": [1031] }))
+            .await
+            .expect("legacy write expected");
+
+        f.engine.tick().await; // client offline - the poll skips, the migration must not
+
+        let plugin = f.plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG);
+        let raw = plugin
+            .get(NAMESPACE, STORE_DUMP_KEY)
+            .await
+            .expect("read expected")
+            .expect("document written during adoption");
+        assert_eq!(raw.get("schema"), Some(&serde_json::json!(1)));
+        let copy = f
+            .storage
+            .guild_scoped("test", GuildId(GUILD))
+            .get(NAMESPACE, LAST_SEEN_KEY)
+            .await
+            .expect("read expected");
+        assert!(copy.is_none(), "legacy copy deleted during adoption");
+    }
+
+    /// A quiet observed cycle still owes its day digest: the write happens
+    /// once, when the UTC day flips, and same-day quiet cycles skip.
+    #[tokio::test]
+    async fn quiet_observed_cycle_writes_the_flipped_day_once() {
+        let f = fixture(FakeLcu::online()).await;
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        f.engine.tick().await; // baseline: today's digest written
+        let today = history::day_key(unix_now());
+        let key = format!("{}{today}", history::HISTORY_PREFIX);
+        let plugin = f.plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG);
+        assert!(plugin.get(NAMESPACE, &key).await.expect("read expected").is_some());
+
+        // Same-day quiet cycle: no rewrite (the deleted doc stays gone).
+        plugin.delete(NAMESPACE, &key).await.expect("delete expected");
+        *f.engine.last_history_day.lock() = Some(today.clone());
+        f.engine.tick().await;
+        assert!(
+            plugin.get(NAMESPACE, &key).await.expect("read expected").is_none(),
+            "same-day quiet cycle must not rewrite"
+        );
+
+        // UTC day flip: the quiet cycle writes the new day's digest.
+        *f.engine.last_history_day.lock() = Some("2000-01-01".to_owned());
+        f.engine.tick().await;
+        assert!(
+            plugin.get(NAMESPACE, &key).await.expect("read expected").is_some(),
+            "flipped day's digest written"
+        );
+    }
+
+    /// Retention is inclusive: exactly `history_days` UTC days survive a
+    /// prune (today included).
+    #[tokio::test]
+    async fn prune_keeps_exactly_history_days() {
+        let f = fixture_with_settings(
+            FakeLcu::online(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: watch::DEFAULT_USER_CAP,
+                watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+                history_days: 2,
+            },
+        )
+        .await;
+        let now = unix_now();
+        let day = |back: u64| history::day_key_before(now, back);
+        let plugin = f.plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG);
+        for back in [1u64, 2] {
+            let d = day(back);
+            plugin
+                .set(
+                    NAMESPACE,
+                    &format!("{}{d}", history::HISTORY_PREFIX),
+                    serde_json::json!({ "schema": 1, "day": d }),
+                )
+                .await
+                .expect("seed write expected");
+        }
+
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        f.engine.tick().await; // change cycle: digest write + prune
+
+        let keys = plugin.list_keys(NAMESPACE).await.expect("list expected");
+        let mut days: Vec<&str> =
+            keys.iter().filter_map(|key| key.strip_prefix(history::HISTORY_PREFIX)).collect();
+        days.sort_unstable();
+        assert_eq!(
+            days,
+            vec![day(1).as_str(), day(0).as_str()],
+            "exactly history_days survive: {keys:?}"
+        );
+    }
+
+    /// A failed history listing is not an empty history: the engine
+    /// surfaces it as `None` so the command can own the reply.
+    #[tokio::test]
+    async fn deal_history_listing_failure_is_not_an_empty_history() {
+        let failing = crate::test_support::FailingPluginStorage::new();
+        let engine = Arc::new(StoreEngine::new(
+            FakeLcu::online(),
+            Arc::new(InMemoryStorage::new()) as Arc<dyn StoragePort>,
+            failing.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG),
+            RecordingChatOutputFactory::new(RecordingChatOutput::new()).boxed(),
+            RecorderBus::default(),
+            crate::test_support::test_platform_info(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: watch::DEFAULT_USER_CAP,
+                watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
+            },
+        ));
+        let target = WatchTarget::Skin {
+            item_id: 1031,
+            champion: "Ahri".to_owned(),
+            skin: "Foxfire Ahri".to_owned(),
+        };
+        assert!(engine.deal_history(&target).await.is_none());
+    }
+
+    /// A day digest with an unknown schema is skipped; readable days still
+    /// fold in.
+    #[tokio::test]
+    async fn unknown_schema_day_digest_is_skipped() {
+        let f = fixture(FakeLcu::online()).await;
+        let plugin = f.plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG);
+        plugin
+            .set(
+                NAMESPACE,
+                "history.2099-01-01",
+                serde_json::json!({ "schema": 99, "day": "2099-01-01" }),
+            )
+            .await
+            .expect("seed write expected");
+        plugin
+            .set(
+                NAMESPACE,
+                "history.2026-09-01",
+                serde_json::to_value(DayDigest {
+                    schema: history::DIGEST_SCHEMA,
+                    day: "2026-09-01".to_owned(),
+                    sales: vec![history::SaleRecord {
+                        sale_id: 7,
+                        item_id: 1031,
+                        champion_id: Some(103),
+                        label: "Ahri \u{2014} Foxfire Ahri".to_owned(),
+                        sale_price: Some(607),
+                        original_price: Some(975),
+                        start: None,
+                        end: None,
+                    }],
+                    mythic: Vec::new(),
+                })
+                .expect("serialize expected"),
+            )
+            .await
+            .expect("seed write expected");
+
+        let target = WatchTarget::Skin {
+            item_id: 1031,
+            champion: "Ahri".to_owned(),
+            skin: "Foxfire Ahri".to_owned(),
+        };
+        let rows = f.engine.deal_history(&target).await.expect("listing expected");
+        assert_eq!(rows.len(), 1, "only the readable day folds in: {rows:?}");
+        assert_eq!(rows.first().expect("row expected").first_day, "2026-09-01");
     }
 
     #[tokio::test]

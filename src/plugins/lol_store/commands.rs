@@ -868,7 +868,15 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for HistoryHan
             return Ok(());
         };
 
-        let rows = self.engine.deal_history(&target).await;
+        // `None` = the listing failed - a transient storage problem, not an
+        // empty history; say so instead of claiming "no recorded deals".
+        let Some(rows) = self.engine.deal_history(&target).await else {
+            services
+                .chat_output
+                .send(command_reply("Store history is temporarily unreadable - try again shortly."))
+                .await?;
+            return Ok(());
+        };
         let reply_text = if rows.is_empty() {
             let days = self.engine.settings().history_days;
             if days == 0 {
