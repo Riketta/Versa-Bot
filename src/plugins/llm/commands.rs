@@ -1406,19 +1406,21 @@ fn render_names(list: &[EmojiWhitelistEntry]) -> String {
 }
 
 /// The `list` reply: one line per entry, the description (if any) after an
-/// em dash.
+/// em dash. Empty-string descriptions (hand-edited docs) count as none -
+/// the same reading the menu applies.
 fn whitelist_list_reply(scope: &str, list: &[EmojiWhitelistEntry]) -> String {
     if list.is_empty() {
         return format!("The {scope} emoji whitelist is empty.");
     }
     let lines: Vec<String> = list
         .iter()
-        .map(|entry| match &entry.description {
+        .map(|entry| match entry.description.as_deref().filter(|text| !text.is_empty()) {
             Some(description) => format!("- `{}` \u{2014} {description}", entry.name),
             None => format!("- `{}`", entry.name),
         })
         .collect();
-    format!("The {scope} emoji whitelist ({} entries):\n{}", list.len(), lines.join("\n"))
+    let noun = if list.len() == 1 { "entry" } else { "entries" };
+    format!("The {scope} emoji whitelist ({} {noun}):\n{}", list.len(), lines.join("\n"))
 }
 
 #[async_trait]
@@ -1464,13 +1466,6 @@ impl CommandHandler for EmojiWhitelistLlmHandler {
                     return Ok(());
                 };
                 if action == "add" {
-                    let description = match normalize_description(args.get("description")) {
-                        Ok(description) => description,
-                        Err(notice) => {
-                            services.chat_output.send(command_reply(notice)).await?;
-                            return Ok(());
-                        }
-                    };
                     let known =
                         services.chat_output_factory.reactable_emojis(&event.origin).list().await;
                     if !known.iter().any(|emoji| emoji.name == name) {
@@ -1492,7 +1487,19 @@ impl CommandHandler for EmojiWhitelistLlmHandler {
                             .await?;
                         return Ok(());
                     }
-                    list.push(EmojiWhitelistEntry { name: name.to_owned(), description });
+                    // The cap check trails the name checks: an invalid name
+                    // with an oversized hint should name the real problem.
+                    let description = match normalize_description(args.get("description")) {
+                        Ok(description) => description,
+                        Err(notice) => {
+                            services.chat_output.send(command_reply(notice)).await?;
+                            return Ok(());
+                        }
+                    };
+                    list.push(EmojiWhitelistEntry {
+                        name: name.to_owned(),
+                        description: description.clone(),
+                    });
                     list.sort_by(|a, b| a.name.cmp(&b.name));
                     storage.set(NAMESPACE, &key, serde_json::json!(list)).await?;
                     let mut reply = format!(
@@ -1500,12 +1507,8 @@ impl CommandHandler for EmojiWhitelistLlmHandler {
                         list.len(),
                         render_names(&list)
                     );
-                    if let Some(stored) = list
-                        .iter()
-                        .find(|entry| entry.name == name)
-                        .and_then(|entry| entry.description.clone())
-                    {
-                        reply.push_str(&format!("\n`{name}` description: {stored}"));
+                    if let Some(text) = &description {
+                        reply.push_str(&format!("\n`{name}` description: {text}"));
                     }
                     services.chat_output.send(command_reply(reply)).await?;
                 } else {
@@ -2420,7 +2423,9 @@ mod tests {
     }
 
     /// The `list` reply renders descriptions after an em dash and stays
-    /// one-per-line; the empty whitelist has its own wording.
+    /// one-per-line; the empty whitelist has its own wording. Empty-string
+    /// descriptions (hand-edited docs) read as none - no dangling em dash -
+    /// and the count pluralizes.
     #[test]
     fn whitelist_list_reply_renders_descriptions_and_empty_scope() {
         assert_eq!(whitelist_list_reply("guild", &[]), "The guild emoji whitelist is empty.");
@@ -2435,6 +2440,15 @@ mod tests {
         assert!(reply.contains("The channel emoji whitelist (2 entries):"), "{reply}");
         assert!(reply.contains("- `dorkiS` \u{2014} smug face"), "{reply}");
         assert!(reply.contains("- `ashuu`"), "{reply}");
+
+        let blank = vec![EmojiWhitelistEntry {
+            name: "dorkiS".to_owned(),
+            description: Some(String::new()),
+        }];
+        let reply = whitelist_list_reply("guild", &blank);
+        assert!(reply.contains("The guild emoji whitelist (1 entry):"), "{reply}");
+        assert!(reply.contains("- `dorkiS`"), "{reply}");
+        assert!(!reply.contains('\u{2014}'), "no dangling em dash: {reply}");
     }
 
     /// All three prompt kinds share the set/clear grammar: text stores,

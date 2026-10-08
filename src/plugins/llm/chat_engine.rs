@@ -589,12 +589,15 @@ impl ChatEngine {
     }
 
     /// The react tool's server-emoji menu: exact wire-form tokens, one per
-    /// custom emoji, sorted by name (byte-stable between emoji-set or
-    /// whitelist changes - the menu rides the prompt's cacheable prefix).
-    /// Entries with a description render as sub-lines under the header; a
-    /// whitelist without descriptions keeps the plain single line. Empty
-    /// unless the channel opted in and the platform lists emojis; every
-    /// failure on the way degrades to empty (the menu is cosmetic).
+    /// custom emoji. Without descriptions the menu is the historical single
+    /// line in the platform's listing order; with any description it
+    /// becomes a header plus sub-lines sorted by name. Both shapes are
+    /// byte-stable between emoji-set or whitelist changes - the menu rides
+    /// the prompt's cacheable prefix. Entries with a description render as
+    /// sub-lines; a whitelist without descriptions keeps the plain single
+    /// line. Empty unless the channel opted in and the platform lists
+    /// emojis; every failure on the way degrades to empty (the menu is
+    /// cosmetic).
     async fn react_emoji_menu(
         &self,
         origin: &Origin,
@@ -610,6 +613,11 @@ impl ChatEngine {
         if config.react_emoji_inject == EmojiInject::Whitelist {
             let whitelist = self.effective_emoji_whitelist(origin, services).await;
             emojis.retain(|emoji| whitelist.iter().any(|entry| entry.name == emoji.name));
+            // Stale whitelists (every entry gone from the guild) stop here -
+            // no menu, and the description map is not worth building.
+            if emojis.is_empty() {
+                return String::new();
+            }
             described = whitelist
                 .into_iter()
                 .filter_map(|entry| {
@@ -4434,6 +4442,58 @@ mod tests {
                  \n  <:dorkiS:9> \u{2014} smug face, for mockery"
             ),
             "byte-exact sub-lines in name order: {}",
+            system.content
+        );
+    }
+
+    /// Descriptions ride the channel override: a non-empty channel list
+    /// replaces the guild baseline, descriptions included - the guild's
+    /// described entry must not leak.
+    #[tokio::test]
+    async fn react_emoji_menu_channel_override_carries_descriptions() {
+        let ctx = ctx_describer_with_emojis(
+            LlmSettings::default(),
+            Arc::new(RandRandom),
+            vec![Ok("hi".to_owned())],
+            Arc::new(FakeDescriber::default()),
+            emoji_menu_emojis(),
+        );
+        let config = ChannelConfig {
+            react: true,
+            react_emoji_inject: EmojiInject::Whitelist,
+            ..assigned_config()
+        };
+        seed_config(&ctx.storage, &config);
+        ctx.storage.seed(
+            "test",
+            GuildId(1),
+            NAMESPACE,
+            GUILD_EMOJI_WHITELIST_KEY,
+            serde_json::json!([{ "name": "ashuu", "description": "guild hint" }]),
+        );
+        ctx.storage.seed(
+            "test",
+            GuildId(1),
+            NAMESPACE,
+            &channel_emoji_whitelist_key(2),
+            serde_json::json!([{ "name": "dorkiS", "description": "channel hint" }]),
+        );
+
+        ctx.engine
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
+            .await;
+
+        let request = ctx.fake.requests().first().expect("one request expected").clone();
+        let system = request.messages.first().expect("system slot expected");
+        assert!(
+            system.content.contains("  <:dorkiS:9> \u{2014} channel hint"),
+            "channel override applied: {}",
+            system.content
+        );
+        assert!(!system.content.contains("ashuu"), "guild baseline replaced: {}", system.content);
+        assert!(
+            !system.content.contains("guild hint"),
+            "guild hint not merged: {}",
             system.content
         );
     }

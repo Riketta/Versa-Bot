@@ -443,9 +443,14 @@ mod tests {
         let parsed = parse_whitelist(serde_json::to_value(&entries).expect("serialize expected"));
         assert_eq!(parsed, entries);
 
-        // Malformed documents degrade to empty (cosmetic-failure rule).
+        // Malformed documents degrade to empty (cosmetic-failure rule):
+        // non-array junk, a bare object, and - the plausible hand-migration
+        // accidents - a mixed legacy/entry array and an entry missing its
+        // name. One bad element kills the whole document, on purpose.
         assert!(parse_whitelist(serde_json::json!("junk")).is_empty());
         assert!(parse_whitelist(serde_json::json!({ "name": "dorkiS" })).is_empty());
+        assert!(parse_whitelist(serde_json::json!(["dorkiS", { "name": "ashuu" }])).is_empty());
+        assert!(parse_whitelist(serde_json::json!([{ "description": "orphan" }])).is_empty());
     }
 
     #[test]

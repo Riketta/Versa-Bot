@@ -841,10 +841,11 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   names on the emoji whitelist (the channel's own list when it has one,
   otherwise the guild-wide list, managed with `/llm_emoji_whitelist`).
   Whitelist entries may carry an optional short description (up to 100
-  characters) the menu renders under the emoji's wire form, so the model
-  knows what the emoji is for - set it with `add`'s `description`
-  argument or the `desc` action; entries without one stay bare, and a
-  whitelist without any description keeps the compact single-line menu.
+  characters) the menu renders next to the emoji's wire form on its own
+  sub-line, so the model knows what the emoji is for - set it with
+  `add`'s `description` argument or the `desc` action; entries without
+  one stay bare, and a whitelist without any description keeps the
+  compact single-line menu.
   Descriptions never appear in `all` mode. Off by default - the list
   costs prompt space and invalidates provider prompt caches whenever the
   emoji set, the whitelist, or a description changes. Setting the mode

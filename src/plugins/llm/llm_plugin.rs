@@ -1099,6 +1099,93 @@ mod tests {
         assert!(reply.contains("- `dorkiS`"), "{reply}");
     }
 
+    /// `remove` drops the entry with its description, and a legacy
+    /// plain-name document self-heals to the entry shape on the next
+    /// write (here: `desc` on a legacy name).
+    #[tokio::test]
+    async fn emoji_whitelist_removes_entries_and_self_heals_legacy_docs() {
+        let (_, f) = fixture_with_emojis(vec![
+            ReactableEmoji { name: "dorkiS".to_owned(), token: "<:dorkiS:9>".to_owned() },
+            ReactableEmoji { name: "ashuu".to_owned(), token: "<a:ashuu:7>".to_owned() },
+        ]);
+        let args = |pairs: &[(&str, &str)]| {
+            CommandArgs(
+                pairs.iter().map(|(key, value)| ((*key).to_owned(), (*value).to_owned())).collect(),
+            )
+        };
+        f.storage
+            .guild_scoped("test", GuildId(1))
+            .set(NAMESPACE, GUILD_EMOJI_WHITELIST_KEY, serde_json::json!(["dorkiS", "ashuu"]))
+            .await
+            .expect("legacy seed write expected");
+
+        // `desc` on a legacy name resolves the entry and rewrites the whole
+        // document in the entry shape - the self-heal.
+        EmojiWhitelistLlmHandler
+            .invoke(
+                &command_event(Some(1)),
+                &args(&[
+                    ("action", "desc"),
+                    ("scope", "guild"),
+                    ("name", "dorkiS"),
+                    ("description", "smug face"),
+                ]),
+                &f.services,
+            )
+            .await
+            .expect("invoke");
+        let doc = f
+            .storage
+            .guild_scoped("test", GuildId(1))
+            .get(NAMESPACE, GUILD_EMOJI_WHITELIST_KEY)
+            .await
+            .expect("read expected");
+        assert_eq!(
+            doc,
+            Some(serde_json::json!([
+                { "name": "dorkiS", "description": "smug face" },
+                { "name": "ashuu" }
+            ])),
+            "legacy array rewritten as entries"
+        );
+
+        // `remove` drops the whole entry (description included) and answers
+        // with the surviving run.
+        EmojiWhitelistLlmHandler
+            .invoke(
+                &command_event(Some(1)),
+                &args(&[("action", "remove"), ("scope", "guild"), ("name", "ashuu")]),
+                &f.services,
+            )
+            .await
+            .expect("invoke");
+        let reply = f.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("Removed `ashuu`"), "{reply}");
+        assert!(reply.contains("`dorkiS`"), "{reply}");
+        let doc = f
+            .storage
+            .guild_scoped("test", GuildId(1))
+            .get(NAMESPACE, GUILD_EMOJI_WHITELIST_KEY)
+            .await
+            .expect("read expected");
+        assert_eq!(
+            doc,
+            Some(serde_json::json!([{ "name": "dorkiS", "description": "smug face" }])),
+        );
+
+        // Removing a name that is not listed is refused.
+        EmojiWhitelistLlmHandler
+            .invoke(
+                &command_event(Some(1)),
+                &args(&[("action", "remove"), ("scope", "guild"), ("name", "ashuu")]),
+                &f.services,
+            )
+            .await
+            .expect("invoke");
+        let reply = f.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("`ashuu` is not on the guild whitelist"), "{reply}");
+    }
+
     #[test]
     fn init_registers_llm_admin_commands() {
         let (plugin, fixture) = fixture();
