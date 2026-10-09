@@ -402,26 +402,26 @@ fn llm_settings_from(
     // the platform cap stays the hard invariant and wins over floor and
     // default alike (`cap.max(1)` keeps a zero-cap platform away from a
     // boot panic, min > max).
-    let min_reply_chunk = match message_limit {
-        Some(cap) => config.min_reply_chunk.max(1).min(cap.max(1)),
-        None => config.min_reply_chunk.max(1),
+    let min_split_length = match message_limit {
+        Some(cap) => config.min_split_length.max(1).min(cap.max(1)),
+        None => config.min_split_length.max(1),
     };
-    if config.min_reply_chunk == 0 {
-        tracing::warn!("[llm] min_reply_chunk is zero - clamped to 1");
+    if config.min_split_length == 0 {
+        tracing::warn!("[llm] min_split_length is zero - clamped to 1");
     } else if let Some(cap) = message_limit
-        && config.min_reply_chunk > cap
+        && config.min_split_length > cap
     {
         tracing::warn!(
-            configured = config.min_reply_chunk,
-            clamped = min_reply_chunk,
-            "[llm] min_reply_chunk exceeds the platform's message cap - clamped"
+            configured = config.min_split_length,
+            clamped = min_split_length,
+            "[llm] min_split_length exceeds the platform's message cap - clamped"
         );
     }
     let max_message_length = match message_limit {
-        Some(cap) => config.max_message_length.max(min_reply_chunk).min(cap.max(1)),
-        None => config.max_message_length.max(min_reply_chunk),
+        Some(cap) => config.max_message_length.max(min_split_length).min(cap.max(1)),
+        None => config.max_message_length.max(min_split_length),
     };
-    if config.max_message_length < min_reply_chunk {
+    if config.max_message_length < min_split_length {
         tracing::warn!(
             configured = config.max_message_length,
             clamped = max_message_length,
@@ -479,7 +479,7 @@ fn llm_settings_from(
         compaction_model: config.compaction_model.clone(),
         compaction_keep_tail,
         max_message_length,
-        min_reply_chunk,
+        min_split_length,
         stream_interval_ms,
         max_prompt_file_bytes: config.max_prompt_file_bytes,
         image_model: config.image_model.clone(),
@@ -904,24 +904,24 @@ mod tests {
         // wins.
         let settings = llm_settings_from(&config, None, None, Some(50));
         assert_eq!(settings.max_message_length, 50);
-        assert_eq!(settings.min_reply_chunk, 50);
+        assert_eq!(settings.min_split_length, 50);
     }
 
     /// The floor itself is operator policy: a raised floor lifts the plugin
     /// default with it; a floor above the cap degrades to the cap.
     #[test]
-    fn min_reply_chunk_is_operator_policy() {
+    fn min_split_length_is_operator_policy() {
         let mut config = LlmConfig::default();
-        config.min_reply_chunk = 500;
+        config.min_split_length = 500;
         config.max_message_length = 10;
         let settings = llm_settings_from(&config, None, None, Some(2000));
-        assert_eq!(settings.min_reply_chunk, 500);
+        assert_eq!(settings.min_split_length, 500);
         assert_eq!(settings.max_message_length, 500);
 
-        config.min_reply_chunk = 2500;
+        config.min_split_length = 2500;
         config.max_message_length = 2500;
         let settings = llm_settings_from(&config, None, None, Some(2000));
-        assert_eq!(settings.min_reply_chunk, 2000);
+        assert_eq!(settings.min_split_length, 2000);
         assert_eq!(settings.max_message_length, 2000);
     }
 
@@ -929,14 +929,14 @@ mod tests {
     fn llm_zero_values_clamp_to_safe_floors() {
         let mut config = LlmConfig::default();
         config.max_message_length = 0;
-        config.min_reply_chunk = 0;
+        config.min_split_length = 0;
         config.stream_interval_ms = 10;
         config.compaction_keep_tail = 0;
         config.image_max_side = 0;
 
         let settings = llm_settings_from(&config, None, None, Some(2000));
         assert_eq!(settings.max_message_length, 1);
-        assert_eq!(settings.min_reply_chunk, 1);
+        assert_eq!(settings.min_split_length, 1);
         assert_eq!(settings.stream_interval_ms, 250);
         assert_eq!(settings.compaction_keep_tail, 1);
         assert_eq!(settings.image_max_side, 1);

@@ -703,7 +703,7 @@ impl MiddlewarePluginPort for LlmPlugin {
                 return Next::Continue;
             }
         };
-        let Ok(config) = ChannelConfig::from_stored(raw, self.engine.settings().min_reply_chunk)
+        let Ok(config) = ChannelConfig::from_stored(raw, self.engine.settings().min_split_length)
         else {
             tracing::warn!(namespace = NAMESPACE, "llm channel config is malformed - skipping");
             return Next::Continue;
@@ -737,7 +737,7 @@ impl MiddlewarePluginPort for LlmPlugin {
                 &services,
                 &payload,
                 origin.channel_id.get(),
-                config.history_depth,
+                config.context_messages,
                 engine.settings().compaction_keep_tail,
             )
             .await
@@ -773,7 +773,7 @@ impl MiddlewarePluginPort for LlmPlugin {
                     &services,
                     &payload,
                     origin.channel_id.get(),
-                    config.history_depth,
+                    config.context_messages,
                     engine.settings().compaction_keep_tail,
                 )
                 .await;
@@ -2739,7 +2739,7 @@ mod tests {
             .invoke(
                 &command_event(Some(1)),
                 &CommandArgs(vec![
-                    ("key".to_owned(), "depth".to_owned()),
+                    ("key".to_owned(), "context_messages".to_owned()),
                     ("value".to_owned(), "abc".to_owned()),
                 ]),
                 &fixture.services,
@@ -2760,7 +2760,7 @@ mod tests {
         // The malformed set must not have touched the stored depth.
         let config: ChannelConfig =
             serde_json::from_value(raw).expect("config expected to deserialize");
-        assert_eq!(config.history_depth, 100);
+        assert_eq!(config.context_messages, 100);
     }
 
     #[tokio::test]
@@ -2772,7 +2772,7 @@ mod tests {
             .invoke(
                 &command_event(Some(1)),
                 &CommandArgs(vec![
-                    ("key".to_owned(), "depth".to_owned()),
+                    ("key".to_owned(), "context_messages".to_owned()),
                     ("value".to_owned(), "10".to_owned()),
                 ]),
                 &fixture.services,

@@ -343,7 +343,7 @@ impl ChatEngine {
         let usage_stats = self.load_stats(storage, channel_id).await;
         // Operational window: everything assembly (depth) plus the compaction
         // tail can ever need - the hard cap on per-message history loading.
-        let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
+        let depth = usize::try_from(config.context_messages).unwrap_or(usize::MAX);
         let keep_tail = usize::try_from(self.settings.compaction_keep_tail).unwrap_or(usize::MAX);
         let window = depth.saturating_add(keep_tail).max(1);
         let live = match self.load_live_records(storage, channel_id, state.cutoff_seq, window).await
@@ -410,7 +410,7 @@ impl ChatEngine {
                 self.send_fallback(origin, services).await;
             }
         } else if captured
-            && (config.random_chance_percent > 0.0
+            && (config.random_reply_chance_percent > 0.0
                 || (config.react && config.random_react_chance_percent > 0.0))
         {
             // Random chime-in: same delivery path as a mention reply - the
@@ -453,7 +453,7 @@ impl ChatEngine {
         live_records: &[ConversationRecord],
     ) -> Option<Result<(u64, ConversationRecord), crate::kernel::models::StorageError>> {
         if !conversation::should_capture(
-            config.capture_mode,
+            config.capture,
             payload.mentions_bot,
             reply_to,
             live_records,
@@ -569,7 +569,7 @@ impl ChatEngine {
     }
 
     /// Assembles one answer attempt's completion request from the channel's
-    /// live records: the newest `history_depth` records as the window, the
+    /// live records: the newest `context_messages` records as the window, the
     /// resolved token budget, the character count the endpoint's usage
     /// report is measured against, and the window size for the audit row.
     /// Shared by the triggered/chime answer and the silent-react chime.
@@ -699,7 +699,7 @@ impl ChatEngine {
         vars: &PromptVars,
         emoji_menu: &str,
     ) -> (CompletionRequest, u64, Option<u64>, usize) {
-        let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
+        let depth = usize::try_from(config.context_messages).unwrap_or(usize::MAX);
         let skip = live.len().saturating_sub(depth);
         let window: &[ConversationRecord] = live.get(skip..).unwrap_or(live);
         let budget =
@@ -754,7 +754,7 @@ impl ChatEngine {
             self.assemble_prompt(config, state, live, usage_stats, &vars, &emoji_menu);
         let started = Instant::now();
 
-        let max_length = config.max_length.unwrap_or(self.settings.max_message_length);
+        let max_length = config.split_length.unwrap_or(self.settings.max_message_length);
         // Streaming channels pull the answer live off the endpoint (SSE
         // deltas reveal on one message); everything else stays single-shot.
         let (live_id, outcome) = if config.streaming {
@@ -1021,7 +1021,7 @@ impl ChatEngine {
         live_id: Option<MessageId>,
         services: &KernelServices,
     ) -> bool {
-        let max_length = config.max_length.unwrap_or(self.settings.max_message_length);
+        let max_length = config.split_length.unwrap_or(self.settings.max_message_length);
         let chunks = conversation::split_reply(content, max_length);
         if chunks.is_empty() {
             tracing::warn!(channel = channel_id, "completion returned no deliverable content");
@@ -1179,7 +1179,7 @@ impl ChatEngine {
             purpose: "reply",
         };
         let react_scope = RandomScope { purpose: "react", ..reply_scope };
-        let reply_allowed = config.random_chance_percent > 0.0
+        let reply_allowed = config.random_reply_chance_percent > 0.0
             && self.chime_allowed(origin, config.random_cooldown_secs);
         let react_allowed = config.react
             && config.random_react_chance_percent > 0.0
@@ -1187,14 +1187,14 @@ impl ChatEngine {
 
         let mut reply_fire = false;
         if reply_allowed {
-            reply_fire = self.rng.chance_percent(reply_scope, config.random_chance_percent);
+            reply_fire = self.rng.chance_percent(reply_scope, config.random_reply_chance_percent);
             tracing::debug!(
                 channel = origin.channel_id.get(),
-                chance = config.random_chance_percent,
+                chance = config.random_reply_chance_percent,
                 rolled = reply_fire,
                 "chime roll"
             );
-        } else if config.random_chance_percent > 0.0 {
+        } else if config.random_reply_chance_percent > 0.0 {
             tracing::debug!(channel = origin.channel_id.get(), "chime roll suppressed by cooldown");
         }
         let mut react_fire = false;
@@ -1518,7 +1518,7 @@ impl ChatEngine {
     }
 
     /// Folds the oldest live messages into the summary once the window
-    /// outgrows `history_depth`: everything but `compaction_keep_tail`
+    /// outgrows `context_messages`: everything but `compaction_keep_tail`
     /// newest records is summarized (via the compaction model) and the
     /// cutoff advances past them. Runs AFTER the reply - the triggering
     /// turn used the pre-compaction context. The commit is one document
@@ -1543,7 +1543,7 @@ impl ChatEngine {
             return;
         }
         let channel_id = origin.channel_id.get();
-        let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
+        let depth = usize::try_from(config.context_messages).unwrap_or(usize::MAX);
         if records.len() <= depth {
             return;
         }
@@ -2672,7 +2672,7 @@ mod tests {
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
-        let config = ChannelConfig { max_length: Some(12), ..assigned_config() };
+        let config = ChannelConfig { split_length: Some(12), ..assigned_config() };
         seed_config(&ctx.storage, &config);
 
         ctx.engine.handle_message(&origin(), &payload(true, None), &config, &services, None).await;
@@ -2719,7 +2719,7 @@ mod tests {
     async fn live_window_caps_history_loading() {
         let ctx = ctx(vec![Ok("ok".to_owned())]);
         let config =
-            ChannelConfig { history_depth: 2, compaction_enabled: false, ..assigned_config() };
+            ChannelConfig { context_messages: 2, compaction_enabled: false, ..assigned_config() };
         seed_config(&ctx.storage, &config);
         for seq in 1..=15 {
             append_record(&ctx.storage, &user_record(seq, "alice", &format!("m{seq}"))).await;
@@ -2732,7 +2732,7 @@ mod tests {
         let request = ctx.fake.requests().first().expect("one request expected").clone();
         let rendered: Vec<&str> =
             request.messages.iter().map(|message| message.content.as_str()).collect();
-        // The newest `depth` records (m14 is already beyond depth) + the
+        // The newest `context_messages` records (m14 is already beyond depth) + the
         // capture - never the old tail.
         assert!(rendered.iter().any(|text| text.contains("m15")));
         assert!(rendered.iter().any(|text| text.contains("hello bot")));
@@ -2747,7 +2747,7 @@ mod tests {
         // ctx() wires a real 2% coin (RandRandom), which made capture tests
         // flake when the coin landed.
         ChannelConfig {
-            random_chance_percent: 0.0,
+            random_reply_chance_percent: 0.0,
             ..ChannelConfig::assigned("local/gemma".to_owned())
         }
     }
@@ -3005,7 +3005,7 @@ mod tests {
     #[tokio::test]
     async fn all_messages_mode_captures_without_triggering() {
         let ctx = ctx(vec![]);
-        let config = ChannelConfig { capture_mode: CaptureMode::AllMessages, ..assigned_config() };
+        let config = ChannelConfig { capture: CaptureMode::AllMessages, ..assigned_config() };
         seed_config(&ctx.storage, &config);
 
         ctx.engine
@@ -3314,7 +3314,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_replies_split_across_messages() {
         let ctx = ctx(vec![Ok("aaa\nbbb".to_owned())]);
-        let config = ChannelConfig { max_length: Some(5), ..assigned_config() };
+        let config = ChannelConfig { split_length: Some(5), ..assigned_config() };
         seed_config(&ctx.storage, &config);
 
         ctx.engine
@@ -3524,9 +3524,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_depth_clamps_the_window() {
+    async fn context_messages_clamps_the_window() {
         let ctx = ctx(vec![Ok("ok".to_owned())]);
-        let config = ChannelConfig { history_depth: 2, ..assigned_config() };
+        let config = ChannelConfig { context_messages: 2, ..assigned_config() };
         seed_config(&ctx.storage, &config);
         append_record(&ctx.storage, &user_record(1, "a1", "m1")).await;
         append_record(&ctx.storage, &user_record(2, "a2", "m2")).await;
@@ -3590,7 +3590,7 @@ mod tests {
         let settings = LlmSettings { compaction_keep_tail: 2, ..LlmSettings::default() };
         let ctx =
             ctx_with(settings, vec![Ok("summary text".to_owned()), Ok("the answer".to_owned())]);
-        let config = ChannelConfig { history_depth: 3, ..assigned_config() };
+        let config = ChannelConfig { context_messages: 3, ..assigned_config() };
         seed_config(&ctx.storage, &config);
         append_record(&ctx.storage, &user_record(1, "a1", "m1")).await;
         append_record(&ctx.storage, &user_record(2, "a2", "m2")).await;
@@ -3655,7 +3655,7 @@ mod tests {
                 reasoning_tokens: None,
             }),
         ]);
-        let config = ChannelConfig { history_depth: 3, ..assigned_config() };
+        let config = ChannelConfig { context_messages: 3, ..assigned_config() };
         seed_config(&ctx.storage, &config);
         append_record(&ctx.storage, &user_record(1, "a1", "m1")).await;
         append_record(&ctx.storage, &user_record(2, "a2", "m2")).await;
@@ -3705,7 +3705,7 @@ mod tests {
                 reasoning_tokens: None,
             }),
         ]);
-        let config = ChannelConfig { history_depth: 3, ..assigned_config() };
+        let config = ChannelConfig { context_messages: 3, ..assigned_config() };
         seed_config(&ctx.storage, &config);
         append_record(&ctx.storage, &user_record(1, "a1", "m1")).await;
         append_record(&ctx.storage, &user_record(2, "a2", "m2")).await;
@@ -3760,7 +3760,7 @@ mod tests {
             settings,
             vec![Err(LlmError::Request("summarizer down".to_owned())), Ok("the answer".to_owned())],
         );
-        let config = ChannelConfig { history_depth: 3, ..assigned_config() };
+        let config = ChannelConfig { context_messages: 3, ..assigned_config() };
         seed_config(&ctx.storage, &config);
         seed_service_channel(&ctx);
         append_record(&ctx.storage, &user_record(1, "a1", "m1")).await;
@@ -3784,13 +3784,13 @@ mod tests {
     }
 
     /// The exact boundary is stable: live records at exactly
-    /// `history_depth` compact nothing (`maybe_compact` early-returns on
+    /// `context_messages` compact nothing (`maybe_compact` early-returns on
     /// `<=`) - no summarizer call, and the cutoff never moves.
     #[tokio::test]
     async fn compaction_is_stable_at_the_exact_depth_boundary() {
         let settings = LlmSettings { compaction_keep_tail: 2, ..LlmSettings::default() };
         let ctx = ctx_with(settings, vec![Ok("the answer".to_owned())]);
-        let config = ChannelConfig { history_depth: 4, ..assigned_config() };
+        let config = ChannelConfig { context_messages: 4, ..assigned_config() };
         seed_config(&ctx.storage, &config);
         append_record(&ctx.storage, &user_record(1, "a1", "m1")).await;
         append_record(&ctx.storage, &user_record(2, "a2", "m2")).await;
@@ -3822,7 +3822,7 @@ mod tests {
     async fn compaction_skips_when_keep_tail_makes_no_progress() {
         let settings = LlmSettings { compaction_keep_tail: 10, ..LlmSettings::default() };
         let ctx = ctx_with(settings, vec![Ok("the answer".to_owned())]);
-        let config = ChannelConfig { history_depth: 2, ..assigned_config() };
+        let config = ChannelConfig { context_messages: 2, ..assigned_config() };
         seed_config(&ctx.storage, &config);
         seed_service_channel(&ctx);
         append_record(&ctx.storage, &user_record(1, "a1", "m1")).await;
@@ -4022,7 +4022,7 @@ mod tests {
         let settings = LlmSettings { compaction_keep_tail: 2, ..LlmSettings::default() };
         let ctx = ctx_with(settings, vec![Ok("the answer".to_owned())]);
         let config =
-            ChannelConfig { history_depth: 1, compaction_enabled: false, ..assigned_config() };
+            ChannelConfig { context_messages: 1, compaction_enabled: false, ..assigned_config() };
         seed_config(&ctx.storage, &config);
         append_record(&ctx.storage, &user_record(1, "a1", "m1")).await;
 
@@ -4051,8 +4051,8 @@ mod tests {
             vec![Ok("random thought".to_owned())],
         );
         let config = ChannelConfig {
-            capture_mode: CaptureMode::AllMessages,
-            random_chance_percent: 2.0,
+            capture: CaptureMode::AllMessages,
+            random_reply_chance_percent: 2.0,
             ..assigned_config()
         };
         seed_config(&ctx.storage, &config);
@@ -4081,8 +4081,8 @@ mod tests {
             vec![Err(LlmError::Request("provider down".to_owned()))],
         );
         let config = ChannelConfig {
-            capture_mode: CaptureMode::AllMessages,
-            random_chance_percent: 2.0,
+            capture: CaptureMode::AllMessages,
+            random_reply_chance_percent: 2.0,
             ..assigned_config()
         };
         seed_config(&ctx.storage, &config);
@@ -4102,8 +4102,8 @@ mod tests {
     async fn random_reply_miss_leaves_only_the_capture() {
         let ctx = ctx_random(LlmSettings::default(), Arc::new(FixedRandom(false)), vec![]);
         let config = ChannelConfig {
-            capture_mode: CaptureMode::AllMessages,
-            random_chance_percent: 2.0,
+            capture: CaptureMode::AllMessages,
+            random_reply_chance_percent: 2.0,
             ..assigned_config()
         };
         seed_config(&ctx.storage, &config);
@@ -4145,8 +4145,8 @@ mod tests {
             vec![Ok("chime".to_owned())],
         );
         let config = ChannelConfig {
-            capture_mode: CaptureMode::AllMessages,
-            random_chance_percent: 2.0,
+            capture: CaptureMode::AllMessages,
+            random_reply_chance_percent: 2.0,
             // Explicit long cooldown: back-to-back messages can never both
             // roll, independent of how fast the test machine runs.
             random_cooldown_secs: 300,
@@ -4178,8 +4178,8 @@ mod tests {
             vec![Ok("chime 2".to_owned()), Ok("chime 1".to_owned())],
         );
         let config = ChannelConfig {
-            capture_mode: CaptureMode::AllMessages,
-            random_chance_percent: 2.0,
+            capture: CaptureMode::AllMessages,
+            random_reply_chance_percent: 2.0,
             random_cooldown_secs: 0,
             ..assigned_config()
         };
@@ -4282,7 +4282,7 @@ mod tests {
                 fail_after: None,
             }),
         );
-        let config = ChannelConfig { streaming: true, max_length: Some(10), ..assigned_config() };
+        let config = ChannelConfig { streaming: true, split_length: Some(10), ..assigned_config() };
         seed_config(&ctx.storage, &config);
 
         ctx.engine
@@ -4818,9 +4818,9 @@ mod tests {
             vec![Ok("prose nobody sees [[react: 🐻]]".to_owned())],
         );
         let config = ChannelConfig {
-            capture_mode: CaptureMode::AllMessages,
+            capture: CaptureMode::AllMessages,
             react: true,
-            random_chance_percent: 0.0, // reply roll off - react-only chime
+            random_reply_chance_percent: 0.0, // reply roll off - react-only chime
             random_react_chance_percent: 100.0,
             ..assigned_config()
         };
@@ -4858,9 +4858,9 @@ mod tests {
             vec![Ok("[[react: 🐻]]".to_owned())],
         );
         let config = ChannelConfig {
-            capture_mode: CaptureMode::AllMessages,
+            capture: CaptureMode::AllMessages,
             react: true,
-            random_chance_percent: 0.0,
+            random_reply_chance_percent: 0.0,
             random_react_chance_percent: 100.0,
             ..assigned_config()
         };
@@ -4896,9 +4896,9 @@ mod tests {
             vec![Ok("just prose, no marker".to_owned())],
         );
         let config = ChannelConfig {
-            capture_mode: CaptureMode::AllMessages,
+            capture: CaptureMode::AllMessages,
             react: true,
-            random_chance_percent: 0.0,
+            random_reply_chance_percent: 0.0,
             random_react_chance_percent: 100.0,
             ..assigned_config()
         };

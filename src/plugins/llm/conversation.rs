@@ -254,7 +254,7 @@ const DEFAULT_COMPLETION_RESERVE: u64 = 1024;
 
 /// Resolves the effective prompt-side token budget:
 ///
-/// 1. the channel's explicit `context_budget_tokens` override;
+/// 1. the channel's explicit `context_tokens` override;
 /// 2. the model's declared `context_window` minus the completion reserve
 ///    (channel `max_tokens` or a default - the answer needs room) and a 10%
 ///    margin for estimator error;
@@ -266,7 +266,7 @@ pub(crate) fn resolve_budget(
     settings: &LlmSettings,
     calibrated: bool,
 ) -> Option<u64> {
-    if let Some(explicit) = config.context_budget_tokens {
+    if let Some(explicit) = config.context_tokens {
         return Some(u64::from(explicit));
     }
     if !calibrated {
@@ -292,9 +292,9 @@ fn estimated_tokens(text: &str, tokens_per_char: f64) -> u64 {
 ///
 /// The whole prompt side (system + summary + turns) counts against the
 /// resolved budget, and turns fill NEWEST-FIRST under that budget and
-/// `history_depth`, whichever bites first. The newest turn is always
+/// `context_messages`, whichever bites first. The newest turn is always
 /// included - a reply must at least see what it answers. Without a budget
-/// (uncalibrated, no model window, no channel override) only `history_depth`
+/// (uncalibrated, no model window, no channel override) only `context_messages`
 /// applies.
 pub fn assemble_context(
     config: &ChannelConfig,
@@ -306,7 +306,7 @@ pub fn assemble_context(
     budget: Option<u64>,
     emoji_menu: &str,
 ) -> Vec<ChatMessage> {
-    let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
+    let depth = usize::try_from(config.context_messages).unwrap_or(usize::MAX);
     // Undeclared models run the default placement (a separate summary slot)
     // - same capability contract as reasoning/context_window.
     let placement = settings
@@ -900,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn image_descriptions_count_toward_the_context_budget() {
+    fn image_descriptions_count_toward_the_context_tokens() {
         let config = flat_turn_config();
         let settings = LlmSettings::default();
         let state = ConversationState::default();
@@ -1017,7 +1017,7 @@ mod tests {
     fn no_compaction_config() -> ChannelConfig {
         let mut config = ChannelConfig::assigned("p/m".to_owned());
         config.compaction_enabled = false;
-        config.history_depth = 100;
+        config.context_messages = 100;
         config
     }
 
@@ -1190,11 +1190,8 @@ mod tests {
             user_record(2, "a2", "bb"),
             user_record(3, "a3", "cccccc"),
         ];
-        let config = ChannelConfig {
-            history_depth: 10,
-            context_budget_tokens: Some(102),
-            ..flat_turn_config()
-        };
+        let config =
+            ChannelConfig { context_messages: 10, context_tokens: Some(102), ..flat_turn_config() };
 
         let budget = resolve_budget(&config, &settings, true);
         let messages =
@@ -1211,7 +1208,7 @@ mod tests {
         let settings = LlmSettings::default();
         let state = ConversationState::default();
         let records = vec![user_record(1, "a1", "a very long message indeed")];
-        let config = ChannelConfig { context_budget_tokens: Some(1), ..flat_turn_config() };
+        let config = ChannelConfig { context_tokens: Some(1), ..flat_turn_config() };
 
         let budget = resolve_budget(&config, &settings, true);
         let messages =
@@ -1246,7 +1243,7 @@ mod tests {
             user_record(4, "a4", &"x".repeat(300)),
         ];
         let config = ChannelConfig {
-            history_depth: 10,
+            context_messages: 10,
             ..ChannelConfig::assigned("local/gemma".to_owned())
         };
 
@@ -1278,7 +1275,7 @@ mod tests {
         assert_eq!(resolve_budget(&config, &settings, true), Some(6176));
 
         // Explicit channel budget wins and does not need calibration.
-        config.context_budget_tokens = Some(1500);
+        config.context_tokens = Some(1500);
         assert_eq!(resolve_budget(&config, &settings, false), Some(1500));
 
         // Undeclared model: no window, no budget.

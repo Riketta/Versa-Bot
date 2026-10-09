@@ -35,9 +35,10 @@ pub struct LlmConfig {
     pub compaction_keep_tail: u32,
     /// Reply splitting limit; per-channel `max_length` overrides this.
     pub max_message_length: usize,
-    /// The smallest per-channel `max_length` admins may set; the platform's
-    /// message cap wins over it.
-    pub min_reply_chunk: usize,
+    /// The smallest per-channel `split_length` admins may set; the
+    /// platform's message cap wins over it.
+    #[serde(alias = "min_reply_chunk")]
+    pub min_split_length: usize,
     /// Streaming edit cadence in milliseconds.
     pub stream_interval_ms: u64,
     /// Cap for `/llm_set_prompt` file attachments, in bytes.
@@ -90,7 +91,7 @@ impl Default for LlmConfig {
             compaction_model: None,
             compaction_keep_tail: 10,
             max_message_length: 2000,
-            min_reply_chunk: 100,
+            min_split_length: 100,
             stream_interval_ms: 2000,
             max_prompt_file_bytes: 131_072,
             image_model: None,
@@ -207,11 +208,20 @@ mod tests {
         let config = serde_json::from_str::<LlmConfig>("{}").expect("empty section deserializes");
         assert_eq!(config.compaction_keep_tail, 10);
         assert_eq!(config.max_message_length, 2000);
-        assert_eq!(config.min_reply_chunk, 100);
+        assert_eq!(config.min_split_length, 100);
         assert_eq!(config.time_offset_minutes, 0);
         assert_eq!(config.bot_name, None);
         assert!(config.providers.is_empty());
         assert!(config.default_system_prompt.contains("{{bot}}"));
+    }
+
+    /// The pre-rename key still deserializes - existing config files keep
+    /// loading; the example config and docs use the new name.
+    #[test]
+    fn legacy_min_reply_chunk_key_still_deserializes() {
+        let config = serde_json::from_str::<LlmConfig>(r#"{ "min_reply_chunk": 300 }"#)
+            .expect("legacy key expected to deserialize");
+        assert_eq!(config.min_split_length, 300);
     }
 
     #[test]
@@ -225,7 +235,7 @@ mod tests {
                 "compaction_model": "zai/glm-5.3-flash",
                 "compaction_keep_tail": 5,
                 "max_message_length": 1500,
-                "min_reply_chunk": 300,
+                "min_split_length": 300,
                 "stream_interval_ms": 1500,
                 "max_prompt_file_bytes": 4096,
                 "image_model": "local/gemma-vision",
@@ -260,7 +270,7 @@ mod tests {
         assert_eq!(config.compaction_model.as_deref(), Some("zai/glm-5.3-flash"));
         assert_eq!(config.compaction_keep_tail, 5);
         assert_eq!(config.max_message_length, 1500);
-        assert_eq!(config.min_reply_chunk, 300);
+        assert_eq!(config.min_split_length, 300);
         assert_eq!(config.max_prompt_file_bytes, 4096);
         assert_eq!(config.image_model.as_deref(), Some("local/gemma-vision"));
         assert_eq!(config.image_max_side, 768);

@@ -43,9 +43,9 @@ pub(super) const SET_KEYS: &[&str] = &[
     "presence_penalty",
     "max_tokens",
     "reasoning_effort",
-    "depth",
-    "context_budget",
-    "capture_mode",
+    "context_messages",
+    "context_tokens",
+    "capture",
     "compaction",
     "compaction_model",
     "images",
@@ -53,10 +53,10 @@ pub(super) const SET_KEYS: &[&str] = &[
     "react",
     "react_emoji_inject",
     "streaming",
-    "random_chance",
+    "random_reply_chance",
     "random_cooldown",
     "random_react_chance",
-    "max_length",
+    "split_length",
     "turn_template",
 ];
 
@@ -65,7 +65,7 @@ pub(super) const SET_KEYS: &[&str] = &[
 async fn load_assigned_config(
     event: &RequestContext,
     services: &KernelServices,
-    min_reply_chunk: usize,
+    min_split_length: usize,
 ) -> anyhow::Result<Option<ChannelConfig>> {
     let Some(storage) = &services.guild_storage else {
         services
@@ -83,7 +83,7 @@ async fn load_assigned_config(
             .await?;
         return Ok(None);
     };
-    Ok(Some(ChannelConfig::from_stored(raw, min_reply_chunk)?))
+    Ok(Some(ChannelConfig::from_stored(raw, min_split_length)?))
 }
 
 async fn save_config(
@@ -120,14 +120,14 @@ fn apply_set(
     key: &str,
     value: &str,
     message_limit: Option<usize>,
-    min_reply_chunk: usize,
+    min_split_length: usize,
 ) -> Result<String, String> {
     let cleared = matches!(value, "clear" | "none" | "default");
     if let Some(result) = apply_numeric(config, key, value, cleared) {
         return result;
     }
     if let Some(result) =
-        apply_optional_field(config, key, value, cleared, message_limit, min_reply_chunk)
+        apply_optional_field(config, key, value, cleared, message_limit, min_split_length)
     {
         return result;
     }
@@ -167,13 +167,13 @@ fn apply_set(
                 "`reasoning_effort` set to `{value}` (sent only if the model declares reasoning support)."
             ))
         }
-        "capture_mode" => {
+        "capture" => {
             let mode: CaptureMode =
                 serde_json::from_value(serde_json::json!(value)).map_err(|_| {
-                    format!("`capture_mode` expects bot_related or all_messages, got `{value}`.")
+                    format!("`capture` expects bot_related or all_messages, got `{value}`.")
                 })?;
-            config.capture_mode = mode;
-            Ok(format!("`capture_mode` set to `{value}`."))
+            config.capture = mode;
+            Ok(format!("`capture` set to `{value}`."))
         }
         "react_emoji_inject" => {
             let mode: EmojiInject =
@@ -191,7 +191,7 @@ fn apply_set(
             }
             Ok(reply)
         }
-        "model" | "depth" => {
+        "model" | "context_messages" => {
             Err(format!("`{key}` cannot be cleared - assign a value or use `/llm_unassign`."))
         }
         other => Err(format!("Unknown key `{other}`. Keys: {}.", SET_KEYS.join(", "))),
@@ -277,24 +277,26 @@ fn apply_numeric(
                 Err(_) => Some(Err(format!("`{key}` expects a whole number, got `{value}`."))),
             }
         }
-        "depth" => {
+        "context_messages" => {
             if cleared {
                 return Some(Err(format!(
                     "`{key}` cannot be cleared - assign a value or use `/llm_unassign`."
                 )));
             }
             match value.parse::<u32>() {
-                Ok(0) => Some(Err("`depth` must be at least 1.".to_owned())),
+                Ok(0) => Some(Err("`context_messages` must be at least 1.".to_owned())),
                 Ok(parsed) => {
-                    config.history_depth = parsed;
-                    Some(Ok(format!("`depth` set to {parsed} messages.")))
+                    config.context_messages = parsed;
+                    Some(Ok(format!("`context_messages` set to {parsed} messages.")))
                 }
-                Err(_) => Some(Err(format!("`depth` expects a whole number, got `{value}`."))),
+                Err(_) => {
+                    Some(Err(format!("`context_messages` expects a whole number, got `{value}`.")))
+                }
             }
         }
-        "context_budget" => {
+        "context_tokens" => {
             if cleared {
-                config.context_budget_tokens = None;
+                config.context_tokens = None;
                 return Some(Ok(format!("`{key}` cleared (count-only filling).")));
             }
             match value.parse::<u32>() {
@@ -302,7 +304,7 @@ fn apply_numeric(
                     "`{key}` must be at least 1 (0 would keep only the newest turn)."
                 ))),
                 Ok(parsed) => {
-                    config.context_budget_tokens = Some(parsed);
+                    config.context_tokens = Some(parsed);
                     Some(Ok(format!("`{key}` set to {parsed} tokens.")))
                 }
                 Err(_) => {
@@ -310,20 +312,20 @@ fn apply_numeric(
                 }
             }
         }
-        "random_chance" => {
+        "random_reply_chance" => {
             if cleared {
-                config.random_chance_percent = 0.0;
-                return Some(Ok("`random_chance` cleared (chime-ins off).".to_owned()));
+                config.random_reply_chance_percent = 0.0;
+                return Some(Ok("`random_reply_chance` cleared (chime-ins off).".to_owned()));
             }
             match value.parse::<f64>() {
                 // Non-finite clamps to NaN, not to the range bounds.
                 Ok(parsed) if parsed.is_finite() => {
                     let clamped = parsed.clamp(0.0, 100.0);
-                    config.random_chance_percent = clamped;
-                    Some(Ok(format!("`random_chance` set to {clamped}.")))
+                    config.random_reply_chance_percent = clamped;
+                    Some(Ok(format!("`random_reply_chance` set to {clamped}.")))
                 }
                 _ => Some(Err(format!(
-                    "`random_chance` expects a finite number (percent), got `{value}`."
+                    "`random_reply_chance` expects a finite number (percent), got `{value}`."
                 ))),
             }
         }
@@ -373,7 +375,7 @@ fn apply_optional_field(
     value: &str,
     cleared: bool,
     message_limit: Option<usize>,
-    min_reply_chunk: usize,
+    min_split_length: usize,
 ) -> Option<Result<String, String>> {
     match key {
         // Model refs sharing the set/clear shape. The text prompts left the
@@ -399,17 +401,17 @@ fn apply_optional_field(
                 }
             }
         }
-        "max_length" => {
+        "split_length" => {
             if cleared {
-                config.max_length = None;
+                config.split_length = None;
                 return Some(Ok(format!("`{key}` cleared (plugin default applies).")));
             }
             match value.parse::<usize>() {
                 // Tiny chunks would flood the channel and starve the send
                 // rate limits - the floor is operator policy (announced at
                 // boot) enforced here.
-                Ok(n) if n < min_reply_chunk => Some(Err(format!(
-                    "`{key}` must be at least {min_reply_chunk} - smaller chunks would flood \
+                Ok(n) if n < min_split_length => Some(Err(format!(
+                    "`{key}` must be at least {min_split_length} - smaller chunks would flood \
                      the channel."
                 ))),
                 // The platform rejects longer text messages outright - a
@@ -425,7 +427,7 @@ fn apply_optional_field(
                     )))
                 }
                 Ok(characters) => {
-                    config.max_length = Some(characters);
+                    config.split_length = Some(characters);
                     Some(Ok(format!("`{key}` set to {characters} characters.")))
                 }
                 Err(_) => Some(Err(format!("`{key}` expects a whole number, got `{value}`."))),
@@ -1242,7 +1244,7 @@ impl CommandHandler for StatusLlmHandler {
                 .await?;
             return Ok(());
         };
-        let config = ChannelConfig::from_stored(raw, self.engine.settings().min_reply_chunk)?;
+        let config = ChannelConfig::from_stored(raw, self.engine.settings().min_split_length)?;
         let state: ConversationState = storage
             .get(NAMESPACE, &channel_state_key(channel_id))
             .await?
@@ -1272,7 +1274,7 @@ impl CommandHandler for StatusLlmHandler {
             .unwrap_or_default();
         // The estimate window: what the engine would actually load for the
         // next message (assembly depth + compaction tail).
-        let depth = usize::try_from(config.history_depth).unwrap_or(usize::MAX);
+        let depth = usize::try_from(config.context_messages).unwrap_or(usize::MAX);
         let keep_tail =
             usize::try_from(self.engine.settings().compaction_keep_tail).unwrap_or(usize::MAX);
         let window = depth.saturating_add(keep_tail).max(1);
@@ -1310,10 +1312,10 @@ Context start: {context_start}",
             config.model,
             prompt_text.chars().count(),
             prompt_fingerprint(prompt_text),
-            config.history_depth,
+            config.context_messages,
             if config.compaction_enabled { "on" } else { "off" },
-            capture_label(config.capture_mode),
-            chime_label(config.random_chance_percent, config.random_cooldown_secs),
+            capture_label(config.capture),
+            chime_label(config.random_reply_chance_percent, config.random_cooldown_secs),
         );
         if let Some(line) = usage.estimate {
             description.push('\n');
@@ -1707,7 +1709,7 @@ impl CommandHandler for SetLlmHandler {
         let channel = self.locks.lock_for(services.platform_info.slug(), &event.origin);
         let _channel = channel.lock().await;
         let Some(mut config) =
-            load_assigned_config(event, services, self.engine.settings().min_reply_chunk).await?
+            load_assigned_config(event, services, self.engine.settings().min_split_length).await?
         else {
             return Ok(());
         };
@@ -1738,7 +1740,7 @@ impl CommandHandler for SetLlmHandler {
             key,
             value,
             services.platform_info.message_limit(),
-            self.engine.settings().min_reply_chunk,
+            self.engine.settings().min_split_length,
         ) {
             Ok(message) => {
                 save_config(event, services, config).await?;
@@ -1776,7 +1778,7 @@ impl CommandHandler for GetLlmHandler {
         services: &KernelServices,
     ) -> anyhow::Result<()> {
         let Some(config) =
-            load_assigned_config(event, services, self.engine.settings().min_reply_chunk).await?
+            load_assigned_config(event, services, self.engine.settings().min_split_length).await?
         else {
             return Ok(());
         };
@@ -1882,7 +1884,7 @@ impl CommandHandler for DumpLlmHandler {
         services: &KernelServices,
     ) -> anyhow::Result<()> {
         let Some(config) =
-            load_assigned_config(event, services, self.engine.settings().min_reply_chunk).await?
+            load_assigned_config(event, services, self.engine.settings().min_split_length).await?
         else {
             return Ok(());
         };
@@ -1965,16 +1967,16 @@ fn current_value(config: &ChannelConfig, key: &str, settings: &LlmSettings) -> O
                 .clone()
                 .map_or_else(not_sent, |value| format!("`{value}`")),
         ),
-        "depth" => Some(format!("{} messages", config.history_depth)),
-        "context_budget" => Some(
+        "context_messages" => Some(format!("{} messages", config.context_messages)),
+        "context_tokens" => Some(
             config
-                .context_budget_tokens
+                .context_tokens
                 .map_or_else(|| "auto".to_owned(), |tokens| format!("{tokens} tokens")),
         ),
         "streaming" => Some(on_off(config.streaming)),
         "react" => Some(on_off(config.react)),
         "react_emoji_inject" => Some(config.react_emoji_inject.as_str().to_owned()),
-        "capture_mode" => Some(match config.capture_mode {
+        "capture" => Some(match config.capture {
             CaptureMode::BotRelated => "bot_related".to_owned(),
             CaptureMode::AllMessages => "all_messages".to_owned(),
         }),
@@ -1992,10 +1994,10 @@ fn current_value(config: &ChannelConfig, key: &str, settings: &LlmSettings) -> O
                 |model| format!("plugin `image_model` (`{model}`)"),
             )
         })),
-        "random_chance" => Some(format!("{:.1}%", config.random_chance_percent)),
+        "random_reply_chance" => Some(format!("{:.1}%", config.random_reply_chance_percent)),
         "random_cooldown" => Some(format!("{} seconds", config.random_cooldown_secs)),
         "random_react_chance" => Some(format!("{:.1}%", config.random_react_chance_percent)),
-        "max_length" => Some(config.max_length.map_or_else(
+        "split_length" => Some(config.split_length.map_or_else(
             || format!("{} (max_message_length)", settings.max_message_length),
             |limit| format!("{limit}"),
         )),
@@ -2236,7 +2238,7 @@ impl CommandHandler for SetPromptLlmHandler {
             let channel = self.locks.lock_for(services.platform_info.slug(), &event.origin);
             let _channel = channel.lock().await;
             let Some(mut config) =
-                load_assigned_config(event, services, self.engine.settings().min_reply_chunk)
+                load_assigned_config(event, services, self.engine.settings().min_split_length)
                     .await?
             else {
                 return Ok(());
@@ -2261,7 +2263,7 @@ impl CommandHandler for SetPromptLlmHandler {
                 let channel = self.locks.lock_for(services.platform_info.slug(), &event.origin);
                 let _channel = channel.lock().await;
                 let Some(mut config) =
-                    load_assigned_config(event, services, self.engine.settings().min_reply_chunk)
+                    load_assigned_config(event, services, self.engine.settings().min_split_length)
                         .await?
                 else {
                     return Ok(());
@@ -2280,7 +2282,7 @@ impl CommandHandler for SetPromptLlmHandler {
             // `/llm_get`).
             None => {
                 let Some(config) =
-                    load_assigned_config(event, services, self.engine.settings().min_reply_chunk)
+                    load_assigned_config(event, services, self.engine.settings().min_split_length)
                         .await?
                 else {
                     return Ok(());
@@ -2661,16 +2663,17 @@ mod tests {
     fn numeric_keys_validate_ranges() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "depth", "0", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
-        apply_set(&mut config, "depth", "50", PLATFORM_LIMIT, CHUNK_FLOOR).expect("depth expected");
-        assert_eq!(config.history_depth, 50);
+        apply_set(&mut config, "context_messages", "0", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
+        apply_set(&mut config, "context_messages", "50", PLATFORM_LIMIT, CHUNK_FLOOR)
+            .expect("depth expected");
+        assert_eq!(config.context_messages, 50);
 
-        apply_set(&mut config, "random_chance", "250", PLATFORM_LIMIT, CHUNK_FLOOR)
+        apply_set(&mut config, "random_reply_chance", "250", PLATFORM_LIMIT, CHUNK_FLOOR)
             .expect("clamp expected");
-        assert!((config.random_chance_percent - 100.0).abs() < f64::EPSILON);
-        apply_set(&mut config, "random_chance", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
+        assert!((config.random_reply_chance_percent - 100.0).abs() < f64::EPSILON);
+        apply_set(&mut config, "random_reply_chance", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
             .expect("clear expected");
-        assert!((config.random_chance_percent).abs() < f64::EPSILON);
+        assert!((config.random_reply_chance_percent).abs() < f64::EPSILON);
 
         apply_set(&mut config, "random_react_chance", "250", PLATFORM_LIMIT, CHUNK_FLOOR)
             .expect("clamp expected");
@@ -2692,35 +2695,35 @@ mod tests {
             .unwrap_err();
 
         // A zero budget would keep only the newest turn - rejected like
-        // `depth` 0, not accepted as "no budget".
-        apply_set(&mut config, "context_budget", "0", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
-        apply_set(&mut config, "context_budget", "4096", PLATFORM_LIMIT, CHUNK_FLOOR)
+        // `context_messages` 0, not accepted as "no budget".
+        apply_set(&mut config, "context_tokens", "0", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
+        apply_set(&mut config, "context_tokens", "4096", PLATFORM_LIMIT, CHUNK_FLOOR)
             .expect("budget expected");
-        assert_eq!(config.context_budget_tokens, Some(4096));
+        assert_eq!(config.context_tokens, Some(4096));
     }
 
     #[test]
     fn max_length_cannot_exceed_the_platform_limit() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "max_length", "2000", Some(2000), CHUNK_FLOOR)
+        apply_set(&mut config, "split_length", "2000", Some(2000), CHUNK_FLOOR)
             .expect("limit value expected");
-        assert_eq!(config.max_length, Some(2000));
+        assert_eq!(config.split_length, Some(2000));
         // Beyond the cap the platform rejects the chunks outright - rejected
         // here so replies never turn into undelivered garbage.
-        apply_set(&mut config, "max_length", "2001", Some(2000), CHUNK_FLOOR).unwrap_err();
-        assert_eq!(config.max_length, Some(2000));
+        apply_set(&mut config, "split_length", "2001", Some(2000), CHUNK_FLOOR).unwrap_err();
+        assert_eq!(config.split_length, Some(2000));
 
         // Below the reply-chunk floor: rejected - tiny chunks would flood
         // the channel and starve the send rate limits. The floor holds even
         // where the platform declares no cap.
-        apply_set(&mut config, "max_length", "99", Some(2000), CHUNK_FLOOR).unwrap_err();
-        assert_eq!(config.max_length, Some(2000));
-        apply_set(&mut config, "max_length", "100", Some(2000), CHUNK_FLOOR)
+        apply_set(&mut config, "split_length", "99", Some(2000), CHUNK_FLOOR).unwrap_err();
+        assert_eq!(config.split_length, Some(2000));
+        apply_set(&mut config, "split_length", "100", Some(2000), CHUNK_FLOOR)
             .expect("floor value expected");
-        assert_eq!(config.max_length, Some(CHUNK_FLOOR));
-        apply_set(&mut config, "max_length", "50", None, CHUNK_FLOOR).unwrap_err();
-        assert_eq!(config.max_length, Some(CHUNK_FLOOR));
+        assert_eq!(config.split_length, Some(CHUNK_FLOOR));
+        apply_set(&mut config, "split_length", "50", None, CHUNK_FLOOR).unwrap_err();
+        assert_eq!(config.split_length, Some(CHUNK_FLOOR));
     }
 
     /// The floor is operator policy, not a hard-coded constant: `/llm_set`
@@ -2729,31 +2732,31 @@ mod tests {
     fn max_length_floor_follows_the_configured_policy() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "max_length", "499", Some(2000), 500).unwrap_err();
-        apply_set(&mut config, "max_length", "500", Some(2000), 500).expect("floor expected");
-        assert_eq!(config.max_length, Some(500));
-        apply_set(&mut config, "max_length", "500", None, 500).expect("no cap expected");
-        assert_eq!(config.max_length, Some(500));
+        apply_set(&mut config, "split_length", "499", Some(2000), 500).unwrap_err();
+        apply_set(&mut config, "split_length", "500", Some(2000), 500).expect("floor expected");
+        assert_eq!(config.split_length, Some(500));
+        apply_set(&mut config, "split_length", "500", None, 500).expect("no cap expected");
+        assert_eq!(config.split_length, Some(500));
     }
 
     #[test]
     fn max_length_ignores_the_cap_when_the_platform_declares_none() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "max_length", "5000", None, CHUNK_FLOOR).expect("no cap expected");
-        assert_eq!(config.max_length, Some(5000));
-        apply_set(&mut config, "max_length", "clear", None, CHUNK_FLOOR).expect("clear expected");
-        assert_eq!(config.max_length, None);
+        apply_set(&mut config, "split_length", "5000", None, CHUNK_FLOOR).expect("no cap expected");
+        assert_eq!(config.split_length, Some(5000));
+        apply_set(&mut config, "split_length", "clear", None, CHUNK_FLOOR).expect("clear expected");
+        assert_eq!(config.split_length, None);
     }
 
     #[test]
-    fn capture_mode_and_template_validate() {
+    fn capture_and_template_validate() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "capture_mode", "all_messages", PLATFORM_LIMIT, CHUNK_FLOOR)
+        apply_set(&mut config, "capture", "all_messages", PLATFORM_LIMIT, CHUNK_FLOOR)
             .expect("mode expected");
-        assert_eq!(config.capture_mode, CaptureMode::AllMessages);
-        apply_set(&mut config, "capture_mode", "chaos", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
+        assert_eq!(config.capture, CaptureMode::AllMessages);
+        apply_set(&mut config, "capture", "chaos", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
 
         apply_set(
             &mut config,
@@ -2779,7 +2782,10 @@ mod tests {
             apply_set(&mut config, "vibes", "maximum", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
         assert!(unknown.contains("Unknown key"));
         assert!(apply_set(&mut config, "model", "clear", PLATFORM_LIMIT, CHUNK_FLOOR).is_err());
-        assert!(apply_set(&mut config, "depth", "clear", PLATFORM_LIMIT, CHUNK_FLOOR).is_err());
+        assert!(
+            apply_set(&mut config, "context_messages", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
+                .is_err()
+        );
         apply_set(&mut config, "model", "zai/glm-5.3-flash", PLATFORM_LIMIT, CHUNK_FLOOR)
             .expect("model expected");
         assert_eq!(config.model, "zai/glm-5.3-flash");
@@ -2813,13 +2819,13 @@ mod tests {
             current_value(&config, "reasoning_effort", &settings).as_deref(),
             Some("not sent (provider default)")
         );
-        assert_eq!(current_value(&config, "depth", &settings).as_deref(), Some("100 messages"));
-        assert_eq!(current_value(&config, "context_budget", &settings).as_deref(), Some("auto"));
-        assert_eq!(current_value(&config, "streaming", &settings).as_deref(), Some("off"));
         assert_eq!(
-            current_value(&config, "capture_mode", &settings).as_deref(),
-            Some("bot_related")
+            current_value(&config, "context_messages", &settings).as_deref(),
+            Some("100 messages")
         );
+        assert_eq!(current_value(&config, "context_tokens", &settings).as_deref(), Some("auto"));
+        assert_eq!(current_value(&config, "streaming", &settings).as_deref(), Some("off"));
+        assert_eq!(current_value(&config, "capture", &settings).as_deref(), Some("bot_related"));
         assert_eq!(current_value(&config, "compaction", &settings).as_deref(), Some("on"));
         assert!(
             current_value(&config, "compaction_model", &settings)
@@ -2828,13 +2834,16 @@ mod tests {
         );
         assert_eq!(current_value(&config, "images", &settings).as_deref(), Some("off"));
         assert_eq!(current_value(&config, "react", &settings).as_deref(), Some("off"));
-        assert_eq!(current_value(&config, "random_chance", &settings).as_deref(), Some("2.0%"));
+        assert_eq!(
+            current_value(&config, "random_reply_chance", &settings).as_deref(),
+            Some("2.0%")
+        );
         assert_eq!(
             current_value(&config, "random_react_chance", &settings).as_deref(),
             Some("10.0%")
         );
         assert_eq!(
-            current_value(&config, "max_length", &settings).as_deref(),
+            current_value(&config, "split_length", &settings).as_deref(),
             Some("2000 (max_message_length)")
         );
         assert!(
@@ -2847,21 +2856,24 @@ mod tests {
         // Set state renders the stored value.
         config.params.temperature = Some(0.7);
         config.params.reasoning_effort = Some("off".to_owned());
-        config.context_budget_tokens = Some(4096);
+        config.context_tokens = Some(4096);
         config.streaming = true;
         config.react = true;
-        config.random_chance_percent = 7.5;
-        config.max_length = Some(500);
+        config.random_reply_chance_percent = 7.5;
+        config.split_length = Some(500);
         assert_eq!(current_value(&config, "temperature", &settings).as_deref(), Some("0.7"));
         assert_eq!(current_value(&config, "reasoning_effort", &settings).as_deref(), Some("`off`"));
         assert_eq!(
-            current_value(&config, "context_budget", &settings).as_deref(),
+            current_value(&config, "context_tokens", &settings).as_deref(),
             Some("4096 tokens")
         );
         assert_eq!(current_value(&config, "streaming", &settings).as_deref(), Some("on"));
         assert_eq!(current_value(&config, "react", &settings).as_deref(), Some("on"));
-        assert_eq!(current_value(&config, "random_chance", &settings).as_deref(), Some("7.5%"));
-        assert_eq!(current_value(&config, "max_length", &settings).as_deref(), Some("500"));
+        assert_eq!(
+            current_value(&config, "random_reply_chance", &settings).as_deref(),
+            Some("7.5%")
+        );
+        assert_eq!(current_value(&config, "split_length", &settings).as_deref(), Some("500"));
     }
 
     /// The `react_emoji_inject` grammar: the three modes apply, `none` is a
@@ -2960,11 +2972,12 @@ mod tests {
         assert_eq!(config.params.temperature, None, "nothing may be stored");
 
         // NaN would clamp to NaN, not to the range bounds; the default stays.
-        let before = config.random_chance_percent;
+        let before = config.random_reply_chance_percent;
         assert!(
-            apply_set(&mut config, "random_chance", "NaN", PLATFORM_LIMIT, CHUNK_FLOOR).is_err()
+            apply_set(&mut config, "random_reply_chance", "NaN", PLATFORM_LIMIT, CHUNK_FLOOR)
+                .is_err()
         );
-        assert!((config.random_chance_percent - before).abs() < f64::EPSILON);
+        assert!((config.random_reply_chance_percent - before).abs() < f64::EPSILON);
     }
 
     fn settings_with_models(refs: &[&str]) -> LlmSettings {

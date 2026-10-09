@@ -46,12 +46,12 @@ pub struct LlmSettings {
     pub compaction_model: Option<String>,
     /// Live messages kept after each compaction (the new window's seed).
     pub compaction_keep_tail: u32,
-    /// Reply splitting limit (per-channel `max_length` overrides this).
+    /// Reply splitting limit (per-channel `split_length` overrides this).
     pub max_message_length: usize,
-    /// The smallest per-channel `max_length` admins may set; the platform's
-    /// message cap wins over it. Enforced by the command layer and the
-    /// stored-config load path.
-    pub min_reply_chunk: usize,
+    /// The smallest per-channel `split_length` admins may set; the
+    /// platform's message cap wins over it. Enforced by the command layer
+    /// and the stored-config load path.
+    pub min_split_length: usize,
     /// Streaming edit cadence in milliseconds.
     pub stream_interval_ms: u64,
     /// Cap for `/llm_set_prompt` file attachments, in bytes.
@@ -109,7 +109,7 @@ impl Default for LlmSettings {
             compaction_model: None,
             compaction_keep_tail: 10,
             max_message_length: 2000,
-            min_reply_chunk: 100,
+            min_split_length: 100,
             stream_interval_ms: 2000,
             max_prompt_file_bytes: 131_072,
             image_model: None,
@@ -227,7 +227,7 @@ pub struct ModelSettings {
     /// `reasoning_effort` is ignored for models without this.
     pub reasoning: bool,
     /// Total context window in tokens. When declared, channels without an
-    /// explicit `context_budget_tokens` fill their prompt up to this window
+    /// explicit `context_tokens` fill their prompt up to this window
     /// minus the completion reserve and an estimator margin (token-budget
     /// filling needs calibrated usage data; before the first reported
     /// request, message-count filling applies).

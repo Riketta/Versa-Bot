@@ -162,7 +162,7 @@ the target channel.
 /llm_models                                  # what this deployment offers
 /llm_assign model:local/gemma                # in #bot-chat: bind the assistant here
 /llm_set reasoning_effort min                # lightest reasoning
-/llm_set capture_mode all_messages           # track everything - also what enables random chime-ins
+/llm_set capture all_messages                # track everything - also what enables random chime-ins
 /llm_set images on                           # describe attached images (needs operator [llm] image_model)
 /llm_set react on                            # the model may react to the message it answers
 /llm_set streaming on                        # the answer live-edits while it generates
@@ -679,7 +679,7 @@ history.
 # bot_name / bot_id (template identity overrides; discovered from the
 # platform at boot), compaction_model, compaction_keep_tail,
 # max_message_length (clamped to the platform's message limit at boot),
-# min_reply_chunk (the smallest per-channel `max_length` admins may set;
+# min_split_length (the smallest per-channel `split_length` admins may set;
 # the platform's message cap wins over it), stream_interval_ms,
 # time_offset_minutes (0 = UTC), max_consecutive_newlines (collapse
 # blank-line runs in answers down to N; absent = untouched). `log_raw_traffic = true`
@@ -770,11 +770,11 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   the captured conversation. `all_messages` tracks everything. The
   bot's own answers are recorded at send time. Chime-ins only roll on
   captured messages - in `bot_related` mode that is essentially never
-  (captured non-triggering messages are rare), so random answers need
-  `capture_mode = all_messages`.
+  captured non-triggering messages are rare), so random answers need
+  `capture = all_messages`.
 - **Trigger** decides when the bot answers: an explicit mention or a
   direct reply to one of the bot's own messages. Replies between users
-  are captured but do not trigger (`random_chance` below is the
+  are captured but do not trigger (`random_reply_chance` below is the
   exception).
 - **Context** is assembled as: system prompt -> compaction summary (or a
   stable placeholder if none - default `summary_placement`, which merges
@@ -786,7 +786,7 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   (unix seconds)); bot turns are plain assistant messages. Template fields
   are baked into the stored record at capture, so a rendered turn never
   changes retroactively. The window is selected newest-first under the
-  token budget and `depth`, whichever bites first - the newest turn is
+  token budget and `context_messages`, whichever bites first - the newest turn is
   always included.
 - **Prompt templates**: the system and compaction prompts (channel
   overrides and `[llm]` defaults alike) render `{{token}}` per request -
@@ -815,7 +815,7 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   unclosed `<think>` mentioned mid-sentence stays literal text, so
   answers can discuss the tag.
 - **Compaction** runs after a reply once the live window outgrows
-  `depth` (100 messages by default): everything except the newest
+  `context_messages` (100 messages by default): everything except the newest
   `compaction_keep_tail` (10) records folds into a rolling summary via
   the compaction model. The window is never slid between compactions,
   so the prompt prefix stays byte-stable and provider prompt caches
@@ -875,16 +875,16 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   bot turn. A hallucinated marker in a react-off channel is stripped
   too, but fires nothing.
 
-**Context sizing.** The engine loads at most the newest `depth` +
+**Context sizing.** The engine loads at most the newest `context_messages` +
 compaction-tail records per message (the operational window - a much
 longer log serves its newest part, so per-message cost stays flat even
-with compaction off). The window then fills newest-first up to `depth`
-messages. Once the endpoint has reported real token usage (recorded
-per channel), filling becomes token-budget based: the channel's
-`context_budget` if set, otherwise the model's declared
+with compaction off). The window then fills newest-first up to
+`context_messages` messages. Once the endpoint has reported real token
+usage (recorded per channel), filling becomes token-budget based: the
+channel's `context_tokens` if set, otherwise the model's declared
 `context_window` minus the completion reserve and a 10% estimator
-margin - with `depth` remaining the secondary cap. Until then (or
-without a declared window) only the message limit applies.
+margin - with `context_messages` remaining the secondary cap. Until
+then (or without a declared window) only the message limit applies.
 `/llm_status` shows which mechanism is active.
 
 **Commands.** All are guild-only, and every reply is **ephemeral** -
@@ -914,7 +914,7 @@ plugin](#authorization-auth-plugin)).
 
 **`/llm_set` keys.** Every key takes one value; `clear`, `none` or
 `default` as the value resets the key to its default - the two keys
-without a default (`model`, `depth`) refuse and point at
+without a default (`model`, `context_messages`) refuse and point at
 `/llm_unassign`. On/off keys accept `on`/`off` (also
 `true`/`yes`/`1` and `false`/`no`/`0`). Invalid values are answered
 with usage and never saved. `/llm_get` reads the same keys back. The
@@ -929,20 +929,20 @@ uploaded files for long texts.
 | `temperature` `top_p` `top_k` `min_p` `frequency_penalty` `presence_penalty` | finite number | not sent | sampling knobs, one per key - tune per-channel tone (an educational channel can run low temperature, an entertainment one high); cleared = not sent |
 | `max_tokens` | whole number | not sent | completion size cap |
 | `reasoning_effort` | free string, or `off` | none - no parameter sent | reasoning hint, sent only when the model declares `reasoning = true`. Any other value is sent as-is to effort-style providers (Z.ai GLM: `low`/`high`/`max`) and enables thinking on switch-style ones. `off` renders an explicit disable on switch-style providers (GLM-4.5-5.2); effort-style endpoints have no off wire value, so their default applies - on Z.ai GLM that default is `max`, and GLM-5.3 thinks forcibly regardless, so throttle it with `low` |
-| `depth` | whole number >= 1 | 100 | live-window size in messages; reaching it triggers compaction |
-| `context_budget` | whole number of tokens | auto | prompt-side token budget. Auto = the model's declared `context_window` minus the completion reserve and a margin, active once the endpoint has reported its first usage (before that, count-only filling by `depth`) |
-| `capture_mode` | `bot_related` or `all_messages` | `bot_related` | what enters the channel's history: only messages mentioning or replying the bot, or everything (random chime-ins need `all_messages` to have material) |
-| `compaction` | on / off | on | summarize-and-cutoff when the window outgrows `depth` |
+| `context_messages` | whole number >= 1 | 100 | live-window size in messages; reaching it triggers compaction |
+| `context_tokens` | whole number of tokens | auto | prompt-side token budget. Auto = the model's declared `context_window` minus the completion reserve and a margin, active once the endpoint has reported its first usage (before that, count-only filling by `context_messages`) |
+| `capture` | `bot_related` or `all_messages` | `bot_related` | what enters the channel's history: only messages mentioning or replying the bot, or everything (random chime-ins need `all_messages` to have material) |
+| `compaction` | on / off | on | summarize-and-cutoff when the window outgrows `context_messages` |
 | `compaction_model` | declared model ref | plugin `[llm] compaction_model`, else the channel's chat model | which model writes the summaries |
 | `images` | on / off | off | describe attached images on captured messages via the recognition model; needs an operator `[llm] image_model` |
 | `image_model` | declared model ref | plugin `[llm] image_model` | recognition model override for this channel |
 | `react` | on / off | off | emoji-reaction tool: the model may decorate the message it replies to by emitting a `[[react: ...]]` marker, stripped before the answer is shown |
 | `react_emoji_inject` | none / all / whitelist | whitelist | list the server's custom emojis as exact forms inside the react tool's prompt (`whitelist` filters by `/llm_emoji_whitelist`, channel list over the guild baseline); an empty whitelist injects nothing - the no-op default, filling it is the opt-in; needs `react` on to reach the model; changes invalidate provider prompt caches |
 | `streaming` | on / off | off | stream the answer live from the provider (SSE): the message appears with the first tokens and is edited at `stream_interval_ms` |
-| `random_chance` | 0-100 (clamped) | 2 | percent chance to chime in on a captured non-trigger message; 0 = off |
+| `random_reply_chance` | 0-100 (clamped) | 2 | percent chance to chime in on a captured non-trigger message; 0 = off |
 | `random_cooldown` | whole seconds | 5 | minimum seconds between chime-ins - the reply and silent-react rolls each keep their own tracker behind it; 0 = none |
-| `random_react_chance` | 0-100 (clamped) | 10 | percent chance for a silent react (emoji only, no reply) on a captured non-trigger message; independent of `random_chance`; needs `react` on |
-| `max_length` | `min_reply_chunk` (default 100) up to the platform's message limit | `max_message_length` | per-channel reply-splitting limit; smaller chunks would flood the channel |
+| `random_react_chance` | 0-100 (clamped) | 10 | percent chance for a silent react (emoji only, no reply) on a captured non-trigger message; independent of `random_reply_chance`; needs `react` on |
+| `split_length` | `min_split_length` (default 100) up to the platform's message limit | `max_message_length` | per-channel reply-splitting limit; smaller chunks would flood the channel |
 | `turn_template` | template containing `{sender}` and `{message}` | `[{sender}](<@{user_id}>): {message}` | how user turns render into the model context; fields: `{sender}`, `{user_id}`, `{guild_name}`, `{time}` (unix), `{message}` |
 
 **Token usage tracking.** Every LLM call counts toward plugin-global

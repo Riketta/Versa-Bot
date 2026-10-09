@@ -212,27 +212,30 @@ pub struct ChannelConfig {
     /// Live-window size in messages. Reaching it triggers compaction - the
     /// window is never slid, so the prompt prefix stays byte-stable between
     /// compactions (provider prompt caches stay warm).
-    #[serde(default = "default_history_depth")]
-    pub history_depth: u32,
-    #[serde(default)]
-    pub capture_mode: CaptureMode,
+    #[serde(default = "default_context_messages", alias = "history_depth")]
+    pub context_messages: u32,
+    /// Which messages enter the history; see [`CaptureMode`].
+    #[serde(default, alias = "capture_mode")]
+    pub capture: CaptureMode,
     /// Progressive rendering: create the answer, edit it in place as text
     /// arrives.
     #[serde(default)]
     pub streaming: bool,
     /// Chance the bot chimes in on an unrelated user message, percent
     /// (`0` = off).
-    #[serde(default = "default_random_chance")]
-    pub random_chance_percent: f64,
+    #[serde(default = "default_random_reply_chance", alias = "random_chance_percent")]
+    pub random_reply_chance_percent: f64,
     /// Minimum seconds between random chime-ins in this channel; `0` =
     /// every eligible message may roll. The deck already balances hits
     /// out per cycle - this prevents two chime-ins on consecutive
     /// messages.
     #[serde(default = "default_random_cooldown")]
     pub random_cooldown_secs: u64,
-    /// Reply splitting limit override; `None` = plugin-wide default.
-    #[serde(default)]
-    pub max_length: Option<usize>,
+    /// Reply splitting limit override: a longer answer splits into
+    /// multiple sent messages, each within this limit. `None` = plugin-
+    /// wide default.
+    #[serde(default, alias = "max_length")]
+    pub split_length: Option<usize>,
     /// User-turn rendering in the context; `{sender}`, `{user_id}`,
     /// `{guild_name}`, `{time}` (unix seconds) and `{message}` are
     /// substituted. `None` = `[{sender}](<@{user_id}>): {message}`.
@@ -240,11 +243,11 @@ pub struct ChannelConfig {
     pub turn_template: Option<String>,
     /// Estimated token budget for the assembled context. When set, turns
     /// fill newest-first by estimated tokens (calibrated from the
-    /// endpoint's own usage reports) and `history_depth` remains the
+    /// endpoint's own usage reports) and `context_messages` remains the
     /// secondary cap; `None` = count-only filling. Completions always keep
     /// room for the reply on top - this budgets the prompt side only.
-    #[serde(default)]
-    pub context_budget_tokens: Option<u32>,
+    #[serde(default, alias = "context_budget_tokens")]
+    pub context_tokens: Option<u32>,
     /// Image recognition for this channel's captured messages:
     /// attachments are described by the image model at capture time and
     /// the descriptions are baked into the records. Requires the operator
@@ -279,31 +282,33 @@ pub struct ChannelConfig {
     #[serde(default)]
     pub react_emoji_inject: EmojiInject,
     /// Chance the bot silently reacts (no reply) to an unrelated captured
-    /// message, percent (`0` = off). Independent of `random_chance_percent`
-    /// and its own cooldown - the two rolls coexist in parallel.
+    /// message, percent (`0` = off). Independent of
+    /// `random_reply_chance_percent` and its own cooldown - the two rolls
+    /// coexist in parallel.
     #[serde(default = "default_random_react_chance")]
     pub random_react_chance_percent: f64,
 }
 
 impl ChannelConfig {
     /// Deserializes a stored channel config, normalizing fields that must
-    /// not be degenerate. `/llm_set` guards `depth` at the command layer,
-    /// but a hand-edited storage document can still carry `0` - which would
-    /// drop every turn (even the newest) from the context. The same holds
-    /// for `max_length` below the configured `min_reply_chunk` floor. Every
-    /// parse site goes through here so the guard cannot drift.
+    /// not be degenerate. `/llm_set` guards `context_messages` at the
+    /// command layer, but a hand-edited storage document can still carry
+    /// `0` - which would drop every turn (even the newest) from the
+    /// context. The same holds for `split_length` below the configured
+    /// `min_split_length` floor. Every parse site goes through here so the
+    /// guard cannot drift.
     pub(crate) fn from_stored(
         raw: serde_json::Value,
-        min_reply_chunk: usize,
+        min_split_length: usize,
     ) -> serde_json::Result<Self> {
         let mut config: Self = serde_json::from_value(raw)?;
-        if config.history_depth == 0 {
-            config.history_depth = 1;
+        if config.context_messages == 0 {
+            config.context_messages = 1;
         }
-        if let Some(n) = config.max_length
-            && n < min_reply_chunk
+        if let Some(n) = config.split_length
+            && n < min_split_length
         {
-            config.max_length = Some(min_reply_chunk);
+            config.split_length = Some(min_split_length);
         }
         Ok(config)
     }
@@ -319,14 +324,14 @@ impl ChannelConfig {
             compaction_enabled: true,
             compaction_model: None,
             compaction_prompt: None,
-            history_depth: default_history_depth(),
-            capture_mode: CaptureMode::default(),
+            context_messages: default_context_messages(),
+            capture: CaptureMode::default(),
             streaming: false,
-            random_chance_percent: default_random_chance(),
+            random_reply_chance_percent: default_random_reply_chance(),
             random_cooldown_secs: default_random_cooldown(),
-            max_length: None,
+            split_length: None,
             turn_template: None,
-            context_budget_tokens: None,
+            context_tokens: None,
             images: false,
             image_model: None,
             image_prompt: None,
@@ -387,11 +392,11 @@ fn default_true() -> bool {
     true
 }
 
-fn default_history_depth() -> u32 {
+fn default_context_messages() -> u32 {
     100
 }
 
-fn default_random_chance() -> f64 {
+fn default_random_reply_chance() -> f64 {
     2.0
 }
 
@@ -475,12 +480,12 @@ mod tests {
         let back: ChannelConfig =
             serde_json::from_value(json).expect("config expected to deserialize");
         assert_eq!(config, back);
-        assert_eq!(config.history_depth, 100);
+        assert_eq!(config.context_messages, 100);
         assert!(config.compaction_enabled);
-        assert!((config.random_chance_percent - 2.0).abs() < f64::EPSILON);
+        assert!((config.random_reply_chance_percent - 2.0).abs() < f64::EPSILON);
         assert_eq!(config.random_cooldown_secs, 5);
-        assert_eq!(config.capture_mode, CaptureMode::BotRelated);
-        assert_eq!(config.context_budget_tokens, None);
+        assert_eq!(config.capture, CaptureMode::BotRelated);
+        assert_eq!(config.context_tokens, None);
         assert!(!config.images);
         assert_eq!(config.image_model, None);
         assert!(!config.react);
@@ -496,12 +501,12 @@ mod tests {
         .expect("minimal config expected to deserialize");
         assert_eq!(config.model, "zai/glm-5.3-flash");
         assert_eq!(config.params, GenParams::default());
-        assert_eq!(config.history_depth, 100);
+        assert_eq!(config.context_messages, 100);
         assert!(config.compaction_enabled);
         assert!(!config.streaming);
-        assert!((config.random_chance_percent - 2.0).abs() < f64::EPSILON);
+        assert!((config.random_reply_chance_percent - 2.0).abs() < f64::EPSILON);
         assert_eq!(config.random_cooldown_secs, 5);
-        assert_eq!(config.max_length, None);
+        assert_eq!(config.split_length, None);
         // Stored before the feature existed: serde defaults keep it loadable.
         assert!(!config.react);
         // Stored before whitelist became the default: the empty-whitelist
@@ -510,20 +515,21 @@ mod tests {
         assert!((config.random_react_chance_percent - 10.0).abs() < f64::EPSILON);
     }
 
-    /// A hand-edited storage doc can carry `depth: 0` (the `/llm_set` guard
-    /// cannot see it): the stored-parse path must clamp it, or the context
-    /// would assemble with zero turns - not even the newest one.
+    /// A hand-edited storage doc can carry `context_messages: 0` (the
+    /// `/llm_set` guard cannot see it): the stored-parse path must clamp
+    /// it, or the context would assemble with zero turns - not even the
+    /// newest one.
     #[test]
     fn from_stored_clamps_a_hand_edited_zero_depth() {
         let config = ChannelConfig::from_stored(
             serde_json::json!({
                 "model": "zai/glm-5.3-flash",
-                "history_depth": 0
+                "context_messages": 0
             }),
             100,
         )
         .expect("config expected to deserialize");
-        assert_eq!(config.history_depth, 1);
+        assert_eq!(config.context_messages, 1);
     }
 
     /// A stored doc predating the reply-chunk floor (or hand-edited) must
@@ -531,26 +537,63 @@ mod tests {
     /// configured floor like it clamps the depth, and leaves values at or
     /// above the floor untouched.
     #[test]
-    fn from_stored_raises_a_below_floor_max_length() {
+    fn from_stored_raises_a_below_floor_split_length() {
         let config = ChannelConfig::from_stored(
             serde_json::json!({
                 "model": "zai/glm-5.3-flash",
-                "max_length": 7
+                "split_length": 7
             }),
             100,
         )
         .expect("config expected to deserialize");
-        assert_eq!(config.max_length, Some(100));
+        assert_eq!(config.split_length, Some(100));
 
         let config = ChannelConfig::from_stored(
             serde_json::json!({
                 "model": "zai/glm-5.3-flash",
-                "max_length": 500
+                "split_length": 500
             }),
             100,
         )
         .expect("config expected to deserialize");
-        assert_eq!(config.max_length, Some(500));
+        assert_eq!(config.split_length, Some(500));
+    }
+
+    /// Pre-rename documents deserialize through the serde aliases - and a
+    /// re-save serializes the new names only, so the first `/llm_set` on a
+    /// channel migrates its stored doc in place.
+    #[test]
+    fn legacy_key_names_deserialize_through_aliases_and_resave_renamed() {
+        let config = ChannelConfig::from_stored(
+            serde_json::json!({
+                "model": "zai/glm-5.3-flash",
+                "history_depth": 50,
+                "capture_mode": "all_messages",
+                "random_chance_percent": 5.0,
+                "max_length": 800,
+                "context_budget_tokens": 4000
+            }),
+            100,
+        )
+        .expect("legacy doc expected to deserialize");
+        assert_eq!(config.context_messages, 50);
+        assert_eq!(config.capture, CaptureMode::AllMessages);
+        assert!((config.random_reply_chance_percent - 5.0).abs() < f64::EPSILON);
+        assert_eq!(config.split_length, Some(800));
+        assert_eq!(config.context_tokens, Some(4000));
+
+        let saved = serde_json::to_value(&config).expect("config expected to serialize");
+        let saved = saved.as_object().expect("object expected");
+        assert!(saved.contains_key("split_length"));
+        assert!(saved.contains_key("context_messages"));
+        assert!(saved.contains_key("capture"));
+        assert!(saved.contains_key("random_reply_chance_percent"));
+        assert!(saved.contains_key("context_tokens"));
+        assert!(!saved.contains_key("max_length"));
+        assert!(!saved.contains_key("history_depth"));
+        assert!(!saved.contains_key("capture_mode"));
+        assert!(!saved.contains_key("random_chance_percent"));
+        assert!(!saved.contains_key("context_budget_tokens"));
     }
 
     #[test]
