@@ -266,7 +266,7 @@ tier on a six-step ladder -
 |---|---|
 | `banned` | nothing - the bot ignores their messages and commands entirely, without any reply |
 | `guest` | talk to the bot (chat interactions), no commands |
-| `user` | basic commands (`/ping`, `/llm_status`, `/llm_models`) |
+| `user` | basic commands (`/ping`, `/help`, `/llm_status`, `/llm_models`) |
 | `moderator` | every service command (`/assign_tracker`, `/llm_assign`, `/llm_set`, ...) |
 | `admin` | everything, including `/auth` tier management |
 | `owner` | everything, plus operator-reserved surfaces (never assignable in any guild) |
@@ -711,10 +711,12 @@ context_window = 131072   # enables token-budget context filling
 
 Providers accept optional `proxy`, `timeout_secs` (request timeout) and
 `max_retries` (default 1): a connection that dies before any HTTP
-response is redialled that many times with exponential backoff (1s, 2s,
-...). Timeouts are never retried - the first request may still complete
-server-side - and neither are HTTP status errors, which are answers, not
-transport faults. 0 disables retrying.
+response - including drops while awaiting it - is redialled that many
+times with exponential backoff (1s, 2s, ...). Timeouts are never
+retried - the first request may still have completed server-side - and
+neither are HTTP status errors, which are answers, not transport faults.
+Values above the boot cap (8) are clamped with a warning; 0 disables
+retrying.
 
 Per-model `summary_placement` controls how the compaction summary enters
 the context: `system_turn` (default - a separate second system message,

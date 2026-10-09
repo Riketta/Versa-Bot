@@ -189,8 +189,24 @@ impl CommandHandler for HelpHandler {
         services: &KernelServices,
     ) -> anyhow::Result<()> {
         let limit = services.platform_info.embed_limit().unwrap_or(DEFAULT_EMBED_LIMIT);
-        let pages = help_pages(self.registry.descriptors(), limit);
+        let pages = help_pages(&self.registry.descriptors(), limit);
         let total = pages.len();
+        if total == 0 {
+            // Unreachable while the plugin registers itself - a defensive
+            // answer anyway: a transactional origin left unserved would
+            // just expire at the platform deadline.
+            services
+                .chat_output
+                .send(
+                    OutboundMessage::embed(Embed {
+                        title: "🧭 Command guide".to_owned(),
+                        description: "No commands are registered.".to_owned(),
+                    })
+                    .ephemeral(),
+                )
+                .await?;
+            return Ok(());
+        }
         for (index, description) in pages.into_iter().enumerate() {
             let title = if total > 1 {
                 format!("🧭 Command guide ({}/{total})", index + 1)
@@ -265,13 +281,13 @@ fn render_section(heading: &str, lines: &[String]) -> String {
 
 /// Packs the guide into embed-sized pages: sections stay whole while they
 /// fit; a section larger than the budget spills per line; a single line
-/// larger than the budget is hard-truncated. Every command is delivered (or
-/// visibly degraded) - the guide never drops one.
-fn help_pages(descriptors: Vec<CommandDescriptor>, limit: usize) -> Vec<String> {
+/// larger than the budget splits across pages. Every character is
+/// delivered - the guide never drops one.
+fn help_pages(descriptors: &[CommandDescriptor], limit: usize) -> Vec<String> {
     let limit = limit.max(1);
     let mut pages: Vec<String> = Vec::new();
     let mut current = String::new();
-    for (heading, lines) in help_sections(&descriptors) {
+    for (heading, lines) in help_sections(descriptors) {
         let section = render_section(&heading, &lines);
         if !current.is_empty() {
             let candidate = format!("{current}\n\n{section}");
@@ -786,7 +802,7 @@ mod tests {
             });
         }
 
-        let pages = help_pages(descriptors, 200);
+        let pages = help_pages(&descriptors, 200);
 
         assert!(pages.len() > 1, "expected multiple pages");
         let mut joined = String::new();
@@ -852,5 +868,147 @@ mod tests {
             // budget even with the title counted.
             assert!(message.chars().count() <= 250, "page over budget: {message}");
         }
+    }
+
+    /// Compiles only while every `AccessTier` variant is classified for
+    /// the guide: a tier added to the kernel must be declared here as
+    /// rendered or deliberately hidden first - otherwise it would
+    /// silently vanish from `/help` (`help_sections` matches by equality,
+    /// not exhaustively).
+    fn tier_rendered(tier: AccessTier) -> bool {
+        match tier {
+            AccessTier::Banned => false,
+            AccessTier::Guest => true,
+            AccessTier::User => true,
+            AccessTier::Moderator => true,
+            AccessTier::Admin => true,
+            AccessTier::Owner => true,
+        }
+    }
+
+    /// The compile-time classification above must agree with what
+    /// `help_sections` actually produces per tier - Banned listed nowhere,
+    /// everything else rendered (Guest under Everyone).
+    #[test]
+    fn rendered_tiers_agree_with_the_sections_actually_produced() {
+        for tier in [
+            AccessTier::Banned,
+            AccessTier::Guest,
+            AccessTier::User,
+            AccessTier::Moderator,
+            AccessTier::Admin,
+            AccessTier::Owner,
+        ] {
+            let descriptors = vec![CommandDescriptor {
+                plugin_id: "test".to_owned(),
+                name: format!("tier_probe_{}", format!("{tier:?}").to_lowercase()),
+                description: "description".to_owned(),
+                arguments: Vec::new(),
+                required_permission: None,
+                required_tier: Some(tier),
+                guild_only: false,
+            }];
+
+            let rendered = help_sections(&descriptors)
+                .iter()
+                .any(|(_, lines)| lines.iter().any(|line| line.contains("tier_probe")));
+
+            assert_eq!(
+                rendered,
+                tier_rendered(tier),
+                "tier {tier:?}: classification vs sections disagree"
+            );
+        }
+    }
+
+    /// A section larger than the budget spills whole lines onto
+    /// continuation pages; a single line larger than the budget splits at
+    /// a char boundary. Every page stays within budget and the split is a
+    /// lossless partition: the pages concatenate back to the rendered
+    /// section, character for character.
+    #[test]
+    fn oversized_content_spills_across_pages_without_loss() {
+        let long_line = "y".repeat(120);
+        let descriptors = vec![CommandDescriptor {
+            plugin_id: "test".to_owned(),
+            name: "spiller".to_owned(),
+            description: long_line.clone(),
+            arguments: Vec::new(),
+            required_permission: None,
+            required_tier: None,
+            guild_only: false,
+        }];
+        let limit = 50;
+
+        let pages = help_pages(&descriptors, limit);
+
+        assert!(pages.len() > 1, "spill expected");
+        let mut joined = String::new();
+        for page in &pages {
+            assert!(utf16_len(page) <= limit, "page over budget: {page}");
+            joined.push_str(page);
+        }
+        assert_eq!(joined, format!("**Everyone**\n`/spiller` - {long_line}"));
+    }
+
+    /// A unit budget degrades to single-character pages rather than
+    /// dropping anything - and still reconstructs.
+    #[test]
+    fn one_unit_budget_degrades_to_single_char_pages_without_loss() {
+        let descriptors = vec![CommandDescriptor {
+            plugin_id: "test".to_owned(),
+            name: "tiny".to_owned(),
+            description: "abc".to_owned(),
+            arguments: Vec::new(),
+            required_permission: None,
+            required_tier: None,
+            guild_only: false,
+        }];
+
+        let pages = help_pages(&descriptors, 1);
+
+        assert_eq!(pages.concat(), "**Everyone**\n`/tiny` - abc");
+    }
+
+    /// A character wider than the whole budget (a surrogate pair against a
+    /// limit of 1) is emitted alone - nothing smaller exists to cut to.
+    #[test]
+    fn wide_char_wider_than_the_budget_is_emitted_alone() {
+        let descriptors = vec![CommandDescriptor {
+            plugin_id: "test".to_owned(),
+            name: "wide".to_owned(),
+            description: "🧭x".to_owned(),
+            arguments: Vec::new(),
+            required_permission: None,
+            required_tier: None,
+            guild_only: false,
+        }];
+
+        let pages = help_pages(&descriptors, 1);
+
+        assert_eq!(pages.concat(), "**Everyone**\n`/wide` - 🧭x");
+    }
+
+    /// The defensive answer: a registry without commands still produces a
+    /// delivered ephemeral embed instead of a silently expiring
+    /// transactional origin. Unreachable in the wired plugin (it registers
+    /// itself), so the handler is constructed directly.
+    #[tokio::test]
+    async fn empty_registry_gets_a_defensive_answer() {
+        let registry = Arc::new(InMemoryCommandRegistry::new()) as Arc<dyn CommandRegistryPort>;
+        let handler = HelpHandler { registry };
+        let output = RecordingChatOutput::new();
+        let services = test_services(&output);
+
+        handler
+            .invoke(&command_event("help", &[]), &CommandArgs(Vec::new()), &services)
+            .await
+            .expect("invoke expected to succeed");
+
+        let sent = output.sent();
+        assert_eq!(sent.len(), 1, "the defensive answer is still delivered");
+        assert!(sent.first().expect("embed expected").ephemeral);
+        let rendered = output.messages().into_iter().next().expect("answer expected");
+        assert!(rendered.contains("No commands are registered."), "{rendered}");
     }
 }

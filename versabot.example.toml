@@ -151,9 +151,10 @@ url = "sqlite://versabot.db"
 # Request timeout in seconds (minimum 1).
 # timeout_secs = 180
 # Transport-level retries per completion request: a connection that dies
-# before any HTTP response is redialled this many times with exponential
-# backoff (1s, 2s, ...). Timeouts and HTTP status errors are never
-# retried. Default 1; 0 disables retrying.
+# before any HTTP response (including drops while awaiting it) is
+# redialled this many times with exponential backoff (1s, 2s, ...).
+# Timeouts and HTTP status errors are never retried. Default 1;
+# 0 disables retrying; clamped to 8 at boot.
 # max_retries = 1
 # Provider-specific fields merged into every completion body - knobs the
 # adapter does not model. llama.cpp example: stop a thinking template from

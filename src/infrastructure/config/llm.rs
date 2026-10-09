@@ -122,9 +122,11 @@ pub struct LlmProviderConfig {
     /// Request timeout in seconds.
     pub timeout_secs: u64,
     /// Transport-level retries per completion request (default 1): a
-    /// connection that dies before any HTTP response is redialled this
-    /// many times with exponential backoff. Timeouts and HTTP status
-    /// errors are never retried; 0 disables retrying. Startup-only.
+    /// connection that dies before any HTTP response - including drops
+    /// while awaiting it - is redialled this many times with exponential
+    /// backoff. Timeouts and HTTP status errors are never retried; 0
+    /// disables retrying; values above the boot cap are clamped with a
+    /// warning. Startup-only.
     pub max_retries: u32,
     pub reasoning_style: LlmReasoningStyle,
     /// Provider-specific fields merged verbatim into every completion

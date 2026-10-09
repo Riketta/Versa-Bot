@@ -244,11 +244,14 @@ struct ProviderClient {
 }
 
 /// A send-stage failure worth redialling: the request died in transport
-/// before any HTTP response (connect, DNS, TLS, dropped mid-send) and it
-/// is NOT a timeout - a timed-out request may still be running (and
-/// billing) server-side, so retrying it risks double answers. HTTP-level
-/// failures (status codes, decode errors) never qualify: they are
-/// answers, not transport faults.
+/// before any HTTP response head - connect, DNS, TLS, dropped while
+/// sending or while awaiting the answer. It is NOT a timeout: the
+/// predicate cannot tell a request the server never saw from one it
+/// processed but could not answer, and the timeout exclusion removes the
+/// clearest double-execution case (a timed-out request may still be
+/// running and billing server-side) - the residual risk for the other
+/// drops is accepted. HTTP-level failures (status codes, decode errors)
+/// never qualify: they are answers, not transport faults.
 fn transport_retryable(err: &reqwest::Error) -> bool {
     !err.is_timeout() && err.is_request()
 }
@@ -263,6 +266,8 @@ fn retry_delay(attempt: u32) -> Duration {
 /// builder is rebuilt per attempt - reqwest builders are single-shot.
 /// Streaming callers are safe by construction: the retry window closes at
 /// the first HTTP response, strictly before any SSE delta exists.
+/// Caller-measured wall time includes the backoff sleeps (endpoint-
+/// reported timings are unaffected).
 async fn send_with_retries(
     provider: &ProviderClient,
     provider_name: &str,
@@ -1959,6 +1964,19 @@ mod tests {
         (format!("http://{addr}/v1"), connections, handle)
     }
 
+    /// Joins the scripted server under a bounded wait: a regression that
+    /// makes the adapter dial FEWER connections than scripted must fail
+    /// the test here, not hang the CI job on the fixture's blocking
+    /// `accept`. Tests whose script deliberately carries unserved tripwire
+    /// entries (the never-retry pins) must not join - their fixture task
+    /// stays blocked by design and is dropped with the test runtime.
+    async fn finished(server: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server task must finish - fewer connections than scripted")
+            .expect("server task");
+    }
+
     /// Transport-only retry: a connection that dies before any HTTP
     /// response is redialled once (the default `max_retries = 1`), and the
     /// retry's answer is the one used.
@@ -1970,7 +1988,7 @@ mod tests {
         let adapter = streaming_adapter(api_url);
 
         let response = adapter.complete(stream_request()).await.expect("retry expected to succeed");
-        server.await.expect("server task");
+        finished(server).await;
 
         assert_eq!(connections.load(Ordering::SeqCst), 2);
         assert_eq!(response.content, "second try");
@@ -1994,7 +2012,7 @@ mod tests {
             .complete_streaming(stream_request(), tx)
             .await
             .expect("retry expected to succeed");
-        server.await.expect("server task");
+        finished(server).await;
 
         assert_eq!(connections.load(Ordering::SeqCst), 2);
         assert_eq!(response.content, "hi");
@@ -2006,14 +2024,22 @@ mod tests {
     }
 
     /// Timeouts never retry: the first request may still complete (and
-    /// bill) server-side, so exactly one attempt is made even though the
-    /// server's late answer would have succeeded.
+    /// bill) server-side, so exactly one attempt is made. The second
+    /// script entry is the regression tripwire: if timeouts ever became
+    /// retryable, attempt 2 would take it after the 1s backoff, succeed,
+    /// and fail the error assertion. Under correct behavior the entry is
+    /// never served - the fixture task stays blocked on its second accept
+    /// and is dropped with the test runtime (deliberately not joined).
     #[tokio::test]
     async fn timeout_is_never_retried() {
         let body = r#"{"choices":[{"message":{"content":"late"}}]}"#;
-        // The server answers 1.5s in - after the client's 1s timeout fired.
-        let (api_url, connections, server) =
-            scripted_http_server(vec![(1500, Some(json_response(body)))]).await;
+        // The server answers 2s in - after the client's 1s timeout fired,
+        // with a 1s margin against scheduler stalls.
+        let (api_url, connections, _server) = scripted_http_server(vec![
+            (2000, Some(json_response(body))),
+            (0, Some(json_response(body))),
+        ])
+        .await;
         let settings = LlmSettings {
             providers: BTreeMap::from([(
                 "local".to_owned(),
@@ -2025,10 +2051,91 @@ mod tests {
             OpenAiCompatibleAdapter::from_settings(Arc::new(settings)).expect("adapter builds");
 
         let result = adapter.complete(stream_request()).await;
-        server.await.expect("server task");
 
-        assert!(result.is_err(), "the timed-out request must fail");
+        let Err(err) = result else {
+            panic!("the timed-out request must fail - a retry got through");
+        };
+        assert!(matches!(err, LlmError::Request(_)), "unexpected error class: {err}");
         assert_eq!(connections.load(Ordering::SeqCst), 1, "timeouts must not retry");
+    }
+
+    /// HTTP status errors are answers, not transport faults - never
+    /// retried. The second script entry is the regression tripwire: if
+    /// statuses ever became retryable, attempt 2 would take it and the
+    /// request would succeed, failing the assertions. Under correct
+    /// behavior the entry is never served - the fixture task stays blocked
+    /// on its second accept (deliberately not joined, see
+    /// [`timeout_is_never_retried`]).
+    #[tokio::test]
+    async fn http_status_errors_are_never_retried() {
+        let failure = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\n\
+                       Content-Length: 5\r\n\r\noops!"
+            .to_owned();
+        let ok = json_response(r#"{"choices":[{"message":{"content":"unreachable"}}]}"#);
+        let (api_url, connections, _server) =
+            scripted_http_server(vec![(0, Some(failure)), (0, Some(ok))]).await;
+        let adapter = streaming_adapter(api_url);
+
+        let result = adapter.complete(stream_request()).await;
+
+        let Err(err) = result else {
+            panic!("the status error must stay terminal - a retry got through");
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("HTTP 500"), "status expected in: {rendered}");
+        assert_eq!(connections.load(Ordering::SeqCst), 1, "status errors must not retry");
+    }
+
+    /// A retryable failure that exhausts the budget is terminal: the
+    /// final transport error surfaces after exactly `max_retries + 1`
+    /// attempts - the path the recovery tests never reach, since they
+    /// succeed on their first retry.
+    #[tokio::test]
+    async fn transport_error_exhausting_the_budget_is_terminal() {
+        let (api_url, connections, server) = scripted_http_server(vec![(0, None), (0, None)]).await;
+        let adapter = streaming_adapter(api_url);
+
+        let result = adapter.complete(stream_request()).await;
+        finished(server).await;
+
+        assert!(matches!(result, Err(LlmError::Request(_))), "got {result:?}");
+        assert_eq!(connections.load(Ordering::SeqCst), 2, "default budget = 1 retry");
+    }
+
+    /// The budget bounds the redials exactly: `max_retries = 2` gives
+    /// three attempts, and the third one's answer wins (the two earlier
+    /// connections both die before any HTTP response).
+    #[tokio::test]
+    async fn retry_budget_bounds_the_attempts_exactly() {
+        let body = r#"{"choices":[{"message":{"content":"third try"}}]}"#;
+        let (api_url, connections, server) =
+            scripted_http_server(vec![(0, None), (0, None), (0, Some(json_response(body)))]).await;
+        let settings = LlmSettings {
+            providers: BTreeMap::from([(
+                "local".to_owned(),
+                ProviderSettings { api_url, max_retries: 2, ..ProviderSettings::default() },
+            )]),
+            ..LlmSettings::default()
+        };
+        let adapter =
+            OpenAiCompatibleAdapter::from_settings(Arc::new(settings)).expect("adapter builds");
+
+        let response = adapter.complete(stream_request()).await.expect("retry expected to succeed");
+        finished(server).await;
+
+        assert_eq!(connections.load(Ordering::SeqCst), 3);
+        assert_eq!(response.content, "third try");
+    }
+
+    /// The backoff schedule: 1s, 2s, 4s, then the 8s cap - growth stops
+    /// so a large retry budget cannot multiply into minutes of silence.
+    #[test]
+    fn retry_backoff_grows_then_caps() {
+        assert_eq!(retry_delay(1), Duration::from_secs(1));
+        assert_eq!(retry_delay(2), Duration::from_secs(2));
+        assert_eq!(retry_delay(3), Duration::from_secs(4));
+        assert_eq!(retry_delay(4), Duration::from_secs(8));
+        assert_eq!(retry_delay(5), Duration::from_secs(8));
     }
 
     /// `max_retries = 0` disables retrying: the first transport error is

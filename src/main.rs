@@ -501,6 +501,20 @@ fn llm_settings_from(
                 if provider.timeout_secs == 0 {
                     tracing::warn!(provider = %name, "[llm] timeout_secs is zero - clamped to 1");
                 }
+                // Backoff caps at 8s, but every attempt still burns up to
+                // `timeout_secs` inside the engine's per-channel lock - a
+                // typo'd retry count must not quietly scale that into
+                // minutes.
+                const MAX_RETRIES: u32 = 8;
+                let max_retries = provider.max_retries.min(MAX_RETRIES);
+                if provider.max_retries > MAX_RETRIES {
+                    tracing::warn!(
+                        provider = %name,
+                        configured = provider.max_retries,
+                        clamped = MAX_RETRIES,
+                        "[llm] max_retries above the cap - clamped"
+                    );
+                }
                 (
                     name.clone(),
                     ProviderSettings {
@@ -508,7 +522,7 @@ fn llm_settings_from(
                         api_key_env: provider.api_key_env.clone(),
                         proxy: provider.proxy.clone(),
                         timeout_secs,
-                        max_retries: provider.max_retries,
+                        max_retries,
                         reasoning_style: match provider.reasoning_style {
                             LlmReasoningStyle::OpenaiEffort => ReasoningStyle::OpenaiEffort,
                             LlmReasoningStyle::GlmThinking => ReasoningStyle::GlmThinking,
@@ -861,7 +875,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use versa_bot::infrastructure::{LolLeaderboardConfig, LolStoreConfig};
+    use versa_bot::infrastructure::{LlmProviderConfig, LolLeaderboardConfig, LolStoreConfig};
     use versa_bot::plugins::lol_leaderboard::{RegionLeaderboard, SourceError};
 
     /// The boot-time clamp matrix of `llm_settings_from`: the platform cap,
@@ -938,6 +952,35 @@ mod tests {
         config.time_offset_minutes = -5000;
         let settings = llm_settings_from(&config, None, None, None);
         assert_eq!(settings.time_offset_minutes, -1439);
+    }
+
+    /// A typo'd retry count must not quietly scale the per-channel lock
+    /// hold into minutes: values above the cap clamp (announced at boot -
+    /// here only the resulting values are pinned). The cap itself, sane
+    /// values, and the disable value pass through unchanged.
+    #[test]
+    fn max_retries_clamps_to_the_cap() {
+        let mut config = LlmConfig::default();
+        config.providers.insert(
+            "zai".to_owned(),
+            LlmProviderConfig {
+                api_url: "https://example.invalid/v4".to_owned(),
+                max_retries: 100,
+                ..LlmProviderConfig::default()
+            },
+        );
+        let settings = llm_settings_from(&config, None, None, None);
+        assert_eq!(settings.providers.get("zai").expect("zai provider").max_retries, 8);
+
+        let provider = config.providers.get_mut("zai").expect("zai provider");
+        provider.max_retries = 8;
+        let settings = llm_settings_from(&config, None, None, None);
+        assert_eq!(settings.providers.get("zai").expect("zai provider").max_retries, 8);
+
+        let provider = config.providers.get_mut("zai").expect("zai provider");
+        provider.max_retries = 0;
+        let settings = llm_settings_from(&config, None, None, None);
+        assert_eq!(settings.providers.get("zai").expect("zai provider").max_retries, 0);
     }
 
     /// The store watcher's disable matrix: absent section, empty lockfile
