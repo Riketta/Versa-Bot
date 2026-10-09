@@ -52,6 +52,20 @@ impl PluginPort for CommandPlugin {
             },
             Arc::new(PingHandler),
         );
+        // The guide renders the live registry - the dispatcher's own view,
+        // so it always reflects what is actually registered.
+        self.registry.register(
+            CommandDescriptor {
+                plugin_id: self.name().to_owned(),
+                name: "help".to_owned(),
+                description: "List every command with usage and who may run it".to_owned(),
+                arguments: Vec::new(),
+                required_permission: None,
+                required_tier: Some(AccessTier::User),
+                guild_only: false,
+            },
+            Arc::new(HelpHandler { registry: Arc::clone(&self.registry) }),
+        );
         Ok(())
     }
 }
@@ -158,30 +172,188 @@ impl CommandHandler for PingHandler {
     }
 }
 
+/// The `/help` guide: renders the live command registry as an ephemeral
+/// embed, grouped by access tier, each command as a usage line. Pages are
+/// packed under the platform's embed budget - the guide degrades (splits),
+/// it never fails.
+struct HelpHandler {
+    registry: Arc<dyn CommandRegistryPort>,
+}
+
+#[async_trait]
+impl CommandHandler for HelpHandler {
+    async fn invoke(
+        &self,
+        _event: &RequestContext,
+        _args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
+        let limit = services.platform_info.embed_limit().unwrap_or(DEFAULT_EMBED_LIMIT);
+        let pages = help_pages(self.registry.descriptors(), limit);
+        let total = pages.len();
+        for (index, description) in pages.into_iter().enumerate() {
+            let title = if total > 1 {
+                format!("🧭 Command guide ({}/{total})", index + 1)
+            } else {
+                "🧭 Command guide".to_owned()
+            };
+            services
+                .chat_output
+                .send(OutboundMessage::embed(Embed { title, description }).ephemeral())
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// Embed budget where the platform declares none (Discord's own cap).
+const DEFAULT_EMBED_LIMIT: usize = 4096;
+
+/// UTF-16 length - the unit the strictest platforms count limits in, so
+/// budgeting in it stays safe under both a chars and a units cap.
+fn utf16_len(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
+}
+
+/// The guide's sections in privilege order, one per tier that has commands.
+/// `Guest` and undeclared tiers render as `Everyone`; `Banned` commands are
+/// listed nowhere - they run for nobody. Names sort within sections.
+fn help_sections(descriptors: &[CommandDescriptor]) -> Vec<(&'static str, Vec<String>)> {
+    const ORDER: [(&str, Option<AccessTier>); 5] = [
+        ("Everyone", None),
+        ("User", Some(AccessTier::User)),
+        ("Moderator", Some(AccessTier::Moderator)),
+        ("Admin", Some(AccessTier::Admin)),
+        ("Bot owner", Some(AccessTier::Owner)),
+    ];
+    let mut sorted: Vec<&CommandDescriptor> = descriptors.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    ORDER
+        .iter()
+        .filter_map(|(heading, tier)| {
+            let lines: Vec<String> = sorted
+                .iter()
+                .filter(|descriptor| match tier {
+                    None => matches!(descriptor.required_tier, None | Some(AccessTier::Guest)),
+                    Some(expected) => descriptor.required_tier == Some(*expected),
+                })
+                .map(|descriptor| help_line(descriptor))
+                .collect();
+            (!lines.is_empty()).then_some((*heading, lines))
+        })
+        .collect()
+}
+
+/// One guide line: usage with required args as `<name>`, optional ones as
+/// `[name]`, then the command's own mini-doc description.
+fn help_line(descriptor: &CommandDescriptor) -> String {
+    let usage: String = descriptor
+        .arguments
+        .iter()
+        .map(
+            |arg| {
+                if arg.required { format!(" <{}>", arg.name) } else { format!(" [{}]", arg.name) }
+            },
+        )
+        .collect();
+    format!("`/{}{usage}` - {}", descriptor.name, descriptor.description)
+}
+
+fn render_section(heading: &str, lines: &[String]) -> String {
+    format!("**{heading}**\n{}", lines.join("\n"))
+}
+
+/// Packs the guide into embed-sized pages: sections stay whole while they
+/// fit; a section larger than the budget spills per line; a single line
+/// larger than the budget is hard-truncated. Every command is delivered (or
+/// visibly degraded) - the guide never drops one.
+fn help_pages(descriptors: Vec<CommandDescriptor>, limit: usize) -> Vec<String> {
+    let limit = limit.max(1);
+    let mut pages: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for (heading, lines) in help_sections(&descriptors) {
+        let section = render_section(&heading, &lines);
+        if !current.is_empty() {
+            let candidate = format!("{current}\n\n{section}");
+            if utf16_len(&candidate) <= limit {
+                current = candidate;
+                continue;
+            }
+            pages.push(std::mem::take(&mut current));
+        }
+        current = section;
+        // The section sits alone on the page; if it alone exceeds the
+        // budget, spill whole lines onto continuation pages.
+        while utf16_len(&current) > limit {
+            let (head, rest) = spill_over_limit(&current, limit);
+            if head.is_empty() {
+                // One character larger than the whole budget: emit it
+                // alone - nothing smaller exists to cut to.
+                let alone: String = current.chars().take(1).collect();
+                current = current.chars().skip(1).collect();
+                pages.push(alone);
+            } else {
+                pages.push(head);
+                current = rest;
+            }
+        }
+    }
+    if !current.is_empty() {
+        pages.push(current);
+    }
+    pages
+}
+
+/// Splits `text` at the last line break inside the budget, counting UTF-16
+/// units; when no break fits, cuts at the largest fitting char boundary.
+/// The head may be empty when a single character exceeds the whole budget -
+/// the caller emits it anyway, so no character is ever lost.
+fn spill_over_limit(text: &str, limit: usize) -> (String, String) {
+    let mut units = 0usize;
+    let mut chars = 0usize;
+    let mut line_break: Option<usize> = None;
+    for ch in text.chars() {
+        if units + ch.len_utf16() > limit {
+            let head_chars = line_break.unwrap_or(chars);
+            let tail: String = text.chars().skip(head_chars).collect();
+            return (text.chars().take(head_chars).collect(), tail);
+        }
+        units += ch.len_utf16();
+        chars += 1;
+        if ch == '\n' {
+            line_break = Some(chars);
+        }
+    }
+    (text.to_owned(), String::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::infrastructure::plugin_adapters::InMemoryCommandRegistry;
     use crate::kernel::{
         models::{ChannelId, EventKind, GuildId, MessageId, Origin, UserId},
-        spi_ports::StoragePort,
+        plugin_ports::{ArgDescriptor, ArgKind},
+        spi_ports::{PlatformInfoPort, StoragePort},
     };
     use crate::test_support::{InMemoryStorage, RecordingChatOutput, RecordingChatOutputFactory};
     use std::sync::Arc;
 
-    /// The demo command carries the same description discipline as every
-    /// other plugin: self-sufficient docs within Discord's 100-char cap.
+    /// The walking-skeleton commands carry the same description discipline
+    /// as every other plugin: self-sufficient docs within Discord's
+    /// 100-char cap.
     #[test]
-    fn init_registers_ping_within_discord_limits() {
+    fn init_registers_ping_and_help_within_discord_limits() {
         let registry = Arc::new(InMemoryCommandRegistry::new());
         let plugin = CommandPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>);
         plugin.init().expect("init expected to succeed");
 
         let descriptors = registry.descriptors();
         crate::test_support::assert_descriptions_fit_discord(&descriptors);
-        let descriptor = descriptors.first().expect("one descriptor expected");
-        assert_eq!(descriptor.name, "ping");
-        assert_eq!(descriptor.required_tier, Some(AccessTier::User));
+        let ping = registry.descriptor("ping").expect("ping descriptor expected");
+        assert_eq!(ping.required_tier, Some(AccessTier::User));
+        let help = registry.descriptor("help").expect("help descriptor expected");
+        assert_eq!(help.required_tier, Some(AccessTier::User));
     }
 
     struct StaticHandler {
@@ -239,6 +411,38 @@ mod tests {
             Arc::new(StaticHandler { reply }),
         );
         Arc::new(registry)
+    }
+
+    /// Declares one test command with the given tier and arguments; the
+    /// handler is never invoked.
+    fn declare(
+        registry: &InMemoryCommandRegistry,
+        name: &str,
+        tier: Option<AccessTier>,
+        arguments: Vec<ArgDescriptor>,
+    ) {
+        registry.register(
+            CommandDescriptor {
+                plugin_id: "test".to_owned(),
+                name: name.to_owned(),
+                description: format!("{name} description"),
+                arguments,
+                required_permission: None,
+                required_tier: tier,
+                guild_only: false,
+            },
+            Arc::new(StaticHandler { reply: "unused" }),
+        );
+    }
+
+    fn arg(name: &str, required: bool) -> ArgDescriptor {
+        ArgDescriptor {
+            name: name.to_owned(),
+            description: "arg".to_owned(),
+            required,
+            kind: ArgKind::String,
+            choices: None,
+        }
     }
 
     fn test_services(output: &Arc<RecordingChatOutput>) -> KernelServices {
@@ -508,5 +712,145 @@ mod tests {
 
         assert!(matches!(next, Next::Stop));
         assert!(output.messages().is_empty());
+    }
+
+    /// `/help` renders the live registry: every command with usage, grouped
+    /// by tier in privilege order, delivered as an ephemeral embed. Banned
+    /// commands are listed nowhere.
+    #[tokio::test]
+    async fn help_lists_every_command_grouped_by_tier() {
+        let registry = InMemoryCommandRegistry::new();
+        declare(&registry, "zeta", None, Vec::new());
+        declare(&registry, "banned_thing", Some(AccessTier::Banned), Vec::new());
+        declare(
+            &registry,
+            "mod_thing",
+            Some(AccessTier::Moderator),
+            vec![arg("channel", true), arg("quiet", false)],
+        );
+        declare(&registry, "admin_thing", Some(AccessTier::Admin), Vec::new());
+        declare(&registry, "owner_thing", Some(AccessTier::Owner), Vec::new());
+        let registry = Arc::new(registry);
+        let plugin = CommandPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>);
+        plugin.init().expect("init expected to succeed");
+
+        let output = RecordingChatOutput::new();
+        let services = test_services(&output);
+        let handler = registry.lookup("help").expect("help handler expected");
+        handler
+            .invoke(&command_event("help", &[]), &CommandArgs(Vec::new()), &services)
+            .await
+            .expect("invoke expected to succeed");
+
+        let sent = output.sent();
+        assert_eq!(sent.len(), 1, "one embed expected under the default budget");
+        assert!(sent.first().expect("embed expected").ephemeral);
+        let rendered = output.messages().into_iter().next().expect("guide expected");
+
+        assert!(rendered.contains("**Everyone**"), "{rendered}");
+        assert!(rendered.contains("`/zeta` - zeta description"), "{rendered}");
+        assert!(rendered.contains("**User**"), "{rendered}");
+        assert!(rendered.contains("`/help` - "), "{rendered}");
+        assert!(rendered.contains("`/ping` - "), "{rendered}");
+        assert!(rendered.contains("**Moderator**"), "{rendered}");
+        assert!(
+            rendered.contains("`/mod_thing <channel> [quiet]` - mod_thing description"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("**Admin**"), "{rendered}");
+        assert!(rendered.contains("**Bot owner**"), "{rendered}");
+        assert!(!rendered.contains("banned_thing"), "banned commands are listed nowhere");
+
+        // Sections appear in privilege order.
+        let position = |marker: &str| rendered.find(marker).expect("section expected");
+        assert!(position("**Everyone**") < position("**User**"));
+        assert!(position("**User**") < position("**Moderator**"));
+        assert!(position("**Moderator**") < position("**Admin**"));
+        assert!(position("**Admin**") < position("**Bot owner**"));
+    }
+
+    /// Pages respect the embed budget and no command is dropped, whatever
+    /// the registry size.
+    #[test]
+    fn help_pages_fit_the_budget_and_keep_every_command() {
+        let mut descriptors = Vec::new();
+        for index in 0..40 {
+            descriptors.push(CommandDescriptor {
+                plugin_id: "test".to_owned(),
+                name: format!("command_{index:02}"),
+                description: format!("description {index}"),
+                arguments: Vec::new(),
+                required_permission: None,
+                required_tier: Some(AccessTier::Moderator),
+                guild_only: false,
+            });
+        }
+
+        let pages = help_pages(descriptors, 200);
+
+        assert!(pages.len() > 1, "expected multiple pages");
+        let mut joined = String::new();
+        for page in &pages {
+            assert!(utf16_len(page) <= 200, "page over budget: {page}");
+            joined.push_str(page);
+            joined.push('\n');
+        }
+        for index in 0..40 {
+            assert!(joined.contains(&format!("command_{index:02}")), "command dropped");
+        }
+    }
+
+    /// The handler packs pages by the platform's own embed budget, not a
+    /// built-in constant.
+    struct TinyEmbedPlatform;
+
+    impl PlatformInfoPort for TinyEmbedPlatform {
+        fn slug(&self) -> &'static str {
+            "test"
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Test"
+        }
+
+        fn message_limit(&self) -> Option<usize> {
+            Some(2000)
+        }
+
+        fn embed_limit(&self) -> Option<usize> {
+            Some(200)
+        }
+    }
+
+    #[tokio::test]
+    async fn help_splits_pages_by_the_platform_embed_budget() {
+        let registry = InMemoryCommandRegistry::new();
+        for index in 0..30 {
+            declare(
+                &registry,
+                &format!("command_{index:02}"),
+                Some(AccessTier::Moderator),
+                Vec::new(),
+            );
+        }
+        let registry = Arc::new(registry);
+        let plugin = CommandPlugin::new(Arc::clone(&registry) as Arc<dyn CommandRegistryPort>);
+        plugin.init().expect("init expected to succeed");
+
+        let output = RecordingChatOutput::new();
+        let mut services = test_services(&output);
+        services.platform_info = Arc::new(TinyEmbedPlatform);
+        let handler = registry.lookup("help").expect("help handler expected");
+        handler
+            .invoke(&command_event("help", &[]), &CommandArgs(Vec::new()), &services)
+            .await
+            .expect("invoke expected to succeed");
+
+        assert!(output.sent().len() > 1, "multiple pages expected");
+        for message in output.messages() {
+            // Title-plus-description projection stays comfortably within the
+            // budget even with the title counted.
+            assert!(message.chars().count() <= 250, "page over budget: {message}");
+        }
     }
 }

@@ -347,15 +347,19 @@ undo it.
 
 ### Command demo (`command` plugin)
 
-Ships `/ping` - the walking-skeleton command proving the full loop
-(plugin declaration -> Discord sync -> interaction -> dispatch ->
-reply). It answers `Pong` and works in DMs too. Real commands belong to
-the feature plugins that own their meaning; this one exists to keep the
-loop honest.
+Ships `/ping` and `/help` - the walking-skeleton commands proving the full
+loop (plugin declaration -> Discord sync -> interaction -> dispatch ->
+reply). `/ping` answers `Pong` and works in DMs too. `/help` renders the
+live command registry as an ephemeral guide - every command with its usage
+and description, grouped by access tier, packed into embed-sized pages -
+so it always reflects what is actually registered. Real commands belong to
+the feature plugins that own their meaning; these exist to keep the loop
+honest and the command set discoverable.
 
 | Command | Tier | Effect |
 |---|---|---|
 | `/ping` | user | check that the bot is alive - it replies with Pong |
+| `/help` | user | list every registered command with usage, grouped by who may run it |
 
 ### User activity tracker (`tracker` plugin)
 
