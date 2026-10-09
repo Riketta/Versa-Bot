@@ -703,7 +703,8 @@ impl MiddlewarePluginPort for LlmPlugin {
                 return Next::Continue;
             }
         };
-        let Ok(config) = ChannelConfig::from_stored(raw) else {
+        let Ok(config) = ChannelConfig::from_stored(raw, self.engine.settings().min_reply_chunk)
+        else {
             tracing::warn!(namespace = NAMESPACE, "llm channel config is malformed - skipping");
             return Next::Continue;
         };

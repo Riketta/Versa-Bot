@@ -20,10 +20,9 @@ use super::conversation::ConversationRecord;
 use super::llm_plugin::ChannelLocks;
 use super::model::{
     CaptureMode, ChannelConfig, ConversationState, EmojiInject, EmojiWhitelistEntry,
-    GUILD_EMOJI_WHITELIST_KEY, GenParams, MIN_REPLY_CHUNK, NAMESPACE, SERVICE_CHANNEL_KEY,
-    UsageStats, channel_config_key, channel_emoji_whitelist_key, channel_state_key,
-    channel_state_undo_key, channel_stats_key, default_random_cooldown, parse_whitelist,
-    records_namespace, unix_now,
+    GUILD_EMOJI_WHITELIST_KEY, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats,
+    channel_config_key, channel_emoji_whitelist_key, channel_state_key, channel_state_undo_key,
+    channel_stats_key, default_random_cooldown, parse_whitelist, records_namespace, unix_now,
 };
 use super::prompts;
 use super::providers::{LlmSettings, ModelSettings};
@@ -66,6 +65,7 @@ pub(super) const SET_KEYS: &[&str] = &[
 async fn load_assigned_config(
     event: &RequestContext,
     services: &KernelServices,
+    min_reply_chunk: usize,
 ) -> anyhow::Result<Option<ChannelConfig>> {
     let Some(storage) = &services.guild_storage else {
         services
@@ -83,7 +83,7 @@ async fn load_assigned_config(
             .await?;
         return Ok(None);
     };
-    Ok(Some(ChannelConfig::from_stored(raw)?))
+    Ok(Some(ChannelConfig::from_stored(raw, min_reply_chunk)?))
 }
 
 async fn save_config(
@@ -120,12 +120,15 @@ fn apply_set(
     key: &str,
     value: &str,
     message_limit: Option<usize>,
+    min_reply_chunk: usize,
 ) -> Result<String, String> {
     let cleared = matches!(value, "clear" | "none" | "default");
     if let Some(result) = apply_numeric(config, key, value, cleared) {
         return result;
     }
-    if let Some(result) = apply_optional_field(config, key, value, cleared, message_limit) {
+    if let Some(result) =
+        apply_optional_field(config, key, value, cleared, message_limit, min_reply_chunk)
+    {
         return result;
     }
     if let Some(result) = apply_flag(config, key, value) {
@@ -370,6 +373,7 @@ fn apply_optional_field(
     value: &str,
     cleared: bool,
     message_limit: Option<usize>,
+    min_reply_chunk: usize,
 ) -> Option<Result<String, String>> {
     match key {
         // Model refs sharing the set/clear shape. The text prompts left the
@@ -401,11 +405,11 @@ fn apply_optional_field(
                 return Some(Ok(format!("`{key}` cleared (plugin default applies).")));
             }
             match value.parse::<usize>() {
-                // One-character chunks would flood the channel and starve
-                // the send rate limits - the floor is an invariant, not a
-                // suggestion.
-                Ok(n) if n < MIN_REPLY_CHUNK => Some(Err(format!(
-                    "`{key}` must be at least {MIN_REPLY_CHUNK} - smaller chunks would flood \
+                // Tiny chunks would flood the channel and starve the send
+                // rate limits - the floor is operator policy (announced at
+                // boot) enforced here.
+                Ok(n) if n < min_reply_chunk => Some(Err(format!(
+                    "`{key}` must be at least {min_reply_chunk} - smaller chunks would flood \
                      the channel."
                 ))),
                 // The platform rejects longer text messages outright - a
@@ -1238,7 +1242,7 @@ impl CommandHandler for StatusLlmHandler {
                 .await?;
             return Ok(());
         };
-        let config = ChannelConfig::from_stored(raw)?;
+        let config = ChannelConfig::from_stored(raw, self.engine.settings().min_reply_chunk)?;
         let state: ConversationState = storage
             .get(NAMESPACE, &channel_state_key(channel_id))
             .await?
@@ -1702,7 +1706,9 @@ impl CommandHandler for SetLlmHandler {
         // same channel must not lose one update.
         let channel = self.locks.lock_for(services.platform_info.slug(), &event.origin);
         let _channel = channel.lock().await;
-        let Some(mut config) = load_assigned_config(event, services).await? else {
+        let Some(mut config) =
+            load_assigned_config(event, services, self.engine.settings().min_reply_chunk).await?
+        else {
             return Ok(());
         };
         let (Some(key), Some(value)) = (args.get("key"), args.get("value")) else {
@@ -1727,7 +1733,13 @@ impl CommandHandler for SetLlmHandler {
             return Ok(());
         }
 
-        match apply_set(&mut config, key, value, services.platform_info.message_limit()) {
+        match apply_set(
+            &mut config,
+            key,
+            value,
+            services.platform_info.message_limit(),
+            self.engine.settings().min_reply_chunk,
+        ) {
             Ok(message) => {
                 save_config(event, services, config).await?;
                 services.chat_output.send(command_reply(message)).await?;
@@ -1763,7 +1775,9 @@ impl CommandHandler for GetLlmHandler {
         args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
-        let Some(config) = load_assigned_config(event, services).await? else {
+        let Some(config) =
+            load_assigned_config(event, services, self.engine.settings().min_reply_chunk).await?
+        else {
             return Ok(());
         };
         match args.get("key") {
@@ -1867,7 +1881,9 @@ impl CommandHandler for DumpLlmHandler {
         _args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
-        let Some(config) = load_assigned_config(event, services).await? else {
+        let Some(config) =
+            load_assigned_config(event, services, self.engine.settings().min_reply_chunk).await?
+        else {
             return Ok(());
         };
         // A fresh assignment is the default baseline. Built with the
@@ -2219,7 +2235,10 @@ impl CommandHandler for SetPromptLlmHandler {
             }
             let channel = self.locks.lock_for(services.platform_info.slug(), &event.origin);
             let _channel = channel.lock().await;
-            let Some(mut config) = load_assigned_config(event, services).await? else {
+            let Some(mut config) =
+                load_assigned_config(event, services, self.engine.settings().min_reply_chunk)
+                    .await?
+            else {
                 return Ok(());
             };
             *kind.field_mut(&mut config) = Some(prompt);
@@ -2241,7 +2260,10 @@ impl CommandHandler for SetPromptLlmHandler {
                 let cleared = matches!(text, "clear" | "none" | "default");
                 let channel = self.locks.lock_for(services.platform_info.slug(), &event.origin);
                 let _channel = channel.lock().await;
-                let Some(mut config) = load_assigned_config(event, services).await? else {
+                let Some(mut config) =
+                    load_assigned_config(event, services, self.engine.settings().min_reply_chunk)
+                        .await?
+                else {
                     return Ok(());
                 };
                 match apply_prompt(&mut config, kind, (!cleared).then_some(text)) {
@@ -2257,7 +2279,10 @@ impl CommandHandler for SetPromptLlmHandler {
             // Read-back: no channel lock (single document read, like
             // `/llm_get`).
             None => {
-                let Some(config) = load_assigned_config(event, services).await? else {
+                let Some(config) =
+                    load_assigned_config(event, services, self.engine.settings().min_reply_chunk)
+                        .await?
+                else {
                     return Ok(());
                 };
                 services
@@ -2348,6 +2373,9 @@ mod tests {
     /// The cap tests exercise: what [`TestPlatformInfo`] serves, mirroring
     /// the wired adapter.
     const PLATFORM_LIMIT: Option<usize> = Some(2000);
+
+    /// The default reply-chunk floor, as an untouched `[llm]` config yields.
+    const CHUNK_FLOOR: usize = 100;
 
     /// The attachment argument must name Discord's CDN - https and the exact
     /// pinned host. Anything else (other hosts, other schemes, lookalike
@@ -2532,39 +2560,43 @@ mod tests {
     fn float_params_set_and_clear() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        let message =
-            apply_set(&mut config, "temperature", "0.7", PLATFORM_LIMIT).expect("set expected");
+        let message = apply_set(&mut config, "temperature", "0.7", PLATFORM_LIMIT, CHUNK_FLOOR)
+            .expect("set expected");
         assert!(message.contains("0.7"));
         assert_eq!(config.params.temperature, Some(0.7));
 
-        apply_set(&mut config, "top_k", "40", PLATFORM_LIMIT).expect("set expected");
+        apply_set(&mut config, "top_k", "40", PLATFORM_LIMIT, CHUNK_FLOOR).expect("set expected");
         assert_eq!(config.params.top_k, Some(40.0));
 
-        apply_set(&mut config, "temperature", "clear", PLATFORM_LIMIT).expect("clear expected");
+        apply_set(&mut config, "temperature", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
+            .expect("clear expected");
         assert_eq!(config.params.temperature, None);
 
-        assert!(apply_set(&mut config, "top_p", "abc", PLATFORM_LIMIT).is_err());
+        assert!(apply_set(&mut config, "top_p", "abc", PLATFORM_LIMIT, CHUNK_FLOOR).is_err());
     }
 
     #[test]
     fn bool_keys_accept_on_off_words() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "streaming", "on", PLATFORM_LIMIT).expect("on expected");
+        apply_set(&mut config, "streaming", "on", PLATFORM_LIMIT, CHUNK_FLOOR)
+            .expect("on expected");
         assert!(config.streaming);
-        apply_set(&mut config, "streaming", "off", PLATFORM_LIMIT).expect("off expected");
+        apply_set(&mut config, "streaming", "off", PLATFORM_LIMIT, CHUNK_FLOOR)
+            .expect("off expected");
         assert!(!config.streaming);
-        apply_set(&mut config, "compaction", "false", PLATFORM_LIMIT).expect("false expected");
+        apply_set(&mut config, "compaction", "false", PLATFORM_LIMIT, CHUNK_FLOOR)
+            .expect("false expected");
         assert!(!config.compaction_enabled);
-        apply_set(&mut config, "images", "on", PLATFORM_LIMIT).expect("on expected");
+        apply_set(&mut config, "images", "on", PLATFORM_LIMIT, CHUNK_FLOOR).expect("on expected");
         assert!(config.images);
-        apply_set(&mut config, "images", "off", PLATFORM_LIMIT).expect("off expected");
+        apply_set(&mut config, "images", "off", PLATFORM_LIMIT, CHUNK_FLOOR).expect("off expected");
         assert!(!config.images);
-        apply_set(&mut config, "react", "on", PLATFORM_LIMIT).expect("on expected");
+        apply_set(&mut config, "react", "on", PLATFORM_LIMIT, CHUNK_FLOOR).expect("on expected");
         assert!(config.react);
-        apply_set(&mut config, "react", "off", PLATFORM_LIMIT).expect("off expected");
+        apply_set(&mut config, "react", "off", PLATFORM_LIMIT, CHUNK_FLOOR).expect("off expected");
         assert!(!config.react);
-        assert!(apply_set(&mut config, "streaming", "maybe", PLATFORM_LIMIT).is_err());
+        assert!(apply_set(&mut config, "streaming", "maybe", PLATFORM_LIMIT, CHUNK_FLOOR).is_err());
     }
 
     /// Image settings follow the same set/clear grammar as their compaction
@@ -2575,17 +2607,28 @@ mod tests {
     fn image_keys_set_and_clear() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "image_model", "local/vision", PLATFORM_LIMIT)
+        apply_set(&mut config, "image_model", "local/vision", PLATFORM_LIMIT, CHUNK_FLOOR)
             .expect("set expected");
         assert_eq!(config.image_model.as_deref(), Some("local/vision"));
 
-        apply_set(&mut config, "image_model", "clear", PLATFORM_LIMIT).expect("clear expected");
+        apply_set(&mut config, "image_model", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
+            .expect("clear expected");
         assert_eq!(config.image_model, None);
 
         assert!(
-            apply_set(&mut config, "image_prompt", "Describe in Russian.", PLATFORM_LIMIT).is_err()
+            apply_set(
+                &mut config,
+                "image_prompt",
+                "Describe in Russian.",
+                PLATFORM_LIMIT,
+                CHUNK_FLOOR
+            )
+            .is_err()
         );
-        assert!(apply_set(&mut config, "compaction_prompt", "Summarize.", PLATFORM_LIMIT).is_err());
+        assert!(
+            apply_set(&mut config, "compaction_prompt", "Summarize.", PLATFORM_LIMIT, CHUNK_FLOOR)
+                .is_err()
+        );
     }
 
     /// `off` is an explicit choice with its own acknowledgment and its own
@@ -2596,19 +2639,20 @@ mod tests {
     fn reasoning_effort_distinguishes_off_from_reset() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        let set = apply_set(&mut config, "reasoning_effort", "low", PLATFORM_LIMIT)
+        let set = apply_set(&mut config, "reasoning_effort", "low", PLATFORM_LIMIT, CHUNK_FLOOR)
             .expect("set expected");
         assert!(set.contains("set to `low`"));
         assert_eq!(config.params.reasoning_effort.as_deref(), Some("low"));
 
-        let off = apply_set(&mut config, "reasoning_effort", "off", PLATFORM_LIMIT)
+        let off = apply_set(&mut config, "reasoning_effort", "off", PLATFORM_LIMIT, CHUNK_FLOOR)
             .expect("off expected");
         assert!(off.contains("`reasoning_effort` off"));
         assert!(off.contains("explicit disable"));
         assert_eq!(config.params.reasoning_effort.as_deref(), Some("off"));
 
-        let cleared = apply_set(&mut config, "reasoning_effort", "clear", PLATFORM_LIMIT)
-            .expect("clear expected");
+        let cleared =
+            apply_set(&mut config, "reasoning_effort", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
+                .expect("clear expected");
         assert!(cleared.contains("cleared"));
         assert_eq!(config.params.reasoning_effort, None);
     }
@@ -2617,35 +2661,41 @@ mod tests {
     fn numeric_keys_validate_ranges() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "depth", "0", PLATFORM_LIMIT).unwrap_err();
-        apply_set(&mut config, "depth", "50", PLATFORM_LIMIT).expect("depth expected");
+        apply_set(&mut config, "depth", "0", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
+        apply_set(&mut config, "depth", "50", PLATFORM_LIMIT, CHUNK_FLOOR).expect("depth expected");
         assert_eq!(config.history_depth, 50);
 
-        apply_set(&mut config, "random_chance", "250", PLATFORM_LIMIT).expect("clamp expected");
+        apply_set(&mut config, "random_chance", "250", PLATFORM_LIMIT, CHUNK_FLOOR)
+            .expect("clamp expected");
         assert!((config.random_chance_percent - 100.0).abs() < f64::EPSILON);
-        apply_set(&mut config, "random_chance", "clear", PLATFORM_LIMIT).expect("clear expected");
+        apply_set(&mut config, "random_chance", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
+            .expect("clear expected");
         assert!((config.random_chance_percent).abs() < f64::EPSILON);
 
-        apply_set(&mut config, "random_react_chance", "250", PLATFORM_LIMIT)
+        apply_set(&mut config, "random_react_chance", "250", PLATFORM_LIMIT, CHUNK_FLOOR)
             .expect("clamp expected");
         assert!((config.random_react_chance_percent - 100.0).abs() < f64::EPSILON);
-        apply_set(&mut config, "random_react_chance", "clear", PLATFORM_LIMIT)
+        apply_set(&mut config, "random_react_chance", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
             .expect("clear expected");
         assert!((config.random_react_chance_percent).abs() < f64::EPSILON);
 
-        apply_set(&mut config, "random_cooldown", "30", PLATFORM_LIMIT).expect("cooldown expected");
+        apply_set(&mut config, "random_cooldown", "30", PLATFORM_LIMIT, CHUNK_FLOOR)
+            .expect("cooldown expected");
         assert_eq!(config.random_cooldown_secs, 30);
-        apply_set(&mut config, "random_cooldown", "clear", PLATFORM_LIMIT)
+        apply_set(&mut config, "random_cooldown", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
             .expect("cooldown clear expected");
         assert_eq!(config.random_cooldown_secs, 5);
-        apply_set(&mut config, "random_cooldown", "not-a-number", PLATFORM_LIMIT).unwrap_err();
+        apply_set(&mut config, "random_cooldown", "not-a-number", PLATFORM_LIMIT, CHUNK_FLOOR)
+            .unwrap_err();
 
-        apply_set(&mut config, "max_tokens", "not-a-number", PLATFORM_LIMIT).unwrap_err();
+        apply_set(&mut config, "max_tokens", "not-a-number", PLATFORM_LIMIT, CHUNK_FLOOR)
+            .unwrap_err();
 
         // A zero budget would keep only the newest turn - rejected like
         // `depth` 0, not accepted as "no budget".
-        apply_set(&mut config, "context_budget", "0", PLATFORM_LIMIT).unwrap_err();
-        apply_set(&mut config, "context_budget", "4096", PLATFORM_LIMIT).expect("budget expected");
+        apply_set(&mut config, "context_budget", "0", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
+        apply_set(&mut config, "context_budget", "4096", PLATFORM_LIMIT, CHUNK_FLOOR)
+            .expect("budget expected");
         assert_eq!(config.context_budget_tokens, Some(4096));
     }
 
@@ -2653,31 +2703,46 @@ mod tests {
     fn max_length_cannot_exceed_the_platform_limit() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "max_length", "2000", Some(2000)).expect("limit value expected");
+        apply_set(&mut config, "max_length", "2000", Some(2000), CHUNK_FLOOR)
+            .expect("limit value expected");
         assert_eq!(config.max_length, Some(2000));
         // Beyond the cap the platform rejects the chunks outright - rejected
         // here so replies never turn into undelivered garbage.
-        apply_set(&mut config, "max_length", "2001", Some(2000)).unwrap_err();
+        apply_set(&mut config, "max_length", "2001", Some(2000), CHUNK_FLOOR).unwrap_err();
         assert_eq!(config.max_length, Some(2000));
 
-        // Below the reply-chunk floor: rejected - one-character chunks would
-        // flood the channel and starve the send rate limits. The floor holds
-        // even where the platform declares no cap.
-        apply_set(&mut config, "max_length", "99", Some(2000)).unwrap_err();
+        // Below the reply-chunk floor: rejected - tiny chunks would flood
+        // the channel and starve the send rate limits. The floor holds even
+        // where the platform declares no cap.
+        apply_set(&mut config, "max_length", "99", Some(2000), CHUNK_FLOOR).unwrap_err();
         assert_eq!(config.max_length, Some(2000));
-        apply_set(&mut config, "max_length", "100", Some(2000)).expect("floor value expected");
-        assert_eq!(config.max_length, Some(MIN_REPLY_CHUNK));
-        apply_set(&mut config, "max_length", "50", None).unwrap_err();
-        assert_eq!(config.max_length, Some(MIN_REPLY_CHUNK));
+        apply_set(&mut config, "max_length", "100", Some(2000), CHUNK_FLOOR)
+            .expect("floor value expected");
+        assert_eq!(config.max_length, Some(CHUNK_FLOOR));
+        apply_set(&mut config, "max_length", "50", None, CHUNK_FLOOR).unwrap_err();
+        assert_eq!(config.max_length, Some(CHUNK_FLOOR));
+    }
+
+    /// The floor is operator policy, not a hard-coded constant: `/llm_set`
+    /// enforces whatever floor the composition root configured.
+    #[test]
+    fn max_length_floor_follows_the_configured_policy() {
+        let mut config = ChannelConfig::assigned("m".to_owned());
+
+        apply_set(&mut config, "max_length", "499", Some(2000), 500).unwrap_err();
+        apply_set(&mut config, "max_length", "500", Some(2000), 500).expect("floor expected");
+        assert_eq!(config.max_length, Some(500));
+        apply_set(&mut config, "max_length", "500", None, 500).expect("no cap expected");
+        assert_eq!(config.max_length, Some(500));
     }
 
     #[test]
     fn max_length_ignores_the_cap_when_the_platform_declares_none() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "max_length", "5000", None).expect("no cap expected");
+        apply_set(&mut config, "max_length", "5000", None, CHUNK_FLOOR).expect("no cap expected");
         assert_eq!(config.max_length, Some(5000));
-        apply_set(&mut config, "max_length", "clear", None).expect("clear expected");
+        apply_set(&mut config, "max_length", "clear", None, CHUNK_FLOOR).expect("clear expected");
         assert_eq!(config.max_length, None);
     }
 
@@ -2685,16 +2750,24 @@ mod tests {
     fn capture_mode_and_template_validate() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "capture_mode", "all_messages", PLATFORM_LIMIT)
+        apply_set(&mut config, "capture_mode", "all_messages", PLATFORM_LIMIT, CHUNK_FLOOR)
             .expect("mode expected");
         assert_eq!(config.capture_mode, CaptureMode::AllMessages);
-        apply_set(&mut config, "capture_mode", "chaos", PLATFORM_LIMIT).unwrap_err();
+        apply_set(&mut config, "capture_mode", "chaos", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
 
-        apply_set(&mut config, "turn_template", "<{sender}> {message}", PLATFORM_LIMIT)
-            .expect("template expected");
+        apply_set(
+            &mut config,
+            "turn_template",
+            "<{sender}> {message}",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+        )
+        .expect("template expected");
         assert_eq!(config.turn_template.as_deref(), Some("<{sender}> {message}"));
-        apply_set(&mut config, "turn_template", "no placeholders", PLATFORM_LIMIT).unwrap_err();
-        apply_set(&mut config, "turn_template", "clear", PLATFORM_LIMIT).expect("clear expected");
+        apply_set(&mut config, "turn_template", "no placeholders", PLATFORM_LIMIT, CHUNK_FLOOR)
+            .unwrap_err();
+        apply_set(&mut config, "turn_template", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
+            .expect("clear expected");
         assert_eq!(config.turn_template, None);
     }
 
@@ -2702,11 +2775,12 @@ mod tests {
     fn unknown_keys_and_required_fields_are_rejected() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        let unknown = apply_set(&mut config, "vibes", "maximum", PLATFORM_LIMIT).unwrap_err();
+        let unknown =
+            apply_set(&mut config, "vibes", "maximum", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
         assert!(unknown.contains("Unknown key"));
-        assert!(apply_set(&mut config, "model", "clear", PLATFORM_LIMIT).is_err());
-        assert!(apply_set(&mut config, "depth", "clear", PLATFORM_LIMIT).is_err());
-        apply_set(&mut config, "model", "zai/glm-5.3-flash", PLATFORM_LIMIT)
+        assert!(apply_set(&mut config, "model", "clear", PLATFORM_LIMIT, CHUNK_FLOOR).is_err());
+        assert!(apply_set(&mut config, "depth", "clear", PLATFORM_LIMIT, CHUNK_FLOOR).is_err());
+        apply_set(&mut config, "model", "zai/glm-5.3-flash", PLATFORM_LIMIT, CHUNK_FLOOR)
             .expect("model expected");
         assert_eq!(config.model, "zai/glm-5.3-flash");
     }
@@ -2717,7 +2791,8 @@ mod tests {
     fn flag_with_invalid_value_reports_usage_not_unknown_key() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        let err = apply_set(&mut config, "streaming", "maybe", PLATFORM_LIMIT).unwrap_err();
+        let err =
+            apply_set(&mut config, "streaming", "maybe", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
         assert!(err.contains("on or off"), "unexpected reply: {err}");
         assert!(!err.contains("Unknown key"), "unexpected reply: {err}");
         assert!(!config.streaming, "the failed set must not mutate");
@@ -2797,7 +2872,8 @@ mod tests {
         let mut config = ChannelConfig::assigned("local/gemma".to_owned());
 
         assert_eq!(
-            apply_set(&mut config, "react_emoji_inject", "all", None).expect("all applies"),
+            apply_set(&mut config, "react_emoji_inject", "all", None, CHUNK_FLOOR)
+                .expect("all applies"),
             "`react_emoji_inject` set to `all` (the react tool's prompt lists this server's \
              custom emojis). Note: `react` is off - enable it for the list to reach the model."
         );
@@ -2805,22 +2881,24 @@ mod tests {
 
         config.react = true;
         assert_eq!(
-            apply_set(&mut config, "react_emoji_inject", "whitelist", None)
+            apply_set(&mut config, "react_emoji_inject", "whitelist", None, CHUNK_FLOOR)
                 .expect("whitelist applies"),
             "`react_emoji_inject` set to `whitelist` (the react tool's prompt lists this server's \
              custom emojis)."
         );
         assert_eq!(config.react_emoji_inject, EmojiInject::Whitelist);
         assert!(
-            !apply_set(&mut config, "react_emoji_inject", "none", None)
+            !apply_set(&mut config, "react_emoji_inject", "none", None, CHUNK_FLOOR)
                 .expect("none applies")
                 .contains("Note:"),
             "no hint once react is on"
         );
         assert_eq!(config.react_emoji_inject, EmojiInject::None);
 
-        assert!(apply_set(&mut config, "react_emoji_inject", "clear", None).is_err());
-        assert!(apply_set(&mut config, "react_emoji_inject", "sometimes", None).is_err());
+        assert!(apply_set(&mut config, "react_emoji_inject", "clear", None, CHUNK_FLOOR).is_err());
+        assert!(
+            apply_set(&mut config, "react_emoji_inject", "sometimes", None, CHUNK_FLOOR).is_err()
+        );
     }
 
     /// The reactions status label: off stays plain, the inject mode shows
@@ -2876,14 +2954,16 @@ mod tests {
     fn float_keys_reject_non_finite_values() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        assert!(apply_set(&mut config, "temperature", "NaN", PLATFORM_LIMIT).is_err());
-        assert!(apply_set(&mut config, "top_p", "inf", PLATFORM_LIMIT).is_err());
-        assert!(apply_set(&mut config, "min_p", "-inf", PLATFORM_LIMIT).is_err());
+        assert!(apply_set(&mut config, "temperature", "NaN", PLATFORM_LIMIT, CHUNK_FLOOR).is_err());
+        assert!(apply_set(&mut config, "top_p", "inf", PLATFORM_LIMIT, CHUNK_FLOOR).is_err());
+        assert!(apply_set(&mut config, "min_p", "-inf", PLATFORM_LIMIT, CHUNK_FLOOR).is_err());
         assert_eq!(config.params.temperature, None, "nothing may be stored");
 
         // NaN would clamp to NaN, not to the range bounds; the default stays.
         let before = config.random_chance_percent;
-        assert!(apply_set(&mut config, "random_chance", "NaN", PLATFORM_LIMIT).is_err());
+        assert!(
+            apply_set(&mut config, "random_chance", "NaN", PLATFORM_LIMIT, CHUNK_FLOOR).is_err()
+        );
         assert!((config.random_chance_percent - before).abs() < f64::EPSILON);
     }
 

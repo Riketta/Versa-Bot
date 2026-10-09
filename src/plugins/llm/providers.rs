@@ -48,6 +48,10 @@ pub struct LlmSettings {
     pub compaction_keep_tail: u32,
     /// Reply splitting limit (per-channel `max_length` overrides this).
     pub max_message_length: usize,
+    /// The smallest per-channel `max_length` admins may set; the platform's
+    /// message cap wins over it. Enforced by the command layer and the
+    /// stored-config load path.
+    pub min_reply_chunk: usize,
     /// Streaming edit cadence in milliseconds.
     pub stream_interval_ms: u64,
     /// Cap for `/llm_set_prompt` file attachments, in bytes.
@@ -105,6 +109,7 @@ impl Default for LlmSettings {
             compaction_model: None,
             compaction_keep_tail: 10,
             max_message_length: 2000,
+            min_reply_chunk: 100,
             stream_interval_ms: 2000,
             max_prompt_file_bytes: 131_072,
             image_model: None,

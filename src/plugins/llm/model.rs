@@ -285,28 +285,25 @@ pub struct ChannelConfig {
     pub random_react_chance_percent: f64,
 }
 
-/// Reply-splitting floor - `/llm_set max_length`, stored channel configs,
-/// and the operator's `[llm] max_message_length` all respect it. Smaller
-/// chunks would deliver one answer as hundreds of tiny messages: a channel
-/// flood and a self-inflicted rate-limit starvation.
-pub const MIN_REPLY_CHUNK: usize = 100;
-
 impl ChannelConfig {
     /// Deserializes a stored channel config, normalizing fields that must
     /// not be degenerate. `/llm_set` guards `depth` at the command layer,
     /// but a hand-edited storage document can still carry `0` - which would
     /// drop every turn (even the newest) from the context. The same holds
-    /// for `max_length` below [`MIN_REPLY_CHUNK`]. Every parse site goes
-    /// through here so the guard cannot drift.
-    pub(crate) fn from_stored(raw: serde_json::Value) -> serde_json::Result<Self> {
+    /// for `max_length` below the configured `min_reply_chunk` floor. Every
+    /// parse site goes through here so the guard cannot drift.
+    pub(crate) fn from_stored(
+        raw: serde_json::Value,
+        min_reply_chunk: usize,
+    ) -> serde_json::Result<Self> {
         let mut config: Self = serde_json::from_value(raw)?;
         if config.history_depth == 0 {
             config.history_depth = 1;
         }
         if let Some(n) = config.max_length
-            && n < MIN_REPLY_CHUNK
+            && n < min_reply_chunk
         {
-            config.max_length = Some(MIN_REPLY_CHUNK);
+            config.max_length = Some(min_reply_chunk);
         }
         Ok(config)
     }
@@ -518,25 +515,42 @@ mod tests {
     /// would assemble with zero turns - not even the newest one.
     #[test]
     fn from_stored_clamps_a_hand_edited_zero_depth() {
-        let config = ChannelConfig::from_stored(serde_json::json!({
-            "model": "zai/glm-5.3-flash",
-            "history_depth": 0
-        }))
+        let config = ChannelConfig::from_stored(
+            serde_json::json!({
+                "model": "zai/glm-5.3-flash",
+                "history_depth": 0
+            }),
+            100,
+        )
         .expect("config expected to deserialize");
         assert_eq!(config.history_depth, 1);
     }
 
     /// A stored doc predating the reply-chunk floor (or hand-edited) must
-    /// not load a flooding chunk size - `from_stored` raises it like it
-    /// clamps the depth.
+    /// not load a flooding chunk size - `from_stored` raises it to the
+    /// configured floor like it clamps the depth, and leaves values at or
+    /// above the floor untouched.
     #[test]
     fn from_stored_raises_a_below_floor_max_length() {
-        let config = ChannelConfig::from_stored(serde_json::json!({
-            "model": "zai/glm-5.3-flash",
-            "max_length": 7
-        }))
+        let config = ChannelConfig::from_stored(
+            serde_json::json!({
+                "model": "zai/glm-5.3-flash",
+                "max_length": 7
+            }),
+            100,
+        )
         .expect("config expected to deserialize");
-        assert_eq!(config.max_length, Some(MIN_REPLY_CHUNK));
+        assert_eq!(config.max_length, Some(100));
+
+        let config = ChannelConfig::from_stored(
+            serde_json::json!({
+                "model": "zai/glm-5.3-flash",
+                "max_length": 500
+            }),
+            100,
+        )
+        .expect("config expected to deserialize");
+        assert_eq!(config.max_length, Some(500));
     }
 
     #[test]
