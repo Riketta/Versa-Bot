@@ -140,6 +140,13 @@ pub struct ProviderSettings {
     pub proxy: Option<String>,
     /// Request timeout in seconds.
     pub timeout_secs: u64,
+    /// Transport-level retries per completion request: a connection that
+    /// dies before any HTTP response (DNS, refused, TLS, dropped mid-send)
+    /// is redialled this many times with exponential backoff (1s, 2s, ...).
+    /// Timeouts are never retried - the first request may still complete
+    /// and bill server-side - and neither are HTTP status errors (4xx/5xx
+    /// are answers, not transport faults). 0 disables retrying.
+    pub max_retries: u32,
     pub reasoning_style: ReasoningStyle,
     /// Provider-specific fields merged verbatim into every completion
     /// request body (llama.cpp `chat_template_kwargs` / `reasoning_budget`,
@@ -156,6 +163,7 @@ impl Default for ProviderSettings {
             api_key_env: None,
             proxy: None,
             timeout_secs: 120,
+            max_retries: 1,
             reasoning_style: ReasoningStyle::default(),
             extra_body: BTreeMap::new(),
         }
@@ -233,6 +241,56 @@ struct ProviderClient {
     settings: ProviderSettings,
     client: reqwest::Client,
     api_key: Option<String>,
+}
+
+/// A send-stage failure worth redialling: the request died in transport
+/// before any HTTP response (connect, DNS, TLS, dropped mid-send) and it
+/// is NOT a timeout - a timed-out request may still be running (and
+/// billing) server-side, so retrying it risks double answers. HTTP-level
+/// failures (status codes, decode errors) never qualify: they are
+/// answers, not transport faults.
+fn transport_retryable(err: &reqwest::Error) -> bool {
+    !err.is_timeout() && err.is_request()
+}
+
+/// Backoff before retry `attempt` (1-based): 1s, 2s, 4s, capped at 8s.
+fn retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(1 << attempt.saturating_sub(1).min(3))
+}
+
+/// Sends the request built by `build`, redialling transport-level
+/// failures up to `max_retries` times (see [`transport_retryable`]). The
+/// builder is rebuilt per attempt - reqwest builders are single-shot.
+/// Streaming callers are safe by construction: the retry window closes at
+/// the first HTTP response, strictly before any SSE delta exists.
+async fn send_with_retries(
+    provider: &ProviderClient,
+    provider_name: &str,
+    model_name: &str,
+    build: impl Fn() -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, LlmError> {
+    let max_retries = provider.settings.max_retries;
+    let mut attempt: u32 = 1;
+    loop {
+        let err = match build().send().await {
+            Ok(response) => return Ok(response),
+            Err(err) => err,
+        };
+        let retry = transport_retryable(&err) && attempt <= max_retries;
+        tracing::debug!(
+            provider = provider_name,
+            model = model_name,
+            attempt,
+            retrying = retry,
+            %err,
+            "LLM request transport error"
+        );
+        if !retry {
+            return Err(LlmError::Request(err.to_string()));
+        }
+        tokio::time::sleep(retry_delay(attempt)).await;
+        attempt += 1;
+    }
 }
 
 /// The one adapter (for now): every OpenAI-compatible endpoint - `OpenAI`,
@@ -343,10 +401,6 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
         );
 
         let url = format!("{}/chat/completions", provider.settings.api_url.trim_end_matches('/'));
-        let mut request_builder = provider.client.post(url).json(&body);
-        if let Some(api_key) = &provider.api_key {
-            request_builder = request_builder.bearer_auth(api_key);
-        }
         let started = std::time::Instant::now();
         tracing::debug!(
             provider = provider_name,
@@ -369,8 +423,14 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
                 "LLM raw request"
             );
         }
-        let response =
-            request_builder.send().await.map_err(|err| LlmError::Request(err.to_string()))?;
+        let response = send_with_retries(provider, provider_name, model_name, || {
+            let mut request_builder = provider.client.post(url.clone()).json(&body);
+            if let Some(api_key) = &provider.api_key {
+                request_builder = request_builder.bearer_auth(api_key);
+            }
+            request_builder
+        })
+        .await?;
         let status = response.status();
         let text = response.text().await.map_err(|err| LlmError::Request(err.to_string()))?;
         // Dumped before the status check so rejected requests are dumped too
@@ -429,10 +489,6 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
         apply_stream_fields(&mut body);
 
         let url = format!("{}/chat/completions", provider.settings.api_url.trim_end_matches('/'));
-        let mut request_builder = provider.client.post(url).json(&body);
-        if let Some(api_key) = &provider.api_key {
-            request_builder = request_builder.bearer_auth(api_key);
-        }
         let started = std::time::Instant::now();
         tracing::debug!(
             provider = provider_name,
@@ -449,8 +505,14 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
                 "LLM raw request"
             );
         }
-        let response =
-            request_builder.send().await.map_err(|err| LlmError::Request(err.to_string()))?;
+        let response = send_with_retries(provider, provider_name, model_name, || {
+            let mut request_builder = provider.client.post(url.clone()).json(&body);
+            if let Some(api_key) = &provider.api_key {
+                request_builder = request_builder.bearer_auth(api_key);
+            }
+            request_builder
+        })
+        .await?;
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.map_err(|err| LlmError::Request(err.to_string()))?;
@@ -1113,6 +1175,7 @@ fn collapse_newlines(content: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::plugins::llm::completion_port::{ChatRole, ImagePart};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Feeds the stripper delta-by-delta and appends the finish flush -
     /// mirrors exactly what `read_sse_stream` does on the wire.
@@ -1863,6 +1926,131 @@ mod tests {
             socket.write_all(script.as_bytes()).await.expect("write");
         });
         (format!("http://{addr}/v1"), handle)
+    }
+
+    /// Scripted multi-connection server: one entry per accepted TCP
+    /// connection - read the request head, wait `delay_ms`, then either
+    /// write `response` or drop the connection empty (a transport error
+    /// for the client). `connections` counts accepted connections, so
+    /// tests can assert exactly how many attempts the adapter made.
+    async fn scripted_http_server(
+        conns: Vec<(u64, Option<String>)>,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&connections);
+        let handle = tokio::spawn(async move {
+            for (delay_ms, response) in conns {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                if let Some(script) = response {
+                    let _ = socket.write_all(script.as_bytes()).await;
+                }
+            }
+        });
+        (format!("http://{addr}/v1"), connections, handle)
+    }
+
+    /// Transport-only retry: a connection that dies before any HTTP
+    /// response is redialled once (the default `max_retries = 1`), and the
+    /// retry's answer is the one used.
+    #[tokio::test]
+    async fn transport_error_is_retried_and_the_retry_answer_wins() {
+        let body = r#"{"choices":[{"message":{"content":"second try"}}]}"#;
+        let (api_url, connections, server) =
+            scripted_http_server(vec![(0, None), (0, Some(json_response(body)))]).await;
+        let adapter = streaming_adapter(api_url);
+
+        let response = adapter.complete(stream_request()).await.expect("retry expected to succeed");
+        server.await.expect("server task");
+
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        assert_eq!(response.content, "second try");
+    }
+
+    /// Same contract on the streaming path: the send-stage failure
+    /// precedes any SSE delta, so the retry is invisible to the delta
+    /// consumer - exactly one delta stream arrives, from the second
+    /// connection.
+    #[tokio::test]
+    async fn streaming_transport_error_is_retried_before_any_delta() {
+        let script = String::new()
+            + &sse_frame(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)
+            + "data: [DONE]\n\n";
+        let (api_url, connections, server) =
+            scripted_http_server(vec![(0, None), (0, Some(sse_response(&script)))]).await;
+        let adapter = streaming_adapter(api_url);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let response = adapter
+            .complete_streaming(stream_request(), tx)
+            .await
+            .expect("retry expected to succeed");
+        server.await.expect("server task");
+
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        assert_eq!(response.content, "hi");
+        let mut deltas = Vec::new();
+        while let Ok(delta) = rx.try_recv() {
+            deltas.push(delta);
+        }
+        assert_eq!(deltas, vec!["hi".to_owned()]);
+    }
+
+    /// Timeouts never retry: the first request may still complete (and
+    /// bill) server-side, so exactly one attempt is made even though the
+    /// server's late answer would have succeeded.
+    #[tokio::test]
+    async fn timeout_is_never_retried() {
+        let body = r#"{"choices":[{"message":{"content":"late"}}]}"#;
+        // The server answers 1.5s in - after the client's 1s timeout fired.
+        let (api_url, connections, server) =
+            scripted_http_server(vec![(1500, Some(json_response(body)))]).await;
+        let settings = LlmSettings {
+            providers: BTreeMap::from([(
+                "local".to_owned(),
+                ProviderSettings { api_url, timeout_secs: 1, ..ProviderSettings::default() },
+            )]),
+            ..LlmSettings::default()
+        };
+        let adapter =
+            OpenAiCompatibleAdapter::from_settings(Arc::new(settings)).expect("adapter builds");
+
+        let result = adapter.complete(stream_request()).await;
+        server.await.expect("server task");
+
+        assert!(result.is_err(), "the timed-out request must fail");
+        assert_eq!(connections.load(Ordering::SeqCst), 1, "timeouts must not retry");
+    }
+
+    /// `max_retries = 0` disables retrying: the first transport error is
+    /// final.
+    #[tokio::test]
+    async fn zero_retries_disables_the_retry() {
+        let (api_url, connections, server) = scripted_http_server(vec![(0, None)]).await;
+        let settings = LlmSettings {
+            providers: BTreeMap::from([(
+                "local".to_owned(),
+                ProviderSettings { api_url, max_retries: 0, ..ProviderSettings::default() },
+            )]),
+            ..LlmSettings::default()
+        };
+        let adapter =
+            OpenAiCompatibleAdapter::from_settings(Arc::new(settings)).expect("adapter builds");
+
+        let result = adapter.complete(stream_request()).await;
+        server.await.expect("server task");
+
+        assert!(matches!(result, Err(LlmError::Request(_))));
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
     }
 
     /// Multi-part variant: writes each part as its own TCP write with a

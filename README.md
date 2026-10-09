@@ -709,6 +709,13 @@ reasoning = true          # per-channel reasoning_effort is sent only for these
 context_window = 131072   # enables token-budget context filling
 ```
 
+Providers accept optional `proxy`, `timeout_secs` (request timeout) and
+`max_retries` (default 1): a connection that dies before any HTTP
+response is redialled that many times with exponential backoff (1s, 2s,
+...). Timeouts are never retried - the first request may still complete
+server-side - and neither are HTTP status errors, which are answers, not
+transport faults. 0 disables retrying.
+
 Per-model `summary_placement` controls how the compaction summary enters
 the context: `system_turn` (default - a separate second system message,
 with a stable placeholder keeping the slot present), `system_suffix`

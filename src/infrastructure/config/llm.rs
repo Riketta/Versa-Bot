@@ -121,6 +121,11 @@ pub struct LlmProviderConfig {
     pub proxy: Option<String>,
     /// Request timeout in seconds.
     pub timeout_secs: u64,
+    /// Transport-level retries per completion request (default 1): a
+    /// connection that dies before any HTTP response is redialled this
+    /// many times with exponential backoff. Timeouts and HTTP status
+    /// errors are never retried; 0 disables retrying. Startup-only.
+    pub max_retries: u32,
     pub reasoning_style: LlmReasoningStyle,
     /// Provider-specific fields merged verbatim into every completion
     /// request body - knobs the adapter does not model (llama.cpp
@@ -138,6 +143,7 @@ impl Default for LlmProviderConfig {
             api_key_env: None,
             proxy: None,
             timeout_secs: 120,
+            max_retries: 1,
             reasoning_style: LlmReasoningStyle::default(),
             extra_body: BTreeMap::new(),
         }
@@ -232,6 +238,7 @@ mod tests {
                     "zai": {
                         "api_url": "https://api.z.ai/api/coding/paas/v4",
                         "api_key_env": "VERSABOT_LLM_ZAI_KEY",
+                        "max_retries": 2,
                         "reasoning_style": "glm_thinking"
                     },
                     "local": {
@@ -264,7 +271,10 @@ mod tests {
         let zai = config.providers.get("zai").expect("zai provider expected");
         assert_eq!(zai.reasoning_style, LlmReasoningStyle::GlmThinking);
         assert_eq!(zai.timeout_secs, 120);
+        assert_eq!(zai.max_retries, 2);
         let local = config.providers.get("local").expect("local provider expected");
+        // Absent key: the serde default (one transport retry).
+        assert_eq!(local.max_retries, 1);
         assert_eq!(local.extra_body.get("reasoning_budget").and_then(Value::as_i64), Some(0));
         assert!(config.models.get("zai/glm-5.3-flash").is_some_and(|model| model.reasoning));
     }

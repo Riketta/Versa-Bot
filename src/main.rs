@@ -508,6 +508,7 @@ fn llm_settings_from(
                         api_key_env: provider.api_key_env.clone(),
                         proxy: provider.proxy.clone(),
                         timeout_secs,
+                        max_retries: provider.max_retries,
                         reasoning_style: match provider.reasoning_style {
                             LlmReasoningStyle::OpenaiEffort => ReasoningStyle::OpenaiEffort,
                             LlmReasoningStyle::GlmThinking => ReasoningStyle::GlmThinking,

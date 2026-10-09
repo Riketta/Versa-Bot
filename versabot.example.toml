@@ -132,7 +132,8 @@ url = "sqlite://versabot.db"
 # Providers are OpenAI-compatible endpoints. `api_key_env` NAMES the
 # environment variable holding the key - it must never contain the key
 # itself (keys never live in config files or guild storage); local
-# endpoints may omit it. Optional per-provider `proxy` and `timeout_secs`.
+# endpoints may omit it. Optional per-provider `proxy`, `timeout_secs`
+# and `max_retries`.
 # [llm.providers.zai]
 # api_url = "https://api.z.ai/api/coding/paas/v4"
 # api_key_env = "VERSABOT_LLM_ZAI_KEY"   # then: VERSABOT_LLM_ZAI_KEY=<key> in the environment
@@ -149,6 +150,11 @@ url = "sqlite://versabot.db"
 # api_url = "http://192.168.1.35:8001/v1"
 # Request timeout in seconds (minimum 1).
 # timeout_secs = 180
+# Transport-level retries per completion request: a connection that dies
+# before any HTTP response is redialled this many times with exponential
+# backoff (1s, 2s, ...). Timeouts and HTTP status errors are never
+# retried. Default 1; 0 disables retrying.
+# max_retries = 1
 # Provider-specific fields merged into every completion body - knobs the
 # adapter does not model. llama.cpp example: stop a thinking template from
 # thinking (the per-channel reasoning_effort scale means nothing to it).
