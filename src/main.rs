@@ -31,8 +31,8 @@ use versa_bot::plugins::auth::{AuthPlugin, OwnerList};
 use versa_bot::plugins::command::CommandPlugin;
 use versa_bot::plugins::llm::{
     ChatEngine, DeckRandom, ImageDescriber, LlmCompletionPort, LlmPlugin, LlmSettings,
-    ModelSettings, OpenAiCompatibleAdapter, ProviderSettings, RandomPort, ReasoningStyle,
-    SummaryPlacement, VisionService,
+    MIN_REPLY_CHUNK, ModelSettings, OpenAiCompatibleAdapter, ProviderSettings, RandomPort,
+    ReasoningStyle, SummaryPlacement, VisionService,
 };
 use versa_bot::plugins::lol_leaderboard::{
     DeepLolSource, EngineSettings as LeaderboardEngineSettings, LeaderboardEngine,
@@ -398,14 +398,20 @@ fn llm_settings_from(
 ) -> LlmSettings {
     // Operator knobs clamped to safe ranges, mirroring the command-layer
     // guards. The clamp is announced - a silent correction hides a typo.
+    // Floor first, platform cap last: the cap is the hard invariant and
+    // wins even where a platform declares one below the reply-chunk floor
+    // (`cap.max(1)` keeps a zero-cap platform away from a boot panic,
+    // min > max).
     let max_message_length = match message_limit {
-        // `cap.max(1)`: a platform declaring a zero limit degrades to the
-        // same clamp as an absent one, never a boot panic (min > max).
-        Some(cap) => config.max_message_length.clamp(1, cap.max(1)),
-        None => config.max_message_length.max(1),
+        Some(cap) => config.max_message_length.max(MIN_REPLY_CHUNK).min(cap.max(1)),
+        None => config.max_message_length.max(MIN_REPLY_CHUNK),
     };
-    if config.max_message_length == 0 {
-        tracing::warn!("[llm] max_message_length is zero - clamped to 1");
+    if config.max_message_length < MIN_REPLY_CHUNK {
+        tracing::warn!(
+            configured = config.max_message_length,
+            clamped = max_message_length,
+            "[llm] max_message_length below the reply-chunk floor - raised"
+        );
     } else if let Some(cap) = message_limit
         && config.max_message_length > cap
     {
@@ -855,6 +861,17 @@ mod tests {
         // No platform cap: the configured value passes through.
         let settings = llm_settings_from(&config, None, None, None);
         assert_eq!(settings.max_message_length, 5000);
+
+        // Below the reply-chunk floor: raised to it, cap or no cap.
+        config.max_message_length = 10;
+        let settings = llm_settings_from(&config, None, None, Some(2000));
+        assert_eq!(settings.max_message_length, MIN_REPLY_CHUNK);
+        let settings = llm_settings_from(&config, None, None, None);
+        assert_eq!(settings.max_message_length, MIN_REPLY_CHUNK);
+
+        // A cap below the floor degrades to the cap: the hard invariant wins.
+        let settings = llm_settings_from(&config, None, None, Some(50));
+        assert_eq!(settings.max_message_length, 50);
     }
 
     #[test]
@@ -866,7 +883,7 @@ mod tests {
         config.image_max_side = 0;
 
         let settings = llm_settings_from(&config, None, None, Some(2000));
-        assert_eq!(settings.max_message_length, 1);
+        assert_eq!(settings.max_message_length, MIN_REPLY_CHUNK);
         assert_eq!(settings.stream_interval_ms, 250);
         assert_eq!(settings.compaction_keep_tail, 1);
         assert_eq!(settings.image_max_side, 1);

@@ -20,9 +20,10 @@ use super::conversation::ConversationRecord;
 use super::llm_plugin::ChannelLocks;
 use super::model::{
     CaptureMode, ChannelConfig, ConversationState, EmojiInject, EmojiWhitelistEntry,
-    GUILD_EMOJI_WHITELIST_KEY, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats,
-    channel_config_key, channel_emoji_whitelist_key, channel_state_key, channel_state_undo_key,
-    channel_stats_key, default_random_cooldown, parse_whitelist, records_namespace, unix_now,
+    GUILD_EMOJI_WHITELIST_KEY, GenParams, MIN_REPLY_CHUNK, NAMESPACE, SERVICE_CHANNEL_KEY,
+    UsageStats, channel_config_key, channel_emoji_whitelist_key, channel_state_key,
+    channel_state_undo_key, channel_stats_key, default_random_cooldown, parse_whitelist,
+    records_namespace, unix_now,
 };
 use super::prompts;
 use super::providers::{LlmSettings, ModelSettings};
@@ -400,7 +401,13 @@ fn apply_optional_field(
                 return Some(Ok(format!("`{key}` cleared (plugin default applies).")));
             }
             match value.parse::<usize>() {
-                Ok(0) => Some(Err(format!("`{key}` must be at least 1."))),
+                // One-character chunks would flood the channel and starve
+                // the send rate limits - the floor is an invariant, not a
+                // suggestion.
+                Ok(n) if n < MIN_REPLY_CHUNK => Some(Err(format!(
+                    "`{key}` must be at least {MIN_REPLY_CHUNK} - smaller chunks would flood \
+                     the channel."
+                ))),
                 // The platform rejects longer text messages outright - a
                 // bigger limit would only turn split replies into
                 // undelivered chunks. Platforms declaring no cap accept
@@ -2652,6 +2659,16 @@ mod tests {
         // here so replies never turn into undelivered garbage.
         apply_set(&mut config, "max_length", "2001", Some(2000)).unwrap_err();
         assert_eq!(config.max_length, Some(2000));
+
+        // Below the reply-chunk floor: rejected - one-character chunks would
+        // flood the channel and starve the send rate limits. The floor holds
+        // even where the platform declares no cap.
+        apply_set(&mut config, "max_length", "99", Some(2000)).unwrap_err();
+        assert_eq!(config.max_length, Some(2000));
+        apply_set(&mut config, "max_length", "100", Some(2000)).expect("floor value expected");
+        assert_eq!(config.max_length, Some(MIN_REPLY_CHUNK));
+        apply_set(&mut config, "max_length", "50", None).unwrap_err();
+        assert_eq!(config.max_length, Some(MIN_REPLY_CHUNK));
     }
 
     #[test]

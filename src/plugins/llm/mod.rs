@@ -25,8 +25,8 @@ pub use completion_port::{
 pub use conversation::{ConversationRecord, RecordRole};
 pub use llm_plugin::LlmPlugin;
 pub use model::{
-    CaptureMode, ChannelConfig, ConversationState, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY,
-    channel_config_key, channel_state_key,
+    CaptureMode, ChannelConfig, ConversationState, GenParams, MIN_REPLY_CHUNK, NAMESPACE,
+    SERVICE_CHANNEL_KEY, channel_config_key, channel_state_key,
 };
 pub use prompts::warn_unknown_prompt_tokens;
 pub use providers::{

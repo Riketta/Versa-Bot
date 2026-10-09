@@ -79,6 +79,8 @@ url = "sqlite://versabot.db"
 # Live messages kept after each compaction (minimum 1 - zero would make
 # compaction unreachable).
 # compaction_keep_tail = 10
+# Reply-splitting limit; raised to 100 when smaller, capped by the
+# platform's message limit.
 # max_message_length = 2000
 # Streaming edit cadence while a channel streams its answer live
 # (`streaming` on); the final edit always carries the exact full text.
