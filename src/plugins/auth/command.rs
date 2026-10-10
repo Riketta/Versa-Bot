@@ -229,6 +229,17 @@ async fn set_tier(
         }
     };
 
+    // A banned assignment on a target that carries Discord's administrator
+    // bit never takes effect - the clamp resolves them to `Admin` (pinned
+    // by tests). The handler cannot see permission bits, so the caveat is
+    // unconditional on this one tier: a success reply must not claim a ban
+    // that may not hold.
+    if tier == AccessTier::Banned {
+        answer.push_str(
+            "\n⚠️ Discord administrators always act as Admin regardless of this assignment.",
+        );
+    }
+
     // A self-demotion is possible (the gate already passed), warn before it
     // locks the invoker out; guild administrators are immune by the clamp.
     if let Target::User(id) = &target
@@ -369,8 +380,11 @@ async fn read_policy(storage: &dyn GuildStorage) -> Result<AuthConfig, OutboundM
             return Err(unavailable());
         }
     };
-    match serde_json::from_value(value) {
-        Ok(policy) => Ok(policy),
+    match serde_json::from_value::<AuthConfig>(value) {
+        // Sanitized like the gate's read: a hand-edited document carrying
+        // `owner` tiers must not render in `/auth show` - and, more
+        // importantly, must not be persisted verbatim by the next write.
+        Ok(policy) => Ok(policy.sanitized()),
         Err(err) => {
             tracing::warn!(
                 namespace = NAMESPACE,

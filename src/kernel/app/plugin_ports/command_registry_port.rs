@@ -82,8 +82,10 @@ pub struct CommandDescriptor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AccessTier {
-    /// Ignored entirely: messages and commands are dropped without any
-    /// output - bans never announce themselves.
+    /// Ignored entirely in guild contexts: messages and commands are
+    /// dropped without any output - bans never announce themselves. DMs
+    /// carry no guild policy, so the few guild-legal commands remain
+    /// invocable there.
     Banned,
     /// May talk to the bot (chat interactions) but runs no commands.
     Guest,

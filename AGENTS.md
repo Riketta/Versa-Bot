@@ -36,7 +36,9 @@ with NO inbound events - it discovers subscribers via
 (`/lol_leaderboard`: world-data statistics over a pluggable source
 port; in-process TTL cache warmed by a background scheduler job by
 default - the command serves cached data as-is - or re-parsed on
-demand; no storage), LLM chat bot
+demand; the complete dump persists to plugin-global storage and is
+restored on boot, so restarts serve the last parsed data age-honest),
+LLM chat bot
 (per-channel identity, config, and history; plain `reqwest` against
 OpenAI-compatible endpoints - no `rig`). A generic message-history plugin
 is deferred until a real consumer appears.

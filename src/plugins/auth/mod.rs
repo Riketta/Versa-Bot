@@ -44,7 +44,9 @@ pub struct AuthConfig {
     /// deny the very commands that configure it.
     pub default_tier: AccessTier,
     /// Explicit per-user tier assignments (platform user IDs as strings).
-    /// A `Banned` assignment wins over every role grant.
+    /// A `Banned` assignment wins over every role grant - the one exception
+    /// is Discord's administrator clamp, which resolves such a member to
+    /// `Admin` regardless.
     pub users: BTreeMap<String, AccessTier>,
     /// Per-role tier assignments (platform role IDs as strings): holding the
     /// role grants at least that tier.

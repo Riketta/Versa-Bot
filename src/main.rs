@@ -237,8 +237,11 @@ async fn main() -> ExitCode {
     // the data window (regions, parse depth, cache TTL, display view)
     // hot-reloads. The data is world data: no guild storage, no scheduler -
     // the refresh runs inside the command under the typing indicator.
+    // 3 = the documented `request_interval_secs` default for an absent
+    // section (the engine then serves no regions, so nothing calls the
+    // source anyway).
     let leaderboard_interval = Duration::from_secs(
-        config.lol_leaderboard.as_ref().map_or(1, |config| config.request_interval_secs).max(1),
+        config.lol_leaderboard.as_ref().map_or(3, |config| config.request_interval_secs).max(1),
     );
     let leaderboard_proxy = config.lol_leaderboard.as_ref().and_then(|c| c.proxy.clone());
     let leaderboard_source: Arc<dyn LeaderboardSourcePort> = Arc::new(
@@ -570,7 +573,12 @@ fn gateway_exit_code(start_result: serenity::Result<()>) -> ExitCode {
 fn load_config() -> anyhow::Result<Configuration> {
     let config = Config::builder()
         .add_source(File::with_name("versabot").required(false))
-        .add_source(Environment::with_prefix("VERSABOT").separator("__"))
+        .add_source(
+            // `ignore_empty`: an empty variable (`VERSABOT__DISCORD__TOKEN=`)
+            // means absent - a blank line in an env file or a placeholder
+            // export must not override a valid file value with "".
+            Environment::with_prefix("VERSABOT").separator("__").ignore_empty(true),
+        )
         .build()?;
     Ok(config.try_deserialize()?)
 }
@@ -811,6 +819,15 @@ impl ConfigChangeHandler<Configuration> for LolStoreSettingsReloader {
             tracing::info!("config lol_store absent or disabled - watcher values kept");
             return;
         }
+        // The poll cadence is boot-frozen (the job is scheduled once):
+        // naming a changed-but-kept value keeps the section-level "hot"
+        // diff line from reading as applied.
+        let current = self.engine.settings();
+        if current.poll != settings.poll {
+            tracing::info!(
+                "config lol_store poll_secs changed - kept until restart (the poll job is \n                 scheduled once)"
+            );
+        }
         self.engine.update_settings(settings);
     }
 }
@@ -829,10 +846,29 @@ struct LolLeaderboardSettingsReloader {
 
 impl ConfigChangeHandler<Configuration> for LolLeaderboardSettingsReloader {
     fn on_change(&self, config: Arc<Configuration>) {
-        let old_ttl = self.engine.settings().cache_ttl;
+        let old = self.engine.settings();
+        let old_ttl = old.cache_ttl;
         let settings =
             leaderboard_engine_settings(config.lol_leaderboard.as_ref(), self.source.as_ref());
         let new_ttl = settings.cache_ttl;
+        // Pacing, refresh mode and the inline budget are boot-frozen with
+        // the source adapter and the job; naming a changed-but-kept value
+        // keeps the section-level "hot" diff line honest.
+        if old.request_interval != settings.request_interval {
+            tracing::info!(
+                "config lol_leaderboard request_interval_secs changed - kept until restart"
+            );
+        }
+        if old.background_refresh != settings.background_refresh {
+            tracing::info!(
+                "config lol_leaderboard background_refresh changed - kept until restart (boot \n                 decision)"
+            );
+        }
+        if old.inline_budget != settings.inline_budget {
+            tracing::info!(
+                "config lol_leaderboard inline_refresh_budget_secs changed - kept until restart"
+            );
+        }
         self.engine.update_settings(settings);
         if old_ttl != new_ttl {
             self.plugin.reschedule(new_ttl);
@@ -941,6 +977,33 @@ mod tests {
         assert_eq!(settings.stream_interval_ms, 250);
         assert_eq!(settings.compaction_keep_tail, 1);
         assert_eq!(settings.image_max_side, 1);
+    }
+
+    /// The plugin-facing defaults and the config-file defaults are two
+    /// `Default` impls that must agree: production values come from the
+    /// config side only, so a one-sided edit would make the plugin's own
+    /// tests exercise numbers the composition root never produces.
+    #[test]
+    fn llm_defaults_survive_the_config_mapping() {
+        let settings = llm_settings_from(&LlmConfig::default(), None, None, None);
+        let expected = LlmSettings::default();
+        assert_eq!(settings.default_system_prompt, expected.default_system_prompt);
+        assert_eq!(settings.default_compaction_prompt, expected.default_compaction_prompt);
+        assert_eq!(settings.time_offset_minutes, expected.time_offset_minutes);
+        assert_eq!(settings.compaction_keep_tail, expected.compaction_keep_tail);
+        assert_eq!(settings.max_message_length, expected.max_message_length);
+        assert_eq!(settings.min_split_length, expected.min_split_length);
+        assert_eq!(settings.stream_interval_ms, expected.stream_interval_ms);
+        assert_eq!(settings.max_prompt_file_bytes, expected.max_prompt_file_bytes);
+        assert_eq!(settings.image_max_side, expected.image_max_side);
+        assert_eq!(settings.image_jpeg_quality, expected.image_jpeg_quality);
+        assert_eq!(settings.image_max_source_bytes, expected.image_max_source_bytes);
+        assert_eq!(settings.max_images_per_message, expected.max_images_per_message);
+        assert_eq!(settings.max_consecutive_newlines, expected.max_consecutive_newlines);
+        assert_eq!(settings.react_max_per_message, expected.react_max_per_message);
+        assert_eq!(settings.log_raw_traffic, expected.log_raw_traffic);
+        assert_eq!(settings.image_prompt, expected.image_prompt);
+        assert!(settings.providers.is_empty() && expected.providers.is_empty());
     }
 
     #[test]

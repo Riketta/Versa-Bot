@@ -264,7 +264,7 @@ tier on a six-step ladder -
 
 | Tier | What it allows |
 |---|---|
-| `banned` | nothing - the bot ignores their messages and commands entirely, without any reply |
+| `banned` | nothing in guild contexts - the bot ignores their messages and commands entirely, without any reply (DMs carry no guild policy; Discord administrators always act as `admin` regardless of this tier) |
 | `guest` | talk to the bot (chat interactions), no commands |
 | `user` | basic commands (`/ping`, `/help`, `/llm_status`, `/llm_models`) |
 | `moderator` | every service command (`/assign_tracker`, `/llm_assign`, `/llm_set`, ...) |

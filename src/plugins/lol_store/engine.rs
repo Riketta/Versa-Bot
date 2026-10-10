@@ -1875,7 +1875,7 @@ mod tests {
         *f.lcu.sales.lock() = Some((0..300u64).map(|i| skin_sale(1_000 + i, 20_000 + i)).collect());
         f.engine.tick().await;
 
-        let mut sent = f.output.sent();
+        let sent = f.output.sent();
         assert!(sent.len() >= 2, "a multi-page announcement was expected");
         let first = sent.first().expect("first page expected");
         assert_eq!(first.content, "<@&999>", "first page pings the role");

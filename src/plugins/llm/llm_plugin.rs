@@ -18,7 +18,7 @@ use crate::kernel::{
     services::KernelServices,
 };
 
-use super::chat_engine::ChatEngine;
+use super::chat_engine::{ChatEngine, FALLBACK_MESSAGE};
 use super::commands::{
     AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler, CutoffLlmHandler,
     CutoffUndoLlmHandler, DumpLlmHandler, EmojiWhitelistLlmHandler, ForgetLlmHandler,
@@ -676,7 +676,11 @@ impl MiddlewarePluginPort for LlmPlugin {
         // MAX_PENDING_RUNS_PER_CHANNEL accepted-but-unfinished runs per
         // channel. `try_acquire` never blocks the pipeline - a channel
         // flooding past the cap sheds its excess messages (not captured,
-        // warned) instead of accumulating unbounded work.
+        // warned) instead of accumulating unbounded work. The shed keeps
+        // the guaranteed-answer contract: a mention dropped here would
+        // otherwise vanish without a trace, so it gets the generic
+        // fallback; non-trigger messages stay silent - they were never
+        // promised an answer.
         let Ok(permit) = self
             .channel_permits
             .permit_for(services.platform_info.slug(), origin)
@@ -686,6 +690,9 @@ impl MiddlewarePluginPort for LlmPlugin {
                 channel = origin.channel_id.get(),
                 "engine run backlog full - shedding message"
             );
+            if payload.mentions_bot {
+                self.engine.send_fallback(origin, services).await;
+            }
             return Next::Continue;
         };
 
@@ -975,6 +982,51 @@ mod tests {
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         }
+    }
+
+    /// The whitelist read-modify-write serializes on its mutex: an `add`
+    /// issued while the lock is held waits, instead of both writers reading
+    /// the same document and the second write silently dropping the first
+    /// entry.
+    #[tokio::test]
+    async fn whitelist_writes_serialize_on_the_write_lock() {
+        let (_, f) = fixture_with_emojis(vec![ReactableEmoji {
+            name: "dorkiS".to_owned(),
+            token: "<:dorkiS:9>".to_owned(),
+        }]);
+
+        // Hold the whitelist write lock for the guild scope.
+        let guard = crate::plugins::llm::commands::WHITELIST_WRITE.lock().await;
+
+        let services = f.services.clone();
+        let args = CommandArgs(vec![
+            ("action".to_owned(), "add".to_owned()),
+            ("scope".to_owned(), "guild".to_owned()),
+            ("name".to_owned(), "dorkiS".to_owned()),
+        ]);
+        let task = tokio::spawn(async move {
+            EmojiWhitelistLlmHandler
+                .invoke(&command_event(Some(1)), &args, &services)
+                .await
+                .expect("add expected to succeed");
+        });
+
+        // The add must still be waiting: the document is untouched.
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            f.output.messages().len(),
+            0,
+            "the add must wait for the whitelist write lock, not race it"
+        );
+
+        drop(guard);
+        task.await.expect("add task expected to finish");
+        assert!(
+            f.output.messages().iter().any(|message| message.contains("Added `dorkiS`")),
+            "the add lands once the lock frees"
+        );
     }
 
     /// `/llm_emoji_whitelist` with descriptions: `add` persists the entry
@@ -2254,7 +2306,9 @@ mod tests {
     }
 
     /// A full backlog sheds the message at intake: not captured, no engine
-    /// run, pipeline unaffected.
+    /// run, pipeline unaffected. The shed keeps the guaranteed-answer
+    /// contract for mentions (the generic fallback), while non-trigger
+    /// messages stay silent - they were never promised an answer.
     #[tokio::test]
     async fn full_backlog_sheds_the_message() {
         let (plugin, fixture) = fixture();
@@ -2279,6 +2333,20 @@ mod tests {
         assert!(matches!(next, Next::Continue));
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(stored_records(&fixture).await.is_empty(), "shed messages must not be captured");
+        // The mention survives the valve as the generic fallback.
+        assert!(
+            fixture.output.messages().contains(&FALLBACK_MESSAGE.to_owned()),
+            "a shed mention still gets the fallback: {:?}",
+            fixture.output.messages()
+        );
+
+        // A non-mention under the same full backlog stays silent.
+        let mut event = message_event(2, false);
+        let next = plugin.pre(&mut event, &fixture.services).await;
+        assert!(matches!(next, Next::Continue));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let messages = fixture.output.messages();
+        assert_eq!(messages.len(), 1, "non-trigger sheds stay silent: {messages:?}");
     }
 
     /// `stop` cancels admission: a stopped plugin spawns no engine runs -

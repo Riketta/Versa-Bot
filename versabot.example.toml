@@ -164,7 +164,7 @@ url = "sqlite://versabot.db"
 # or, on servers that support the budget field:
 # extra_body = { reasoning_budget = 0 }
 # String values may carry template variables resolved per request from the
-# channel's reasoning setting - `/llm_set reasoning_effort=off` then
+# channel's reasoning setting - `/llm_set reasoning_effort off` then
 # reaches templates too:
 # extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" } }
 # ${enable_reasoning}: JSON false only when the channel sets

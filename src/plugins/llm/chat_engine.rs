@@ -245,7 +245,7 @@ fn live_outcome(
 /// cannot receive a generated answer. Deliberately detail-free: the error
 /// classification goes to the service channel, endpoint bodies stay in the
 /// logs.
-const FALLBACK_MESSAGE: &str = "I couldn't process that just now - the language model is unreachable. Please try again in a moment.";
+pub(crate) const FALLBACK_MESSAGE: &str = "I couldn't process that just now - the language model is unreachable. Please try again in a moment.";
 
 pub struct ChatEngine {
     settings: Arc<LlmSettings>,
@@ -754,7 +754,7 @@ impl ChatEngine {
             self.assemble_prompt(config, state, live, usage_stats, &vars, &emoji_menu);
         let started = Instant::now();
 
-        let max_length = config.split_length.unwrap_or(self.settings.max_message_length);
+        let max_length = self.split_limit(config);
         // Streaming channels pull the answer live off the endpoint (SSE
         // deltas reveal on one message); everything else stays single-shot.
         let (live_id, outcome) = if config.streaming {
@@ -1010,6 +1010,19 @@ impl ChatEngine {
     /// already-streaming message from [`Self::complete_live`] - its final
     /// edit pins the exact first chunk (the reference was set at its
     /// `begin`); without one, `begin` posts the first chunk directly.
+    /// The effective reply-splitting limit for a channel: the per-channel
+    /// override, else the plugin-wide default (already clamped to the
+    /// platform's cap at boot).
+    fn split_limit(&self, config: &ChannelConfig) -> usize {
+        config.split_length.unwrap_or(self.settings.max_message_length)
+    }
+
+    /// Delivers the authoritative reply: splits at the channel's limit,
+    /// pins the first chunk (as a reply anchor when live-streaming, else as
+    /// the plain `begin`), then sends the remaining parts. The live
+    /// already-streaming message from [`Self::complete_live`] - its final
+    /// edit pins the exact first chunk (the reference was set at its
+    /// `begin`); without one, `begin` posts the first chunk directly.
     /// Returns whether delivery could start - the caller's fallback follows
     /// when it did not.
     async fn deliver_reply(
@@ -1021,7 +1034,7 @@ impl ChatEngine {
         live_id: Option<MessageId>,
         services: &KernelServices,
     ) -> bool {
-        let max_length = config.split_length.unwrap_or(self.settings.max_message_length);
+        let max_length = self.split_limit(config);
         let chunks = conversation::split_reply(content, max_length);
         if chunks.is_empty() {
             tracing::warn!(channel = channel_id, "completion returned no deliverable content");
@@ -1039,7 +1052,25 @@ impl ChatEngine {
             // final edit pins it to the authoritative first chunk (reasoning
             // stripping may have shortened the raw deltas).
             if let Err(err) = stream.update(id, first_chunk.clone()).await {
-                tracing::warn!(channel = channel_id, %err, "final stream update failed");
+                // The edit failed: the screen keeps the last revealed
+                // prefix, so the un-revealed tail of this chunk would be
+                // lost. Plain-send the full chunk instead - a duplicated
+                // prefix beats a silently truncated answer. The duplicate
+                // is neither the reply anchor (the live message is) nor
+                // recorded twice (history holds the content once).
+                tracing::warn!(
+                    channel = channel_id,
+                    %err,
+                    "final stream update failed - sending the full first chunk plainly"
+                );
+                let resent = OutboundMessage::text(first_chunk.clone());
+                if let Err(err) = services.chat_output.send(resent).await {
+                    tracing::warn!(
+                        channel = channel_id,
+                        %err,
+                        "plain resend of the first chunk failed too"
+                    );
+                }
             }
             delivered = true; // the live begin already put content on screen
             Some(id.get())
@@ -1411,22 +1442,37 @@ impl ChatEngine {
         let records_ns = records_namespace(channel_id);
         let limit = u32::try_from(window.max(1)).unwrap_or(u32::MAX);
         let stored = storage.list_last(&records_ns, limit).await?;
+        let mut skipped = 0usize;
         let live: Vec<(u64, ConversationRecord)> = stored
             .into_iter()
             .filter(|record| record.seq > after_seq)
             .filter_map(|record| {
-                serde_json::from_value::<ConversationRecord>(record.payload)
-                    .inspect_err(|err| {
+                match serde_json::from_value::<ConversationRecord>(record.payload) {
+                    Ok(parsed) => Some((record.seq, parsed)),
+                    Err(err) => {
+                        skipped += 1;
                         tracing::warn!(
                             channel = channel_id,
                             %err,
                             "skipping malformed conversation record"
                         );
-                    })
-                    .ok()
-                    .map(|parsed| (record.seq, parsed))
+                        None
+                    }
+                }
             })
             .collect();
+        if skipped > 0 {
+            // A dropped record silently shrinks the window - the summary and
+            // the depth budget both assume it is there. Naming the effective
+            // size keeps the shrink visible instead of
+            // discovered-much-later.
+            tracing::warn!(
+                channel = channel_id,
+                skipped,
+                kept = live.len(),
+                "live window loaded with malformed records - the effective window is smaller"
+            );
+        }
         if live.len() >= window.max(1) {
             tracing::debug!(
                 channel = channel_id,

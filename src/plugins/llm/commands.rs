@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::common::command_reply;
+use crate::common::{command_reply, utf16_len};
 use crate::kernel::{
     models::{Embed, MessageId, OutboundMessage, RequestContext},
     plugin_ports::{CommandArgs, CommandHandler},
@@ -1123,6 +1123,7 @@ impl CommandHandler for UsageLlmHandler {
         // The snapshot seeds lazily, so a fresh process still serves the
         // stored history.
         let (all_time, today) = self.engine.usage().guild_snapshot(guild_id.get()).await;
+        let limit = services.platform_info.message_limit();
         let text = if all_time.total.requests == 0 {
             "No LLM usage recorded for this server yet.".to_owned()
         } else {
@@ -1138,7 +1139,7 @@ impl CommandHandler for UsageLlmHandler {
                     lines.push(format!("- `{model}` \u{b7} {}", usage_counts(total)));
                 }
             }
-            lines.join("\n")
+            join_capped(&lines, 3, limit)
         };
         services.chat_output.send(command_reply(text)).await?;
         Ok(())
@@ -1148,6 +1149,33 @@ impl CommandHandler for UsageLlmHandler {
 /// Cap on the per-server ranking: a deployment serving many guilds must
 /// not grow one reply without bound - the long tail is the small one.
 pub(super) const GLOBAL_GUILD_CAP: usize = 10;
+
+/// Joins usage lines under the platform message limit (counted in UTF-16
+/// units): the leading `keep` lines always stay - title and the all-time/
+/// today pair - and trailing per-model/server lines are dropped, with a
+/// count, when they would not fit. A platform without a message cap fits
+/// everything.
+fn join_capped(lines: &[String], keep: usize, limit: Option<usize>) -> String {
+    let Some(limit) = limit else {
+        return lines.join("\n");
+    };
+    let mut used = 0usize;
+    let mut fit = 0usize;
+    for (index, line) in lines.iter().enumerate() {
+        let len = utf16_len(line) + usize::from(index > 0);
+        if index >= keep && used + len > limit {
+            break;
+        }
+        used += len;
+        fit = index + 1;
+    }
+    let mut out = lines.iter().take(fit).cloned().collect::<Vec<_>>().join("\n");
+    let dropped = lines.len() - fit;
+    if dropped > 0 {
+        out.push_str(&format!("\n...and {dropped} more"));
+    }
+    out
+}
 
 /// `/llm_usage_global`: every server's token usage. Operator information,
 /// therefore owner-tier: the auth gate enforces the tier (bot owners come
@@ -1184,6 +1212,7 @@ impl CommandHandler for GlobalUsageLlmHandler {
         // The snapshot seeds lazily, so a fresh process still serves the
         // stored history.
         let (snapshot, today) = self.engine.usage().global_snapshot().await;
+        let limit = services.platform_info.message_limit();
         let text = if snapshot.total.requests == 0 {
             "No LLM usage recorded yet.".to_owned()
         } else {
@@ -1213,7 +1242,7 @@ impl CommandHandler for GlobalUsageLlmHandler {
                     lines.push(format!("...and {hidden} more"));
                 }
             }
-            lines.join("\n")
+            join_capped(&lines, 3, limit)
         };
         services.chat_output.send(command_reply(text)).await?;
         Ok(())
@@ -1413,8 +1442,17 @@ impl CommandHandler for ClearServiceChannelHandler {
 /// actual custom emojis at add time, so the list only ever contains
 /// reactable entries; each entry may carry a short description the menu
 /// renders next to the emoji's wire form (`desc` sets, updates, or clears
-/// it). Lock-free like `/llm_admin`: rare moderator writes, last one wins.
+/// it). The read-modify-write serializes on [`WHITELIST_WRITE`] - rare
+/// moderator writes, so contention is nil, but two concurrent `add`s must
+/// not silently drop each other's entries.
 pub(super) struct EmojiWhitelistLlmHandler;
+
+/// Serializes every whitelist read-modify-write: `add`/`remove`/`desc` read
+/// the document, mutate it in memory, and write it back - without the lock
+/// the second writer's document would silently drop the first writer's
+/// entry. One process-wide mutex: moderator writes are rare, so contention
+/// is nil, and the same pattern the lol_store config writes use.
+pub(super) static WHITELIST_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Longest accepted emoji description, in characters: a short hint for the
 /// model, not documentation.
@@ -1490,6 +1528,10 @@ impl CommandHandler for EmojiWhitelistLlmHandler {
                 return Ok(());
             }
         };
+        // The read-modify-write serializes on the process-wide whitelist
+        // mutex: the read must not race another writer's write, and the
+        // guard holds through the matching write.
+        let _write = WHITELIST_WRITE.lock().await;
         let mut list: Vec<EmojiWhitelistEntry> =
             storage.get(NAMESPACE, &key).await?.map(parse_whitelist).unwrap_or_default();
         match action {
@@ -2375,6 +2417,32 @@ mod tests {
     /// The cap tests exercise: what [`TestPlatformInfo`] serves, mirroring
     /// the wired adapter.
     const PLATFORM_LIMIT: Option<usize> = Some(2000);
+
+    /// The usage reply never overflows the platform message limit: entries
+    /// past it are dropped (with a count), while the title and the
+    /// all-time/today lines always stay.
+    #[test]
+    fn usage_lines_cap_at_the_platform_limit() {
+        let lines: Vec<String> = vec![
+            "**LLM usage for this server**".to_owned(),
+            "All time line".to_owned(),
+            "Today line".to_owned(),
+            "- model_a \u{b7} stats".to_owned(),
+            "- model_b \u{b7} stats".to_owned(),
+            "- model_c \u{b7} stats".to_owned(),
+        ];
+        // No platform cap: everything fits.
+        assert_eq!(join_capped(&lines, 3, None), lines.join("\n"));
+        // A limit that fits only the head: entries collapse into a count.
+        let joined = join_capped(&lines, 3, Some(70));
+        assert!(joined.starts_with("**LLM usage for this server**"));
+        assert!(!joined.contains("model_a"), "{joined}");
+        assert!(joined.contains("...and 3 more"), "{joined}");
+        // The kept lines stay whatever the limit says.
+        let joined = join_capped(&lines, 3, Some(10));
+        assert!(joined.contains("All time line"), "{joined}");
+        assert!(joined.contains("...and 3 more"), "{joined}");
+    }
 
     /// The default reply-chunk floor, as an untouched `[llm]` config yields.
     const CHUNK_FLOOR: usize = 100;

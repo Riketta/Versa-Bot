@@ -95,7 +95,10 @@ impl<E: EventBusPort> KernelService<E> {
     /// plugin (e.g. auth) must be registered before the plugins it gates.
     ///
     /// A failed boot rolls the one-shot guard back - the rollback already
-    /// stopped everything that started, so `boot` may be retried.
+    /// stopped everything that started, so `boot` may be retried. The
+    /// lifecycle is otherwise one-shot FOREVER: after a successful
+    /// `shutdown()` the kernel stays dead - plugins are not required to be
+    /// restartable, and the composition root boots exactly once.
     ///
     /// # Errors
     /// Propagates the first plugin `init`/`start` failure, or
@@ -104,7 +107,10 @@ impl<E: EventBusPort> KernelService<E> {
         // One-shot like `shutdown`: re-running init/start on live plugins is
         // always a bug, and plugins that guard themselves must not have to.
         if self.boot_started.swap(true, Ordering::SeqCst) {
-            tracing::warn!("kernel boot called twice - ignoring, plugins are already booted");
+            tracing::warn!(
+                "kernel boot called twice - ignoring (one-shot lifecycle: the kernel was \
+                 already booted, or already shut down)"
+            );
             return Ok(());
         }
         let outcome = self.boot_plugins();

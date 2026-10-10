@@ -22,3 +22,11 @@ pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 pub(crate) fn command_reply(text: impl Into<String>) -> crate::kernel::models::OutboundMessage {
     crate::kernel::models::OutboundMessage::text(text.into()).ephemeral()
 }
+
+/// UTF-16 code-unit length of `text` - the unit the strictest platforms
+/// count limits in, so budgeting in it stays safe under both a chars and a
+/// units cap (message splits, embed packing, nickname checks).
+#[must_use]
+pub(crate) fn utf16_len(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
+}

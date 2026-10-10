@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use serenity::all::{
     ChannelId as SerenityChannelId, CommandDataOption, CommandDataOptionValue, CommandDataResolved,
-    Context, EventHandler, GuildId as SerenityGuildId, Interaction, Member, Message, Permissions,
-    Ready, RoleId as SerenityRoleId, User, UserId as SerenityUserId,
+    Context, EventHandler, GuildId as SerenityGuildId, Interaction, Member, Message, MessageType,
+    Permissions, Ready, RoleId as SerenityRoleId, User, UserId as SerenityUserId,
 };
 use serenity::async_trait;
 
@@ -317,6 +317,12 @@ fn message_event(
     if message.author.bot || message.webhook_id.is_some() {
         return None;
     }
+    // System notices (member joins, pins, boosts) ride MESSAGE_CREATE with
+    // empty content and a human author - they are not conversation turns
+    // and must not be captured as one.
+    if message.kind != MessageType::Regular {
+        return None;
+    }
 
     // Best effort: role data is only present when Discord included the
     // member in the payload; missing roles are treated as "no roles".
@@ -595,7 +601,7 @@ mod tests {
 
     use serenity::all::{
         Attachment, MessageId as SerenityMessageId, MessageReference, MessageReferenceKind,
-        PartialMember, WebhookId,
+        MessageType, PartialMember, WebhookId,
     };
 
     fn resolver(kind: MentionKind, id: u64) -> Option<String> {
@@ -897,6 +903,17 @@ mod tests {
     fn webhook_message_produces_no_event() {
         let mut message = plain_message("spoofed human");
         message.webhook_id = Some(WebhookId::new(77));
+
+        assert!(message_event(&message, 99, 0, None, &no_names).is_none());
+    }
+
+    /// System notices (member joins, pins, boosts) ride MESSAGE_CREATE as
+    /// human-authored, contentless messages - they are not conversation
+    /// turns and must not be captured.
+    #[test]
+    fn system_message_produces_no_event() {
+        let mut message = plain_message("");
+        message.kind = MessageType::MemberJoin;
 
         assert!(message_event(&message, 99, 0, None, &no_names).is_none());
     }

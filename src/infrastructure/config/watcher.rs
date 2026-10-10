@@ -32,6 +32,13 @@ impl<C: PartialEq + Send + Sync + 'static> PollingConfigWatcher<C> {
     }
 
     /// One reload-and-notify pass. Runs on the scheduler; public for tests.
+    ///
+    /// Single-caller by contract: exactly one scheduler job polls, and
+    /// scheduler jobs of one name never overlap. The equality check and
+    /// the state swap take separate locks, so two concurrent callers could
+    /// both pass the check and double-notify - harmless today (subscribers
+    /// treat identical snapshots as no-ops), but do not add a second poll
+    /// driver without making the pair atomic.
     pub fn poll(&self) {
         let snapshot = match (self.reload)() {
             Ok(config) => Arc::new(config),

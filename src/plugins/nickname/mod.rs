@@ -19,8 +19,9 @@ use crate::kernel::{
     spi_ports::NicknamePort,
 };
 
-/// Discord's nickname length cap - enforced locally so the admin gets a
-/// usage notice instead of a platform rejection.
+/// Discord's nickname length cap, counted in UTF-16 code units (Discord's
+/// counting unit - astral-plane characters cost two) - enforced locally so
+/// the admin gets a usage notice instead of a platform rejection.
 const MAX_NICKNAME_CHARS: usize = 32;
 
 pub struct NicknamePlugin {
@@ -95,7 +96,7 @@ impl CommandHandler for SetGuildNameHandler {
         // spelled two ways: the argument omitted, or whitespace only.
         let name = args.get("name").map(str::trim).filter(|name| !name.is_empty());
         if let Some(name) = name
-            && name.chars().count() > MAX_NICKNAME_CHARS
+            && crate::common::utf16_len(name) > MAX_NICKNAME_CHARS
         {
             services
                 .chat_output

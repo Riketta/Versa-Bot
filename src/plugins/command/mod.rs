@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::FutureExt;
 
-use crate::common::{command_reply, panic_message};
+use crate::common::{command_reply, panic_message, utf16_len};
 use crate::kernel::{
     models::{Embed, EventPayload, OutboundMessage, RequestContext},
     plugin_ports::{
@@ -15,8 +15,10 @@ use crate::kernel::{
 
 /// Command dispatcher: routes native [`EventKind::CommandInvoked`] events to
 /// handlers registered in the `CommandRegistryPort`. Meaning lives in the
-/// owning plugins; this plugin only dispatches. An unknown command yields no
-/// output - there is no "not found" default. A handler failure (an `Err` or
+/// owning plugins; this plugin only dispatches. An unknown command yields
+/// no output on plain events - there is no "not found" default; a deferred
+/// interaction still gets an ephemeral not-found notice so it cannot hang
+/// on "thinking". A handler failure (an `Err` or
 /// a panic - both are caught here, the pipeline never sees either) on a
 /// transactional invocation sends a generic ephemeral failure notice; plain
 /// events stay silent.
@@ -224,12 +226,6 @@ impl CommandHandler for HelpHandler {
 
 /// Embed budget where the platform declares none (Discord's own cap).
 const DEFAULT_EMBED_LIMIT: usize = 4096;
-
-/// UTF-16 length - the unit the strictest platforms count limits in, so
-/// budgeting in it stays safe under both a chars and a units cap.
-fn utf16_len(text: &str) -> usize {
-    text.chars().map(char::len_utf16).sum()
-}
 
 /// The guide's sections in privilege order, one per tier that has commands.
 /// `Guest` and undeclared tiers render as `Everyone`; `Banned` commands are

@@ -464,9 +464,7 @@ pub fn split_reply(content: &str, max_length: usize) -> Vec<String> {
 }
 
 /// Length in UTF-16 code units - the unit platform message caps count.
-pub(crate) fn utf16_len(text: &str) -> usize {
-    text.chars().map(char::len_utf16).sum()
-}
+pub(crate) use crate::common::utf16_len;
 
 /// Splits `text` after the longest char-boundary prefix that fits `max`
 /// UTF-16 code units. A first scalar that alone exceeds the budget is
