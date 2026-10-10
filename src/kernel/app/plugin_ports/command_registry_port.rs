@@ -153,6 +153,11 @@ pub enum ArgKind {
     String,
     User,
     Role,
+    /// A guild channel. The adapter renders a native channel picker
+    /// (Discord: option type `CHANNEL`); the resolved entity arrives in
+    /// `args` as the channel's ID string. Same-guild by construction -
+    /// pickers only offer channels of the invoking guild.
+    Channel,
     /// An uploaded file. The adapter hands the plugin a platform URL the
     /// plugin may fetch - Discord: the attachment's CDN URL, a pinned
     /// trusted host (never an arbitrary guild-chosen URL).

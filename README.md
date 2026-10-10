@@ -909,6 +909,7 @@ plugin](#authorization-auth-plugin)).
 | `/llm_unassign` | moderator | remove the bot from this channel (history is kept) |
 | `/llm_set_prompt kind:<kind> prompt:<text>` | moderator | set a channel prompt - `kind` is `system` (persona), `compaction` (summary instruction) or `image` (recognition instruction); `clear` falls back to the plugin default; attach `file` instead of `prompt` for long prompts (Discord CDN only, capped by `[llm] max_prompt_file_bytes`, 128 KiB default); omitting both arguments shows the current value |
 | `/llm_set key:<key> value:<value>` | moderator | tune one channel setting (table below) |
+| `/llm_copy_settings channel:<#channel>` | moderator | preset copy: the source channel's customized settings (its `/llm_set` keys and prompt overrides that differ from defaults, plus the model) are applied to this channel; settings the source leaves at default keep this channel's values; history is untouched |
 | `/llm_get key:<key>` | moderator | show a setting's current value (defaults render as the effective value, long text truncated); omit `key` to list every setting |
 | `/llm_dump` | moderator | dump every setting at once in one copy-pasteable code fence (`key = value`, effective values); lines that differ from a fresh `/llm_assign` carry a `*` marker; prompts are not dumped at all - only set-or-not and size, the text is one argument-free `/llm_set_prompt kind` away |
 | `/llm_cutoff` | moderator | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |

@@ -20,10 +20,11 @@ use crate::kernel::{
 
 use super::chat_engine::{ChatEngine, FALLBACK_MESSAGE};
 use super::commands::{
-    AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler, CutoffLlmHandler,
-    CutoffUndoLlmHandler, DumpLlmHandler, EmojiWhitelistLlmHandler, ForgetLlmHandler,
-    GetLlmHandler, GlobalUsageLlmHandler, ModelsLlmHandler, SET_KEYS, SetLlmHandler,
-    SetPromptLlmHandler, StatusLlmHandler, UnassignLlmHandler, UsageLlmHandler, model_choices,
+    AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler,
+    CopySettingsLlmHandler, CutoffLlmHandler, CutoffUndoLlmHandler, DumpLlmHandler,
+    EmojiWhitelistLlmHandler, ForgetLlmHandler, GetLlmHandler, GlobalUsageLlmHandler,
+    ModelsLlmHandler, SET_KEYS, SetLlmHandler, SetPromptLlmHandler, StatusLlmHandler,
+    UnassignLlmHandler, UsageLlmHandler, model_choices,
 };
 use super::conversation::{ConversationRecord, RecordRole};
 use super::model::{
@@ -581,6 +582,26 @@ impl PluginPort for LlmPlugin {
         );
         self.registry.register(
             self.descriptor(
+                "llm_copy_settings",
+                "Copy another channel's customized LLM settings onto this channel (same server)",
+                vec![ArgDescriptor {
+                    name: "channel".to_owned(),
+                    description: "Source channel - only settings that differ from defaults are \
+                         copied"
+                        .to_owned(),
+                    required: true,
+                    kind: ArgKind::Channel,
+                    choices: None,
+                }],
+                AccessTier::Moderator,
+            ),
+            Arc::new(CopySettingsLlmHandler::new(
+                Arc::clone(&self.channel_locks),
+                Arc::clone(&self.engine),
+            )),
+        );
+        self.registry.register(
+            self.descriptor(
                 "llm_get",
                 "Show the current value of a channel chat setting (all keys when omitted)",
                 vec![ArgDescriptor {
@@ -808,7 +829,8 @@ mod tests {
         plugin_ports::{CommandArgs, CommandHandler},
         services::KernelServices,
         spi_ports::{
-            ChatOutputFactoryPort, ChatOutputPort, GUILD_SETTINGS, ReactableEmoji, StoragePort,
+            ChatOutputFactoryPort, ChatOutputPort, GUILD_SETTINGS, GuildStorage, ReactableEmoji,
+            StoragePort,
         },
     };
     use crate::plugins::llm::model::{
@@ -982,6 +1004,242 @@ mod tests {
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         }
+    }
+
+    /// The preset copy: the source channel's customizations land on the
+    /// target, the target's own non-delta settings survive, and history
+    /// documents (state, records, stats) are never touched.
+    #[tokio::test]
+    async fn copy_settings_applies_the_source_customizations() {
+        let (plugin, f) = fixture();
+        plugin.init().expect("init expected to succeed");
+        AssignLlmHandler::new(Arc::clone(&f.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("model".to_owned(), "zai/glm-5.3-flash".to_owned())]),
+                &f.services,
+            )
+            .await
+            .expect("assign expected to succeed");
+        SetLlmHandler::new(ChannelLocks::new(), Arc::clone(&f.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![
+                    ("key".to_owned(), "split_length".to_owned()),
+                    ("value".to_owned(), "500".to_owned()),
+                ]),
+                &f.services,
+            )
+            .await
+            .expect("set expected to succeed");
+
+        let mut source = ChannelConfig::assigned("local/gemma".to_owned());
+        source.capture = crate::plugins::llm::model::CaptureMode::AllMessages;
+        source.params.temperature = Some(0.5);
+        source.system_prompt = Some("be brief".to_owned());
+        f.storage
+            .guild_scoped("test", GuildId(1))
+            .set(
+                NAMESPACE,
+                &channel_config_key(9),
+                serde_json::to_value(&source).expect("source config serializes"),
+            )
+            .await
+            .expect("seed expected to succeed");
+
+        CopySettingsLlmHandler::new(ChannelLocks::new(), Arc::clone(&f.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("channel".to_owned(), "9".to_owned())]),
+                &f.services,
+            )
+            .await
+            .expect("copy expected to succeed");
+
+        let reply = f.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("Settings copied from <#9>"), "{reply}");
+        assert!(reply.contains("capture"), "copied keys listed: {reply}");
+        assert!(reply.contains("history is untouched"), "{reply}");
+
+        let stored = f
+            .storage
+            .guild_scoped("test", GuildId(1))
+            .get(NAMESPACE, &channel_config_key(2))
+            .await
+            .expect("read expected")
+            .expect("target config expected");
+        let updated = ChannelConfig::from_stored(stored, 100).expect("config expected to parse");
+        assert_eq!(updated.model, "local/gemma", "the assignment travels");
+        assert_eq!(updated.capture, crate::plugins::llm::model::CaptureMode::AllMessages);
+        assert_eq!(updated.params.temperature, Some(0.5));
+        assert_eq!(updated.system_prompt.as_deref(), Some("be brief"));
+        assert_eq!(updated.split_length, Some(500), "non-delta settings keep the target's values");
+        // The copy swaps tuning only - the target's history surface stays.
+        assert!(
+            f.storage
+                .guild_scoped("test", GuildId(1))
+                .get(NAMESPACE, &channel_state_key(2))
+                .await
+                .expect("read expected")
+                .is_none()
+        );
+    }
+
+    /// A source without an assignment in this guild has nothing to copy -
+    /// and a foreign channel id cannot have one, storage is guild-
+    /// partitioned.
+    #[tokio::test]
+    async fn copy_settings_requires_an_assigned_source() {
+        let (plugin, f) = fixture();
+        plugin.init().expect("init expected to succeed");
+        AssignLlmHandler::new(Arc::clone(&f.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("model".to_owned(), "local/gemma".to_owned())]),
+                &f.services,
+            )
+            .await
+            .expect("assign expected to succeed");
+
+        CopySettingsLlmHandler::new(ChannelLocks::new(), Arc::clone(&f.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("channel".to_owned(), "123".to_owned())]),
+                &f.services,
+            )
+            .await
+            .expect("invoke expected to succeed");
+
+        let reply = f.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("<#123> has no LLM assignment"), "{reply}");
+    }
+
+    /// A copy never silently assigns: an unassigned target is pointed at
+    /// `/llm_assign` first (the shared unassigned-channel answer).
+    #[tokio::test]
+    async fn copy_settings_never_assigns_the_target() {
+        let (plugin, f) = fixture();
+        plugin.init().expect("init expected to succeed");
+        let mut source = ChannelConfig::assigned("local/gemma".to_owned());
+        source.streaming = true;
+        f.storage
+            .guild_scoped("test", GuildId(1))
+            .set(
+                NAMESPACE,
+                &channel_config_key(9),
+                serde_json::to_value(&source).expect("source config serializes"),
+            )
+            .await
+            .expect("seed expected to succeed");
+
+        CopySettingsLlmHandler::new(ChannelLocks::new(), Arc::clone(&f.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("channel".to_owned(), "9".to_owned())]),
+                &f.services,
+            )
+            .await
+            .expect("invoke expected to succeed");
+
+        let reply = f.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("not assigned"), "{reply}");
+        assert!(
+            f.storage
+                .guild_scoped("test", GuildId(1))
+                .get(NAMESPACE, &channel_config_key(2))
+                .await
+                .expect("read expected")
+                .is_none(),
+            "no config may appear on the target"
+        );
+    }
+
+    /// The source's model must be a declared one - a preset cannot smuggle
+    /// an undeclared reference into the target.
+    #[tokio::test]
+    async fn copy_settings_validates_the_source_model() {
+        let (plugin, f) = fixture();
+        plugin.init().expect("init expected to succeed");
+        AssignLlmHandler::new(Arc::clone(&f.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("model".to_owned(), "local/gemma".to_owned())]),
+                &f.services,
+            )
+            .await
+            .expect("assign expected to succeed");
+        f.storage
+            .guild_scoped("test", GuildId(1))
+            .set(
+                NAMESPACE,
+                &channel_config_key(9),
+                serde_json::to_value(&ChannelConfig::assigned("mystery/model".to_owned()))
+                    .expect("source config serializes"),
+            )
+            .await
+            .expect("seed expected to succeed");
+
+        CopySettingsLlmHandler::new(ChannelLocks::new(), Arc::clone(&f.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("channel".to_owned(), "9".to_owned())]),
+                &f.services,
+            )
+            .await
+            .expect("invoke expected to succeed");
+
+        let reply = f.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("model cannot be copied"), "{reply}");
+        assert!(reply.contains("Declared models"), "{reply}");
+    }
+
+    /// Copying a channel onto itself and copying onto an already identical
+    /// target are both no-ops with honest replies.
+    #[tokio::test]
+    async fn copy_settings_no_ops_are_answered_honestly() {
+        let (plugin, f) = fixture();
+        plugin.init().expect("init expected to succeed");
+        AssignLlmHandler::new(Arc::clone(&f.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("model".to_owned(), "local/gemma".to_owned())]),
+                &f.services,
+            )
+            .await
+            .expect("assign expected to succeed");
+
+        CopySettingsLlmHandler::new(ChannelLocks::new(), Arc::clone(&f.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("channel".to_owned(), "2".to_owned())]),
+                &f.services,
+            )
+            .await
+            .expect("invoke expected to succeed");
+        let reply = f.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("That is this channel"), "{reply}");
+
+        // A pristine source whose model already matches: nothing changes.
+        f.storage
+            .guild_scoped("test", GuildId(1))
+            .set(
+                NAMESPACE,
+                &channel_config_key(9),
+                serde_json::to_value(&ChannelConfig::assigned("local/gemma".to_owned()))
+                    .expect("source config serializes"),
+            )
+            .await
+            .expect("seed expected to succeed");
+        CopySettingsLlmHandler::new(ChannelLocks::new(), Arc::clone(&f.engine))
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![("channel".to_owned(), "9".to_owned())]),
+                &f.services,
+            )
+            .await
+            .expect("invoke expected to succeed");
+        let reply = f.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("already matches"), "{reply}");
     }
 
     /// The whitelist read-modify-write serializes on its mutex: an `add`
@@ -1291,6 +1549,7 @@ mod tests {
                 "llm_admin",
                 "llm_admin_clear",
                 "llm_assign",
+                "llm_copy_settings",
                 "llm_cutoff",
                 "llm_cutoff_undo",
                 "llm_dump",

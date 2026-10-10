@@ -1830,6 +1830,213 @@ impl CommandHandler for SetLlmHandler {
     }
 }
 
+/// `/llm_copy_settings`: copies the source channel's customized tuning onto
+/// the current channel - a preset. "Customized" = fields that differ from a
+/// fresh assignment's defaults, plus the model itself; knobs the source
+/// leaves at default keep this channel's own values. Same guild by
+/// construction: the source document is looked up in this guild's storage
+/// partition, so a foreign channel id has no assignment to copy. History
+/// (records, state, stats) is never touched - the copy swaps tuning only.
+pub(super) struct CopySettingsLlmHandler {
+    locks: Arc<ChannelLocks>,
+    engine: Arc<ChatEngine>,
+}
+
+impl CopySettingsLlmHandler {
+    pub(super) fn new(locks: Arc<ChannelLocks>, engine: Arc<ChatEngine>) -> Self {
+        Self { locks, engine }
+    }
+}
+
+/// The source's customizations as a partial config object: top-level fields
+/// whose value differs from a fresh assignment's defaults, `model` always
+/// riding along (the assignment travels with the preset), and `params`
+/// reduced to the sampling knobs that actually differ. Carries serde field
+/// names - the reply maps them onto the command-facing names.
+fn customization_delta(source: &ChannelConfig) -> serde_json::Value {
+    let baseline = ChannelConfig::assigned(source.model.clone());
+    let base = serde_json::to_value(&baseline).expect("channel config serializes");
+    let mut delta = serde_json::to_value(source).expect("channel config serializes");
+    if let (Some(delta_obj), Some(base_obj)) = (delta.as_object_mut(), base.as_object()) {
+        delta_obj.retain(|key, value| base_obj.get(key) != Some(value));
+        if let Some(params_value) = delta_obj.remove("params")
+            && let Some(params_obj) = params_value.as_object()
+        {
+            let base_params = base_obj.get("params");
+            let mut partial = serde_json::Map::new();
+            for (key, value) in params_obj {
+                let equal = base_params
+                    .and_then(|params| params.get(key))
+                    .is_some_and(|base_value| base_value == value);
+                if !equal {
+                    partial.insert(key.clone(), value.clone());
+                }
+            }
+            delta_obj.insert("params".to_owned(), serde_json::Value::Object(partial));
+        }
+        delta_obj.insert("model".to_owned(), serde_json::json!(source.model));
+    }
+    delta
+}
+
+/// Overlays the delta onto the target's config: delta keys replace the
+/// target's values, everything else survives. `params` merges field-wise
+/// (a partial sampling object replaces none of the target's other knobs).
+/// Every parse site goes through `from_stored` - this one too, so the
+/// stored-config guards cannot drift.
+fn apply_delta(
+    target: &ChannelConfig,
+    delta: &serde_json::Value,
+    min_split_length: usize,
+) -> serde_json::Result<ChannelConfig> {
+    let mut merged = serde_json::to_value(target).expect("channel config serializes");
+    if let (Some(merged_obj), Some(delta_obj)) = (merged.as_object_mut(), delta.as_object()) {
+        for (key, value) in delta_obj {
+            if key == "params"
+                && let Some(target_params) =
+                    merged_obj.get_mut("params").and_then(|params| params.as_object_mut())
+                && let Some(delta_params) = value.as_object()
+            {
+                for (field, field_value) in delta_params {
+                    target_params.insert(field.clone(), field_value.clone());
+                }
+            } else {
+                merged_obj.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    ChannelConfig::from_stored(merged, min_split_length)
+}
+
+/// The keys a copy applies, command-facing and sorted: top-level delta
+/// fields map through [`display_key`], the `params` object flattens into
+/// its sampling-knob names.
+fn delta_display_names(delta: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if let Some(obj) = delta.as_object() {
+        for (key, value) in obj {
+            if key == "params"
+                && let Some(params_obj) = value.as_object()
+            {
+                names.extend(params_obj.keys().cloned());
+            } else {
+                names.push(display_key(key).to_owned());
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// serde field name -> the name `/llm_set` uses for the same knob.
+fn display_key(serde_name: &str) -> &str {
+    match serde_name {
+        "compaction_enabled" => "compaction",
+        "random_reply_chance_percent" => "random_reply_chance",
+        "random_cooldown_secs" => "random_cooldown",
+        other => other,
+    }
+}
+
+#[async_trait]
+impl CommandHandler for CopySettingsLlmHandler {
+    async fn invoke(
+        &self,
+        event: &RequestContext,
+        args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
+        // Same per-channel serialization as /llm_set: the copy rewrites the
+        // config, an in-flight engine run must not straddle it.
+        let channel = self.locks.lock_for(services.platform_info.slug(), &event.origin);
+        let _channel = channel.lock().await;
+        let Some(storage) = &services.guild_storage else {
+            services
+                .chat_output
+                .send(command_reply("This command only works inside a server."))
+                .await?;
+            return Ok(());
+        };
+        let Some(source_arg) = args.get("channel") else {
+            services
+                .chat_output
+                .send(command_reply("Usage: `/llm_copy_settings channel:<#channel>`."))
+                .await?;
+            return Ok(());
+        };
+        let Ok(source_id) = source_arg.parse::<u64>() else {
+            services
+                .chat_output
+                .send(command_reply(format!(
+                    "`{source_arg}` is not a channel - use the channel picker."
+                )))
+                .await?;
+            return Ok(());
+        };
+        if source_id == event.origin.channel_id.get() {
+            services
+                .chat_output
+                .send(command_reply("That is this channel - nothing to copy."))
+                .await?;
+            return Ok(());
+        }
+
+        // The target must be assigned: a copy never silently assigns.
+        let Some(target) =
+            load_assigned_config(event, services, self.engine.settings().min_split_length).await?
+        else {
+            return Ok(()); // DM / unassigned - already answered
+        };
+
+        // Guild-partitioned storage makes the source same-guild by
+        // construction: a foreign id has no document here.
+        let source = match storage.get(NAMESPACE, &channel_config_key(source_id)).await? {
+            Some(raw) => ChannelConfig::from_stored(raw, self.engine.settings().min_split_length)?,
+            None => {
+                services
+                    .chat_output
+                    .send(command_reply(format!(
+                        "<#{source_id}> has no LLM assignment in this server - nothing to copy."
+                    )))
+                    .await?;
+                return Ok(());
+            }
+        };
+        if let Err(reply) = validate_model_ref(self.engine.settings(), &source.model) {
+            services
+                .chat_output
+                .send(command_reply(format!(
+                    "The source channel's model cannot be copied: {reply} Re-assign it first."
+                )))
+                .await?;
+            return Ok(());
+        }
+
+        let delta = customization_delta(&source);
+        let updated = apply_delta(&target, &delta, self.engine.settings().min_split_length)?;
+        if updated == target {
+            services
+                .chat_output
+                .send(command_reply(format!(
+                    "This channel already matches <#{source_id}> - nothing to copy."
+                )))
+                .await?;
+            return Ok(());
+        }
+        save_config(event, services, updated).await?;
+
+        let names = delta_display_names(&delta).join(", ");
+        services
+            .chat_output
+            .send(command_reply(format!(
+                "Settings copied from <#{source_id}>: {names}. Settings the source leaves at \
+                 default keep this channel's values; history is untouched."
+            )))
+            .await?;
+        Ok(())
+    }
+}
+
 /// `/llm_get`: reads back a channel's current setting values - one key, or
 /// every key when the argument is omitted. Read-only twin of `/llm_set`:
 /// same moderator tier, same ephemeral visibility (config details are
@@ -2812,6 +3019,50 @@ mod tests {
         .expect("clear expected");
         assert_eq!(config.image_max_side, 512);
         assert_eq!(cleared, "`image_max_side` cleared (default 512 px applies).");
+    }
+
+    /// The preset copy travels as a delta against a fresh assignment: a
+    /// pristine source carries only its model, customized fields ride along
+    /// (sampling knobs flattened to the ones that differ), and the overlay
+    /// replaces exactly those keys while the target keeps the rest.
+    #[test]
+    fn copy_delta_captures_only_customizations_and_overlays_them() {
+        let fresh = ChannelConfig::assigned("local/gemma".to_owned());
+        let delta = customization_delta(&fresh);
+        let keys: Vec<&str> =
+            delta.as_object().expect("object expected").keys().map(String::as_str).collect();
+        assert_eq!(keys, ["model"], "a pristine source's only cargo is its model");
+
+        let mut source = ChannelConfig::assigned("local/gemma".to_owned());
+        source.capture = CaptureMode::AllMessages;
+        source.compaction_enabled = false;
+        source.params.temperature = Some(0.5);
+        source.random_reply_chance_percent = 7.0;
+        let delta = customization_delta(&source);
+        assert_eq!(
+            delta_display_names(&delta),
+            ["capture", "compaction", "model", "random_reply_chance", "temperature"]
+        );
+
+        let mut target = ChannelConfig::assigned("zai/glm-5.3-flash".to_owned());
+        target.split_length = Some(500);
+        target.params.top_k = Some(40.0);
+        let updated = apply_delta(&target, &delta, 100).expect("overlay expected to parse");
+        assert_eq!(updated.model, "local/gemma", "the assignment travels");
+        assert_eq!(updated.capture, CaptureMode::AllMessages);
+        assert!(!updated.compaction_enabled);
+        assert_eq!(updated.params.temperature, Some(0.5));
+        assert_eq!(updated.params.top_k, Some(40.0), "the target's own knob survives");
+        assert_eq!(
+            updated.split_length,
+            Some(500),
+            "fields the source leaves at default keep the target's value"
+        );
+        assert_eq!(updated.random_reply_chance_percent, 7.0);
+
+        assert_eq!(display_key("compaction_enabled"), "compaction");
+        assert_eq!(display_key("random_cooldown_secs"), "random_cooldown");
+        assert_eq!(display_key("capture"), "capture");
     }
 
     /// `off` is an explicit choice with its own acknowledgment and its own

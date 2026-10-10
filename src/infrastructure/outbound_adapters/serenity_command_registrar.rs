@@ -118,6 +118,7 @@ fn option_type(kind: ArgKind) -> u8 {
     match kind {
         ArgKind::String => 3,
         ArgKind::User => 6,
+        ArgKind::Channel => 7,
         ArgKind::Role => 8,
         ArgKind::Attachment => 11,
     }
@@ -167,6 +168,13 @@ mod tests {
                     kind: ArgKind::User,
                     choices: None,
                 },
+                ArgDescriptor {
+                    name: "channel".to_owned(),
+                    description: "Target channel".to_owned(),
+                    required: false,
+                    kind: ArgKind::Channel,
+                    choices: None,
+                },
             ],
             required_permission: Some(Permission { name: "manage_guild".to_owned() }),
             required_tier: Some(AccessTier::Admin),
@@ -179,7 +187,7 @@ mod tests {
         assert_eq!(field(&json, "default_member_permissions").as_str(), Some("32"));
         assert_eq!(field(&json, "dm_permission").as_bool(), Some(false));
         let options = field(&json, "options").as_array().expect("options expected");
-        assert_eq!(options.len(), 2);
+        assert_eq!(options.len(), 3);
         let action = options.first().expect("action option expected");
         assert_eq!(field(action, "type").as_u64(), Some(3));
         let choices = field(action, "choices").as_array().expect("choices expected");
@@ -187,6 +195,8 @@ mod tests {
         assert_eq!(field(deny, "value").as_str(), Some("deny"));
         let user = options.get(1).expect("user option expected");
         assert_eq!(field(user, "type").as_u64(), Some(6));
+        let channel = options.get(2).expect("channel option expected");
+        assert_eq!(field(channel, "type").as_u64(), Some(7));
     }
 
     #[test]

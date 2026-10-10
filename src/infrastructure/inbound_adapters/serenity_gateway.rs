@@ -711,6 +711,7 @@ mod tests {
             { "name": "text", "type": 3, "value": "privit" },
             { "name": "count", "type": 4, "value": 3 },
             { "name": "target", "type": 6, "value": "130000000000000000" },
+            { "name": "channel", "type": 7, "value": "130000000000000001" },
             { "name": "sub", "type": 1, "options": [
                 { "name": "inner", "type": 3, "value": "value" }
             ] }
@@ -725,6 +726,7 @@ mod tests {
                 ("text".to_owned(), "privit".to_owned()),
                 ("count".to_owned(), "3".to_owned()),
                 ("target".to_owned(), "130000000000000000".to_owned()),
+                ("channel".to_owned(), "130000000000000001".to_owned()),
                 ("inner".to_owned(), "value".to_owned()),
             ]
         );
