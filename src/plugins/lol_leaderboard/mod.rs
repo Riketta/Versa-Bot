@@ -3,14 +3,17 @@
 //! data source, dumped on demand by `/lol_leaderboard`.
 //!
 //! A `PluginPort`-only plugin (no middleware hook, no events): its primary
-//! driver is the command, and its only state is a process-lifetime cache
-//! of world data - there is deliberately no guild storage and no per-guild
-//! setup. With `background_refresh` (the default) a scheduler job keeps
-//! the cache warm off the user path and the command serves whatever is
-//! cached, age-honest; without it the command re-parses stale regions
-//! inline before replying. Own hexagon inside: the engine depends on
-//! the [`port::LeaderboardSourcePort`] boundary,
-//! [`DeepLolSource`] is the one adapter.
+//! driver is the command, and its only state is a cache of world data -
+//! there is deliberately no guild storage and no per-guild setup. The
+//! complete dump persists to the plugin-global storage after every refresh
+//! cycle and is restored on boot, so restarts keep serving the last parsed
+//! data (age-honest) instead of paying a full re-parse. With
+//! `background_refresh` (the default) a scheduler job keeps the cache warm
+//! off the user path and the command serves whatever is cached,
+//! age-honest; without it the command re-parses stale regions inline
+//! before replying. Own hexagon inside: the engine depends on the
+//! [`port::LeaderboardSourcePort`] boundary, [`DeepLolSource`] is the one
+//! adapter.
 //!
 //! Disabled by default: without a `[lol_leaderboard]` config section (or
 //! with no usable regions) the command still registers and explains

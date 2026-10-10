@@ -245,9 +245,10 @@ async fn main() -> ExitCode {
         DeepLolSource::new(leaderboard_proxy.as_deref(), leaderboard_interval)
             .expect("config [lol_leaderboard] section expected to be valid (proxy parseable)"),
     );
-    let leaderboard_engine = Arc::new(LeaderboardEngine::new(
+    let leaderboard_engine = Arc::new(LeaderboardEngine::with_storage(
         Arc::clone(&leaderboard_source),
         leaderboard_engine_settings(config.lol_leaderboard.as_ref(), leaderboard_source.as_ref()),
+        storage.plugin_scoped(platform_info.slug()),
     ));
     let lol_leaderboard = Arc::new(LeaderboardPlugin::new(
         Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,

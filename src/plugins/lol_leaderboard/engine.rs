@@ -1,9 +1,13 @@
-//! The leaderboard engine: a process-lifetime cache over the data source
-//! with singleflight refresh.
+//! The leaderboard engine: a cache over the data source with singleflight
+//! refresh, persisted across restarts.
 //!
 //! The data is world data, not guild data - there is deliberately no
-//! `GuildStorage` here. Nothing is persisted: after a restart the first
-//! command pays the full parse, which an 18h-class TTL makes irrelevant.
+//! `GuildStorage` here. The complete dump (all cached regions + the
+//! champion-name table + the completion timestamp) is written to the
+//! plugin-global storage after every refresh cycle, and the first snapshot
+//! or cycle after a restart restores it: a restart inside the TTL serves
+//! the old dump without touching the source, an older one serves it stale
+//! (age-honest) until a cycle refreshes it.
 //!
 //! Refresh has two drivers sharing one singleflight: the background job
 //! (default) re-parses TTL-expired regions off the user path, while the
@@ -19,10 +23,12 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::kernel::plugin_ports::Job;
+use crate::kernel::spi_ports::PluginStorage;
 
-use super::port::{LeaderboardSourcePort, RegionLeaderboard, SourceError};
+use super::port::{LeaderboardPlayer, LeaderboardSourcePort, RegionLeaderboard, SourceError};
 
 /// Player-count windows resolved from config: buckets clamped to the parse
 /// depth (sorted, deduplicated; empty -> a single full-depth row), the
@@ -152,7 +158,10 @@ pub struct Snapshot {
 
 struct CachedRegion {
     data: RegionLeaderboard,
-    fetched_at: Instant,
+    /// Unix seconds when this region's parse completed. Unix, not
+    /// `Instant`, so the age survives a restart (the persisted dump
+    /// restores it verbatim).
+    fetched_at: u64,
 }
 
 /// How long a failed champion-names fetch suppresses the inline (command
@@ -161,12 +170,53 @@ struct CachedRegion {
 /// and retries on its own tick cadence.
 const NAMES_FAILURE_RETRY: Duration = Duration::from_secs(30);
 
+/// Where the dump persists. Plugin-global (world data, platform-scoped by
+/// the storage port's own view), one document per deployment.
+const STORAGE_NAMESPACE: &str = "leaderboard";
+const STORAGE_KEY: &str = "snapshot";
+
+/// One region's entry in the persisted dump: the cached data plus the
+/// region's own parse-completion second - per-region, so a dump assembled
+/// from mixed cycles (restored regions + a fresh one) stays age-honest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedRegion {
+    region: String,
+    fetched_at: u64,
+    players: Vec<LeaderboardPlayer>,
+}
+
+/// The persisted shape of the complete dump, written after every refresh
+/// cycle. `saved_at` is the unix second the writing cycle completed - the
+/// timestamp that says how old the whole dump is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedDump {
+    saved_at: u64,
+    regions: Vec<PersistedRegion>,
+    champ_names: HashMap<String, String>,
+}
+
+/// Unix seconds right now - cache timestamps and staleness math. Unix, not
+/// `Instant`, because the timestamps must survive restarts.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+/// TTL semantics in unix-second granularity: a zero TTL is always stale
+/// (the documented always-reparse escape hatch); otherwise an age of at
+/// least the TTL is stale.
+fn is_stale(fetched_at: u64, ttl: Duration, now: u64) -> bool {
+    ttl.is_zero() || now.saturating_sub(fetched_at) >= ttl.as_secs()
+}
+
 #[derive(Default)]
 struct CacheState {
     regions: HashMap<String, CachedRegion>,
     champ_names: HashMap<String, String>,
-    names_fetched_at: Option<Instant>,
+    names_fetched_at: Option<u64>,
     /// Not-before instant of the next inline names retry after a failure.
+    /// Process-local backoff - deliberately not persisted.
     names_retry_not_before: Option<Instant>,
 }
 
@@ -177,6 +227,12 @@ pub struct LeaderboardEngine {
     /// Singleflight: concurrent invocations share one refresh cycle - the
     /// second caller waits, then finds everything fresh.
     refresh: tokio::sync::Mutex<()>,
+    /// Plugin-global document storage behind the dump persistence; `None`
+    /// keeps the engine memory-only.
+    storage: Option<Arc<dyn PluginStorage>>,
+    /// Restores the persisted dump exactly once, on the first snapshot or
+    /// background cycle - whichever comes first after boot.
+    restored: tokio::sync::OnceCell<()>,
 }
 
 impl LeaderboardEngine {
@@ -187,6 +243,30 @@ impl LeaderboardEngine {
             settings: Mutex::new(settings),
             cache: Mutex::new(CacheState::default()),
             refresh: tokio::sync::Mutex::new(()),
+            storage: None,
+            restored: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// [`Self::new`] plus dump persistence: every refresh cycle writes the
+    /// complete dump (all cached regions + champion names, each region
+    /// stamped with its own parse-completion second), and the first
+    /// snapshot or cycle after a restart restores it - a restart inside
+    /// the TTL serves the old dump with zero source calls, an older one
+    /// serves it stale (age-honest) until a cycle refreshes it.
+    #[must_use]
+    pub fn with_storage(
+        source: Arc<dyn LeaderboardSourcePort>,
+        settings: EngineSettings,
+        storage: Arc<dyn PluginStorage>,
+    ) -> Self {
+        Self {
+            source,
+            settings: Mutex::new(settings),
+            cache: Mutex::new(CacheState::default()),
+            refresh: tokio::sync::Mutex::new(()),
+            storage: Some(storage),
+            restored: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -195,6 +275,101 @@ impl LeaderboardEngine {
     #[must_use]
     pub fn is_configured(&self) -> bool {
         !self.settings.lock().regions.is_empty()
+    }
+
+    /// Restores the persisted dump exactly once per process, before the
+    /// first staleness decision - a restart inside the TTL must serve the
+    /// dump without touching the source. Only fills entries the runtime
+    /// cache does not have yet: it never overwrites fresher data a cycle
+    /// already fetched. A broken storage read degrades to an empty cache
+    /// and retries on the next use (the cell init error is not stored); a
+    /// document that does not parse is skipped permanently - it cannot get
+    /// better on its own.
+    async fn ensure_restored(&self) {
+        let Some(storage) = self.storage.as_ref() else {
+            return;
+        };
+        let _ = self
+            .restored
+            .get_or_try_init(|| async {
+                match storage.get(STORAGE_NAMESPACE, STORAGE_KEY).await {
+                    Ok(Some(value)) => match serde_json::from_value::<PersistedDump>(value) {
+                        Ok(dump) => {
+                            let mut state = self.cache.lock();
+                            for entry in dump.regions {
+                                state.regions.entry(entry.region.clone()).or_insert(CachedRegion {
+                                    data: RegionLeaderboard {
+                                        region: entry.region,
+                                        players: entry.players,
+                                    },
+                                    fetched_at: entry.fetched_at,
+                                });
+                            }
+                            if state.names_fetched_at.is_none() {
+                                state.champ_names = dump.champ_names;
+                                state.names_fetched_at = Some(dump.saved_at);
+                            }
+                            tracing::debug!(
+                                saved_at = dump.saved_at,
+                                "leaderboard dump restored from storage"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "leaderboard persisted dump not understood - starting empty"
+                            );
+                        }
+                    },
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::debug!(
+                            error = %err,
+                            "leaderboard dump restore failed - retrying on next use"
+                        );
+                        return Err(());
+                    }
+                }
+                Ok(())
+            })
+            .await;
+    }
+
+    /// Writes the complete dump with per-region parse timestamps plus the
+    /// writing cycle's completion second. Best-effort: a failed write
+    /// keeps the in-memory cache serving; it only reappears as a re-parse
+    /// after a restart, never as a failed reply.
+    async fn persist(&self) {
+        let Some(storage) = self.storage.as_ref() else {
+            return;
+        };
+        let dump = {
+            let state = self.cache.lock();
+            PersistedDump {
+                saved_at: unix_now(),
+                regions: state
+                    .regions
+                    .iter()
+                    .map(|(region, entry)| PersistedRegion {
+                        region: region.clone(),
+                        fetched_at: entry.fetched_at,
+                        players: entry.data.players.clone(),
+                    })
+                    .collect(),
+                champ_names: state.champ_names.clone(),
+            }
+        };
+        match serde_json::to_value(&dump) {
+            Ok(value) => {
+                if let Err(err) = storage.set(STORAGE_NAMESPACE, STORAGE_KEY, value).await {
+                    tracing::warn!(
+                        error = %err,
+                        "leaderboard dump persistence failed - a restart will re-parse"
+                    );
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "leaderboard dump serialization failed"),
+        }
     }
 
     /// The current settings (boot-time scheduling reads the TTL and mode
@@ -256,6 +431,7 @@ impl LeaderboardEngine {
     /// this refresh cycle with an empty cache) - the source error of the
     /// last failed region is returned.
     pub async fn snapshot(&self) -> Result<Snapshot, SourceError> {
+        self.ensure_restored().await;
         let settings = self.settings.lock().clone();
         let scope = if settings.background_refresh {
             RefreshScope::MissingOnly
@@ -283,19 +459,23 @@ impl LeaderboardEngine {
             }
         }
 
-        // Short lock: build the snapshot from the settled cache.
-        let built_at = Instant::now();
-        let (regions, ages, champ_names) = {
+        // Short lock: build the snapshot from the settled cache. The age
+        // is the oldest served region's data - unix-second granularity,
+        // which is what makes a restored dump's age honest.
+        let now = unix_now();
+        let (regions, oldest, champ_names) = {
             let state = self.cache.lock();
             let mut regions = Vec::new();
-            let mut ages = Vec::new();
+            let mut oldest: Option<u64> = None;
             for region in &settings.regions {
                 if let Some(entry) = state.regions.get(region) {
                     regions.push(entry.data.clone());
-                    ages.push(built_at.duration_since(entry.fetched_at));
+                    oldest = Some(
+                        oldest.map_or(entry.fetched_at, |seen: u64| seen.min(entry.fetched_at)),
+                    );
                 }
             }
-            (regions, ages, state.champ_names.clone())
+            (regions, oldest, state.champ_names.clone())
         };
 
         if regions.is_empty() {
@@ -303,8 +483,9 @@ impl LeaderboardEngine {
                 .unwrap_or(SourceError::Request("no leaderboard data available".to_owned())));
         }
 
-        let age = ages.iter().copied().max().unwrap_or_default();
-        let stale = !failures.is_empty() || age > settings.cache_ttl;
+        let oldest = oldest.unwrap_or_else(unix_now);
+        let age = Duration::from_secs(now.saturating_sub(oldest));
+        let stale = !failures.is_empty() || is_stale(oldest, settings.cache_ttl, now);
         Ok(Snapshot {
             requested_players: settings.regions.len() * settings.parse_depth as usize,
             regions,
@@ -320,6 +501,7 @@ impl LeaderboardEngine {
     /// region past the TTL, off the user path, under the singleflight,
     /// WITHOUT the inline budget. A cheap no-op when everything is fresh.
     pub async fn refresh_stale(&self) {
+        self.ensure_restored().await;
         let settings = self.settings.lock().clone();
         let pending = self.pending_refresh(&settings, RefreshScope::StaleOrMissing);
         if pending.regions.is_empty() && !pending.names {
@@ -348,7 +530,7 @@ impl LeaderboardEngine {
     /// A recently failed names fetch holds the inline (MissingOnly) retry
     /// back; the job and on-demand commands keep retrying every cycle.
     fn pending_refresh(&self, settings: &EngineSettings, scope: RefreshScope) -> PendingRefresh {
-        let now = Instant::now();
+        let now = unix_now();
         let state = self.cache.lock();
         let regions = settings
             .regions
@@ -356,7 +538,7 @@ impl LeaderboardEngine {
             .filter(|region| match state.regions.get(*region) {
                 Some(entry) => {
                     scope == RefreshScope::StaleOrMissing
-                        && now.duration_since(entry.fetched_at) > settings.cache_ttl
+                        && is_stale(entry.fetched_at, settings.cache_ttl, now)
                 }
                 None => true,
             })
@@ -364,13 +546,13 @@ impl LeaderboardEngine {
             .collect();
         let names = match state.names_fetched_at {
             Some(at) => {
-                scope == RefreshScope::StaleOrMissing && now.duration_since(at) > settings.cache_ttl
+                scope == RefreshScope::StaleOrMissing && is_stale(at, settings.cache_ttl, now)
             }
             None => match scope {
                 RefreshScope::StaleOrMissing => true,
-                RefreshScope::MissingOnly => {
-                    state.names_retry_not_before.is_none_or(|not_before| now >= not_before)
-                }
+                RefreshScope::MissingOnly => state
+                    .names_retry_not_before
+                    .is_none_or(|not_before| Instant::now() >= not_before),
             },
         };
         PendingRefresh { regions, names }
@@ -416,7 +598,7 @@ impl LeaderboardEngine {
                 Ok(names) => {
                     let mut state = self.cache.lock();
                     state.champ_names = names;
-                    state.names_fetched_at = Some(Instant::now());
+                    state.names_fetched_at = Some(unix_now());
                     state.names_retry_not_before = None;
                 }
                 Err(err) => {
@@ -459,7 +641,7 @@ impl LeaderboardEngine {
                     let mut state = self.cache.lock();
                     state
                         .regions
-                        .insert(region.clone(), CachedRegion { data, fetched_at: Instant::now() });
+                        .insert(region.clone(), CachedRegion { data, fetched_at: unix_now() });
                 }
                 Err(err) => {
                     tracing::warn!(region = %region, error = %err, "leaderboard region refresh failed");
@@ -468,6 +650,10 @@ impl LeaderboardEngine {
                 }
             }
         }
+
+        // The cycle changed (or attempted to change) the dump: persist it
+        // so a restart keeps serving whatever this cycle left behind.
+        self.persist().await;
 
         (failures, last_error)
     }
@@ -647,7 +833,11 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::FakeSource;
     use super::*;
+    use crate::kernel::spi_ports::PluginStoragePort;
     use crate::plugins::lol_leaderboard::port::Role;
+    use crate::test_support::{
+        FailingPluginStorage, InMemoryPluginStorage, TEST_PLATFORM_SLUG, test_plugin_storage,
+    };
 
     fn engine_with(
         source: &Arc<FakeSource>,
@@ -703,16 +893,18 @@ mod tests {
     }
 
     /// A stale region must refetch: without this, the dump would serve
-    /// frozen data forever after one failed refresh cycle.
+    /// frozen data forever after one failed refresh cycle. Timestamps are
+    /// unix seconds (they must survive restarts), so the TTL granularity
+    /// is one second - the test uses a 2s TTL and crosses it for real.
     #[tokio::test]
     async fn ttl_expiry_triggers_a_refetch() {
         let source = FakeSource::ungated();
-        let engine = engine_with(&source, &["kr"], Duration::from_millis(60));
+        let engine = engine_with(&source, &["kr"], Duration::from_secs(2));
         let _ = engine.snapshot().await.expect("first snapshot");
         let _ = engine.snapshot().await.expect("fresh snapshot");
         assert_eq!(source.leaderboard_calls(), 1, "fresh cache answers without the source");
 
-        tokio::time::sleep(Duration::from_millis(90)).await;
+        tokio::time::sleep(Duration::from_millis(2100)).await;
         let _ = engine.snapshot().await.expect("stale snapshot");
         assert_eq!(source.leaderboard_calls(), 2, "TTL expiry must trigger a refetch");
     }
@@ -1171,5 +1363,177 @@ mod tests {
         assert_eq!(kr.players.first().expect("2 players").champ_id.as_deref(), Some("1"));
         assert_eq!(kr.players.get(1).expect("2 players").champ_id, None);
         assert_eq!(snapshot.champ_names.get("1").map(String::as_str), Some("Annie"));
+    }
+
+    /// Engine backed by real (in-memory) plugin storage - the shape the
+    /// persistence tests need.
+    fn engine_with_storage(
+        source: &Arc<FakeSource>,
+        regions: &[&str],
+        ttl: Duration,
+        background: bool,
+        storage: Arc<dyn PluginStorage>,
+    ) -> Arc<LeaderboardEngine> {
+        let keys: Vec<String> = regions.iter().map(|key| (*key).to_owned()).collect();
+        let settings = EngineSettings::new(
+            source.as_ref(),
+            &keys,
+            1000,
+            ttl,
+            Duration::ZERO,
+            background,
+            Duration::ZERO,
+            ResolvedView::resolve(1000, &[300, 1000], 1000, 5),
+        );
+        Arc::new(LeaderboardEngine::with_storage(
+            Arc::clone(source) as Arc<dyn LeaderboardSourcePort>,
+            settings,
+            storage,
+        ))
+    }
+
+    /// The dump persists across a restart: a fresh engine over the same
+    /// storage serves the restored regions with zero source calls while
+    /// they are inside the TTL.
+    #[tokio::test]
+    async fn dump_persists_and_restores_across_a_restart() {
+        let storage = test_plugin_storage();
+        let first_source = FakeSource::ungated();
+        let first = engine_with_storage(
+            &first_source,
+            &["kr"],
+            Duration::from_secs(3600),
+            true,
+            Arc::clone(&storage),
+        );
+        let first_snapshot = first.snapshot().await.expect("first life parses");
+        assert_eq!(first_source.leaderboard_calls(), 1);
+        assert_eq!(first_snapshot.regions.len(), 1);
+
+        // The persisted document is there, stamped with a completion time.
+        let saved = storage
+            .get(STORAGE_NAMESPACE, STORAGE_KEY)
+            .await
+            .expect("read")
+            .expect("dump persisted");
+        assert!(saved.get("saved_at").and_then(|value| value.as_u64()).is_some_and(|at| at > 0));
+
+        // Second life over the same storage: restored, not re-parsed.
+        let second_source = FakeSource::ungated();
+        let second =
+            engine_with_storage(&second_source, &["kr"], Duration::from_secs(3600), true, storage);
+        let snapshot = second.snapshot().await.expect("restored dump serves");
+
+        assert_eq!(second_source.leaderboard_calls(), 0, "inside the TTL the dump serves as-is");
+        assert_eq!(second_source.name_calls(), 0);
+        assert_eq!(snapshot.regions, first_snapshot.regions);
+        assert!(snapshot.age < Duration::from_secs(5), "a fresh dump's age is ~zero");
+        assert!(!snapshot.stale);
+    }
+
+    /// A restored dump keeps its true age: the persisted parse timestamps
+    /// are unix seconds, so an hours-old dump says so (and shows stale
+    /// past the TTL) instead of looking freshly parsed.
+    #[tokio::test]
+    async fn restored_dump_keeps_its_true_age() {
+        let backend = InMemoryPluginStorage::new();
+        let seeded_at = unix_now() - 7200;
+        backend.seed(
+            TEST_PLATFORM_SLUG,
+            STORAGE_NAMESPACE,
+            STORAGE_KEY,
+            serde_json::json!({
+                "saved_at": seeded_at,
+                "regions": [{
+                    "region": "kr",
+                    "fetched_at": seeded_at,
+                    "players": [
+                        {"position": 1, "role": "top", "champ_id": "1"},
+                        {"position": 2, "role": "mid", "champ_id": null}
+                    ]
+                }],
+                "champ_names": {"1": "Annie"}
+            }),
+        );
+        let source = FakeSource::ungated();
+        let engine = engine_with_storage(
+            &source,
+            &["kr"],
+            Duration::from_secs(3600),
+            true,
+            backend.plugin_scoped(TEST_PLATFORM_SLUG),
+        );
+
+        let snapshot = engine.snapshot().await.expect("restored dump serves");
+
+        assert_eq!(source.leaderboard_calls(), 0, "the dump serves without the source");
+        assert_eq!(snapshot.regions.len(), 1);
+        assert_eq!(snapshot.regions.first().expect("region").players.len(), 2);
+        assert_eq!(snapshot.champ_names.get("1").map(String::as_str), Some("Annie"));
+        // 2h old, give or take the second the test itself consumed.
+        assert!(snapshot.age >= Duration::from_secs(7200));
+        assert!(snapshot.age < Duration::from_secs(7300));
+        assert!(snapshot.stale, "2h is past the 1h TTL - the age must show");
+    }
+
+    /// A persisted document that does not parse is skipped permanently
+    /// (it cannot heal on its own) - the engine starts empty and behaves
+    /// exactly like a first boot.
+    #[tokio::test]
+    async fn corrupt_dump_starts_empty_and_still_answers() {
+        let backend = InMemoryPluginStorage::new();
+        backend.seed(TEST_PLATFORM_SLUG, STORAGE_NAMESPACE, STORAGE_KEY, serde_json::json!("junk"));
+        let source = FakeSource::ungated();
+        let engine = engine_with_storage(
+            &source,
+            &["kr"],
+            Duration::from_secs(3600),
+            true,
+            backend.plugin_scoped(TEST_PLATFORM_SLUG),
+        );
+
+        let snapshot = engine.snapshot().await.expect("a corrupt dump must not fail the command");
+
+        assert_eq!(source.leaderboard_calls(), 1, "behaves like a first boot");
+        assert_eq!(snapshot.regions.len(), 1);
+    }
+
+    /// Persistence is best-effort: a failing storage never fails the
+    /// reply - the refresh serves its parsed data and only the write is
+    /// lost. Once the storage heals, the next cycle's write lands and a
+    /// restarted engine restores the dump.
+    #[tokio::test]
+    async fn storage_write_failure_does_not_break_the_cycle() {
+        let storage = FailingPluginStorage::new();
+        let source = FakeSource::ungated();
+        // A zero TTL makes every snapshot a full refresh cycle, so each
+        // one attempts a dump write.
+        let engine = engine_with_storage(
+            &source,
+            &["kr"],
+            Duration::ZERO,
+            false,
+            storage.plugin_scoped(TEST_PLATFORM_SLUG),
+        );
+
+        let snapshot =
+            engine.snapshot().await.expect("the reply must not depend on the dump write");
+        assert_eq!(snapshot.regions.len(), 1);
+        assert_eq!(source.leaderboard_calls(), 1);
+
+        // Storage heals: the next cycle's write lands, and a restarted
+        // engine restores the dump without touching the source.
+        storage.set_failing(false);
+        let _ = engine.snapshot().await.expect("second cycle");
+        let restarted = engine_with_storage(
+            &source,
+            &["kr"],
+            Duration::from_secs(3600),
+            true,
+            storage.plugin_scoped(TEST_PLATFORM_SLUG),
+        );
+        let restored = restarted.snapshot().await.expect("restored dump serves");
+        assert_eq!(restored.regions.len(), 1);
+        assert_eq!(source.leaderboard_calls(), 2, "no re-parse for the restored engine");
     }
 }

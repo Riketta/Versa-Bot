@@ -8,11 +8,13 @@ use std::collections::HashMap;
 use std::fmt;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 /// The lane a leaderboard entry is associated with. Provider role strings
 /// are mapped onto this enum at the source boundary - the stats and format
 /// layers never see raw strings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     Top,
     Jungle,
@@ -62,7 +64,7 @@ impl fmt::Display for Role {
 /// One leaderboard entry, reduced to what the statistics need. `position`
 /// is the dense 1-based rank within the region (renumbered after sorting -
 /// provider ranks can be sparse when players are hidden).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaderboardPlayer {
     pub position: u32,
     /// The player's primary role; `None` when the source does not tell.
@@ -73,7 +75,7 @@ pub struct LeaderboardPlayer {
 }
 
 /// A region's parsed leaderboard slice, already sorted best-first.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegionLeaderboard {
     /// Neutral region key as configured (e.g. `kr`).
     pub region: String,

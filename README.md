@@ -559,8 +559,14 @@ per-guild setup**: the command answers wherever it is invoked.
 
 The bot parses at most `parse_depth` players per configured region,
 sequentially and rate-limited; the champion tables pool each region's
-highest-ranked `champ_pool_depth` players. Results are cached
-process-lifetime for `cache_ttl`.
+highest-ranked `champ_pool_depth` players. Results are cached for
+`cache_ttl` - and the complete dump persists to the plugin's storage
+after every refresh cycle, so a restart keeps serving the last parsed
+data (the `data age` line tells you how old it is) instead of paying a
+full re-parse: a restart inside the TTL answers without touching the
+source at all, an older dump serves stale until a refresh cycle lands.
+Storage writes are best-effort - a failed write only means the next
+restart re-parses, never a failed command.
 
 **Background refresh (default on):** a scheduler job re-parses stale
 regions off the user path - first run at boot (the warm-up starts before
