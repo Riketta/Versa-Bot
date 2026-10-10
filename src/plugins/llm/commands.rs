@@ -22,7 +22,8 @@ use super::model::{
     CaptureMode, ChannelConfig, ConversationState, EmojiInject, EmojiWhitelistEntry,
     GUILD_EMOJI_WHITELIST_KEY, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats,
     channel_config_key, channel_emoji_whitelist_key, channel_state_key, channel_state_undo_key,
-    channel_stats_key, default_random_cooldown, parse_whitelist, records_namespace, unix_now,
+    channel_stats_key, default_image_max_side, default_random_cooldown, parse_whitelist,
+    records_namespace, unix_now,
 };
 use super::prompts;
 use super::providers::{LlmSettings, ModelSettings};
@@ -50,6 +51,7 @@ pub(super) const SET_KEYS: &[&str] = &[
     "compaction_model",
     "images",
     "image_model",
+    "image_max_side",
     "react",
     "react_emoji_inject",
     "streaming",
@@ -121,9 +123,10 @@ fn apply_set(
     value: &str,
     message_limit: Option<usize>,
     min_split_length: usize,
+    image_max_side_cap: u32,
 ) -> Result<String, String> {
     let cleared = matches!(value, "clear" | "none" | "default");
-    if let Some(result) = apply_numeric(config, key, value, cleared) {
+    if let Some(result) = apply_numeric(config, key, value, cleared, image_max_side_cap) {
         return result;
     }
     if let Some(result) =
@@ -246,6 +249,7 @@ fn apply_numeric(
     key: &str,
     value: &str,
     cleared: bool,
+    image_max_side_cap: u32,
 ) -> Option<Result<String, String>> {
     match key {
         "temperature" | "top_p" | "top_k" | "min_p" | "frequency_penalty" | "presence_penalty" => {
@@ -360,6 +364,32 @@ fn apply_numeric(
                 }
                 Err(_) => {
                     Some(Err(format!("`{key}` expects a whole number of seconds, got `{value}`.")))
+                }
+            }
+        }
+        "image_max_side" => {
+            if cleared {
+                let default = default_image_max_side();
+                config.image_max_side = default;
+                return Some(Ok(format!("`{key}` cleared (default {default} px applies).")));
+            }
+            match value.parse::<u32>() {
+                Ok(0) => Some(Err("`image_max_side` must be at least 1.".to_owned())),
+                // Clamp + notify rather than reject: the capture-time path
+                // applies the same min() anyway, so the stored value is
+                // honest only if it names the applied size.
+                Ok(parsed) => {
+                    let applied = parsed.min(image_max_side_cap);
+                    config.image_max_side = applied;
+                    let reply = if applied == parsed {
+                        format!("`{key}` set to {applied} px.")
+                    } else {
+                        format!("`{key}` set to {applied} px (clamped to the operator cap).")
+                    };
+                    Some(Ok(reply))
+                }
+                Err(_) => {
+                    Some(Err(format!("`{key}` expects a whole number of pixels, got `{value}`.")))
                 }
             }
         }
@@ -1005,7 +1035,10 @@ fn images_label(config: &ChannelConfig, settings: &LlmSettings) -> String {
         .clone()
         .or_else(|| settings.image_prompt.clone())
         .unwrap_or_else(|| DEFAULT_IMAGE_PROMPT.to_owned());
-    format!("on ({model}, {}-char prompt)", prompt.chars().count())
+    // The applied ceiling, not the raw stored value - the label answers
+    // "what happens to the next image".
+    let max_side = config.image_max_side.min(settings.image_max_side_cap);
+    format!("on ({model}, {max_side} px, {}-char prompt)", prompt.chars().count())
 }
 
 /// `/llm_status` label of the reaction tool state: off, or on with the
@@ -1783,6 +1816,7 @@ impl CommandHandler for SetLlmHandler {
             value,
             services.platform_info.message_limit(),
             self.engine.settings().min_split_length,
+            self.engine.settings().image_max_side_cap,
         ) {
             Ok(message) => {
                 save_config(event, services, config).await?;
@@ -2036,6 +2070,7 @@ fn current_value(config: &ChannelConfig, key: &str, settings: &LlmSettings) -> O
                 |model| format!("plugin `image_model` (`{model}`)"),
             )
         })),
+        "image_max_side" => Some(format!("{} px", config.image_max_side)),
         "random_reply_chance" => Some(format!("{:.1}%", config.random_reply_chance_percent)),
         "random_cooldown" => Some(format!("{} seconds", config.random_cooldown_secs)),
         "random_react_chance" => Some(format!("{:.1}%", config.random_react_chance_percent)),
@@ -2418,6 +2453,10 @@ mod tests {
     /// the wired adapter.
     const PLATFORM_LIMIT: Option<usize> = Some(2000);
 
+    /// The image-size ceiling the tests assume, as an untouched `[llm]`
+    /// config yields.
+    const IMAGE_CAP: u32 = 768;
+
     /// The usage reply never overflows the platform message limit: entries
     /// past it are dropped (with a count), while the title and the
     /// all-time/today lines always stay.
@@ -2630,43 +2669,54 @@ mod tests {
     fn float_params_set_and_clear() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        let message = apply_set(&mut config, "temperature", "0.7", PLATFORM_LIMIT, CHUNK_FLOOR)
-            .expect("set expected");
+        let message =
+            apply_set(&mut config, "temperature", "0.7", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+                .expect("set expected");
         assert!(message.contains("0.7"));
         assert_eq!(config.params.temperature, Some(0.7));
 
-        apply_set(&mut config, "top_k", "40", PLATFORM_LIMIT, CHUNK_FLOOR).expect("set expected");
+        apply_set(&mut config, "top_k", "40", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+            .expect("set expected");
         assert_eq!(config.params.top_k, Some(40.0));
 
-        apply_set(&mut config, "temperature", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
+        apply_set(&mut config, "temperature", "clear", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
             .expect("clear expected");
         assert_eq!(config.params.temperature, None);
 
-        assert!(apply_set(&mut config, "top_p", "abc", PLATFORM_LIMIT, CHUNK_FLOOR).is_err());
+        assert!(
+            apply_set(&mut config, "top_p", "abc", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP).is_err()
+        );
     }
 
     #[test]
     fn bool_keys_accept_on_off_words() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "streaming", "on", PLATFORM_LIMIT, CHUNK_FLOOR)
+        apply_set(&mut config, "streaming", "on", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
             .expect("on expected");
         assert!(config.streaming);
-        apply_set(&mut config, "streaming", "off", PLATFORM_LIMIT, CHUNK_FLOOR)
+        apply_set(&mut config, "streaming", "off", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
             .expect("off expected");
         assert!(!config.streaming);
-        apply_set(&mut config, "compaction", "false", PLATFORM_LIMIT, CHUNK_FLOOR)
+        apply_set(&mut config, "compaction", "false", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
             .expect("false expected");
         assert!(!config.compaction_enabled);
-        apply_set(&mut config, "images", "on", PLATFORM_LIMIT, CHUNK_FLOOR).expect("on expected");
+        apply_set(&mut config, "images", "on", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+            .expect("on expected");
         assert!(config.images);
-        apply_set(&mut config, "images", "off", PLATFORM_LIMIT, CHUNK_FLOOR).expect("off expected");
+        apply_set(&mut config, "images", "off", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+            .expect("off expected");
         assert!(!config.images);
-        apply_set(&mut config, "react", "on", PLATFORM_LIMIT, CHUNK_FLOOR).expect("on expected");
+        apply_set(&mut config, "react", "on", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+            .expect("on expected");
         assert!(config.react);
-        apply_set(&mut config, "react", "off", PLATFORM_LIMIT, CHUNK_FLOOR).expect("off expected");
+        apply_set(&mut config, "react", "off", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+            .expect("off expected");
         assert!(!config.react);
-        assert!(apply_set(&mut config, "streaming", "maybe", PLATFORM_LIMIT, CHUNK_FLOOR).is_err());
+        assert!(
+            apply_set(&mut config, "streaming", "maybe", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+                .is_err()
+        );
     }
 
     /// Image settings follow the same set/clear grammar as their compaction
@@ -2677,11 +2727,18 @@ mod tests {
     fn image_keys_set_and_clear() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "image_model", "local/vision", PLATFORM_LIMIT, CHUNK_FLOOR)
-            .expect("set expected");
+        apply_set(
+            &mut config,
+            "image_model",
+            "local/vision",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+            IMAGE_CAP,
+        )
+        .expect("set expected");
         assert_eq!(config.image_model.as_deref(), Some("local/vision"));
 
-        apply_set(&mut config, "image_model", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
+        apply_set(&mut config, "image_model", "clear", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
             .expect("clear expected");
         assert_eq!(config.image_model, None);
 
@@ -2691,14 +2748,70 @@ mod tests {
                 "image_prompt",
                 "Describe in Russian.",
                 PLATFORM_LIMIT,
-                CHUNK_FLOOR
+                CHUNK_FLOOR,
+                IMAGE_CAP
             )
             .is_err()
         );
         assert!(
-            apply_set(&mut config, "compaction_prompt", "Summarize.", PLATFORM_LIMIT, CHUNK_FLOOR)
+            apply_set(
+                &mut config,
+                "compaction_prompt",
+                "Summarize.",
+                PLATFORM_LIMIT,
+                CHUNK_FLOOR,
+                IMAGE_CAP
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn image_max_side_clamps_to_the_operator_cap_and_clears_to_default() {
+        let mut config = ChannelConfig::assigned("m".to_owned());
+        assert_eq!(config.image_max_side, 512);
+
+        let plain =
+            apply_set(&mut config, "image_max_side", "640", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+                .expect("set expected");
+        assert_eq!(config.image_max_side, 640);
+        assert_eq!(plain, "`image_max_side` set to 640 px.");
+
+        // Above the cap the same value is stored that capture time will
+        // apply - the reply names the clamp instead of leaving a surprise.
+        let clamped = apply_set(
+            &mut config,
+            "image_max_side",
+            "4096",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+            IMAGE_CAP,
+        )
+        .expect("clamped set expected");
+        assert_eq!(config.image_max_side, IMAGE_CAP);
+        assert_eq!(clamped, "`image_max_side` set to 768 px (clamped to the operator cap).");
+
+        assert!(
+            apply_set(&mut config, "image_max_side", "0", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
                 .is_err()
         );
+        assert!(
+            apply_set(&mut config, "image_max_side", "big", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+                .is_err()
+        );
+        assert_eq!(config.image_max_side, IMAGE_CAP, "failed sets leave the value alone");
+
+        let cleared = apply_set(
+            &mut config,
+            "image_max_side",
+            "clear",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+            IMAGE_CAP,
+        )
+        .expect("clear expected");
+        assert_eq!(config.image_max_side, 512);
+        assert_eq!(cleared, "`image_max_side` cleared (default 512 px applies).");
     }
 
     /// `off` is an explicit choice with its own acknowledgment and its own
@@ -2709,20 +2822,40 @@ mod tests {
     fn reasoning_effort_distinguishes_off_from_reset() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        let set = apply_set(&mut config, "reasoning_effort", "low", PLATFORM_LIMIT, CHUNK_FLOOR)
-            .expect("set expected");
+        let set = apply_set(
+            &mut config,
+            "reasoning_effort",
+            "low",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+            IMAGE_CAP,
+        )
+        .expect("set expected");
         assert!(set.contains("set to `low`"));
         assert_eq!(config.params.reasoning_effort.as_deref(), Some("low"));
 
-        let off = apply_set(&mut config, "reasoning_effort", "off", PLATFORM_LIMIT, CHUNK_FLOOR)
-            .expect("off expected");
+        let off = apply_set(
+            &mut config,
+            "reasoning_effort",
+            "off",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+            IMAGE_CAP,
+        )
+        .expect("off expected");
         assert!(off.contains("`reasoning_effort` off"));
         assert!(off.contains("explicit disable"));
         assert_eq!(config.params.reasoning_effort.as_deref(), Some("off"));
 
-        let cleared =
-            apply_set(&mut config, "reasoning_effort", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
-                .expect("clear expected");
+        let cleared = apply_set(
+            &mut config,
+            "reasoning_effort",
+            "clear",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+            IMAGE_CAP,
+        )
+        .expect("clear expected");
         assert!(cleared.contains("cleared"));
         assert_eq!(config.params.reasoning_effort, None);
     }
@@ -2731,41 +2864,85 @@ mod tests {
     fn numeric_keys_validate_ranges() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "context_messages", "0", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
-        apply_set(&mut config, "context_messages", "50", PLATFORM_LIMIT, CHUNK_FLOOR)
+        apply_set(&mut config, "context_messages", "0", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+            .unwrap_err();
+        apply_set(&mut config, "context_messages", "50", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
             .expect("depth expected");
         assert_eq!(config.context_messages, 50);
 
-        apply_set(&mut config, "random_reply_chance", "250", PLATFORM_LIMIT, CHUNK_FLOOR)
-            .expect("clamp expected");
+        apply_set(
+            &mut config,
+            "random_reply_chance",
+            "250",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+            IMAGE_CAP,
+        )
+        .expect("clamp expected");
         assert!((config.random_reply_chance_percent - 100.0).abs() < f64::EPSILON);
-        apply_set(&mut config, "random_reply_chance", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
-            .expect("clear expected");
+        apply_set(
+            &mut config,
+            "random_reply_chance",
+            "clear",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+            IMAGE_CAP,
+        )
+        .expect("clear expected");
         assert!((config.random_reply_chance_percent).abs() < f64::EPSILON);
 
-        apply_set(&mut config, "random_react_chance", "250", PLATFORM_LIMIT, CHUNK_FLOOR)
-            .expect("clamp expected");
+        apply_set(
+            &mut config,
+            "random_react_chance",
+            "250",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+            IMAGE_CAP,
+        )
+        .expect("clamp expected");
         assert!((config.random_react_chance_percent - 100.0).abs() < f64::EPSILON);
-        apply_set(&mut config, "random_react_chance", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
-            .expect("clear expected");
+        apply_set(
+            &mut config,
+            "random_react_chance",
+            "clear",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+            IMAGE_CAP,
+        )
+        .expect("clear expected");
         assert!((config.random_react_chance_percent).abs() < f64::EPSILON);
 
-        apply_set(&mut config, "random_cooldown", "30", PLATFORM_LIMIT, CHUNK_FLOOR)
+        apply_set(&mut config, "random_cooldown", "30", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
             .expect("cooldown expected");
         assert_eq!(config.random_cooldown_secs, 30);
-        apply_set(&mut config, "random_cooldown", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
+        apply_set(&mut config, "random_cooldown", "clear", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
             .expect("cooldown clear expected");
         assert_eq!(config.random_cooldown_secs, 5);
-        apply_set(&mut config, "random_cooldown", "not-a-number", PLATFORM_LIMIT, CHUNK_FLOOR)
-            .unwrap_err();
+        apply_set(
+            &mut config,
+            "random_cooldown",
+            "not-a-number",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+            IMAGE_CAP,
+        )
+        .unwrap_err();
 
-        apply_set(&mut config, "max_tokens", "not-a-number", PLATFORM_LIMIT, CHUNK_FLOOR)
-            .unwrap_err();
+        apply_set(
+            &mut config,
+            "max_tokens",
+            "not-a-number",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+            IMAGE_CAP,
+        )
+        .unwrap_err();
 
         // A zero budget would keep only the newest turn - rejected like
         // `context_messages` 0, not accepted as "no budget".
-        apply_set(&mut config, "context_tokens", "0", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
-        apply_set(&mut config, "context_tokens", "4096", PLATFORM_LIMIT, CHUNK_FLOOR)
+        apply_set(&mut config, "context_tokens", "0", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+            .unwrap_err();
+        apply_set(&mut config, "context_tokens", "4096", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
             .expect("budget expected");
         assert_eq!(config.context_tokens, Some(4096));
     }
@@ -2774,23 +2951,25 @@ mod tests {
     fn max_length_cannot_exceed_the_platform_limit() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "split_length", "2000", Some(2000), CHUNK_FLOOR)
+        apply_set(&mut config, "split_length", "2000", Some(2000), CHUNK_FLOOR, IMAGE_CAP)
             .expect("limit value expected");
         assert_eq!(config.split_length, Some(2000));
         // Beyond the cap the platform rejects the chunks outright - rejected
         // here so replies never turn into undelivered garbage.
-        apply_set(&mut config, "split_length", "2001", Some(2000), CHUNK_FLOOR).unwrap_err();
+        apply_set(&mut config, "split_length", "2001", Some(2000), CHUNK_FLOOR, IMAGE_CAP)
+            .unwrap_err();
         assert_eq!(config.split_length, Some(2000));
 
         // Below the reply-chunk floor: rejected - tiny chunks would flood
         // the channel and starve the send rate limits. The floor holds even
         // where the platform declares no cap.
-        apply_set(&mut config, "split_length", "99", Some(2000), CHUNK_FLOOR).unwrap_err();
+        apply_set(&mut config, "split_length", "99", Some(2000), CHUNK_FLOOR, IMAGE_CAP)
+            .unwrap_err();
         assert_eq!(config.split_length, Some(2000));
-        apply_set(&mut config, "split_length", "100", Some(2000), CHUNK_FLOOR)
+        apply_set(&mut config, "split_length", "100", Some(2000), CHUNK_FLOOR, IMAGE_CAP)
             .expect("floor value expected");
         assert_eq!(config.split_length, Some(CHUNK_FLOOR));
-        apply_set(&mut config, "split_length", "50", None, CHUNK_FLOOR).unwrap_err();
+        apply_set(&mut config, "split_length", "50", None, CHUNK_FLOOR, IMAGE_CAP).unwrap_err();
         assert_eq!(config.split_length, Some(CHUNK_FLOOR));
     }
 
@@ -2800,10 +2979,12 @@ mod tests {
     fn max_length_floor_follows_the_configured_policy() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "split_length", "499", Some(2000), 500).unwrap_err();
-        apply_set(&mut config, "split_length", "500", Some(2000), 500).expect("floor expected");
+        apply_set(&mut config, "split_length", "499", Some(2000), 500, IMAGE_CAP).unwrap_err();
+        apply_set(&mut config, "split_length", "500", Some(2000), 500, IMAGE_CAP)
+            .expect("floor expected");
         assert_eq!(config.split_length, Some(500));
-        apply_set(&mut config, "split_length", "500", None, 500).expect("no cap expected");
+        apply_set(&mut config, "split_length", "500", None, 500, IMAGE_CAP)
+            .expect("no cap expected");
         assert_eq!(config.split_length, Some(500));
     }
 
@@ -2811,9 +2992,11 @@ mod tests {
     fn max_length_ignores_the_cap_when_the_platform_declares_none() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "split_length", "5000", None, CHUNK_FLOOR).expect("no cap expected");
+        apply_set(&mut config, "split_length", "5000", None, CHUNK_FLOOR, IMAGE_CAP)
+            .expect("no cap expected");
         assert_eq!(config.split_length, Some(5000));
-        apply_set(&mut config, "split_length", "clear", None, CHUNK_FLOOR).expect("clear expected");
+        apply_set(&mut config, "split_length", "clear", None, CHUNK_FLOOR, IMAGE_CAP)
+            .expect("clear expected");
         assert_eq!(config.split_length, None);
     }
 
@@ -2821,10 +3004,11 @@ mod tests {
     fn capture_and_template_validate() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        apply_set(&mut config, "capture", "all_messages", PLATFORM_LIMIT, CHUNK_FLOOR)
+        apply_set(&mut config, "capture", "all_messages", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
             .expect("mode expected");
         assert_eq!(config.capture, CaptureMode::AllMessages);
-        apply_set(&mut config, "capture", "chaos", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
+        apply_set(&mut config, "capture", "chaos", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+            .unwrap_err();
 
         apply_set(
             &mut config,
@@ -2832,12 +3016,20 @@ mod tests {
             "<{sender}> {message}",
             PLATFORM_LIMIT,
             CHUNK_FLOOR,
+            IMAGE_CAP,
         )
         .expect("template expected");
         assert_eq!(config.turn_template.as_deref(), Some("<{sender}> {message}"));
-        apply_set(&mut config, "turn_template", "no placeholders", PLATFORM_LIMIT, CHUNK_FLOOR)
-            .unwrap_err();
-        apply_set(&mut config, "turn_template", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
+        apply_set(
+            &mut config,
+            "turn_template",
+            "no placeholders",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+            IMAGE_CAP,
+        )
+        .unwrap_err();
+        apply_set(&mut config, "turn_template", "clear", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
             .expect("clear expected");
         assert_eq!(config.turn_template, None);
     }
@@ -2847,15 +3039,33 @@ mod tests {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
         let unknown =
-            apply_set(&mut config, "vibes", "maximum", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
+            apply_set(&mut config, "vibes", "maximum", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+                .unwrap_err();
         assert!(unknown.contains("Unknown key"));
-        assert!(apply_set(&mut config, "model", "clear", PLATFORM_LIMIT, CHUNK_FLOOR).is_err());
         assert!(
-            apply_set(&mut config, "context_messages", "clear", PLATFORM_LIMIT, CHUNK_FLOOR)
+            apply_set(&mut config, "model", "clear", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
                 .is_err()
         );
-        apply_set(&mut config, "model", "zai/glm-5.3-flash", PLATFORM_LIMIT, CHUNK_FLOOR)
-            .expect("model expected");
+        assert!(
+            apply_set(
+                &mut config,
+                "context_messages",
+                "clear",
+                PLATFORM_LIMIT,
+                CHUNK_FLOOR,
+                IMAGE_CAP
+            )
+            .is_err()
+        );
+        apply_set(
+            &mut config,
+            "model",
+            "zai/glm-5.3-flash",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+            IMAGE_CAP,
+        )
+        .expect("model expected");
         assert_eq!(config.model, "zai/glm-5.3-flash");
     }
 
@@ -2866,7 +3076,8 @@ mod tests {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
         let err =
-            apply_set(&mut config, "streaming", "maybe", PLATFORM_LIMIT, CHUNK_FLOOR).unwrap_err();
+            apply_set(&mut config, "streaming", "maybe", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+                .unwrap_err();
         assert!(err.contains("on or off"), "unexpected reply: {err}");
         assert!(!err.contains("Unknown key"), "unexpected reply: {err}");
         assert!(!config.streaming, "the failed set must not mutate");
@@ -2901,6 +3112,7 @@ mod tests {
                 .contains("chat model")
         );
         assert_eq!(current_value(&config, "images", &settings).as_deref(), Some("off"));
+        assert_eq!(current_value(&config, "image_max_side", &settings).as_deref(), Some("512 px"));
         assert_eq!(current_value(&config, "react", &settings).as_deref(), Some("off"));
         assert_eq!(
             current_value(&config, "random_reply_chance", &settings).as_deref(),
@@ -2952,7 +3164,7 @@ mod tests {
         let mut config = ChannelConfig::assigned("local/gemma".to_owned());
 
         assert_eq!(
-            apply_set(&mut config, "react_emoji_inject", "all", None, CHUNK_FLOOR)
+            apply_set(&mut config, "react_emoji_inject", "all", None, CHUNK_FLOOR, IMAGE_CAP)
                 .expect("all applies"),
             "`react_emoji_inject` set to `all` (the react tool's prompt lists this server's \
              custom emojis). Note: `react` is off - enable it for the list to reach the model."
@@ -2961,23 +3173,27 @@ mod tests {
 
         config.react = true;
         assert_eq!(
-            apply_set(&mut config, "react_emoji_inject", "whitelist", None, CHUNK_FLOOR)
+            apply_set(&mut config, "react_emoji_inject", "whitelist", None, CHUNK_FLOOR, IMAGE_CAP)
                 .expect("whitelist applies"),
             "`react_emoji_inject` set to `whitelist` (the react tool's prompt lists this server's \
              custom emojis)."
         );
         assert_eq!(config.react_emoji_inject, EmojiInject::Whitelist);
         assert!(
-            !apply_set(&mut config, "react_emoji_inject", "none", None, CHUNK_FLOOR)
+            !apply_set(&mut config, "react_emoji_inject", "none", None, CHUNK_FLOOR, IMAGE_CAP)
                 .expect("none applies")
                 .contains("Note:"),
             "no hint once react is on"
         );
         assert_eq!(config.react_emoji_inject, EmojiInject::None);
 
-        assert!(apply_set(&mut config, "react_emoji_inject", "clear", None, CHUNK_FLOOR).is_err());
         assert!(
-            apply_set(&mut config, "react_emoji_inject", "sometimes", None, CHUNK_FLOOR).is_err()
+            apply_set(&mut config, "react_emoji_inject", "clear", None, CHUNK_FLOOR, IMAGE_CAP)
+                .is_err()
+        );
+        assert!(
+            apply_set(&mut config, "react_emoji_inject", "sometimes", None, CHUNK_FLOOR, IMAGE_CAP)
+                .is_err()
         );
     }
 
@@ -3034,16 +3250,31 @@ mod tests {
     fn float_keys_reject_non_finite_values() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        assert!(apply_set(&mut config, "temperature", "NaN", PLATFORM_LIMIT, CHUNK_FLOOR).is_err());
-        assert!(apply_set(&mut config, "top_p", "inf", PLATFORM_LIMIT, CHUNK_FLOOR).is_err());
-        assert!(apply_set(&mut config, "min_p", "-inf", PLATFORM_LIMIT, CHUNK_FLOOR).is_err());
+        assert!(
+            apply_set(&mut config, "temperature", "NaN", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+                .is_err()
+        );
+        assert!(
+            apply_set(&mut config, "top_p", "inf", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP).is_err()
+        );
+        assert!(
+            apply_set(&mut config, "min_p", "-inf", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+                .is_err()
+        );
         assert_eq!(config.params.temperature, None, "nothing may be stored");
 
         // NaN would clamp to NaN, not to the range bounds; the default stays.
         let before = config.random_reply_chance_percent;
         assert!(
-            apply_set(&mut config, "random_reply_chance", "NaN", PLATFORM_LIMIT, CHUNK_FLOOR)
-                .is_err()
+            apply_set(
+                &mut config,
+                "random_reply_chance",
+                "NaN",
+                PLATFORM_LIMIT,
+                CHUNK_FLOOR,
+                IMAGE_CAP
+            )
+            .is_err()
         );
         assert!((config.random_reply_chance_percent - before).abs() < f64::EPSILON);
     }

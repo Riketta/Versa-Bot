@@ -694,8 +694,10 @@ history.
 # stays off by default.
 # Image recognition: set image_model to a vision-capable declared model;
 # channels then opt in with /llm_set images on. Optional: image_prompt,
-# image_max_side (512), image_jpeg_quality (85), image_max_source_bytes
-# (16 MiB), max_images_per_message (2), react_max_per_message (3 - the
+# image_max_side_cap (768 - the largest image_max_side a channel may set;
+# channels rescale to their per-channel image_max_side, 512 by default),
+# image_jpeg_quality (85), image_max_source_bytes (16 MiB),
+# max_images_per_message (2), react_max_per_message (3 - the
 # emoji-reaction tool's per-answer cap).
 # image_model = "local/unsloth/gemma-4-26B-A4B-it-qat-GGUF"
 
@@ -839,8 +841,9 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
   frame) - so the chat model
   reads what an image showed without ever receiving pixels: any declared
   model works, and costs stay bounded (each image is described once,
-  rescaled to `image_max_side`, at most `max_images_per_message` per
-  message). The recognition prompt is customizable per channel
+  rescaled to the channel's `image_max_side`, capped by the operator's
+  `image_max_side_cap`, at most `max_images_per_message` per message).
+  The recognition prompt is customizable per channel
   (`image_prompt`) - useful for pinning the description language.
   Undescribed images (feature off, recognition failure, oversize,
   over-cap) still render `![image without description](image.png)`, so
@@ -942,6 +945,7 @@ uploaded files for long texts.
 | `compaction_model` | declared model ref | plugin `[llm] compaction_model`, else the channel's chat model | which model writes the summaries |
 | `images` | on / off | off | describe attached images on captured messages via the recognition model; needs an operator `[llm] image_model` |
 | `image_model` | declared model ref | plugin `[llm] image_model` | recognition model override for this channel |
+| `image_max_side` | whole number >= 1, clamped to `[llm] image_max_side_cap` | 512 | max side (aspect kept) recognition images are rescaled to; smaller images pass through untouched |
 | `react` | on / off | off | emoji-reaction tool: the model may decorate the message it replies to by emitting a `[[react: ...]]` marker, stripped before the answer is shown |
 | `react_emoji_inject` | none / all / whitelist | whitelist | list the server's custom emojis as exact forms inside the react tool's prompt (`whitelist` filters by `/llm_emoji_whitelist`, channel list over the guild baseline); an empty whitelist injects nothing - the no-op default, filling it is the opt-in; needs `react` on to reach the model; changes invalidate provider prompt caches |
 | `streaming` | on / off | off | stream the answer live from the provider (SSE): the message appears with the first tokens and is edited at `stream_interval_ms` |

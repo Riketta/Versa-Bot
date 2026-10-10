@@ -440,9 +440,9 @@ fn llm_settings_from(
             "[llm] max_message_length exceeds the platform's message cap - clamped"
         );
     }
-    let image_max_side = config.image_max_side.max(1);
-    if config.image_max_side == 0 {
-        tracing::warn!("[llm] image_max_side is zero - clamped to 1");
+    let image_max_side_cap = config.image_max_side_cap.max(1);
+    if config.image_max_side_cap == 0 {
+        tracing::warn!("[llm] image_max_side_cap is zero - clamped to 1");
     }
     // A zero tail makes compaction unreachable (it would fold everything
     // and keep nothing) - the window degrades to a sliding depth cap.
@@ -487,7 +487,7 @@ fn llm_settings_from(
         stream_interval_ms,
         max_prompt_file_bytes: config.max_prompt_file_bytes,
         image_model: config.image_model.clone(),
-        image_max_side,
+        image_max_side_cap,
         image_jpeg_quality: config.image_jpeg_quality,
         image_max_source_bytes: config.image_max_source_bytes,
         image_prompt: config.image_prompt.clone(),
@@ -969,14 +969,14 @@ mod tests {
         config.min_split_length = 0;
         config.stream_interval_ms = 10;
         config.compaction_keep_tail = 0;
-        config.image_max_side = 0;
+        config.image_max_side_cap = 0;
 
         let settings = llm_settings_from(&config, None, None, Some(2000));
         assert_eq!(settings.max_message_length, 1);
         assert_eq!(settings.min_split_length, 1);
         assert_eq!(settings.stream_interval_ms, 250);
         assert_eq!(settings.compaction_keep_tail, 1);
-        assert_eq!(settings.image_max_side, 1);
+        assert_eq!(settings.image_max_side_cap, 1);
     }
 
     /// The plugin-facing defaults and the config-file defaults are two
@@ -995,7 +995,7 @@ mod tests {
         assert_eq!(settings.min_split_length, expected.min_split_length);
         assert_eq!(settings.stream_interval_ms, expected.stream_interval_ms);
         assert_eq!(settings.max_prompt_file_bytes, expected.max_prompt_file_bytes);
-        assert_eq!(settings.image_max_side, expected.image_max_side);
+        assert_eq!(settings.image_max_side_cap, expected.image_max_side_cap);
         assert_eq!(settings.image_jpeg_quality, expected.image_jpeg_quality);
         assert_eq!(settings.image_max_source_bytes, expected.image_max_source_bytes);
         assert_eq!(settings.max_images_per_message, expected.max_images_per_message);

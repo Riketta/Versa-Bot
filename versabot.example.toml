@@ -110,9 +110,11 @@ url = "sqlite://versabot.db"
 # Recognition prompt; channels can override per-channel
 # (/llm_set image_prompt). Text below is the built-in default.
 # image_prompt = "Describe this image concisely for a chat transcript: the scene, notable objects and people, and any visible text verbatim."
-# Images are rescaled to this max side (aspect kept) before recognition;
-# smaller images pass through. Keeps cost and latency low.
-# image_max_side = 512
+# Largest image_max_side a channel may set (/llm_set image_max_side).
+# Channels rescale recognition images to their per-channel max side
+# (aspect kept; smaller images pass through), 512 px by default - values
+# above this cap clamp down to it.
+# image_max_side_cap = 768
 # JPEG quality of the rescaled recognition payload.
 # image_jpeg_quality = 85
 # Download cap per image attachment, in bytes; larger images are recorded

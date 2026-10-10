@@ -531,7 +531,10 @@ impl ChatEngine {
                 .clone()
                 .or_else(|| self.settings.image_prompt.clone())
                 .unwrap_or_else(|| DEFAULT_IMAGE_PROMPT.to_owned()),
-            max_side: self.settings.image_max_side,
+            // The command layer already clamps to the cap, but stored docs
+            // can be hand-edited and the cap can drop below stored values -
+            // enforce the ceiling at the point of use, not just at set time.
+            max_side: config.image_max_side.min(self.settings.image_max_side_cap),
             jpeg_quality: self.settings.image_jpeg_quality,
             max_source_bytes: self.settings.image_max_source_bytes,
         };
@@ -2215,11 +2218,11 @@ mod tests {
     }
 
     /// Capture-path fake: records describe jobs (model ref, prompt, image
-    /// count) and hands out canned descriptions in order; exhausted queues
-    /// yield undescribed images.
+    /// count, effective max side) and hands out canned descriptions in
+    /// order; exhausted queues yield undescribed images.
     #[derive(Default)]
     struct FakeDescriber {
-        jobs: Mutex<Vec<(String, String, usize)>>,
+        jobs: Mutex<Vec<(String, String, usize, u32)>>,
         results: Mutex<VecDeque<Option<String>>>,
     }
 
@@ -2234,7 +2237,7 @@ mod tests {
         }
 
         fn job_count(&self) -> usize {
-            self.jobs.lock().iter().map(|(_, _, count)| *count).sum()
+            self.jobs.lock().iter().map(|(_, _, count, _)| *count).sum()
         }
     }
 
@@ -2246,7 +2249,12 @@ mod tests {
             images: Vec<ImageSource>,
             _usage: Option<UsageSink<'_>>,
         ) -> Vec<Option<String>> {
-            self.jobs.lock().push((job.model.clone(), job.prompt.clone(), images.len()));
+            self.jobs.lock().push((
+                job.model.clone(),
+                job.prompt.clone(),
+                images.len(),
+                job.max_side,
+            ));
             let mut out = Vec::with_capacity(images.len());
             for _ in images {
                 out.push(self.results.lock().pop_front().flatten());
@@ -3095,7 +3103,7 @@ mod tests {
 
         // The recognition call went to the channel's image model override
         // with the built-in default prompt (no override configured).
-        let (model, prompt, count) =
+        let (model, prompt, count, _) =
             ctx.describer.jobs.lock().first().expect("job expected").clone();
         assert_eq!((model.as_str(), count), ("local/vision", 1));
         assert!(prompt.contains("Describe this image"));
@@ -3137,8 +3145,55 @@ mod tests {
             .await;
 
         // Channel override > plugin `[llm] image_prompt` > built-in default.
-        let (_, prompt, _) = ctx.describer.jobs.lock().first().expect("job expected").clone();
+        let (_, prompt, _, _) = ctx.describer.jobs.lock().first().expect("job expected").clone();
         assert_eq!(prompt, "channel prompt");
+    }
+
+    /// The per-channel image size meets the operator ceiling at capture
+    /// time: stored values above the cap (hand-edited docs, or a cap that
+    /// dropped after the value was set) clamp down before reaching the
+    /// recognition call.
+    #[tokio::test]
+    async fn channel_image_max_side_clamps_to_the_operator_cap() {
+        let ctx = ctx_describer(
+            LlmSettings::default(), // image_max_side_cap: 768
+            Arc::new(RandRandom),
+            vec![Ok("ok".to_owned())],
+            Arc::new(FakeDescriber::with_results(vec![Some("desc")])),
+        );
+        let mut config = images_enabled_config("local/vision");
+        config.image_max_side = 4096; // as a hand-edited doc could carry
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine
+            .handle_message(
+                &origin(),
+                &payload_with_images(&["https://cdn.example/1.png"]),
+                &config,
+                &ctx.services,
+                None,
+            )
+            .await;
+
+        let (_, _, _, max_side) = ctx.describer.jobs.lock().first().expect("job expected").clone();
+        assert_eq!(max_side, 768);
+
+        // Below the cap the channel value wins untouched.
+        let mut config = images_enabled_config("local/vision");
+        config.image_max_side = 320;
+        seed_config(&ctx.storage, &config);
+        ctx.engine
+            .handle_message(
+                &origin(),
+                &payload_with_images(&["https://cdn.example/2.png"]),
+                &config,
+                &ctx.services,
+                None,
+            )
+            .await;
+
+        let (_, _, _, max_side) = ctx.describer.jobs.lock().last().expect("job expected").clone();
+        assert_eq!(max_side, 320);
     }
 
     #[tokio::test]

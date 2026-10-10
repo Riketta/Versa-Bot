@@ -45,9 +45,11 @@ pub struct LlmConfig {
     /// Image recognition model fallback (`provider/model`); absent = image
     /// recognition off globally (channels can only toggle within that).
     pub image_model: Option<String>,
-    /// Images are rescaled to this max side (aspect kept) before the
-    /// recognition call; smaller images pass through untouched.
-    pub image_max_side: u32,
+    /// Largest `image_max_side` a channel may request via `/llm_set` - the
+    /// operator ceiling. Channels rescale images to their per-channel max
+    /// side (aspect kept) before the recognition call; values above this
+    /// cap clamp down to it.
+    pub image_max_side_cap: u32,
     /// JPEG quality of the rescaled recognition payload.
     pub image_jpeg_quality: u8,
     /// Download cap per image attachment, in bytes; larger images are
@@ -94,7 +96,7 @@ impl Default for LlmConfig {
             stream_interval_ms: 2000,
             max_prompt_file_bytes: 131_072,
             image_model: None,
-            image_max_side: 512,
+            image_max_side_cap: 768,
             image_jpeg_quality: 85,
             image_max_source_bytes: 16_777_216,
             image_prompt: None,
@@ -229,7 +231,7 @@ mod tests {
                 "stream_interval_ms": 1500,
                 "max_prompt_file_bytes": 4096,
                 "image_model": "local/gemma-vision",
-                "image_max_side": 768,
+                "image_max_side_cap": 1024,
                 "image_jpeg_quality": 80,
                 "image_max_source_bytes": 4096,
                 "image_prompt": "Describe this.",
@@ -263,7 +265,7 @@ mod tests {
         assert_eq!(config.min_split_length, 300);
         assert_eq!(config.max_prompt_file_bytes, 4096);
         assert_eq!(config.image_model.as_deref(), Some("local/gemma-vision"));
-        assert_eq!(config.image_max_side, 768);
+        assert_eq!(config.image_max_side_cap, 1024);
         assert_eq!(config.image_jpeg_quality, 80);
         assert_eq!(config.image_max_source_bytes, 4096);
         assert_eq!(config.image_prompt.as_deref(), Some("Describe this."));

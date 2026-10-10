@@ -59,9 +59,10 @@ pub struct LlmSettings {
     /// Image recognition model fallback (`provider/model`); `None` = image
     /// recognition off globally (channels can only toggle within that).
     pub image_model: Option<String>,
-    /// Images are rescaled to this max side (aspect kept) before the
-    /// recognition call; smaller images pass through untouched.
-    pub image_max_side: u32,
+    /// Largest per-channel `image_max_side` admins may set - the operator
+    /// ceiling. Enforced by the command layer (clamp + notify) and again at
+    /// capture time (covers hand-edited docs and lowered caps).
+    pub image_max_side_cap: u32,
     /// JPEG quality of the rescaled recognition payload.
     pub image_jpeg_quality: u8,
     /// Download cap per image attachment, in bytes; larger images are
@@ -113,7 +114,7 @@ impl Default for LlmSettings {
             stream_interval_ms: 2000,
             max_prompt_file_bytes: 131_072,
             image_model: None,
-            image_max_side: 512,
+            image_max_side_cap: 768,
             image_jpeg_quality: 85,
             image_max_source_bytes: 16_777_216,
             image_prompt: None,

@@ -264,6 +264,11 @@ pub struct ChannelConfig {
     /// conversations need.
     #[serde(default)]
     pub image_prompt: Option<String>,
+    /// Max side (aspect kept) recognition images are rescaled to; smaller
+    /// images pass through untouched. Clamped to the operator's
+    /// `image_max_side_cap` at the command layer and again at capture time.
+    #[serde(default = "default_image_max_side")]
+    pub image_max_side: u32,
     /// Emoji-reaction tool for this channel: the model may decorate the
     /// message it replies to by emitting a `[[react: ...]]` marker, which is
     /// stripped before delivery (see `tools`). Off by default - the marker
@@ -295,8 +300,8 @@ impl ChannelConfig {
     /// command layer, but a hand-edited storage document can still carry
     /// `0` - which would drop every turn (even the newest) from the
     /// context. The same holds for `split_length` below the configured
-    /// `min_split_length` floor. Every parse site goes through here so the
-    /// guard cannot drift.
+    /// `min_split_length` floor and for a zero `image_max_side`. Every
+    /// parse site goes through here so the guard cannot drift.
     pub(crate) fn from_stored(
         raw: serde_json::Value,
         min_split_length: usize,
@@ -309,6 +314,9 @@ impl ChannelConfig {
             && n < min_split_length
         {
             config.split_length = Some(min_split_length);
+        }
+        if config.image_max_side == 0 {
+            config.image_max_side = default_image_max_side();
         }
         Ok(config)
     }
@@ -335,6 +343,7 @@ impl ChannelConfig {
             images: false,
             image_model: None,
             image_prompt: None,
+            image_max_side: default_image_max_side(),
             react: false,
             react_emoji_inject: EmojiInject::default(),
             random_react_chance_percent: default_random_react_chance(),
@@ -394,6 +403,13 @@ fn default_true() -> bool {
 
 fn default_context_messages() -> u32 {
     100
+}
+
+/// Plugin default of the per-channel recognition size (`/llm_set
+/// image_max_side clear` resets to this). Smaller than the operator cap
+/// default on purpose: the cap is headroom, not the everyday value.
+pub(crate) fn default_image_max_side() -> u32 {
+    512
 }
 
 fn default_random_reply_chance() -> f64 {
@@ -557,6 +573,31 @@ mod tests {
         )
         .expect("config expected to deserialize");
         assert_eq!(config.split_length, Some(500));
+    }
+
+    /// A stored doc predating the per-channel image size parses as the
+    /// default (serde default), and a hand-edited zero cannot disable the
+    /// rescale floor - `from_stored` restores the default.
+    #[test]
+    fn from_stored_defaults_and_normalizes_image_max_side() {
+        let config =
+            ChannelConfig::from_stored(serde_json::json!({ "model": "zai/glm-5.3-flash" }), 100)
+                .expect("config expected to deserialize");
+        assert_eq!(config.image_max_side, 512);
+
+        let config = ChannelConfig::from_stored(
+            serde_json::json!({ "model": "zai/glm-5.3-flash", "image_max_side": 0 }),
+            100,
+        )
+        .expect("config expected to deserialize");
+        assert_eq!(config.image_max_side, 512);
+
+        let config = ChannelConfig::from_stored(
+            serde_json::json!({ "model": "zai/glm-5.3-flash", "image_max_side": 640 }),
+            100,
+        )
+        .expect("config expected to deserialize");
+        assert_eq!(config.image_max_side, 640);
     }
 
     #[test]
