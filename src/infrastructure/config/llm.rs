@@ -37,7 +37,6 @@ pub struct LlmConfig {
     pub max_message_length: usize,
     /// The smallest per-channel `split_length` admins may set; the
     /// platform's message cap wins over it.
-    #[serde(alias = "min_reply_chunk")]
     pub min_split_length: usize,
     /// Streaming edit cadence in milliseconds.
     pub stream_interval_ms: u64,
@@ -213,15 +212,6 @@ mod tests {
         assert_eq!(config.bot_name, None);
         assert!(config.providers.is_empty());
         assert!(config.default_system_prompt.contains("{{bot}}"));
-    }
-
-    /// The pre-rename key still deserializes - existing config files keep
-    /// loading; the example config and docs use the new name.
-    #[test]
-    fn legacy_min_reply_chunk_key_still_deserializes() {
-        let config = serde_json::from_str::<LlmConfig>(r#"{ "min_reply_chunk": 300 }"#)
-            .expect("legacy key expected to deserialize");
-        assert_eq!(config.min_split_length, 300);
     }
 
     #[test]

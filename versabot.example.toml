@@ -83,8 +83,7 @@ url = "sqlite://versabot.db"
 # by the platform's message limit.
 # max_message_length = 2000
 # The smallest per-channel `split_length` admins may set; the platform's
-# message cap wins over it. (The pre-rename key `min_reply_chunk` still
-# loads.)
+# message cap wins over it.
 # min_split_length = 100
 # Streaming edit cadence while a channel streams its answer live
 # (`streaming` on); the final edit always carries the exact full text.

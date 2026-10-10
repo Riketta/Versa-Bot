@@ -212,10 +212,10 @@ pub struct ChannelConfig {
     /// Live-window size in messages. Reaching it triggers compaction - the
     /// window is never slid, so the prompt prefix stays byte-stable between
     /// compactions (provider prompt caches stay warm).
-    #[serde(default = "default_context_messages", alias = "history_depth")]
+    #[serde(default = "default_context_messages")]
     pub context_messages: u32,
     /// Which messages enter the history; see [`CaptureMode`].
-    #[serde(default, alias = "capture_mode")]
+    #[serde(default)]
     pub capture: CaptureMode,
     /// Progressive rendering: create the answer, edit it in place as text
     /// arrives.
@@ -223,7 +223,7 @@ pub struct ChannelConfig {
     pub streaming: bool,
     /// Chance the bot chimes in on an unrelated user message, percent
     /// (`0` = off).
-    #[serde(default = "default_random_reply_chance", alias = "random_chance_percent")]
+    #[serde(default = "default_random_reply_chance")]
     pub random_reply_chance_percent: f64,
     /// Minimum seconds between random chime-ins in this channel; `0` =
     /// every eligible message may roll. The deck already balances hits
@@ -234,7 +234,7 @@ pub struct ChannelConfig {
     /// Reply splitting limit override: a longer answer splits into
     /// multiple sent messages, each within this limit. `None` = plugin-
     /// wide default.
-    #[serde(default, alias = "max_length")]
+    #[serde(default)]
     pub split_length: Option<usize>,
     /// User-turn rendering in the context; `{sender}`, `{user_id}`,
     /// `{guild_name}`, `{time}` (unix seconds) and `{message}` are
@@ -246,7 +246,7 @@ pub struct ChannelConfig {
     /// endpoint's own usage reports) and `context_messages` remains the
     /// secondary cap; `None` = count-only filling. Completions always keep
     /// room for the reply on top - this budgets the prompt side only.
-    #[serde(default, alias = "context_budget_tokens")]
+    #[serde(default)]
     pub context_tokens: Option<u32>,
     /// Image recognition for this channel's captured messages:
     /// attachments are described by the image model at capture time and
@@ -557,43 +557,6 @@ mod tests {
         )
         .expect("config expected to deserialize");
         assert_eq!(config.split_length, Some(500));
-    }
-
-    /// Pre-rename documents deserialize through the serde aliases - and a
-    /// re-save serializes the new names only, so the first `/llm_set` on a
-    /// channel migrates its stored doc in place.
-    #[test]
-    fn legacy_key_names_deserialize_through_aliases_and_resave_renamed() {
-        let config = ChannelConfig::from_stored(
-            serde_json::json!({
-                "model": "zai/glm-5.3-flash",
-                "history_depth": 50,
-                "capture_mode": "all_messages",
-                "random_chance_percent": 5.0,
-                "max_length": 800,
-                "context_budget_tokens": 4000
-            }),
-            100,
-        )
-        .expect("legacy doc expected to deserialize");
-        assert_eq!(config.context_messages, 50);
-        assert_eq!(config.capture, CaptureMode::AllMessages);
-        assert!((config.random_reply_chance_percent - 5.0).abs() < f64::EPSILON);
-        assert_eq!(config.split_length, Some(800));
-        assert_eq!(config.context_tokens, Some(4000));
-
-        let saved = serde_json::to_value(&config).expect("config expected to serialize");
-        let saved = saved.as_object().expect("object expected");
-        assert!(saved.contains_key("split_length"));
-        assert!(saved.contains_key("context_messages"));
-        assert!(saved.contains_key("capture"));
-        assert!(saved.contains_key("random_reply_chance_percent"));
-        assert!(saved.contains_key("context_tokens"));
-        assert!(!saved.contains_key("max_length"));
-        assert!(!saved.contains_key("history_depth"));
-        assert!(!saved.contains_key("capture_mode"));
-        assert!(!saved.contains_key("random_chance_percent"));
-        assert!(!saved.contains_key("context_budget_tokens"));
     }
 
     #[test]
