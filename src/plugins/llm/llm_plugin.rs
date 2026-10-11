@@ -134,6 +134,11 @@ struct UsageFlushJob {
     tracker: Arc<UsageTracker>,
 }
 
+/// Scheduler name of [`UsageFlushJob`] - log attribution only, following
+/// the `<plugin>_<what>` convention of the other job names
+/// (`config_watcher`, `lol_store_poll`, `lol_leaderboard_refresh`).
+const USAGE_FLUSH_JOB_NAME: &str = "llm_usage_flush";
+
 #[async_trait]
 impl Job for UsageFlushJob {
     async fn run(&self) {
@@ -629,15 +634,15 @@ impl PluginPort for LlmPlugin {
         Ok(())
     }
 
-    /// Schedules the usage-totals flush. The job name is the plugin's own -
-    /// log attribution only. First run is immediate per the scheduler
+    /// Schedules the usage-totals flush under
+    /// [`USAGE_FLUSH_JOB_NAME`]. First run is immediate per the scheduler
     /// contract: harmless, the tracker is empty and the flush refuses to
     /// run before its lazy seed succeeds.
     fn start(&self) -> Result<(), PluginError> {
         let mut job = self.flush_job.lock();
         if job.is_none() {
             *job = Some(self.scheduler.schedule(
-                self.name(),
+                USAGE_FLUSH_JOB_NAME,
                 Duration::from_secs(FLUSH_INTERVAL_SECS),
                 Arc::new(UsageFlushJob { tracker: self.engine.usage() }),
             ));
@@ -1847,7 +1852,7 @@ mod tests {
         plugin.start().expect("second start expected to succeed");
         assert_eq!(fixture.scheduler.scheduled().len(), 1, "start is idempotent");
         let (name, interval) = fixture.scheduler.scheduled().first().expect("job expected").clone();
-        assert_eq!(name, "llm");
+        assert_eq!(name, "llm_usage_flush");
         assert_eq!(interval, Duration::from_secs(super::super::usage_total::FLUSH_INTERVAL_SECS));
 
         plugin.stop().expect("stop expected to succeed");

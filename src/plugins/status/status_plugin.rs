@@ -53,6 +53,11 @@ pub struct StatusRotatorPlugin {
     stopped: AtomicBool,
 }
 
+/// Scheduler name of the rotation job - log attribution only, following the
+/// `<plugin>_<what>` convention of the other job names (`config_watcher`,
+/// `lol_store_poll`, `llm_usage_flush`).
+const ROTATION_JOB_NAME: &str = "status_rotate";
+
 impl StatusRotatorPlugin {
     #[must_use]
     pub fn new(
@@ -119,7 +124,7 @@ impl StatusRotatorPlugin {
         }
 
         let job = Arc::new(StatusJob::new(Arc::clone(&self.presence), settings.statuses.clone()));
-        Some(self.scheduler.schedule(self.name(), settings.interval, job))
+        Some(self.scheduler.schedule(ROTATION_JOB_NAME, settings.interval, job))
     }
 }
 
@@ -298,7 +303,7 @@ mod tests {
 
         assert_eq!(
             scheduler.scheduled(),
-            vec![("status_rotator".to_owned(), Duration::from_secs(30))]
+            vec![("status_rotate".to_owned(), Duration::from_secs(30))]
         );
     }
 
@@ -404,8 +409,8 @@ mod tests {
         assert_eq!(
             scheduler.scheduled(),
             vec![
-                ("status_rotator".to_owned(), Duration::from_secs(30)),
-                ("status_rotator".to_owned(), Duration::from_secs(60)),
+                ("status_rotate".to_owned(), Duration::from_secs(30)),
+                ("status_rotate".to_owned(), Duration::from_secs(60)),
             ]
         );
         assert_eq!(scheduler.cancel_count.load(Ordering::SeqCst), 1);
@@ -445,7 +450,7 @@ mod tests {
 
         assert_eq!(
             scheduler.scheduled(),
-            vec![("status_rotator".to_owned(), Duration::from_secs(45))]
+            vec![("status_rotate".to_owned(), Duration::from_secs(45))]
         );
     }
 
