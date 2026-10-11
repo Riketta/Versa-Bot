@@ -4446,7 +4446,7 @@ mod tests {
         assert_eq!(stored_records(&ctx).await.len(), 3);
     }
 
-    /// `random_cooldown = 0` disables the gate entirely: consecutive
+    /// `chime_cooldown = 0` disables the gate entirely: consecutive
     /// eligible messages may each roll (and with a always-true deck, each
     /// chime).
     #[tokio::test]

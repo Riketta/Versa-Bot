@@ -30,12 +30,16 @@ use super::providers::{LlmSettings, ModelSettings};
 use super::usage_total::Dimension;
 use super::vision::DEFAULT_IMAGE_PROMPT;
 
-/// Recognized `/llm_set` keys, in display order. Doubles as the Discord
-/// choices dropdown for the `key` argument. Channel prompts are NOT keys -
-/// they have their own command (`/llm_set_prompt`), which also keeps this
-/// list well under Discord's 25-choice cap.
+/// Recognized `/llm_set` keys, in display order (grouped: identity and
+/// delivery mode, sampling, capture/context, compaction, images, reactions,
+/// chime-ins, delivery). Doubles as the Discord choices dropdown for the `key`
+/// argument. Channel prompts are NOT keys - they have their own command
+/// (`/llm_set_prompt`), which keeps this list AT Discord's 25-choice cap
+/// - a 26th key needs a dropdown redesign.
 pub(super) const SET_KEYS: &[&str] = &[
     "model",
+    "reasoning_effort",
+    "streaming",
     "temperature",
     "top_p",
     "top_k",
@@ -43,10 +47,10 @@ pub(super) const SET_KEYS: &[&str] = &[
     "frequency_penalty",
     "presence_penalty",
     "max_tokens",
-    "reasoning_effort",
+    "capture",
     "context_messages",
     "context_tokens",
-    "capture",
+    "turn_template",
     "compaction",
     "compaction_model",
     "images",
@@ -54,12 +58,10 @@ pub(super) const SET_KEYS: &[&str] = &[
     "image_max_side",
     "react",
     "react_emoji_inject",
-    "streaming",
-    "random_reply_chance",
-    "random_cooldown",
-    "random_react_chance",
+    "chime_reply_chance",
+    "chime_react_chance",
+    "chime_cooldown",
     "split_length",
-    "turn_template",
 ];
 
 /// Loads the channel's config for mutation, replying (and returning `None`)
@@ -316,42 +318,40 @@ fn apply_numeric(
                 }
             }
         }
-        "random_reply_chance" => {
+        "chime_reply_chance" => {
             if cleared {
                 config.random_reply_chance_percent = 0.0;
-                return Some(Ok("`random_reply_chance` cleared (chime-ins off).".to_owned()));
+                return Some(Ok("`chime_reply_chance` cleared (chime-ins off).".to_owned()));
             }
             match value.parse::<f64>() {
                 // Non-finite clamps to NaN, not to the range bounds.
                 Ok(parsed) if parsed.is_finite() => {
                     let clamped = parsed.clamp(0.0, 100.0);
                     config.random_reply_chance_percent = clamped;
-                    Some(Ok(format!("`random_reply_chance` set to {clamped}.")))
+                    Some(Ok(format!("`chime_reply_chance` set to {clamped}.")))
                 }
                 _ => Some(Err(format!(
-                    "`random_reply_chance` expects a finite number (percent), got `{value}`."
+                    "`chime_reply_chance` expects a finite number (percent), got `{value}`."
                 ))),
             }
         }
-        "random_react_chance" => {
+        "chime_react_chance" => {
             if cleared {
                 config.random_react_chance_percent = 0.0;
-                return Some(
-                    Ok("`random_react_chance` cleared (silent reactions off).".to_owned()),
-                );
+                return Some(Ok("`chime_react_chance` cleared (silent reactions off).".to_owned()));
             }
             match value.parse::<f64>() {
                 Ok(parsed) if parsed.is_finite() => {
                     let clamped = parsed.clamp(0.0, 100.0);
                     config.random_react_chance_percent = clamped;
-                    Some(Ok(format!("`random_react_chance` set to {clamped}.")))
+                    Some(Ok(format!("`chime_react_chance` set to {clamped}.")))
                 }
                 _ => Some(Err(format!(
-                    "`random_react_chance` expects a finite number (percent), got `{value}`."
+                    "`chime_react_chance` expects a finite number (percent), got `{value}`."
                 ))),
             }
         }
-        "random_cooldown" => {
+        "chime_cooldown" => {
             if cleared {
                 let default = default_random_cooldown();
                 config.random_cooldown_secs = default;
@@ -1954,8 +1954,8 @@ fn delta_display_names(delta: &serde_json::Value) -> Vec<String> {
 fn display_key(serde_name: &str) -> &str {
     match serde_name {
         "compaction_enabled" => "compaction",
-        "random_reply_chance_percent" => "random_reply_chance",
-        "random_cooldown_secs" => "random_cooldown",
+        "random_reply_chance_percent" => "chime_reply_chance",
+        "random_cooldown_secs" => "chime_cooldown",
         other => other,
     }
 }
@@ -2180,6 +2180,60 @@ fn fence_safe(value: &str) -> String {
     out
 }
 
+/// One line spec of the `/llm_dump` layout: keys and prompts interleaved at
+/// their feature, [`DumpItem::Gap`] separates the groups.
+#[derive(Clone, Copy)]
+enum DumpItem {
+    Key(&'static str),
+    Prompt(PromptKind),
+    Gap,
+}
+
+/// `/llm_dump` display order, grouped: identity and delivery mode, sampling,
+/// capture/context, compaction, images, reactions, chime-ins, delivery. The three
+/// prompts ride with their feature - set-or-not and size only; the text is
+/// one `/llm_set_prompt kind` away. Every key appears exactly once - the
+/// `dump_layout_covers_the_key_set` test pins parity with `SET_KEYS`, so a
+/// key added there without a layout entry fails a test instead of silently
+/// vanishing from the dump.
+const DUMP_LAYOUT: &[DumpItem] = &[
+    DumpItem::Key("model"),
+    DumpItem::Key("reasoning_effort"),
+    DumpItem::Key("streaming"),
+    DumpItem::Gap,
+    DumpItem::Key("temperature"),
+    DumpItem::Key("top_p"),
+    DumpItem::Key("top_k"),
+    DumpItem::Key("min_p"),
+    DumpItem::Key("frequency_penalty"),
+    DumpItem::Key("presence_penalty"),
+    DumpItem::Key("max_tokens"),
+    DumpItem::Gap,
+    DumpItem::Key("capture"),
+    DumpItem::Key("context_messages"),
+    DumpItem::Key("context_tokens"),
+    DumpItem::Key("turn_template"),
+    DumpItem::Prompt(PromptKind::System),
+    DumpItem::Gap,
+    DumpItem::Key("compaction"),
+    DumpItem::Key("compaction_model"),
+    DumpItem::Prompt(PromptKind::Compaction),
+    DumpItem::Gap,
+    DumpItem::Key("images"),
+    DumpItem::Key("image_model"),
+    DumpItem::Prompt(PromptKind::Image),
+    DumpItem::Key("image_max_side"),
+    DumpItem::Gap,
+    DumpItem::Key("react"),
+    DumpItem::Key("react_emoji_inject"),
+    DumpItem::Gap,
+    DumpItem::Key("chime_reply_chance"),
+    DumpItem::Key("chime_react_chance"),
+    DumpItem::Key("chime_cooldown"),
+    DumpItem::Gap,
+    DumpItem::Key("split_length"),
+];
+
 #[async_trait]
 impl CommandHandler for DumpLlmHandler {
     async fn invoke(
@@ -2197,43 +2251,45 @@ impl CommandHandler for DumpLlmHandler {
         // channel's own model, so `model` itself never reads as customized -
         // it IS the assignment.
         let baseline = ChannelConfig::assigned(config.model.clone());
-        let mut lines: Vec<String> = SET_KEYS
+        let settings = self.engine.settings();
+        let lines: Vec<String> = DUMP_LAYOUT
             .iter()
-            .map(|key| {
-                let value = current_value(&config, key, self.engine.settings())
-                    .map(|value| fence_safe(&value))
-                    .unwrap_or_else(|| "?".to_owned());
-                let marker = if current_value(&baseline, key, self.engine.settings())
-                    .map(|value| fence_safe(&value))
-                    .as_deref()
-                    == Some(value.as_str())
-                {
-                    ""
-                } else {
-                    "* "
-                };
-                let value = if value.chars().count() > DUMP_VALUE_PREVIEW {
-                    format!(
-                        "{}… ({} chars total)",
-                        preview(&value, DUMP_VALUE_PREVIEW),
-                        value.chars().count()
-                    )
-                } else {
-                    value
-                };
-                format!("{marker}{key} = {value}")
+            .filter_map(|item| match item {
+                DumpItem::Gap => Some(String::new()),
+                DumpItem::Key(key) => {
+                    let value = current_value(&config, key, settings)
+                        .map(|value| fence_safe(&value))
+                        .unwrap_or_else(|| "?".to_owned());
+                    let marker = if current_value(&baseline, key, settings)
+                        .map(|value| fence_safe(&value))
+                        .as_deref()
+                        == Some(value.as_str())
+                    {
+                        ""
+                    } else {
+                        "* "
+                    };
+                    let value = if value.chars().count() > DUMP_VALUE_PREVIEW {
+                        format!(
+                            "{}… ({} chars total)",
+                            preview(&value, DUMP_VALUE_PREVIEW),
+                            value.chars().count()
+                        )
+                    } else {
+                        value
+                    };
+                    Some(format!("{marker}{key} = {value}"))
+                }
+                DumpItem::Prompt(kind) => {
+                    let marker = if kind.field(&config).is_some() { "* " } else { "" };
+                    Some(format!(
+                        "{marker}{} = {}",
+                        kind.field_name(),
+                        prompt_shape(kind.field(&config).as_ref())
+                    ))
+                }
             })
             .collect();
-        // The three prompts are never dumped - set-or-not and size only;
-        // the text is one `/llm_set_prompt kind` away.
-        for kind in [PromptKind::System, PromptKind::Compaction, PromptKind::Image] {
-            let marker = if kind.field(&config).is_some() { "* " } else { "" };
-            lines.push(format!(
-                "{marker}{} = {}",
-                kind.field_name(),
-                prompt_shape(kind.field(&config).as_ref())
-            ));
-        }
         services
             .chat_output
             .send(command_reply(format!(
@@ -2290,21 +2346,21 @@ fn current_value(config: &ChannelConfig, key: &str, settings: &LlmSettings) -> O
             config
                 .compaction_model
                 .clone()
-                .unwrap_or_else(|| format!("the channel's chat model (`{}`)", config.model)),
+                .unwrap_or_else(|| format!("channel chat model (`{}`)", config.model)),
         ),
         "images" => Some(on_off(config.images)),
         "image_model" => Some(config.image_model.clone().unwrap_or_else(|| {
             settings.image_model.clone().map_or_else(
-                || "off (no operator image model)".to_owned(),
-                |model| format!("plugin `image_model` (`{model}`)"),
+                || "off (no plugin image model)".to_owned(),
+                |model| format!("plugin image model (`{model}`)"),
             )
         })),
         "image_max_side" => Some(format!("{} px", config.image_max_side)),
-        "random_reply_chance" => Some(format!("{:.1}%", config.random_reply_chance_percent)),
-        "random_cooldown" => Some(format!("{} seconds", config.random_cooldown_secs)),
-        "random_react_chance" => Some(format!("{:.1}%", config.random_react_chance_percent)),
+        "chime_reply_chance" => Some(format!("{:.1}%", config.random_reply_chance_percent)),
+        "chime_cooldown" => Some(format!("{} seconds", config.random_cooldown_secs)),
+        "chime_react_chance" => Some(format!("{:.1}%", config.random_react_chance_percent)),
         "split_length" => Some(config.split_length.map_or_else(
-            || format!("{} (max_message_length)", settings.max_message_length),
+            || format!("{} (max message length)", settings.max_message_length),
             |limit| format!("{limit}"),
         )),
         "turn_template" => Some(config.turn_template.clone().map_or_else(
@@ -3068,7 +3124,7 @@ mod tests {
         let delta = customization_delta(&source);
         assert_eq!(
             delta_display_names(&delta),
-            ["capture", "compaction", "model", "random_reply_chance", "temperature"]
+            ["capture", "chime_reply_chance", "compaction", "model", "temperature"]
         );
 
         let mut target = ChannelConfig::assigned("zai/glm-5.3-flash".to_owned());
@@ -3088,7 +3144,7 @@ mod tests {
         assert_eq!(updated.random_reply_chance_percent, 7.0);
 
         assert_eq!(display_key("compaction_enabled"), "compaction");
-        assert_eq!(display_key("random_cooldown_secs"), "random_cooldown");
+        assert_eq!(display_key("random_cooldown_secs"), "chime_cooldown");
         assert_eq!(display_key("capture"), "capture");
     }
 
@@ -3148,19 +3204,12 @@ mod tests {
             .expect("depth expected");
         assert_eq!(config.context_messages, 50);
 
-        apply_set(
-            &mut config,
-            "random_reply_chance",
-            "250",
-            PLATFORM_LIMIT,
-            CHUNK_FLOOR,
-            IMAGE_CAP,
-        )
-        .expect("clamp expected");
+        apply_set(&mut config, "chime_reply_chance", "250", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+            .expect("clamp expected");
         assert!((config.random_reply_chance_percent - 100.0).abs() < f64::EPSILON);
         apply_set(
             &mut config,
-            "random_reply_chance",
+            "chime_reply_chance",
             "clear",
             PLATFORM_LIMIT,
             CHUNK_FLOOR,
@@ -3169,19 +3218,12 @@ mod tests {
         .expect("clear expected");
         assert!((config.random_reply_chance_percent).abs() < f64::EPSILON);
 
-        apply_set(
-            &mut config,
-            "random_react_chance",
-            "250",
-            PLATFORM_LIMIT,
-            CHUNK_FLOOR,
-            IMAGE_CAP,
-        )
-        .expect("clamp expected");
+        apply_set(&mut config, "chime_react_chance", "250", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+            .expect("clamp expected");
         assert!((config.random_react_chance_percent - 100.0).abs() < f64::EPSILON);
         apply_set(
             &mut config,
-            "random_react_chance",
+            "chime_react_chance",
             "clear",
             PLATFORM_LIMIT,
             CHUNK_FLOOR,
@@ -3190,15 +3232,15 @@ mod tests {
         .expect("clear expected");
         assert!((config.random_react_chance_percent).abs() < f64::EPSILON);
 
-        apply_set(&mut config, "random_cooldown", "30", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+        apply_set(&mut config, "chime_cooldown", "30", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
             .expect("cooldown expected");
         assert_eq!(config.random_cooldown_secs, 30);
-        apply_set(&mut config, "random_cooldown", "clear", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+        apply_set(&mut config, "chime_cooldown", "clear", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
             .expect("cooldown clear expected");
         assert_eq!(config.random_cooldown_secs, 5);
         apply_set(
             &mut config,
-            "random_cooldown",
+            "chime_cooldown",
             "not-a-number",
             PLATFORM_LIMIT,
             CHUNK_FLOOR,
@@ -3393,16 +3435,16 @@ mod tests {
         assert_eq!(current_value(&config, "image_max_side", &settings).as_deref(), Some("512 px"));
         assert_eq!(current_value(&config, "react", &settings).as_deref(), Some("off"));
         assert_eq!(
-            current_value(&config, "random_reply_chance", &settings).as_deref(),
+            current_value(&config, "chime_reply_chance", &settings).as_deref(),
             Some("2.0%")
         );
         assert_eq!(
-            current_value(&config, "random_react_chance", &settings).as_deref(),
+            current_value(&config, "chime_react_chance", &settings).as_deref(),
             Some("10.0%")
         );
         assert_eq!(
             current_value(&config, "split_length", &settings).as_deref(),
-            Some("2000 (max_message_length)")
+            Some("2000 (max message length)")
         );
         assert!(
             current_value(&config, "turn_template", &settings)
@@ -3428,10 +3470,28 @@ mod tests {
         assert_eq!(current_value(&config, "streaming", &settings).as_deref(), Some("on"));
         assert_eq!(current_value(&config, "react", &settings).as_deref(), Some("on"));
         assert_eq!(
-            current_value(&config, "random_reply_chance", &settings).as_deref(),
+            current_value(&config, "chime_reply_chance", &settings).as_deref(),
             Some("7.5%")
         );
         assert_eq!(current_value(&config, "split_length", &settings).as_deref(), Some("500"));
+    }
+
+    /// The dump layout and the `/llm_set` key set must stay in sync: every
+    /// key exactly once, no extras - a key added to `SET_KEYS` without a
+    /// `DUMP_LAYOUT` entry would silently vanish from `/llm_dump`.
+    #[test]
+    fn dump_layout_covers_the_key_set() {
+        let mut dumped: Vec<&str> = DUMP_LAYOUT
+            .iter()
+            .filter_map(|item| match item {
+                DumpItem::Key(key) => Some(*key),
+                _ => None,
+            })
+            .collect();
+        dumped.sort_unstable();
+        let mut expected = SET_KEYS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(dumped, expected);
     }
 
     /// The `react_emoji_inject` grammar: the three modes apply, `none` is a
@@ -3546,7 +3606,7 @@ mod tests {
         assert!(
             apply_set(
                 &mut config,
-                "random_reply_chance",
+                "chime_reply_chance",
                 "NaN",
                 PLATFORM_LIMIT,
                 CHUNK_FLOOR,
