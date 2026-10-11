@@ -73,11 +73,12 @@ pub(crate) fn parse_mention_tag(text: &str) -> Option<(MentionKind, u64, usize)>
 
 /// The outbound inverse: `[Name]<@id>` -> `<@id>`, so tags the model
 /// assembles from normalized history arrive as clean Discord mentions
-/// (rendered output shows the resolved name anyway). The name segment must
-/// be bracket-adjacent to the tag and free of nested brackets; literal user
-/// text matching that same shape (e.g. `[at this]<@123>`) is inherently
-/// ambiguous and is rewritten too - only non-adjacent or nested brackets
-/// pass through byte-identical.
+/// (rendered output shows the resolved name anyway). The name segment is
+/// everything from the last `[` before the tag; any earlier `[` stays
+/// verbatim in the prefix. Literal text matching the same shape (e.g.
+/// `[at this]<@123>`, or `[[b]<@1>` collapsing to `[<@1>`) is inherently
+/// ambiguous and is rewritten too - only shapes where no `]` sits directly
+/// before the tag pass through byte-identical.
 fn denormalize_mention_tags(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
     let mut rest = content;
@@ -85,7 +86,6 @@ fn denormalize_mention_tags(content: &str) -> String {
         if let Some((_, _, length)) = parse_mention_tag(tail) {
             if let Some((prefix, name)) = before.rsplit_once('[')
                 && !name.is_empty()
-                && !name.contains('[')
             {
                 out.push_str(prefix);
                 out.push_str(tail.get(..length).unwrap_or(""));
@@ -774,12 +774,24 @@ impl<T: InteractionApi> ChatOutputPort for InteractionFollowupOutput<T> {
     /// "thinking" state clears without any content arriving. Nothing to
     /// do once a real reply already consumed the slot.
     async fn dismiss(&self) {
-        if !self.first_followup_used.swap(true, Ordering::Relaxed)
-            && let Ok(placeholder) =
-                self.api.create_followup(&self.token, &placeholder_body()).await
-        {
-            if let Err(err) = self.api.delete_followup(&self.token, placeholder).await {
-                tracing::warn!(%err, "failed to clean up the dismissed interaction slot");
+        if self.first_followup_used.swap(true, Ordering::Relaxed) {
+            return; // a real reply already consumed the slot
+        }
+        match self.api.create_followup(&self.token, &placeholder_body()).await {
+            Ok(placeholder) => {
+                if let Err(err) = self.api.delete_followup(&self.token, placeholder).await {
+                    tracing::warn!(%err, "failed to clean up the dismissed interaction slot");
+                }
+            }
+            // The invoker's pending loading state now hangs until token
+            // expiry - invisible to users, so at least name it to the
+            // operator (same policy as the failed placeholder in `send`).
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "dismiss placeholder failed - the invoker's pending loading state stays \
+                     until the interaction token expires"
+                );
             }
         }
     }
@@ -961,10 +973,12 @@ mod tests {
         assert_eq!(denormalize_mention_tags("plain text"), "plain text");
         // Markdown adjacent to a tag is never mangled: the link's bracket
         // pair stays untouched, and names containing parentheses still
-        // strip (only nested `[` rejects a candidate).
+        // strip. A literal bracket pair DIRECTLY before the tag collapses
+        // - pinned here so the accepted ambiguity stays visible contract.
         assert_eq!(denormalize_mention_tags("[text](url)<@123>"), "[text](url)<@123>");
         assert_eq!(denormalize_mention_tags("[Name (x)]<@123>"), "<@123>");
         assert_eq!(denormalize_mention_tags("[l](u) [Name]<@1>"), "[l](u) <@1>");
+        assert_eq!(denormalize_mention_tags("[[b]<@1>"), "[<@1>");
     }
 
     /// Owner => everything; anyone else => @everyone + member roles union.
@@ -1132,6 +1146,23 @@ mod tests {
         output.dismiss().await;
 
         assert_eq!(api.log(), ["create:flags"]);
+    }
+
+    /// A failed dismiss placeholder stays silent to users but must name the
+    /// failure to the operator (the invocation's loading state hangs until
+    /// token expiry) - and the slot stays consumed either way.
+    #[tokio::test]
+    async fn failed_dismiss_placeholder_still_consumes_the_slot() {
+        let api = Arc::new(ScriptedApi::new(true, false));
+        let output = scripted_output(Arc::clone(&api));
+
+        output.dismiss().await;
+        output
+            .send(OutboundMessage::text("late reply"))
+            .await
+            .expect("content posts degraded, invoker-only");
+
+        assert_eq!(api.log(), ["create:flags", "create:public"]);
     }
 
     /// If the placeholder itself fails, the content still posts (degraded

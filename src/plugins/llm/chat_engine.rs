@@ -30,7 +30,7 @@ use super::completion_port::{
 };
 use super::conversation::{self, ConversationRecord, RecordRole};
 use super::model::{
-    ChannelConfig, ChannelKey, ConversationState, EmojiInject, EmojiWhitelistEntry,
+    CaptureMode, ChannelConfig, ChannelKey, ConversationState, EmojiInject, EmojiWhitelistEntry,
     GUILD_EMOJI_WHITELIST_KEY, GenParams, NAMESPACE, SERVICE_CHANNEL_KEY, UsageStats, blend_ratio,
     channel_emoji_whitelist_key, channel_key, channel_state_key, channel_stats_key,
     parse_whitelist, records_namespace, unix_now,
@@ -326,8 +326,22 @@ impl ChatEngine {
             return; // DMs cannot have channel config; unreachable via `pre`.
         };
         let channel_id = origin.channel_id.get();
+        // A `bot_related` channel provably ignores a message that neither
+        // mentions the bot nor replies to one: it cannot be captured
+        // (`should_capture`) and cannot trigger (`should_trigger`). Skip the
+        // history and stats loads entirely - busy channels would otherwise
+        // pay a state read, a stats read and a full window parse per
+        // non-bot message. Accepted trade-off: `maybe_compact` no longer
+        // runs on such messages, so a stuck compaction retries on the next
+        // capture or trigger instead of the next message of any kind.
+        if config.capture == CaptureMode::BotRelated
+            && !payload.mentions_bot
+            && payload.reply_to.is_none()
+        {
+            return;
+        }
         // Usage totals seed lazily on first use; the seed is a no-op once
-        // done, so every message pays one `OnceCell::get`.
+        // done, so every processed message pays one `OnceCell::get`.
         self.usage.ensure_seeded().await;
 
         // History integrity unknown -> no generated answer. A mention is
@@ -835,6 +849,7 @@ impl ChatEngine {
                     tokens_per_char: usage_stats.tokens_per_char,
                     budget,
                 },
+                usage_stats,
             )
             .await;
         // Per-completion audit: usage, latency and context shape.
@@ -1306,6 +1321,7 @@ impl ChatEngine {
                 tokens_per_char: usage_stats.tokens_per_char,
                 budget,
             },
+            usage_stats,
         )
         .await;
 
@@ -1865,7 +1881,9 @@ impl ChatEngine {
     /// estimate back to the previous ratio. A usage-less response keeps the
     /// previously reported usage: dropping it would silently disable
     /// token-budget context filling (the budget gate keys on a stored usage)
-    /// after one omitted report. Returns the model's updated cumulative
+    /// after one omitted report. `loaded` is the stats snapshot the caller
+    /// already holds (same channel lock - the reload it replaces could only
+    /// ever return the same value). Returns the model's updated cumulative
     /// totals for the audit row.
     async fn record_usage(
         &self,
@@ -1874,6 +1892,7 @@ impl ChatEngine {
         channel_id: u64,
         model: &str,
         record: UsageRecord,
+        loaded: &UsageStats,
     ) -> Dimension {
         let UsageRecord { usage, timing, context_chars, completion_chars, tokens_per_char, budget } =
             record;
@@ -1889,7 +1908,7 @@ impl ChatEngine {
             Some(usage) => {
                 (Some(usage), blend_ratio(tokens_per_char, usage.prompt_tokens, context_chars))
             }
-            None => (self.load_stats(storage, channel_id).await.last, tokens_per_char),
+            None => (loaded.last.clone(), tokens_per_char),
         };
         let stats =
             UsageStats { last, last_timing: Some(timing), tokens_per_char, last_budget: budget };
@@ -3071,6 +3090,33 @@ mod tests {
         assert_eq!(records.first().map(|r| r.role), Some(RecordRole::User));
         assert!(ctx.fake.requests().is_empty());
         assert!(ctx.begins.lock().is_empty());
+    }
+
+    /// The `bot_related` early exit: a message that provably cannot capture
+    /// (no mention, no reply to the bot) must not touch guild storage at all
+    /// - busy channels would otherwise pay a state read, a stats read and a
+    /// full window parse per non-bot message. A mention still runs the
+    /// loads (and gets the guaranteed answer path).
+    #[tokio::test]
+    async fn bot_related_channels_skip_all_loads_for_ignorable_messages() {
+        let ctx = ctx(vec![]);
+        let scoped = ctx.storage.guild_scoped("test", GuildId(1));
+        let counting = Arc::new(crate::test_support::CountingGuildStorage::new(scoped));
+        let services = KernelServices {
+            chat_output: Arc::clone(&ctx.output) as Arc<dyn ChatOutputPort>,
+            chat_output_factory: Arc::clone(&ctx.factory) as Arc<dyn ChatOutputFactoryPort>,
+            guild_storage: Some(Arc::clone(&counting) as Arc<dyn GuildStorage>),
+            plugin_storage: crate::test_support::test_plugin_storage(),
+            platform_info: crate::test_support::test_platform_info(),
+        };
+        let config = assigned_config(); // bot_related (the default)
+        seed_config(&ctx.storage, &config);
+
+        ctx.engine.handle_message(&origin(), &payload(false, None), &config, &services, None).await;
+        assert_eq!(counting.reads(), 0, "ignorable message must not read storage");
+
+        ctx.engine.handle_message(&origin(), &payload(true, None), &config, &services, None).await;
+        assert!(counting.reads() > 0, "mention must run the full load path");
     }
 
     fn images_enabled_config(model: &str) -> ChannelConfig {

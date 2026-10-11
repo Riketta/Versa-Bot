@@ -328,7 +328,10 @@ impl OpenAiCompatibleAdapter {
     ///
     /// # Errors
     /// A declared `proxy` that reqwest cannot parse, a client that cannot
-    /// build, or an `api_key_env` naming a missing environment variable.
+    /// build, or an `api_key_env` naming a missing - or exported-but-empty
+    /// (fail-fast: a placeholder mistake must not become keyless requests
+    /// that fail at every call with a generic HTTP error) - environment
+    /// variable.
     pub fn from_settings(settings: Arc<LlmSettings>) -> Result<Self, LlmError> {
         let mut providers = BTreeMap::new();
         for (name, provider) in &settings.providers {
@@ -343,24 +346,7 @@ impl OpenAiCompatibleAdapter {
                 .build()
                 .map_err(|err| LlmError::Request(format!("provider `{name}` client: {err}")))?;
             let api_key = match &provider.api_key_env {
-                Some(var) => {
-                    let key = std::env::var(var).map_err(|_| {
-                        // The most common misconfiguration is the key pasted
-                        // into the field that must name the variable holding
-                        // it - such values carry characters no settable env
-                        // var name can (dots, slashes), so call it out.
-                        let hint = if var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                            ""
-                        } else {
-                            " - api_key_env must NAME the environment variable holding \
-                             the key (e.g. VERSABOT_LLM_ZAI_KEY), not contain the key itself"
-                        };
-                        LlmError::Request(format!(
-                            "provider `{name}`: env var `{var}` (api_key_env) is not set{hint}"
-                        ))
-                    })?;
-                    Some(key).filter(|key| !key.is_empty())
-                }
+                Some(var) => Self::resolve_api_key(name, var, std::env::var(var).ok().as_deref())?,
                 None => None,
             };
             providers.insert(
@@ -369,6 +355,39 @@ impl OpenAiCompatibleAdapter {
             );
         }
         Ok(Self { settings, providers, warned_models: Mutex::new(HashSet::new()) })
+    }
+
+    /// Resolves one provider's API key from the env var's outcome. Pure so
+    /// the diagnostics stay unit-testable without touching process env
+    /// state (`value` is `None` for any env error - both unreadable and
+    /// unset variables answer "is not set").
+    fn resolve_api_key(
+        name: &str,
+        var: &str,
+        value: Option<&str>,
+    ) -> Result<Option<String>, LlmError> {
+        let Some(key) = value else {
+            // The most common misconfiguration is the key pasted into the
+            // field that must name the variable holding it - such values
+            // carry characters no settable env var name can (dots, slashes),
+            // so call that out.
+            let hint = if var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                ""
+            } else {
+                " - api_key_env must NAME the environment variable holding \
+                     the key (e.g. VERSABOT_LLM_ZAI_KEY), not contain the key itself"
+            };
+            return Err(LlmError::Request(format!(
+                "provider `{name}`: env var `{var}` (api_key_env) is not set{hint}"
+            )));
+        };
+        if key.is_empty() {
+            return Err(LlmError::Request(format!(
+                "provider `{name}`: env var `{var}` (api_key_env) is set but empty - export \
+                 the actual key into it"
+            )));
+        }
+        Ok(Some(key.to_owned()))
     }
 
     /// Capability of the referenced model; undeclared models get the default
@@ -1899,6 +1918,28 @@ mod tests {
             message.contains("must NAME the environment variable"),
             "hint missing from: {message}"
         );
+    }
+
+    /// An exported-but-empty variable is the `.env` placeholder mistake -
+    /// fail-fast at boot with a diagnostic, never a silently keyless
+    /// provider whose requests fail at every call with a generic error.
+    #[test]
+    fn resolve_api_key_fails_fast_on_an_empty_value() {
+        let err = OpenAiCompatibleAdapter::resolve_api_key("zai", "VERSABOT_LLM_ZAI_KEY", Some(""))
+            .expect_err("empty key expected to fail");
+        let LlmError::Request(message) = err else { panic!("expected a request error, got {err}") };
+        assert!(message.contains("set but empty"), "{message}");
+        assert!(message.contains("VERSABOT_LLM_ZAI_KEY"), "{message}");
+
+        // The happy path passes the key through; the unset case keeps the
+        // existing diagnostic.
+        assert_eq!(
+            OpenAiCompatibleAdapter::resolve_api_key("zai", "VAR", Some("k")).ok(),
+            Some(Some("k".to_owned()))
+        );
+        let unset = OpenAiCompatibleAdapter::resolve_api_key("zai", "VAR", None)
+            .expect_err("unset expected to fail");
+        assert!(unset.to_string().contains("is not set"), "{unset}");
     }
 
     #[test]

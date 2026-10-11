@@ -18,8 +18,12 @@ pub trait ChatOutputFactoryPort: Send + Sync + 'static {
 
     /// Port bound to an arbitrary channel *of the origin event's platform and
     /// guild* - for plugins that log to a configured channel (audit, activity
-    /// tracking) instead of replying to the source. Scope stays guild-bound:
-    /// a plugin cannot reach outside the event's own guild.
+    /// tracking) instead of replying to the source. Same-guild scope is the
+    /// caller's contract: plugins may only pass channel ids read from this
+    /// guild's own storage (every current writer stores the event-origin
+    /// channel). The adapter does not re-verify membership - that needs the
+    /// gateway cache and stays deferred until a plugin accepts arbitrary
+    /// channel arguments.
     fn channel_output(&self, origin: &Origin, channel_id: ChannelId) -> Arc<dyn ChatOutputPort>;
 
     /// Streaming port bound to the event's origin channel - for plugins that

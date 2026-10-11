@@ -209,6 +209,11 @@ So exactly two portal toggles are needed today (Developer Portal → Bot),
 otherwise the gateway disconnects on start: enable **Server Members Intent**
 and **Message Content Intent**.
 
+**Permission note.** The bot needs no mention-everyone permission and should
+not be granted one: model output containing a literal `@everyone`/`@here`
+stays inert text only while that permission is absent (the `lol_store` role
+ping uses a dedicated "members can mention" role instead).
+
 Environment variables override the file:
 `VERSABOT__DISCORD__TOKEN`, `VERSABOT__STORAGE__URL`,
 `VERSABOT__SENTRY__DSN`, ...
@@ -697,8 +702,8 @@ history.
 # image_max_side_cap (768 - the largest image_max_side a channel may set;
 # channels rescale to their per-channel image_max_side, 512 by default),
 # image_jpeg_quality (85), image_max_source_bytes (16 MiB),
-# max_images_per_message (2), react_max_per_message (3 - the
-# emoji-reaction tool's per-answer cap).
+# max_images_per_message (2, clamped to 8), react_max_per_message (3 -
+# the emoji-reaction tool's per-answer cap, clamped to 5).
 # image_model = "local/unsloth/gemma-4-26B-A4B-it-qat-GGUF"
 
 [llm.providers.zai]

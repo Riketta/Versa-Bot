@@ -887,6 +887,7 @@ async fn usage_lines(
     state: &ConversationState,
     window: usize,
     stats: &UsageStats,
+    turn_template: &str,
 ) -> UsageLines {
     let last_response = stats.last_timing.map(|timing| {
         format!(
@@ -920,9 +921,15 @@ async fn usage_lines(
         }
         match serde_json::from_value::<ConversationRecord>(stored.payload) {
             Ok(record) => {
+                // The engine's tokens-per-char calibration is fitted to
+                // RENDERED turns (template prefixes, image markdown) -
+                // estimating from raw record content alone would undercount
+                // systematically. Render the same shape the engine bills.
                 // estimator: precision loss is fine
                 #[allow(clippy::cast_precision_loss)]
-                let chars = record.content.chars().count() as u64;
+                let chars = super::conversation::render_user_turn(turn_template, &record)
+                    .chars()
+                    .count() as u64;
                 context_chars += chars;
                 counted += 1;
             }
@@ -1340,7 +1347,12 @@ impl CommandHandler for StatusLlmHandler {
         let keep_tail =
             usize::try_from(self.engine.settings().compaction_keep_tail).unwrap_or(usize::MAX);
         let window = depth.saturating_add(keep_tail).max(1);
-        let usage = usage_lines(storage, &records_ns, &state, window, &usage_stats).await;
+        let turn_template = config
+            .turn_template
+            .as_deref()
+            .unwrap_or(crate::plugins::llm::conversation::DEFAULT_TURN_TEMPLATE);
+        let usage =
+            usage_lines(storage, &records_ns, &state, window, &usage_stats, turn_template).await;
 
         // The effective prompt: what the model will actually see as slot 1,
         // override or not - with length, identity fingerprint and a head
@@ -1561,6 +1573,15 @@ impl CommandHandler for EmojiWhitelistLlmHandler {
                 return Ok(());
             }
         };
+        // The `add` name check consults the platform's emoji list - a
+        // network or cache round-trip. Keep it OUTSIDE the write lock: one
+        // guild's slow listing must not stall every other guild's whitelist
+        // writes. The lock covers only the storage read-modify-write below.
+        let known = if action == "add" && args.get("name").is_some() {
+            Some(services.chat_output_factory.reactable_emojis(&event.origin).list().await)
+        } else {
+            None
+        };
         // The read-modify-write serializes on the process-wide whitelist
         // mutex: the read must not race another writer's write, and the
         // guard holds through the matching write.
@@ -1574,8 +1595,9 @@ impl CommandHandler for EmojiWhitelistLlmHandler {
                     return Ok(());
                 };
                 if action == "add" {
-                    let known =
-                        services.chat_output_factory.reactable_emojis(&event.origin).list().await;
+                    // Fetched before the lock (see above): action is add and
+                    // the name is present, so this is invariant-guarded.
+                    let known = known.expect("emoji list fetched before the lock");
                     if !known.iter().any(|emoji| emoji.name == name) {
                         services
                             .chat_output
@@ -2286,7 +2308,12 @@ fn current_value(config: &ChannelConfig, key: &str, settings: &LlmSettings) -> O
             |limit| format!("{limit}"),
         )),
         "turn_template" => Some(config.turn_template.clone().map_or_else(
-            || format!("`{}` (plugin default)", super::conversation::DEFAULT_TURN_TEMPLATE),
+            || {
+                format!(
+                    "`{}` (plugin default)",
+                    crate::plugins::llm::conversation::DEFAULT_TURN_TEMPLATE
+                )
+            },
             |template| format!("`{template}`"),
         )),
         _ => None,
@@ -3609,6 +3636,7 @@ mod tests {
             &ConversationState::default(),
             0,
             &UsageStats::default(),
+            crate::plugins::llm::conversation::DEFAULT_TURN_TEMPLATE,
         )
         .await;
 
@@ -3628,9 +3656,15 @@ mod tests {
             last_timing: Some(ResponseTiming::reported(50_237)),
             ..UsageStats::default()
         };
-        let lines =
-            usage_lines(&guild, &records_namespace(2), &ConversationState::default(), 0, &timed)
-                .await;
+        let lines = usage_lines(
+            &guild,
+            &records_namespace(2),
+            &ConversationState::default(),
+            0,
+            &timed,
+            crate::plugins::llm::conversation::DEFAULT_TURN_TEMPLATE,
+        )
+        .await;
         assert_eq!(lines.last_response.as_deref(), Some("Last response: 50.2 s (endpoint)"));
         assert!(lines.estimate.is_none());
         assert!(lines.last_request.is_none());
@@ -3639,9 +3673,15 @@ mod tests {
             last_timing: Some(ResponseTiming::measured(950)),
             ..UsageStats::default()
         };
-        let lines =
-            usage_lines(&guild, &records_namespace(2), &ConversationState::default(), 0, &measured)
-                .await;
+        let lines = usage_lines(
+            &guild,
+            &records_namespace(2),
+            &ConversationState::default(),
+            0,
+            &measured,
+            crate::plugins::llm::conversation::DEFAULT_TURN_TEMPLATE,
+        )
+        .await;
         assert_eq!(lines.last_response.as_deref(), Some("Last response: 950 ms (measured)"));
     }
 
@@ -3672,12 +3712,19 @@ mod tests {
             last_budget: Some(500),
         };
 
-        let lines =
-            usage_lines(&guild, &records_namespace(2), &ConversationState::default(), 2, &stats)
-                .await;
+        // est = 1.0 tokens/char * 24 rendered chars per turn ([alice](<@>):
+        // prefix) + 8 per-turn overhead * 2 turns.
+        let lines = usage_lines(
+            &guild,
+            &records_namespace(2),
+            &ConversationState::default(),
+            2,
+            &stats,
+            crate::plugins::llm::conversation::DEFAULT_TURN_TEMPLATE,
+        )
+        .await;
 
-        // est = 1.0 tokens/char * 20 chars + 8 per-turn overhead * 2 turns.
-        assert_eq!(lines.estimate.as_deref(), Some("Est. context: ~36 / 500 tokens"));
+        assert_eq!(lines.estimate.as_deref(), Some("Est. context: ~64 / 500 tokens"));
         assert_eq!(
             lines.last_request.as_deref(),
             Some(
@@ -3691,10 +3738,16 @@ mod tests {
         bare.cached_tokens = None;
         bare.reasoning_tokens = None;
         let plain = UsageStats { last: Some(bare), ..plain };
-        let lines =
-            usage_lines(&guild, &records_namespace(2), &ConversationState::default(), 2, &plain)
-                .await;
-        assert_eq!(lines.estimate.as_deref(), Some("Est. context: ~36 tokens"));
+        let lines = usage_lines(
+            &guild,
+            &records_namespace(2),
+            &ConversationState::default(),
+            2,
+            &plain,
+            crate::plugins::llm::conversation::DEFAULT_TURN_TEMPLATE,
+        )
+        .await;
+        assert_eq!(lines.estimate.as_deref(), Some("Est. context: ~64 tokens"));
         assert_eq!(
             lines.last_request.as_deref(),
             Some("Last request: 100 prompt / 10 completion / 110 total tokens")

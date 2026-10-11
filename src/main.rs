@@ -444,6 +444,39 @@ fn llm_settings_from(
     if config.image_max_side_cap == 0 {
         tracing::warn!("[llm] image_max_side_cap is zero - clamped to 1");
     }
+    // Both knobs multiply per-answer work that holds the channel's
+    // processing lock (concurrent image downloads, per-answer reaction
+    // API calls) - a config typo would park a channel for minutes.
+    // Discord's own reaction cap bounds usefulness at 20; 5 keeps the
+    // decoration light. Zero stays legal: it is the documented "off".
+    const MAX_IMAGES_PER_MESSAGE_CAP: u32 = 8;
+    let max_images_per_message = config.max_images_per_message.min(MAX_IMAGES_PER_MESSAGE_CAP);
+    if config.max_images_per_message > MAX_IMAGES_PER_MESSAGE_CAP {
+        tracing::warn!(
+            configured = config.max_images_per_message,
+            clamped = MAX_IMAGES_PER_MESSAGE_CAP,
+            "[llm] max_images_per_message above the cap - clamped"
+        );
+    }
+    const REACT_MAX_PER_MESSAGE_CAP: usize = 5;
+    let react_max_per_message = config.react_max_per_message.min(REACT_MAX_PER_MESSAGE_CAP);
+    if config.react_max_per_message > REACT_MAX_PER_MESSAGE_CAP {
+        tracing::warn!(
+            configured = config.react_max_per_message,
+            clamped = REACT_MAX_PER_MESSAGE_CAP,
+            "[llm] react_max_per_message above the cap - clamped"
+        );
+    }
+    // The JPEG encoder clamps internally, but the announce-on-correction
+    // convention keeps a typo visible instead of silently degraded.
+    let image_jpeg_quality = config.image_jpeg_quality.clamp(1, 100);
+    if config.image_jpeg_quality != image_jpeg_quality {
+        tracing::warn!(
+            configured = config.image_jpeg_quality,
+            clamped = image_jpeg_quality,
+            "[llm] image_jpeg_quality outside 1..=100 - clamped"
+        );
+    }
     // A zero tail makes compaction unreachable (it would fold everything
     // and keep nothing) - the window degrades to a sliding depth cap.
     let compaction_keep_tail = config.compaction_keep_tail.max(1);
@@ -488,12 +521,12 @@ fn llm_settings_from(
         max_prompt_file_bytes: config.max_prompt_file_bytes,
         image_model: config.image_model.clone(),
         image_max_side_cap,
-        image_jpeg_quality: config.image_jpeg_quality,
+        image_jpeg_quality,
         image_max_source_bytes: config.image_max_source_bytes,
         image_prompt: config.image_prompt.clone(),
-        max_images_per_message: config.max_images_per_message,
+        max_images_per_message,
         max_consecutive_newlines: config.max_consecutive_newlines,
-        react_max_per_message: config.react_max_per_message,
+        react_max_per_message,
         log_raw_traffic: config.log_raw_traffic,
         providers: config
             .providers
@@ -970,6 +1003,7 @@ mod tests {
         config.stream_interval_ms = 10;
         config.compaction_keep_tail = 0;
         config.image_max_side_cap = 0;
+        config.image_jpeg_quality = 0;
 
         let settings = llm_settings_from(&config, None, None, Some(2000));
         assert_eq!(settings.max_message_length, 1);
@@ -977,6 +1011,30 @@ mod tests {
         assert_eq!(settings.stream_interval_ms, 250);
         assert_eq!(settings.compaction_keep_tail, 1);
         assert_eq!(settings.image_max_side_cap, 1);
+        assert_eq!(settings.image_jpeg_quality, 1);
+    }
+
+    /// Per-answer work knobs that hold the channel lock (image downloads,
+    /// reaction calls) clamp down to their caps - a config typo would park
+    /// a channel for minutes. Zero stays legal: it is the documented "off".
+    #[test]
+    fn llm_per_answer_knobs_clamp_to_their_caps() {
+        let mut config = LlmConfig::default();
+        config.max_images_per_message = 100;
+        config.react_max_per_message = 50;
+        config.image_jpeg_quality = 255;
+
+        let settings = llm_settings_from(&config, None, None, Some(2000));
+        assert_eq!(settings.max_images_per_message, 8);
+        assert_eq!(settings.react_max_per_message, 5);
+        assert_eq!(settings.image_jpeg_quality, 100);
+
+        // Zero = off, passes through untouched.
+        config.max_images_per_message = 0;
+        config.react_max_per_message = 0;
+        let settings = llm_settings_from(&config, None, None, Some(2000));
+        assert_eq!(settings.max_images_per_message, 0);
+        assert_eq!(settings.react_max_per_message, 0);
     }
 
     /// The plugin-facing defaults and the config-file defaults are two

@@ -20,21 +20,33 @@ use super::watch::{
     ChampionHit, SkinHit, WATCH_KEY, WatchDoc, WatchKind, WatchTarget, normalize_name, query_id,
 };
 
-/// Serializes the guild-config read-modify-write across ALL config commands
-/// (and guilds - admin-frequency operations, contention is negligible).
-/// Without it, two concurrent commands can interleave and drop one field's
-/// change: last document write wins.
-static CONFIG_WRITE: AsyncMutex<()> = AsyncMutex::const_new(());
+/// Per-guild write locks for the guild-config read-modify-write, mirroring
+/// the watch-write locks: unrelated guilds' config commands never serialize
+/// against each other, and lock entries are bounded by distinct guilds ever
+/// served. Without serialization two concurrent commands can interleave and
+/// drop one field's change (last document write wins).
+static CONFIG_WRITES: std::sync::OnceLock<AsyncMutex<HashMap<u64, Arc<AsyncMutex<()>>>>> =
+    std::sync::OnceLock::new();
+
+/// The guild's config-write lock from the global registry.
+async fn config_write_lock(guild_id: u64) -> Arc<AsyncMutex<()>> {
+    let registry = CONFIG_WRITES.get_or_init(|| AsyncMutex::new(HashMap::new()));
+    let mut locks = registry.lock().await;
+    Arc::clone(locks.entry(guild_id).or_default())
+}
 
 /// Read-modify-write of the guild config document, so enable/disable and
-/// assign/unassign never clobber each other's fields (serialized by
-/// [`CONFIG_WRITE`]). A doc that fails to deserialize is logged and treated
-/// as defaults for this operation - the corruption predates the command.
+/// assign/unassign never clobber each other's fields (serialized by the
+/// guild's entry in [`CONFIG_WRITES`]). A doc that fails to deserialize is
+/// logged and treated as defaults for this operation - the corruption
+/// predates the command.
 async fn update_config(
     services: &KernelServices,
+    guild_id: u64,
     change: impl FnOnce(&mut GuildConfig),
 ) -> anyhow::Result<GuildConfig> {
-    let _guard = CONFIG_WRITE.lock().await;
+    let lock = config_write_lock(guild_id).await;
+    let _guard = lock.lock().await;
     let storage = services
         .guild_storage
         .as_ref()
@@ -71,14 +83,18 @@ pub struct EnableHandler;
 impl CommandHandler for EnableHandler {
     async fn invoke(
         &self,
-        _event: &RequestContext,
+        event: &RequestContext,
         _args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
         if services.guild_storage.is_none() {
             return reply_guild_only(services).await;
         }
-        let config = update_config(services, |config| config.enabled = true).await?;
+        let config =
+            update_config(services, event.origin.guild_id.map_or(0, |g| g.get()), |config| {
+                config.enabled = true
+            })
+            .await?;
         services
             .chat_output
             .send(command_reply(match config.channel_id {
@@ -102,14 +118,17 @@ pub struct DisableHandler;
 impl CommandHandler for DisableHandler {
     async fn invoke(
         &self,
-        _event: &RequestContext,
+        event: &RequestContext,
         _args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
         if services.guild_storage.is_none() {
             return reply_guild_only(services).await;
         }
-        update_config(services, |config| config.enabled = false).await?;
+        update_config(services, event.origin.guild_id.map_or(0, |g| g.get()), |config| {
+            config.enabled = false
+        })
+        .await?;
         services
             .chat_output
             .send(command_reply(
@@ -136,7 +155,10 @@ impl CommandHandler for AssignHandler {
             return reply_guild_only(services).await;
         }
         let channel = event.origin.channel_id.get().to_string();
-        update_config(services, |config| config.channel_id = Some(channel)).await?;
+        update_config(services, event.origin.guild_id.map_or(0, |g| g.get()), |config| {
+            config.channel_id = Some(channel)
+        })
+        .await?;
         services
             .chat_output
             .send(command_reply(
@@ -155,14 +177,17 @@ pub struct UnassignHandler;
 impl CommandHandler for UnassignHandler {
     async fn invoke(
         &self,
-        _event: &RequestContext,
+        event: &RequestContext,
         _args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
         if services.guild_storage.is_none() {
             return reply_guild_only(services).await;
         }
-        update_config(services, |config| config.channel_id = None).await?;
+        update_config(services, event.origin.guild_id.map_or(0, |g| g.get()), |config| {
+            config.channel_id = None
+        })
+        .await?;
         services
             .chat_output
             .send(command_reply("LoL store events will no longer be posted in this guild."))
@@ -180,7 +205,7 @@ pub struct RoleHandler;
 impl CommandHandler for RoleHandler {
     async fn invoke(
         &self,
-        _event: &RequestContext,
+        event: &RequestContext,
         args: &CommandArgs,
         services: &KernelServices,
     ) -> anyhow::Result<()> {
@@ -199,7 +224,10 @@ impl CommandHandler for RoleHandler {
                         .await?;
                     return Ok(());
                 }
-                update_config(services, |config| config.role_id = Some(role)).await?;
+                update_config(services, event.origin.guild_id.map_or(0, |g| g.get()), |config| {
+                    config.role_id = Some(role)
+                })
+                .await?;
                 services
                     .chat_output
                     .send(command_reply(
@@ -209,7 +237,10 @@ impl CommandHandler for RoleHandler {
                     .await?;
             }
             None => {
-                update_config(services, |config| config.role_id = None).await?;
+                update_config(services, event.origin.guild_id.map_or(0, |g| g.get()), |config| {
+                    config.role_id = None
+                })
+                .await?;
                 services
                     .chat_output
                     .send(command_reply("Store announcements will no longer tag a role."))

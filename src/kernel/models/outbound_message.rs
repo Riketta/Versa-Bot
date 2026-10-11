@@ -9,6 +9,16 @@ pub struct Embed {
     pub description: String,
 }
 
+impl Embed {
+    /// True when the platform would render nothing for this embed - both
+    /// text fields empty. Discord rejects such a message with a 400, just
+    /// like an empty body.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.title.is_empty() && self.description.is_empty()
+    }
+}
+
 /// Outbound chat message delivered via an event-scoped `ChatOutputPort`.
 ///
 /// `ephemeral` is a visibility *hint*: only transactional replies (interaction
@@ -58,10 +68,11 @@ impl OutboundMessage {
     }
 
     /// True when neither content nor embeds would be rendered. Adapters must
-    /// not send such messages - Discord rejects them with a 400.
+    /// not send such messages - Discord rejects them with a 400. An embed
+    /// that carries no text counts as unrendered too.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.content.is_empty() && self.embeds.is_empty()
+        self.content.is_empty() && self.embeds.iter().all(Embed::is_empty)
     }
 }
 
@@ -77,5 +88,20 @@ mod tests {
             !OutboundMessage::embed(Embed { title: "t".to_owned(), description: "d".to_owned() })
                 .is_empty()
         );
+    }
+
+    /// An embed with both text fields empty would render nothing - Discord
+    /// rejects the whole message with a 400, so it counts as empty.
+    #[test]
+    fn a_text_free_embed_counts_as_empty() {
+        let bare =
+            OutboundMessage::embed(Embed { title: String::new(), description: String::new() });
+        assert!(bare.is_empty());
+        let titled =
+            OutboundMessage::embed(Embed { title: "t".to_owned(), description: String::new() });
+        assert!(!titled.is_empty());
+        // Text alongside a text-free embed still carries content.
+        let with_body = OutboundMessage { content: "hi".to_owned(), ..bare };
+        assert!(!with_body.is_empty());
     }
 }

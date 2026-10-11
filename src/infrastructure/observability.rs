@@ -38,14 +38,16 @@ pub struct ObservabilityGuards {
 /// Installs the global tracing subscriber: a stdout fmt layer, an optional
 /// file layer, and an optional Sentry/GlitchTip layer.
 ///
-/// The stdout and Sentry layers share one filter: `RUST_LOG` overrides
-/// everything; when unset, `debug` picks the fallback verbosity. The debug
-/// fallback keeps only the bot's own breadcrumbs at debug and pins the
-/// third-party HTTP stack to warn: `reqwest`/`hyper` emit per-request
-/// connect/frame lines whose span context embeds the entire client dump -
-/// pure volume, no signal for operators. The file layer filters
-/// independently (its default is the flight-recorder verbosity, `RUST_LOG`
-/// never affects it; see the `[logging]` config docs).
+/// The stdout and Sentry layers filter independently: stdout follows
+/// `RUST_LOG` (debug fallback below); Sentry always carries info and above -
+/// audit-grade records ship even when an operator quiets stdout - with the
+/// third-party HTTP stack pinned to warn, mirroring the stdout fallback. The
+/// stdout debug fallback keeps only the bot's own breadcrumbs at debug and
+/// pins `reqwest`/`hyper` to warn: they emit per-request connect/frame lines
+/// whose span context embeds the entire client dump - pure volume, no signal
+/// for operators. The file layer filters independently too (its default is
+/// the flight-recorder verbosity, `RUST_LOG` never affects it; see the
+/// `[logging]` config docs).
 ///
 /// The Sentry endpoint is any Sentry-protocol DSN (GlitchTip included), so
 /// "address" is just the DSN host - nothing else to configure. Without a DSN
@@ -151,7 +153,11 @@ pub fn init(
                         tracing::Level::WARN | tracing::Level::INFO => EventFilter::Log,
                         tracing::Level::DEBUG | tracing::Level::TRACE => EventFilter::Ignore,
                     })
-                    .with_filter(stdout_filter),
+                    // The Sentry layer filters independently of stdout (and of
+                    // RUST_LOG): audit-grade info must ship even when an operator
+                    // quiets stdout. The third-party pins mirror the stdout
+                    // fallback - their info lines are pure volume, no signal.
+                    .with_filter(EnvFilter::new("info,hyper=warn,reqwest=warn")),
             )
             .init(),
         None => registry.init(),

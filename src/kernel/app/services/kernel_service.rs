@@ -100,6 +100,12 @@ impl<E: EventBusPort> KernelService<E> {
     /// `shutdown()` the kernel stays dead - plugins are not required to be
     /// restartable, and the composition root boots exactly once.
     ///
+    /// Concurrent calls: a second `boot` while one is still in flight also
+    /// sees the guard set and returns `Ok` - if the first boot then fails
+    /// and rolls back, that `Ok` was premature. Unreachable via the
+    /// composition root (boots once, sequentially); do not call `boot`
+    /// concurrently.
+    ///
     /// # Errors
     /// Propagates the first plugin `init`/`start` failure, or
     /// `PluginError::Invalid` on registration conflicts.

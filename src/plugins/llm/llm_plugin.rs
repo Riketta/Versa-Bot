@@ -829,8 +829,7 @@ mod tests {
         plugin_ports::{CommandArgs, CommandHandler},
         services::KernelServices,
         spi_ports::{
-            ChatOutputFactoryPort, ChatOutputPort, GUILD_SETTINGS, GuildStorage, ReactableEmoji,
-            StoragePort,
+            ChatOutputFactoryPort, ChatOutputPort, GUILD_SETTINGS, ReactableEmoji, StoragePort,
         },
     };
     use crate::plugins::llm::model::{

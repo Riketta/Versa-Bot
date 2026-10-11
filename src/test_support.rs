@@ -1004,5 +1004,97 @@ pub fn assert_descriptions_fit_discord(
                 argument.description
             );
         }
+        // Tier gate needs a guild: DMs carry no guild storage, so the auth
+        // plugin's `pre` returns `Continue` there - a Moderator+ command
+        // reachable in a DM would run enforcement-free. The convention is
+        // `guild_only: true` for every Moderator+ descriptor; pinned here so
+        // a future plugin forgetting it fails a test, not an audit.
+        if let Some(tier) = descriptor.required_tier {
+            let privileged = !matches!(
+                tier,
+                crate::kernel::plugin_ports::AccessTier::Banned
+                    | crate::kernel::plugin_ports::AccessTier::Guest
+                    | crate::kernel::plugin_ports::AccessTier::User
+            );
+            assert!(
+                !privileged || descriptor.guild_only,
+                "command `{}` requires {} but is not guild-only - DMs bypass the tier gate",
+                descriptor.name,
+                tier
+            );
+        }
+    }
+}
+
+/// In-memory [`GuildStorage`] counting scoped reads (`get`/`list_last`) -
+/// lets tests assert that a code path performs or skips storage reads (the
+/// LLM intake's early-exit contract). Delegates to a real scoped view.
+pub struct CountingGuildStorage {
+    inner: Arc<dyn GuildStorage>,
+    reads: AtomicUsize,
+}
+
+impl CountingGuildStorage {
+    #[must_use]
+    pub fn new(inner: Arc<dyn GuildStorage>) -> Self {
+        Self { inner, reads: AtomicUsize::new(0) }
+    }
+
+    /// Read operations counted so far.
+    #[must_use]
+    pub fn reads(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl GuildStorage for CountingGuildStorage {
+    async fn get(&self, namespace: &str, key: &str) -> Result<Option<Value>, StorageError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.get(namespace, key).await
+    }
+
+    async fn set(&self, namespace: &str, key: &str, value: Value) -> Result<(), StorageError> {
+        self.inner.set(namespace, key, value).await
+    }
+
+    async fn delete(&self, namespace: &str, key: &str) -> Result<(), StorageError> {
+        self.inner.delete(namespace, key).await
+    }
+
+    async fn list_keys(&self, namespace: &str) -> Result<Vec<String>, StorageError> {
+        self.inner.list_keys(namespace).await
+    }
+
+    async fn append(&self, namespace: &str, payload: Value) -> Result<u64, StorageError> {
+        self.inner.append(namespace, payload).await
+    }
+
+    async fn list_after(
+        &self,
+        namespace: &str,
+        after_seq: u64,
+        limit: u32,
+    ) -> Result<Vec<StoredRecord>, StorageError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.list_after(namespace, after_seq, limit).await
+    }
+
+    async fn list_last(
+        &self,
+        namespace: &str,
+        limit: u32,
+    ) -> Result<Vec<StoredRecord>, StorageError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.list_last(namespace, limit).await
+    }
+
+    async fn count_after(&self, namespace: &str, after_seq: u64) -> Result<u64, StorageError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.count_after(namespace, after_seq).await
+    }
+
+    async fn delete_record(&self, namespace: &str, seq: u64) -> Result<u64, StorageError> {
+        self.inner.delete_record(namespace, seq).await
     }
 }

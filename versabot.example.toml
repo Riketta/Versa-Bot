@@ -16,6 +16,9 @@ debug = true
 
 [discord]
 token = "YOUR_TOKEN"
+# The bot needs no MENTION_EVERYONE-style permissions: model output
+# containing literal @everyone/@here stays inert text only while that
+# permission is absent - do not grant it to the bot's roles.
 # SOCKS/HTTP proxy for Discord REST calls. REST only - the gateway WebSocket
 # bypasses it; on proxy-only networks route the whole container through the
 # proxy at network level (see README, "Running behind a proxy").
@@ -98,7 +101,7 @@ url = "sqlite://versabot.db"
 # max_consecutive_newlines = 2
 # Cap on emoji reactions applied per answer. The model asks via a
 # [[react: ...]] marker, which is stripped before the answer is shown;
-# channels opt in via /llm_set react on.
+# channels opt in via /llm_set react on. Values above 5 clamp down at boot.
 # react_max_per_message = 3
 #
 # Image recognition: attached images in assigned channels are described by
@@ -115,13 +118,14 @@ url = "sqlite://versabot.db"
 # (aspect kept; smaller images pass through), 512 px by default - values
 # above this cap clamp down to it.
 # image_max_side_cap = 768
-# JPEG quality of the rescaled recognition payload.
+# JPEG quality of the rescaled recognition payload (1-100; out-of-range
+# values clamp at boot).
 # image_jpeg_quality = 85
 # Download cap per image attachment, in bytes; larger images are recorded
 # undescribed.
 # image_max_source_bytes = 16777216
 # Cap on images described per captured message; images beyond it are
-# recorded undescribed.
+# recorded undescribed. Values above 8 clamp down at boot.
 # max_images_per_message = 2
 #
 # Diagnostic: dump every LLM request and response body at DEBUG level,
