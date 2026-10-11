@@ -1029,15 +1029,17 @@ another.
 **Failures.** A message that tags the bot or replies to it is guaranteed a
 visible response: if the generated answer is impossible (provider
 unreachable or rejecting, reasoning-only response, unreadable history),
-the channel gets a short generic fallback notice instead - never a raw
-error, and never recorded as a bot turn (history stays consistent). A
-reply into the conversation cannot even be detected when the history is
-unreadable - that failure mode stays silent. If the answer cannot be
-delivered at all (platform outage on every send path), nothing is
-recorded either - the bot never writes down a turn nobody saw. Random
-chime-ins are unprompted and stay silent on failure. The operator
-still sees what happened: a rate-limited embed (at most one per 5 minutes
-per service channel) carries the error classification only - endpoint
+the channel gets a short fallback notice instead - one static sentence
+per failure kind (usage limit reached, model unreachable, configuration
+problem, ...) so the advice fits the failure - never a raw error, and
+never recorded as a bot turn (history stays consistent). A reply into
+the conversation cannot even be detected when the history is unreadable
+- that failure mode stays silent. If the answer cannot be delivered at
+all (platform outage on every send path), nothing is recorded either -
+the bot never writes down a turn nobody saw. Random chime-ins are
+unprompted and stay silent on failure. The operator still sees what
+happened: a rate-limited embed (at most one per 5 minutes per service
+channel) carries the error classification only - status codes, endpoint
 response bodies and storage errors can name operator infrastructure, so
 they stay in the logs.
 

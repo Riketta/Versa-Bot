@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use super::completion_port::{
     ChatMessage, CompletionRequest, CompletionResponse, LlmCompletionPort, LlmError,
-    ResponseTiming, TokenUsage,
+    RequestFailureKind, ResponseTiming, TokenUsage,
 };
 use super::model::GenParams;
 
@@ -262,6 +262,27 @@ fn retry_delay(attempt: u32) -> Duration {
     Duration::from_secs(1 << attempt.saturating_sub(1).min(3))
 }
 
+/// Maps a reqwest failure below the HTTP answer layer onto the failure
+/// taxonomy: a timed-out request is its own kind, everything else is
+/// transport.
+fn transport_failure_kind(err: &reqwest::Error) -> RequestFailureKind {
+    if err.is_timeout() { RequestFailureKind::Timeout } else { RequestFailureKind::Transport }
+}
+
+/// Maps a non-2xx HTTP answer onto the failure taxonomy. Unmatched codes
+/// degrade to `Generic` - the taxonomy drives static user-facing phrases,
+/// so a novel status must never widen what reaches a channel.
+fn status_failure_kind(status: reqwest::StatusCode) -> RequestFailureKind {
+    match status.as_u16() {
+        429 => RequestFailureKind::QuotaExhausted,
+        401 | 403 => RequestFailureKind::AuthRejected,
+        400 | 404 | 413 | 422 => RequestFailureKind::InvalidRequest,
+        408 => RequestFailureKind::Timeout,
+        500..=599 => RequestFailureKind::EndpointError,
+        _ => RequestFailureKind::Generic,
+    }
+}
+
 /// Sends the request built by `build`, redialling transport-level
 /// failures up to `max_retries` times (see [`transport_retryable`]). The
 /// builder is rebuilt per attempt - reqwest builders are single-shot.
@@ -292,7 +313,10 @@ async fn send_with_retries(
             "LLM request transport error"
         );
         if !retry {
-            return Err(LlmError::Request(err.to_string()));
+            return Err(LlmError::Request {
+                kind: transport_failure_kind(&err),
+                detail: err.to_string(),
+            });
         }
         tokio::time::sleep(retry_delay(attempt)).await;
         attempt += 1;
@@ -338,13 +362,16 @@ impl OpenAiCompatibleAdapter {
             let mut builder =
                 reqwest::Client::builder().timeout(Duration::from_secs(provider.timeout_secs));
             if let Some(proxy) = &provider.proxy {
-                let proxy = reqwest::Proxy::all(proxy)
-                    .map_err(|err| LlmError::Request(format!("provider `{name}` proxy: {err}")))?;
+                let proxy = reqwest::Proxy::all(proxy).map_err(|err| LlmError::Request {
+                    kind: RequestFailureKind::Config,
+                    detail: format!("provider `{name}` proxy: {err}"),
+                })?;
                 builder = builder.proxy(proxy);
             }
-            let client = builder
-                .build()
-                .map_err(|err| LlmError::Request(format!("provider `{name}` client: {err}")))?;
+            let client = builder.build().map_err(|err| LlmError::Request {
+                kind: RequestFailureKind::Config,
+                detail: format!("provider `{name}` client: {err}"),
+            })?;
             let api_key = match &provider.api_key_env {
                 Some(var) => Self::resolve_api_key(name, var, std::env::var(var).ok().as_deref())?,
                 None => None,
@@ -377,15 +404,21 @@ impl OpenAiCompatibleAdapter {
                 " - api_key_env must NAME the environment variable holding \
                      the key (e.g. VERSABOT_LLM_ZAI_KEY), not contain the key itself"
             };
-            return Err(LlmError::Request(format!(
-                "provider `{name}`: env var `{var}` (api_key_env) is not set{hint}"
-            )));
+            return Err(LlmError::Request {
+                kind: RequestFailureKind::Config,
+                detail: format!(
+                    "provider `{name}`: env var `{var}` (api_key_env) is not set{hint}"
+                ),
+            });
         };
         if key.is_empty() {
-            return Err(LlmError::Request(format!(
-                "provider `{name}`: env var `{var}` (api_key_env) is set but empty - export \
-                 the actual key into it"
-            )));
+            return Err(LlmError::Request {
+                kind: RequestFailureKind::Config,
+                detail: format!(
+                    "provider `{name}`: env var `{var}` (api_key_env) is set but empty - export \
+                     the actual key into it"
+                ),
+            });
         }
         Ok(Some(key.to_owned()))
     }
@@ -457,7 +490,10 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
         })
         .await?;
         let status = response.status();
-        let text = response.text().await.map_err(|err| LlmError::Request(err.to_string()))?;
+        let text = response.text().await.map_err(|err| LlmError::Request {
+            kind: transport_failure_kind(&err),
+            detail: err.to_string(),
+        })?;
         // Dumped before the status check so rejected requests are dumped too
         // - the response body is usually the only explanation an endpoint
         // gives (and the only place reasoning_content is ever visible).
@@ -472,7 +508,10 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
             );
         }
         if !status.is_success() {
-            return Err(LlmError::Request(format!("HTTP {status}: {}", truncate(&text, 300))));
+            return Err(LlmError::Request {
+                kind: status_failure_kind(status),
+                detail: format!("HTTP {status}: {}", truncate(&text, 300)),
+            });
         }
         let mut parsed = parse_completion_content(&text, wall_ms(started))?;
         parsed.content = self.normalize(&parsed.content);
@@ -540,7 +579,10 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
         .await?;
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await.map_err(|err| LlmError::Request(err.to_string()))?;
+            let text = response.text().await.map_err(|err| LlmError::Request {
+                kind: transport_failure_kind(&err),
+                detail: err.to_string(),
+            })?;
             if self.settings.log_raw_traffic {
                 tracing::debug!(
                     target: "llm_raw_traffic",
@@ -551,7 +593,10 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
                     "LLM raw response"
                 );
             }
-            return Err(LlmError::Request(format!("HTTP {status}: {}", truncate(&text, 300))));
+            return Err(LlmError::Request {
+                kind: status_failure_kind(status),
+                detail: format!("HTTP {status}: {}", truncate(&text, 300)),
+            });
         }
 
         // SSE reading is byte-buffered: only complete lines are decoded, so
@@ -571,10 +616,13 @@ impl LlmCompletionPort for OpenAiCompatibleAdapter {
             // The endpoint vanished mid-stream: the assembled prefix is
             // incomplete by definition - it must never pass as a full
             // answer. The engine finalizes what was already revealed.
-            return Err(LlmError::Request(format!(
-                "stream ended without [DONE] after {} content chars",
-                read.content.chars().count()
-            )));
+            return Err(LlmError::Request {
+                kind: RequestFailureKind::Generic,
+                detail: format!(
+                    "stream ended without [DONE] after {} content chars",
+                    read.content.chars().count()
+                ),
+            });
         }
         let content = strip_think_blocks(&read.content);
         let content = self.normalize(&content);
@@ -826,8 +874,10 @@ fn apply_stream_fields(body: &mut Value) {
 /// `measured_ms` is the adapter-measured round trip, used when the endpoint
 /// publishes no timing data of its own.
 fn parse_completion_content(text: &str, measured_ms: u64) -> Result<CompletionResponse, LlmError> {
-    let value: Value = serde_json::from_str(text)
-        .map_err(|err| LlmError::Request(format!("malformed JSON: {err}")))?;
+    let value: Value = serde_json::from_str(text).map_err(|err| LlmError::Request {
+        kind: RequestFailureKind::Generic,
+        detail: format!("malformed JSON: {err}"),
+    })?;
     let content = value
         .get("choices")
         .and_then(|choices| choices.get(0))
@@ -1119,7 +1169,10 @@ async fn read_sse_stream(
     let mut marker_hold = super::tools::MarkerHold::default();
     while !done {
         let Some(chunk) = bytes.next().await else { break };
-        let chunk = chunk.map_err(|err| LlmError::Request(format!("stream read failed: {err}")))?;
+        let chunk = chunk.map_err(|err| LlmError::Request {
+            kind: transport_failure_kind(&err),
+            detail: format!("stream read failed: {err}"),
+        })?;
         buffer.extend_from_slice(&chunk);
         while let Some(pos) = buffer.iter().position(|&byte| byte == b'\n') {
             let line_bytes = buffer.drain(..=pos).collect::<Vec<u8>>();
@@ -1592,7 +1645,7 @@ mod tests {
             Err(LlmError::EmptyResponse)
         ));
         assert!(matches!(parse_completion(r#"{"choices":[]}"#), Err(LlmError::EmptyResponse)));
-        assert!(matches!(parse_completion("not json"), Err(LlmError::Request(_))));
+        assert!(matches!(parse_completion("not json"), Err(LlmError::Request { .. })));
     }
 
     /// Reasoning output never reaches a channel: separate reasoning fields
@@ -1866,7 +1919,7 @@ mod tests {
             ..LlmSettings::default()
         };
         let result = OpenAiCompatibleAdapter::from_settings(Arc::new(settings));
-        assert!(matches!(result, Err(LlmError::Request(_))));
+        assert!(matches!(result, Err(LlmError::Request { kind: RequestFailureKind::Config, .. })));
     }
 
     /// A declared proxy reqwest cannot parse fails the adapter construction
@@ -1886,12 +1939,15 @@ mod tests {
             ..LlmSettings::default()
         };
         let message = match OpenAiCompatibleAdapter::from_settings(Arc::new(settings)) {
-            Err(LlmError::Request(message)) => message,
+            Err(LlmError::Request { kind: kind @ RequestFailureKind::Config, detail: message }) => {
+                (kind, message)
+            }
             Err(err) => panic!("expected a request error, got {err}"),
             Ok(_) => panic!("expected an error, but the adapter built"),
         };
-        assert!(message.contains("`zai`"), "provider name expected in: {message}");
-        assert!(message.contains("proxy"), "proxy context expected in: {message}");
+        assert_eq!(message.0, RequestFailureKind::Config);
+        assert!(message.1.contains("`zai`"), "provider name expected in: {}", message.1);
+        assert!(message.1.contains("proxy"), "proxy context expected in: {}", message.1);
     }
 
     /// A value that cannot be an env var name (dots, slashes) is almost
@@ -1910,7 +1966,7 @@ mod tests {
             ..LlmSettings::default()
         };
         let message = match OpenAiCompatibleAdapter::from_settings(Arc::new(settings)) {
-            Err(LlmError::Request(message)) => message,
+            Err(LlmError::Request { kind: RequestFailureKind::Config, detail: message }) => message,
             Err(err) => panic!("expected a request error, got {err}"),
             Ok(_) => panic!("expected an error, but the adapter built"),
         };
@@ -1927,7 +1983,10 @@ mod tests {
     fn resolve_api_key_fails_fast_on_an_empty_value() {
         let err = OpenAiCompatibleAdapter::resolve_api_key("zai", "VERSABOT_LLM_ZAI_KEY", Some(""))
             .expect_err("empty key expected to fail");
-        let LlmError::Request(message) = err else { panic!("expected a request error, got {err}") };
+        let LlmError::Request { kind, detail: message } = err else {
+            panic!("expected a request error, got {err}")
+        };
+        assert_eq!(kind, RequestFailureKind::Config);
         assert!(message.contains("set but empty"), "{message}");
         assert!(message.contains("VERSABOT_LLM_ZAI_KEY"), "{message}");
 
@@ -2097,7 +2156,10 @@ mod tests {
         let Err(err) = result else {
             panic!("the timed-out request must fail - a retry got through");
         };
-        assert!(matches!(err, LlmError::Request(_)), "unexpected error class: {err}");
+        assert!(
+            matches!(err, LlmError::Request { kind: RequestFailureKind::Timeout, .. }),
+            "unexpected error class: {err}"
+        );
         assert_eq!(connections.load(Ordering::SeqCst), 1, "timeouts must not retry");
     }
 
@@ -2123,6 +2185,10 @@ mod tests {
         let Err(err) = result else {
             panic!("the status error must stay terminal - a retry got through");
         };
+        assert!(
+            matches!(err, LlmError::Request { kind: RequestFailureKind::EndpointError, .. }),
+            "unexpected error class: {err}"
+        );
         let rendered = err.to_string();
         assert!(rendered.contains("HTTP 500"), "status expected in: {rendered}");
         assert_eq!(connections.load(Ordering::SeqCst), 1, "status errors must not retry");
@@ -2140,7 +2206,10 @@ mod tests {
         let result = adapter.complete(stream_request()).await;
         finished(server).await;
 
-        assert!(matches!(result, Err(LlmError::Request(_))), "got {result:?}");
+        assert!(
+            matches!(result, Err(LlmError::Request { kind: RequestFailureKind::Transport, .. })),
+            "got {result:?}"
+        );
         assert_eq!(connections.load(Ordering::SeqCst), 2, "default budget = 1 retry");
     }
 
@@ -2180,6 +2249,31 @@ mod tests {
         assert_eq!(retry_delay(5), Duration::from_secs(8));
     }
 
+    /// Status-to-kind mapping: the taxonomy the user-facing strings hang
+    /// off. Unmatched codes must degrade to `Generic`, never invent a
+    /// wider channel-visible phrase.
+    #[test]
+    fn status_failure_kind_maps_the_taxonomy() {
+        use reqwest::StatusCode;
+        let kind_of = |code: u16| status_failure_kind(StatusCode::from_u16(code).expect("code"));
+        assert_eq!(kind_of(429), RequestFailureKind::QuotaExhausted);
+        assert_eq!(kind_of(401), RequestFailureKind::AuthRejected);
+        assert_eq!(kind_of(403), RequestFailureKind::AuthRejected);
+        assert_eq!(kind_of(400), RequestFailureKind::InvalidRequest);
+        assert_eq!(kind_of(404), RequestFailureKind::InvalidRequest);
+        assert_eq!(kind_of(413), RequestFailureKind::InvalidRequest);
+        assert_eq!(kind_of(422), RequestFailureKind::InvalidRequest);
+        assert_eq!(kind_of(408), RequestFailureKind::Timeout);
+        assert_eq!(kind_of(500), RequestFailureKind::EndpointError);
+        assert_eq!(kind_of(503), RequestFailureKind::EndpointError);
+        assert_eq!(kind_of(599), RequestFailureKind::EndpointError);
+        // Unmatched: 3xx, 409, 418, 451 ...
+        assert_eq!(kind_of(304), RequestFailureKind::Generic);
+        assert_eq!(kind_of(409), RequestFailureKind::Generic);
+        assert_eq!(kind_of(418), RequestFailureKind::Generic);
+        assert_eq!(kind_of(451), RequestFailureKind::Generic);
+    }
+
     /// `max_retries = 0` disables retrying: the first transport error is
     /// final.
     #[tokio::test]
@@ -2198,7 +2292,10 @@ mod tests {
         let result = adapter.complete(stream_request()).await;
         server.await.expect("server task");
 
-        assert!(matches!(result, Err(LlmError::Request(_))));
+        assert!(matches!(
+            result,
+            Err(LlmError::Request { kind: RequestFailureKind::Transport, .. })
+        ));
         assert_eq!(connections.load(Ordering::SeqCst), 1);
     }
 
@@ -2247,7 +2344,13 @@ mod tests {
         let err = adapter.complete(stream_request()).await.expect_err("non-2xx expected to fail");
         server.await.expect("server task");
 
-        assert!(matches!(err, LlmError::Request(_)));
+        assert!(
+            matches!(err, LlmError::Request { kind: RequestFailureKind::EndpointError, .. }),
+            "unexpected error class: {err}"
+        );
+        // The channel fallback for this kind is the static sentence, never
+        // the status or body.
+        assert_eq!(err.fallback_message(), RequestFailureKind::EndpointError.fallback());
         let rendered = err.to_string();
         assert!(rendered.contains("500"), "status expected in the error: {rendered}");
         assert!(rendered.contains("oops"), "body expected in the error: {rendered}");
@@ -2362,7 +2465,8 @@ mod tests {
         let result = adapter.complete_streaming(stream_request(), tx).await;
         server.await.expect("server task");
 
-        let Err(LlmError::Request(message)) = result else {
+        let Err(LlmError::Request { kind: RequestFailureKind::Generic, detail: message }) = result
+        else {
             panic!("expected a stream failure, got {result:?}")
         };
         assert!(message.contains("without [DONE]"), "unexpected: {message}");
@@ -2382,10 +2486,16 @@ mod tests {
         let result = adapter.complete_streaming(stream_request(), tx).await;
         server.await.expect("server task");
 
-        let Err(LlmError::Request(message)) = result else {
+        let Err(LlmError::Request { kind, detail: message }) = result else {
             panic!("expected a request failure, got {result:?}")
         };
         assert!(message.contains("HTTP 429"), "unexpected: {message}");
+        // 429 classifies as an exhausted quota, and the channel fallback is
+        // the static quota sentence - not the body.
+        assert_eq!(kind, RequestFailureKind::QuotaExhausted);
+        let err = LlmError::Request { kind, detail: message };
+        assert_eq!(err.fallback_message(), RequestFailureKind::QuotaExhausted.fallback());
+        assert!(!err.fallback_message().contains("slow down"));
     }
 
     /// A model ref under an undeclared provider is rejected on BOTH port

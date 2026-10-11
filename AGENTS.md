@@ -305,10 +305,11 @@ documented in the README; mechanics in rustdoc:
   markers are ephemeral side effects, and a tool failure never fails the
   answer.
 - A triggered message (mention/reply) is guaranteed a visible response;
-  when an answer is impossible, the channel gets a generic fallback
-  notice that is never recorded and carries no error detail. An
-  unreadable history never produces a model answer. Unprompted
-  chime-ins stay silent on failure.
+  when an answer is impossible, the channel gets a fallback notice that
+  is never recorded and quotes only a static per-kind failure sentence
+  (usage limit, unreachable, configuration, ...) - no error detail
+  beyond the kind. An unreadable history never produces a model answer.
+  Unprompted chime-ins stay silent on failure.
 - State-mutating admin commands run under the same per-channel
   processing lock as the engine; `/llm_assign` is the documented
   single-write exception.

@@ -220,6 +220,17 @@ impl LiveReveal {
     }
 }
 
+/// What one triggered answer attempt produced for the channel.
+enum ReplyOutcome {
+    /// A generated answer (text, or marker reactions as the answer) was
+    /// delivered.
+    Delivered,
+    /// Nothing was generated - the channel is owed this static fallback
+    /// sentence. Kind-aware when the failure was an LLM completion error
+    /// ([`LlmError::fallback_message`]); the generic sentence otherwise.
+    Fallback(&'static str),
+}
+
 /// Maps the streaming completion result onto the outcome: content already
 /// revealed turns a stream failure into a partial answer (the fallback
 /// notice would contradict visible text).
@@ -241,11 +252,13 @@ fn live_outcome(
     }
 }
 
-/// Generic public notice when a message that explicitly addresses the bot
-/// cannot receive a generated answer. Deliberately detail-free: the error
-/// classification goes to the service channel, endpoint bodies stay in the
-/// logs.
-pub(crate) const FALLBACK_MESSAGE: &str = "I couldn't process that just now - the language model is unreachable. Please try again in a moment.";
+/// Public notice when a message that explicitly addresses the bot cannot
+/// receive a generated answer, and the failure is NOT an LLM completion
+/// error (storage outage, failed capture, failed delivery): the generic
+/// sentence. LLM-completion failures use the error's own kind-aware phrase
+/// instead ([`LlmError::fallback_message`]); the classification goes to
+/// the service channel, endpoint bodies stay in the logs.
+pub(crate) const FALLBACK_MESSAGE: &str = "I couldn't process that just now - something unexpected went wrong. Please try again in a moment.";
 
 pub struct ChatEngine {
     settings: Arc<LlmSettings>,
@@ -350,7 +363,7 @@ impl ChatEngine {
         // here and stays silent (logged).
         let Some(state) = self.load_state(storage, channel_id).await else {
             if payload.mentions_bot {
-                self.send_fallback(origin, services).await;
+                self.send_fallback(origin, services, FALLBACK_MESSAGE).await;
             }
             return;
         };
@@ -370,7 +383,7 @@ impl ChatEngine {
                 // GlitchTip issues (warn/info only ride along as log items).
                 tracing::error!(channel = channel_id, %err, "llm record log unreadable - skipping message");
                 if payload.mentions_bot {
-                    self.send_fallback(origin, services).await;
+                    self.send_fallback(origin, services, FALLBACK_MESSAGE).await;
                 }
                 return;
             }
@@ -417,11 +430,14 @@ impl ChatEngine {
         };
         if conversation::should_trigger(payload.mentions_bot, reply_to, &live_records) {
             if capture_failed {
-                self.send_fallback(origin, services).await;
-            } else if !self.answer(origin, request, services, pre_typing).await {
+                self.send_fallback(origin, services, FALLBACK_MESSAGE).await;
+            } else if let ReplyOutcome::Fallback(phrase) =
+                self.answer(origin, request, services, pre_typing).await
+            {
                 // The generated answer is impossible - the triggered message
-                // still gets a visible response.
-                self.send_fallback(origin, services).await;
+                // still gets a visible response, kind-aware when the failure
+                // was an LLM completion error.
+                self.send_fallback(origin, services, phrase).await;
             }
         } else if captured
             && (config.random_reply_chance_percent > 0.0
@@ -746,16 +762,16 @@ impl ChatEngine {
 
     /// Completes and delivers the answer for a triggering message. The
     /// triggering message is already part of `live`, so the context ends
-    /// with what the user just said. Returns whether a generated answer was
-    /// actually delivered - `false` lets the caller honor the
-    /// guaranteed-answer contract with the fallback notice.
+    /// with what the user just said. Returns what was delivered - a
+    /// [`ReplyOutcome::Fallback`] makes the caller honor the
+    /// guaranteed-answer contract with the kind-aware fallback sentence.
     async fn answer(
         &self,
         origin: &Origin,
         request: AnswerRequest<'_>,
         services: &KernelServices,
         typing: Option<ChatTypingGuard>,
-    ) -> bool {
+    ) -> ReplyOutcome {
         let AnswerRequest { config, state, live, usage_stats, trigger, guild_name } = request;
         // The answer may take tens of seconds: hold the platform typing
         // indicator across generation and delivery. A triggered run arrives
@@ -822,13 +838,18 @@ impl ChatEngine {
                     cumulative_completion_tokens = cumulative.completion_tokens,
                     "LLM answer generated (partial - stream interrupted)"
                 );
-                return self
+                return if self
                     .deliver_reply(origin, config, channel_id, &partial, live_id, services)
-                    .await;
+                    .await
+                {
+                    ReplyOutcome::Delivered
+                } else {
+                    ReplyOutcome::Fallback(FALLBACK_MESSAGE)
+                };
             }
             LiveOutcome::Failed(err) => {
                 self.report_completion_failure(origin, config, services, &err).await;
-                return false;
+                return ReplyOutcome::Fallback(err.fallback_message());
             }
         };
         // Totals first (the audit row reports the post-completion
@@ -895,7 +916,7 @@ impl ChatEngine {
                     trigger,
                     "completion produced no deliverable content - falling back"
                 );
-                return false;
+                return ReplyOutcome::Fallback(FALLBACK_MESSAGE);
             }
             tracing::debug!(
                 channel = channel_id,
@@ -903,7 +924,7 @@ impl ChatEngine {
                 "marker-only answer - reacting without a reply"
             );
             self.apply_reactions(origin, &reactions, services).await;
-            return true;
+            return ReplyOutcome::Delivered;
         }
 
         let delivered =
@@ -913,7 +934,7 @@ impl ChatEngine {
         if delivered && !reactions.is_empty() {
             self.apply_reactions(origin, &reactions, services).await;
         }
-        delivered
+        if delivered { ReplyOutcome::Delivered } else { ReplyOutcome::Fallback(FALLBACK_MESSAGE) }
     }
 
     /// Streaming completion half: pulls content deltas off the endpoint and
@@ -1387,11 +1408,17 @@ impl ChatEngine {
     /// the bot (a mention, or a reply to a bot turn) never disappears
     /// silently. When the generated answer is impossible - provider failure,
     /// reasoning-only response, untrustworthy history - the channel gets
-    /// this generic notice instead, natively replying to the triggering
-    /// message so it is unambiguous what failed. It is never recorded as a
-    /// bot turn and never carries error detail.
-    pub(crate) async fn send_fallback(&self, origin: &Origin, services: &KernelServices) {
-        let mut notice = OutboundMessage::text(FALLBACK_MESSAGE.to_owned());
+    /// this notice instead, natively replying to the triggering message so
+    /// it is unambiguous what failed. It is never recorded as a bot turn
+    /// and carries only a static failure-kind sentence - no status codes,
+    /// no endpoint data.
+    pub(crate) async fn send_fallback(
+        &self,
+        origin: &Origin,
+        services: &KernelServices,
+        phrase: &'static str,
+    ) {
+        let mut notice = OutboundMessage::text(phrase.to_owned());
         if let Some(reply_to) = origin.message_id {
             notice = notice.replying_to(reply_to);
         }
@@ -1967,7 +1994,7 @@ mod tests {
         GuildStorage, ReactableEmoji, ReactionPort, StoragePort, StoredRecord,
     };
     use crate::plugins::llm::completion_port::{
-        ChatRole, CompletionResponse, LlmError, ResponseTiming, TokenUsage,
+        ChatRole, CompletionResponse, LlmError, RequestFailureKind, ResponseTiming, TokenUsage,
     };
     use crate::plugins::llm::model::{CaptureMode, EmojiInject, channel_config_key};
     use crate::plugins::llm::rng::RandRandom;
@@ -2312,13 +2339,19 @@ mod tests {
             deltas: mpsc::Sender<String>,
         ) -> Result<CompletionResponse, LlmError> {
             if self.fail_at_start {
-                return Err(LlmError::Request("endpoint down".to_owned()));
+                return Err(LlmError::Request {
+                    kind: RequestFailureKind::Transport,
+                    detail: "endpoint down".to_owned(),
+                });
             }
             for (index, chunk) in self.chunks.iter().enumerate() {
                 tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
                 let _ = deltas.send(chunk.clone()).await;
                 if self.fail_after.is_some_and(|after| index + 1 == after) {
-                    return Err(LlmError::Request("stream aborted".to_owned()));
+                    return Err(LlmError::Request {
+                        kind: RequestFailureKind::Transport,
+                        detail: "stream aborted".to_owned(),
+                    });
                 }
             }
             Ok(CompletionResponse {
@@ -3435,7 +3468,10 @@ mod tests {
 
     #[tokio::test]
     async fn completion_failure_sends_fallback_and_records_no_bot_turn() {
-        let ctx = ctx(vec![Err(LlmError::Request("provider down".to_owned()))]);
+        let ctx = ctx(vec![Err(LlmError::Request {
+            kind: RequestFailureKind::Transport,
+            detail: "provider down".to_owned(),
+        })]);
         seed_config(&ctx.storage, &assigned_config());
 
         ctx.engine
@@ -3449,13 +3485,55 @@ mod tests {
             .await;
 
         // The generated answer is gone, but the triggered message gets the
-        // visible generic fallback - and no bot turn is recorded.
+        // visible kind-aware fallback (transport -> unreachable) - and no
+        // bot turn is recorded.
         assert!(ctx.begins.lock().is_empty());
-        assert_eq!(ctx.output.messages(), vec![FALLBACK_MESSAGE.to_owned()]);
+        assert_eq!(
+            ctx.output.messages(),
+            vec![RequestFailureKind::Transport.fallback().to_owned()]
+        );
         assert_eq!(ctx.output.sent().first().and_then(|m| m.reply_to), Some(MessageId(77)));
         let records = stored_records(&ctx).await;
         assert_eq!(records.len(), 1);
         assert_eq!(records.first().map(|r| r.role), Some(RecordRole::User));
+    }
+
+    /// The fallback is kind-aware: an exhausted quota must not tell the
+    /// channel the model is "unreachable - try again in a moment" (it
+    /// would not recover in a moment); the channel gets the quota sentence
+    /// and the service embed names the limit. Neither quotes the body.
+    #[tokio::test]
+    async fn quota_failure_fallback_names_the_limit() {
+        let ctx = ctx(vec![Err(LlmError::Request {
+            kind: RequestFailureKind::QuotaExhausted,
+            detail: "HTTP 429: {\"error\":{\"code\":\"1302\",\"message\":\"usage limit \
+                     reached\"}}"
+                .to_owned(),
+        })]);
+        seed_config(&ctx.storage, &assigned_config());
+        seed_service_channel(&ctx);
+
+        ctx.engine
+            .handle_message(
+                &origin(),
+                &payload(true, None),
+                &assigned_config(),
+                &ctx.services,
+                None,
+            )
+            .await;
+
+        let messages = ctx.output.messages();
+        assert!(
+            messages.contains(&RequestFailureKind::QuotaExhausted.fallback().to_owned()),
+            "the channel gets the quota sentence: {messages:?}"
+        );
+        let embed = messages
+            .iter()
+            .find(|message| message.contains("LLM completion failed"))
+            .expect("service notice expected");
+        assert!(embed.contains("usage limit"), "quota classification expected: {embed}");
+        assert!(!embed.contains("1302"), "the provider body must stay in the logs: {embed}");
     }
 
     #[tokio::test]
@@ -3905,7 +3983,13 @@ mod tests {
         let settings = LlmSettings { compaction_keep_tail: 2, ..LlmSettings::default() };
         let ctx = ctx_with(
             settings,
-            vec![Err(LlmError::Request("summarizer down".to_owned())), Ok("the answer".to_owned())],
+            vec![
+                Err(LlmError::Request {
+                    kind: RequestFailureKind::Transport,
+                    detail: "summarizer down".to_owned(),
+                }),
+                Ok("the answer".to_owned()),
+            ],
         );
         let config = ChannelConfig { context_messages: 3, ..assigned_config() };
         seed_config(&ctx.storage, &config);
@@ -4053,12 +4137,15 @@ mod tests {
     }
 
     /// Service-channel embeds carry the error classification only: the
-    /// endpoint's response body (operator-domain detail) stays in logs.
+    /// endpoint's response body (operator-domain detail) stays in logs -
+    /// and the channel fallback is the static kind sentence, so neither
+    /// surface can leak the body either.
     #[tokio::test]
     async fn failure_embed_reports_no_endpoint_body() {
-        let ctx = ctx(vec![Err(LlmError::Request(
-            "HTTP 401: account=secret-org project=hidden".to_owned(),
-        ))]);
+        let ctx = ctx(vec![Err(LlmError::Request {
+            kind: RequestFailureKind::AuthRejected,
+            detail: "HTTP 401: account=secret-org project=hidden".to_owned(),
+        })]);
         seed_config(&ctx.storage, &assigned_config());
         seed_service_channel(&ctx);
 
@@ -4076,17 +4163,36 @@ mod tests {
             .output
             .messages()
             .into_iter()
-            .find(|message| message.contains("could not be reached"))
+            .find(|message| message.contains("LLM completion failed"))
             .expect("service notice expected");
         assert!(
             !text.contains("secret-org"),
             "the endpoint body must not reach guild-visible embeds"
         );
+        assert!(
+            text.contains("rejected the bot's credentials"),
+            "kind classification expected in the embed: {text}"
+        );
+        assert_eq!(
+            ctx.output
+                .messages()
+                .iter()
+                .filter(|message| **message == RequestFailureKind::AuthRejected.fallback())
+                .count(),
+            1,
+            "the channel fallback is the kind sentence"
+        );
     }
 
     #[tokio::test]
     async fn error_notices_are_rate_limited_per_channel() {
-        let ctx = ctx(vec![Err(LlmError::Request("down".to_owned())); 5]);
+        let ctx = ctx(vec![
+            Err(LlmError::Request {
+                kind: RequestFailureKind::Transport,
+                detail: "down".to_owned(),
+            });
+            5
+        ]);
         seed_config(&ctx.storage, &assigned_config());
         seed_service_channel(&ctx);
 
@@ -4103,17 +4209,29 @@ mod tests {
         }
 
         // Three failed completions - one rate-limited error embed for the
-        // operator, plus a visible fallback per triggered message.
+        // operator, plus a visible kind-aware fallback per triggered message.
         let messages = ctx.output.messages();
         assert_eq!(messages.iter().filter(|m| m.contains("LLM completion failed")).count(), 1);
-        assert_eq!(messages.iter().filter(|m| m.contains(FALLBACK_MESSAGE)).count(), 3);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.contains(RequestFailureKind::Transport.fallback()))
+                .count(),
+            3
+        );
     }
 
     /// The cooldown keys on the SERVICE channel, not the origin: an outage
     /// across two active channels still yields a single embed per window.
     #[tokio::test]
     async fn error_notices_are_rate_limited_across_channels() {
-        let ctx = ctx(vec![Err(LlmError::Request("down".to_owned())); 4]);
+        let ctx = ctx(vec![
+            Err(LlmError::Request {
+                kind: RequestFailureKind::Transport,
+                detail: "down".to_owned()
+            });
+            4
+        ]);
         seed_config(&ctx.storage, &assigned_config());
         seed_service_channel(&ctx);
 
@@ -4137,7 +4255,13 @@ mod tests {
             1,
             "one outage window = one embed, regardless of origin channels"
         );
-        assert_eq!(messages.iter().filter(|m| m.contains(FALLBACK_MESSAGE)).count(), 2);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.contains(RequestFailureKind::Transport.fallback()))
+                .count(),
+            2
+        );
     }
 
     /// Without a configured service channel an error notice has nowhere to
@@ -4146,7 +4270,10 @@ mod tests {
     /// - no embed, no classification text, and no stream ever began.
     #[tokio::test]
     async fn error_notices_stay_silent_without_a_service_channel() {
-        let ctx = ctx(vec![Err(LlmError::Request("endpoint down".to_owned()))]);
+        let ctx = ctx(vec![Err(LlmError::Request {
+            kind: RequestFailureKind::Transport,
+            detail: "endpoint down".to_owned(),
+        })]);
         seed_config(&ctx.storage, &assigned_config());
         // Deliberately NO seed_service_channel.
 
@@ -4160,7 +4287,10 @@ mod tests {
             )
             .await;
 
-        assert_eq!(ctx.output.messages(), vec![FALLBACK_MESSAGE.to_owned()]);
+        assert_eq!(
+            ctx.output.messages(),
+            vec![RequestFailureKind::Transport.fallback().to_owned()]
+        );
         assert!(begin_texts(&ctx.begins).is_empty());
     }
 
@@ -4225,7 +4355,10 @@ mod tests {
         let ctx = ctx_random(
             LlmSettings::default(),
             Arc::new(FixedRandom(true)),
-            vec![Err(LlmError::Request("provider down".to_owned()))],
+            vec![Err(LlmError::Request {
+                kind: RequestFailureKind::Transport,
+                detail: "provider down".to_owned(),
+            })],
         );
         let config = ChannelConfig {
             capture: CaptureMode::AllMessages,
@@ -4468,7 +4601,10 @@ mod tests {
             .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
             .await;
 
-        assert_eq!(ctx.output.messages(), vec![FALLBACK_MESSAGE.to_owned()]);
+        assert_eq!(
+            ctx.output.messages(),
+            vec![RequestFailureKind::Transport.fallback().to_owned()]
+        );
         assert!(ctx.begins.lock().is_empty());
         // The user's own turn is captured before the answer attempt - it
         // stays; nothing else may appear.

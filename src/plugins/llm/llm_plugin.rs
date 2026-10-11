@@ -712,7 +712,7 @@ impl MiddlewarePluginPort for LlmPlugin {
                 "engine run backlog full - shedding message"
             );
             if payload.mentions_bot {
-                self.engine.send_fallback(origin, services).await;
+                self.engine.send_fallback(origin, services, FALLBACK_MESSAGE).await;
             }
             return Next::Continue;
         };
@@ -806,7 +806,7 @@ impl MiddlewarePluginPort for LlmPlugin {
                 )
                 .await;
                 if triggered {
-                    engine.send_fallback(&origin, &services).await;
+                    engine.send_fallback(&origin, &services, FALLBACK_MESSAGE).await;
                 }
             }
         });
