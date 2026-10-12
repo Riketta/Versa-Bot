@@ -147,6 +147,22 @@ compiler CI and the Docker image use.
    Once they do, wire the bot up in Discord - the
    [demo below](#demo-wiring-up-a-fresh-server) walks a complete setup.
 
+The authorization URL (Application ID from Developer Portal → General
+Information):
+
+```text
+https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot+applications.commands&permissions=274945297472
+```
+
+**Private bots.** With the Developer Portal's **Public Bot** toggle
+unchecked, only the application owner can open that URL - and they need
+**Manage Server** in the target guild. Have a server admin grant the
+owner that permission temporarily, open the URL, pick their server, and
+authorize; the role can be revoked afterwards and the bot stays.
+Toggling **Public Bot** on temporarily also works - your friend then
+opens the URL themselves - but while it is checked, anyone with the
+link can add the bot.
+
 ### Demo: wiring up a fresh server
 
 A complete first-run configuration, as a guild administrator would type
