@@ -141,8 +141,10 @@ compiler CI and the Docker image use.
    bot comes online.
 
 3. Invite the bot with the `bot` + `applications.commands` scopes so slash
-   commands appear. Global commands can take up to an hour to propagate on
-   first registration. Once they do, wire the bot up in Discord - the
+   commands appear, granting permission integer `274945297472` - the
+   minimal set, documented in [Bot permissions](#bot-permissions). Global
+   commands can take up to an hour to propagate on first registration.
+   Once they do, wire the bot up in Discord - the
    [demo below](#demo-wiring-up-a-fresh-server) walks a complete setup.
 
 ### Demo: wiring up a fresh server
@@ -207,12 +209,41 @@ by a concrete plugin or core feature:
 
 So exactly two portal toggles are needed today (Developer Portal → Bot),
 otherwise the gateway disconnects on start: enable **Server Members Intent**
-and **Message Content Intent**.
+and **Message Content Intent**. The **Presence Intent** toggle stays off -
+the status rotator sets the bot's own presence, which needs no intent.
 
-**Permission note.** The bot needs no mention-everyone permission and should
-not be granted one: model output containing a literal `@everyone`/`@here`
-stays inert text only while that permission is absent (the `lol_store` role
-ping uses a dedicated "members can mention" role instead).
+### Bot permissions
+
+The bot's entire Discord write surface is sending messages (including
+interaction followups), editing its own messages (streaming), adding
+reactions, changing its own nickname, and typing indicators. Seven guild
+permissions cover it completely - invite integer `274945297472`:
+
+| Permission | Requested for |
+|---|---|
+| View Channels | the guild gate for everything else |
+| Send Messages | replies, audit notices, store announcements |
+| Send Messages in Threads | replying inside threads |
+| Embed Links | `/help`, auth denials, LLM service notices, `/lol_store_dump` |
+| Add Reactions | the react tool and random chime reacts |
+| Use External Emojis | reacting with emojis from other servers |
+| Change Nickname | `/set_guild_name` (the self-nickname endpoint) |
+
+Grant nothing beyond the list above:
+
+- **Mention Everyone** must stay absent: model output containing a literal
+  `@everyone`/`@here` stays inert text only while that permission is
+  missing (the `lol_store` role ping uses a dedicated "members can
+  mention" role instead).
+- No **Read Message History**: the bot records live gateway traffic and
+  never fetches history over REST.
+- No **Manage Messages**, **Manage Nicknames**, **Kick Members**, or
+  **Ban Members**: moderation data lives in the bot's own storage; auth
+  bans are bot-internal tiers, not Discord bans; `/set_guild_name` renames
+  the bot itself, not other members.
+- No **Bypass Slowmode**: streaming edits the bot's own messages, which is
+  not slowmode-gated. No voice, polls, TTS, stickers, or attachments are
+  ever sent.
 
 Environment variables override the file:
 `VERSABOT__DISCORD__TOKEN`, `VERSABOT__STORAGE__URL`,
@@ -409,8 +440,10 @@ commands.
 Sets the bot's guild-local display name - how members of THIS server
 see it (Discord's member nickname; the global bot username is never
 touched). Nothing is stored: the platform owns the value, the command
-only applies it. The bot needs the **Manage Nicknames** permission in
-the guild, otherwise the change is rejected with an ephemeral notice.
+only applies it. The bot needs the **Change Nickname** permission in the
+guild - the self-nickname endpoint, not Manage Nicknames, which is for
+renaming other members - otherwise the change is rejected with an
+ephemeral notice.
 
 | Command | Tier | Effect |
 |---|---|---|
