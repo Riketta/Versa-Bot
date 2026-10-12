@@ -709,6 +709,12 @@ split of responsibilities is deliberate:
   the catalog. Keys never appear in config files or guild storage; they
   are resolved from environment variables at boot.
 
+Needs the privileged `MESSAGE_CONTENT` intent (see
+[Gateway intents](#gateway-intents)) - this plugin is the only consumer
+of guild message content. Reacts also need **Add Reactions**, and
+cross-server emoji reacts need **Use External Emojis** (see
+[Bot permissions](#bot-permissions)).
+
 Every channel's conversation lives in its own storage namespace inside
 the guild's partition - channels and guilds cannot read each other's
 history.
