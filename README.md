@@ -447,12 +447,18 @@ the audit channel. Needs the privileged `GUILD_MEMBERS` intent (see
   as `📥 **<user>** joined via CODE (created by <creator>)`. Discord
   never names the invite on a join, so the tracker diffs the guild's
   invite directory (cumulative uses per code) against its last
-  observation: one code that grew by exactly one - or an unknown code
-  that already carries uses - is the one used; zero or several
+  observation: one code that grew by exactly one, an unknown code that
+  already carries uses, or the only stored code that vanished from the
+  listing while one use short of its limit (consuming the last permitted
+  use deletes an invite on the spot) is the one used; zero or several
   candidates (joins while the bot was offline, simultaneous joins) stay
-  unattributed and the baseline resyncs. The directory read needs the
-  bot to hold **Manage Server** - without it every join degrades to the
-  plain notice, and nothing else changes.
+  unattributed and the baseline resyncs. The heuristics can mis-pin in
+  rare corners - a single unknown code already carrying uses, or a link
+  revoked at exactly one use below its limit, can catch a join that
+  actually came through something directory-invisible (a vanity URL, a
+  just-consumed link). The directory read needs the bot to hold
+  **Manage Server** - without it every join degrades to the plain
+  notice, and nothing else changes.
 
 Invite edits (changed use limits) are invisible on Discord - only
 create, delete, and use-count changes exist. Vanity URLs

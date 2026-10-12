@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::kernel::models::InvitePayload;
 use crate::kernel::spi_ports::DirectoryInvite;
 
 /// Guild storage key (inside the tracker namespace) holding the serialized
@@ -15,15 +16,11 @@ pub const INVITES_KEY: &str = "invites";
 pub struct InviteDoc {
     pub code: String,
     #[serde(default)]
-    pub channel_id: Option<String>,
-    #[serde(default)]
     pub creator_id: Option<String>,
     #[serde(default)]
     pub creator_name: Option<String>,
     #[serde(default)]
     pub max_uses: Option<u64>,
-    #[serde(default)]
-    pub temporary: Option<bool>,
     /// Last observed cumulative use count - the join-attribution baseline.
     /// `None` = never observed (created outside an observed lifecycle).
     #[serde(default)]
@@ -40,14 +37,37 @@ impl InviteDoc {
     pub fn from_directory(invite: &DirectoryInvite) -> Self {
         Self {
             code: invite.code.clone(),
-            channel_id: invite.channel_id.map(|channel| channel.get().to_string()),
             creator_id: invite.creator_id.map(|user| user.get().to_string()),
             creator_name: invite.creator_name.clone(),
             max_uses: invite.max_uses,
-            temporary: None,
             last_seen_uses: None,
             deleted: false,
         }
+    }
+
+    /// A fresh record from a create event: the platform reports a zeroed
+    /// use counter - the baseline the first attribution diff diffs from.
+    #[must_use]
+    pub fn from_create(invite: &InvitePayload) -> Self {
+        Self {
+            code: invite.code.clone(),
+            creator_id: invite.creator_id.map(|user| user.get().to_string()),
+            creator_name: invite.creator_name.clone(),
+            max_uses: invite.max_uses,
+            last_seen_uses: Some(0),
+            deleted: false,
+        }
+    }
+
+    /// `true` when the doc describes an invite one use short of its limit:
+    /// the next join through it consumes it, which also deletes it from
+    /// the directory - the vanished-code attribution signal.
+    #[must_use]
+    pub fn one_use_from_limit(&self) -> bool {
+        matches!(
+            (self.last_seen_uses, self.max_uses),
+            (Some(seen), Some(max)) if max >= 1 && seen == max - 1
+        )
     }
 
     /// Creator as the audit line renders it: name when known, else the
@@ -68,9 +88,11 @@ impl InviteDoc {
 /// one code whose cumulative uses grew by exactly one since the last
 /// observation. Codes unknown to storage (created outside an observed
 /// lifecycle - before the feature or while the bot was offline) count as
-/// candidates once they carry uses. Multiple candidates (offline catch-up,
-/// concurrent joins) and none stay unattributed - the diff refuses to
-/// guess.
+/// candidates once they carry uses, and a stored code that vanished from
+/// the listing while one use short of its limit was just consumed by this
+/// join (the platform deletes such invites on the spot). Multiple
+/// candidates (offline catch-up, concurrent joins) and none stay
+/// unattributed - the diff refuses to guess.
 #[must_use]
 pub fn attribute_join(
     stored: &HashMap<String, InviteDoc>,
@@ -91,6 +113,14 @@ pub fn attribute_join(
             Some(_) => {}
             // Unknown to storage: created outside an observed lifecycle.
             None => candidates.push(&invite.code),
+        }
+    }
+    // A consumed code is absent from the listing, but its doc survives:
+    // observed one use short of the limit right as a join lands means the
+    // join consumed it.
+    for (code, doc) in stored {
+        if !fetched.iter().any(|invite| invite.code == *code) && doc.one_use_from_limit() {
+            candidates.push(code);
         }
     }
     if candidates.len() == 1 { candidates.pop().map(str::to_owned) } else { None }
@@ -165,5 +195,60 @@ mod tests {
         unknown.uses = None;
 
         assert_eq!(attribute_join(&HashMap::new(), &[unknown]), None);
+    }
+
+    #[test]
+    fn consumed_vanished_single_use_attributes() {
+        // The join consumed the last permitted use; the platform deleted
+        // the invite, so the listing no longer contains it.
+        let mut single = observed("single", 0);
+        single.1.max_uses = Some(1);
+        let stored = HashMap::from([single, observed("old", 9)]);
+        let fetched = vec![directory("old", 9)];
+
+        assert_eq!(attribute_join(&stored, &fetched).as_deref(), Some("single"));
+    }
+
+    #[test]
+    fn vanished_short_of_its_limit_never_attributes() {
+        // Gone because it was revoked or expired by age - no consumption
+        // signal, no attribution.
+        let mut partial = observed("partial", 2);
+        partial.1.max_uses = Some(10);
+        let stored = HashMap::from([partial]);
+
+        assert_eq!(attribute_join(&stored, &[]), None);
+    }
+
+    #[test]
+    fn vanished_and_growing_codes_stay_unattributed() {
+        let mut single = observed("single", 0);
+        single.1.max_uses = Some(1);
+        let stored = HashMap::from([single, observed("live", 4)]);
+        let fetched = vec![directory("live", 5)];
+
+        assert_eq!(attribute_join(&stored, &fetched), None);
+    }
+
+    #[test]
+    fn two_vanished_candidates_stay_unattributed() {
+        let mut first = observed("a", 0);
+        first.1.max_uses = Some(1);
+        let mut second = observed("b", 3);
+        second.1.max_uses = Some(4);
+        let stored = HashMap::from([first, second]);
+
+        assert_eq!(attribute_join(&stored, &[]), None);
+    }
+
+    #[test]
+    fn unlimited_vanished_code_is_not_a_consumption_candidate() {
+        // max_uses 0 = unlimited: using it never deletes it, so its
+        // absence means revocation, not consumption.
+        let mut unlimited = observed("unl", 7);
+        unlimited.1.max_uses = Some(0);
+        let stored = HashMap::from([unlimited]);
+
+        assert_eq!(attribute_join(&stored, &[]), None);
     }
 }

@@ -15,7 +15,7 @@ use crate::kernel::{
         EventBusPort, MiddlewarePluginPort, Next, PluginPort,
     },
     services::KernelServices,
-    spi_ports::{GuildStorage, InviteDirectoryPort},
+    spi_ports::GuildStorage,
 };
 
 use super::events::{UserJoinedGuild, UserLeftGuild};
@@ -194,6 +194,8 @@ impl<B: EventBusPort> UserActivityTrackerPlugin<B> {
 
     /// `INVITE_CREATE`: record the invite (creator, limits, fresh uses
     /// baseline) and log the creation. Best effort like every audit line.
+    /// Only a new (or previously deleted) code starts from zero - a
+    /// duplicate or replayed event must not regress a live baseline.
     async fn invite_created(
         &self,
         origin: &Origin,
@@ -203,27 +205,32 @@ impl<B: EventBusPort> UserActivityTrackerPlugin<B> {
         let Some(storage) = services.guild_storage.as_ref() else {
             return;
         };
-        let _guard = self.invites_lock.lock().await;
-        let mut invites = load_invites(storage).await;
-        invites.insert(
-            invite.code.clone(),
-            InviteDoc {
-                code: invite.code.clone(),
-                channel_id: invite.channel_id.map(|channel| channel.get().to_string()),
-                creator_id: invite.creator_id.map(|user| user.get().to_string()),
-                creator_name: invite.creator_name.clone(),
-                max_uses: invite.max_uses,
-                temporary: invite.temporary,
-                // The create event reports a fresh counter (Discord: always
-                // 0) - the baseline the first attribution diff diffs from.
-                last_seen_uses: Some(0),
-                deleted: false,
-            },
-        );
-        if let Err(err) = save_invites(storage, &invites).await {
-            tracing::warn!(namespace = NAMESPACE, %err, "failed to persist invite record");
+        let guard = self.invites_lock.lock().await;
+        match load_invites(storage).await {
+            Ok(mut invites) => {
+                match invites.get_mut(&invite.code) {
+                    // Live record: duplicate or replayed event - refresh the
+                    // metadata, keep the observed uses baseline.
+                    Some(doc) if !doc.deleted => {
+                        doc.creator_id = invite.creator_id.map(|user| user.get().to_string());
+                        doc.creator_name.clone_from(&invite.creator_name);
+                        doc.max_uses = invite.max_uses;
+                    }
+                    // Re-created after an observed deletion: fresh lifecycle.
+                    Some(doc) => *doc = InviteDoc::from_create(invite),
+                    None => {
+                        invites.insert(invite.code.clone(), InviteDoc::from_create(invite));
+                    }
+                }
+                if let Err(err) = save_invites(storage, &invites).await {
+                    tracing::warn!(namespace = NAMESPACE, %err, "failed to persist invite record");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(namespace = NAMESPACE, %err, "stored invite map unavailable - creation not recorded");
+            }
         }
-        drop(_guard);
+        drop(guard);
 
         let Some(channel_id) = self.audit_channel(services).await else {
             return;
@@ -253,21 +260,31 @@ impl<B: EventBusPort> UserActivityTrackerPlugin<B> {
         let Some(storage) = services.guild_storage.as_ref() else {
             return;
         };
-        let _guard = self.invites_lock.lock().await;
-        let mut invites = load_invites(storage).await;
-        match invites.get_mut(&invite.code) {
-            Some(doc) => doc.deleted = true,
-            None => {
-                invites.insert(
-                    invite.code.clone(),
-                    InviteDoc { code: invite.code.clone(), deleted: true, ..InviteDoc::default() },
-                );
+        let guard = self.invites_lock.lock().await;
+        match load_invites(storage).await {
+            Ok(mut invites) => {
+                match invites.get_mut(&invite.code) {
+                    Some(doc) => doc.deleted = true,
+                    None => {
+                        invites.insert(
+                            invite.code.clone(),
+                            InviteDoc {
+                                code: invite.code.clone(),
+                                deleted: true,
+                                ..InviteDoc::default()
+                            },
+                        );
+                    }
+                }
+                if let Err(err) = save_invites(storage, &invites).await {
+                    tracing::warn!(namespace = NAMESPACE, %err, "failed to persist invite deletion");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(namespace = NAMESPACE, %err, "stored invite map unavailable - deletion not recorded");
             }
         }
-        if let Err(err) = save_invites(storage, &invites).await {
-            tracing::warn!(namespace = NAMESPACE, %err, "failed to persist invite deletion");
-        }
-        drop(_guard);
+        drop(guard);
 
         let Some(channel_id) = self.audit_channel(services).await else {
             return;
@@ -276,24 +293,55 @@ impl<B: EventBusPort> UserActivityTrackerPlugin<B> {
         self.deliver(origin, services, channel_id, &line).await;
     }
 
-    /// Join attribution under the invite-map write lock: fetch the
-    /// directory, diff uses against the stored baseline, persist the new
-    /// baseline (and freshly learned creators). `None` = no signal -
-    /// directory unreadable (missing permission), empty, ambiguous, or no
-    /// growth; the audit line degrades to the plain join notice.
+    /// Join attribution: fetch the directory (outside the write lock - the
+    /// slow REST read needs no stored state), then diff uses against the
+    /// stored baseline under the lock and persist the new baseline (and
+    /// freshly learned creators). `None` = no signal - directory unreadable
+    /// (missing permission), empty, ambiguous, no growth, or the stored
+    /// map temporarily unavailable; the audit line degrades to the plain
+    /// join notice.
     async fn attribute(
         &self,
         origin: &Origin,
         services: &KernelServices,
     ) -> Option<(String, String)> {
         let storage = services.guild_storage.as_ref()?;
-        let _guard = self.invites_lock.lock().await;
         let fetched = services.invite_directory.invites(origin).await;
         if fetched.is_empty() {
             return None;
         }
-        let mut invites = load_invites(storage).await;
+        let _guard = self.invites_lock.lock().await;
+        let mut invites = match load_invites(storage).await {
+            Ok(invites) => invites,
+            // A backend hiccup is not an empty map: diffing from nothing
+            // would mis-pin the join and overwrite the stored state.
+            Err(err) => {
+                tracing::warn!(namespace = NAMESPACE, %err, "stored invite map unavailable - join not attributed");
+                return None;
+            }
+        };
+        // A code re-created while unobserved re-appears in the listing
+        // still flagged deleted from its previous life: the stale counter
+        // would mis-diff, so revive the record from the listing instead.
+        for invite in &fetched {
+            if let Some(doc) = invites.get_mut(&invite.code)
+                && doc.deleted
+            {
+                let mut fresh = InviteDoc::from_directory(invite);
+                fresh.last_seen_uses = invite.uses;
+                *doc = fresh;
+            }
+        }
         let attributed = attribute_join(&invites, &fetched);
+        // Vanished codes matching the consumption pattern are accounted as
+        // consumed whether or not they won the attribution - otherwise the
+        // same doc would re-candidate on every later join.
+        for doc in invites.values_mut() {
+            let present = fetched.iter().any(|invite| invite.code == doc.code);
+            if !present && doc.one_use_from_limit() {
+                doc.last_seen_uses = doc.max_uses;
+            }
+        }
         for invite in &fetched {
             let doc = invites
                 .entry(invite.code.clone())
@@ -305,7 +353,7 @@ impl<B: EventBusPort> UserActivityTrackerPlugin<B> {
             // never showed (invites created before this feature shipped).
             if doc.creator_id.is_none() {
                 doc.creator_id = invite.creator_id.map(|user| user.get().to_string());
-                doc.creator_name = invite.creator_name.clone();
+                doc.creator_name.clone_from(&invite.creator_name);
             }
         }
         if let Err(err) = save_invites(storage, &invites).await {
@@ -362,18 +410,22 @@ impl<B: EventBusPort> UserActivityTrackerPlugin<B> {
     }
 }
 
-/// The guild's stored invite map, fresh on any read failure - the map is
-/// attribution state, and a malformed document must not wedge future joins.
-async fn load_invites(storage: &Arc<dyn GuildStorage>) -> HashMap<String, InviteDoc> {
+/// The guild's stored invite map. A malformed document starts fresh - the
+/// map is attribution state, and corruption must not wedge future joins.
+/// A backend error surfaces instead: the caller skips the round rather
+/// than guessing from (and persisting over) an empty map.
+async fn load_invites(
+    storage: &Arc<dyn GuildStorage>,
+) -> Result<HashMap<String, InviteDoc>, StorageError> {
     match storage.get(NAMESPACE, INVITES_KEY).await {
-        Ok(Some(raw)) => serde_json::from_value(raw).unwrap_or_else(|err| {
+        Ok(Some(raw)) => Ok(serde_json::from_value(raw).unwrap_or_else(|err| {
             tracing::warn!(namespace = NAMESPACE, %err, "stored invite map unreadable - starting fresh");
             HashMap::new()
-        }),
-        Ok(None) => HashMap::new(),
+        })),
+        Ok(None) => Ok(HashMap::new()),
         Err(err) => {
-            tracing::warn!(namespace = NAMESPACE, %err, "stored invite map unreadable - starting fresh");
-            HashMap::new()
+            tracing::warn!(namespace = NAMESPACE, %err, "stored invite map unavailable - skipping this round");
+            Err(err)
         }
     }
 }
@@ -928,6 +980,160 @@ mod tests {
         );
         let map = stored_invites(&storage).await;
         assert_eq!(field(&map, "pre-historic", "last_seen_uses"), 5);
+    }
+
+    /// A consumed single-use invite vanishes from the directory (the
+    /// platform deletes it on the last use) - the stored doc still pins
+    /// the join, and the doc is accounted so it never re-candidates.
+    #[tokio::test]
+    async fn consumed_single_use_invite_attributes_from_the_stored_doc() {
+        let storage = configured_storage("777");
+        let (plugin, services, fixture) = fixture(Some(Arc::clone(&storage)));
+        let mut created = invite_event(EventKind::InviteCreated, "abc123");
+        plugin.pre(&mut created, &services).await;
+        // The join consumed the code: gone from the listing now.
+        fixture.directory.set(vec![directory("other", 0)]);
+        let mut event = member_event(EventKind::MemberJoined, Some(1), "someone");
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+
+        assert_eq!(
+            fixture.sent.messages.lock().last().expect("join line expected").clone(),
+            (777, "📥 **someone** joined via `abc123` (created by rikk)".to_owned())
+        );
+        let map = stored_invites(&storage).await;
+        assert_eq!(field(&map, "abc123", "last_seen_uses"), 1, "accounted as consumed");
+
+        // The accounted doc never re-candidates on later joins.
+        let mut again = member_event(EventKind::MemberJoined, Some(1), "someone-else");
+        assert!(matches!(plugin.pre(&mut again, &services).await, Next::Continue));
+        assert_eq!(
+            fixture.sent.messages.lock().last().expect("join line expected").clone(),
+            (777, "📥 **someone-else** joined the guild".to_owned())
+        );
+    }
+
+    /// A code re-created while the bot was offline re-appears in the
+    /// listing still flagged deleted from its previous life: it must be
+    /// revived from the listing instead of being pinned by its stale
+    /// counter (which sits at exactly stale + 1 here).
+    #[tokio::test]
+    async fn recycled_code_with_stale_baseline_never_false_pins() {
+        let storage = configured_storage("777");
+        let (plugin, services, fixture) = fixture(Some(Arc::clone(&storage)));
+        // Old life of the code: observed up to 4 uses, then deleted.
+        let mut created = invite_event(EventKind::InviteCreated, "abc123");
+        plugin.pre(&mut created, &services).await;
+        fixture.directory.set(vec![directory("abc123", 4)]);
+        let mut warmup = member_event(EventKind::MemberJoined, Some(1), "warmup");
+        plugin.pre(&mut warmup, &services).await;
+        let mut deleted = invite_event(EventKind::InviteDeleted, "abc123");
+        plugin.pre(&mut deleted, &services).await;
+
+        // Offline re-create; the fresh counter already sits at 5 - the
+        // value the stale arithmetic would call "growth by one". The join
+        // actually came through something directory-invisible (vanity).
+        fixture.directory.set(vec![directory("abc123", 5)]);
+        let mut event = member_event(EventKind::MemberJoined, Some(1), "someone");
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+
+        assert_eq!(
+            fixture.sent.messages.lock().last().expect("join line expected").clone(),
+            (777, "📥 **someone** joined the guild".to_owned()),
+            "a recycled code must not be pinned by its stale counter"
+        );
+        let map = stored_invites(&storage).await;
+        assert_eq!(field(&map, "abc123", "deleted"), false, "listing presence revives the doc");
+        assert_eq!(field(&map, "abc123", "last_seen_uses"), 5);
+    }
+
+    /// Re-creating a code after an observed deletion starts a fresh
+    /// lifecycle: the baseline resets instead of keeping the old counter.
+    #[tokio::test]
+    async fn recreated_invite_after_delete_gets_a_fresh_baseline() {
+        let storage = configured_storage("777");
+        let (plugin, services, _fixture) = fixture(Some(Arc::clone(&storage)));
+        let mut created = invite_event(EventKind::InviteCreated, "abc123");
+        plugin.pre(&mut created, &services).await;
+        let mut deleted = invite_event(EventKind::InviteDeleted, "abc123");
+        plugin.pre(&mut deleted, &services).await;
+        let mut recreated = invite_event(EventKind::InviteCreated, "abc123");
+        plugin.pre(&mut recreated, &services).await;
+
+        let map = stored_invites(&storage).await;
+        assert_eq!(field(&map, "abc123", "deleted"), false);
+        assert_eq!(field(&map, "abc123", "last_seen_uses"), 0);
+    }
+
+    /// A duplicate `INVITE_CREATE` must not regress a live record's baseline.
+    #[tokio::test]
+    async fn duplicate_invite_create_keeps_the_uses_baseline() {
+        let storage = configured_storage("777");
+        let (plugin, services, fixture) = fixture(Some(Arc::clone(&storage)));
+        let mut created = invite_event(EventKind::InviteCreated, "abc123");
+        plugin.pre(&mut created, &services).await;
+        // A join lifts the baseline to 1 before the duplicate arrives.
+        fixture.directory.set(vec![directory("abc123", 1)]);
+        let mut join = member_event(EventKind::MemberJoined, Some(1), "someone");
+        plugin.pre(&mut join, &services).await;
+        let mut duplicate = invite_event(EventKind::InviteCreated, "abc123");
+        plugin.pre(&mut duplicate, &services).await;
+
+        let map = stored_invites(&storage).await;
+        assert_eq!(
+            field(&map, "abc123", "last_seen_uses"),
+            1,
+            "duplicate create must not regress the baseline"
+        );
+        assert_eq!(field(&map, "abc123", "deleted"), false);
+    }
+
+    /// A backend failure must not be mistaken for an empty map: the old
+    /// behavior fabricated an attribution from nothing and overwrote the
+    /// stored map with the result. Attribution skips instead.
+    #[tokio::test]
+    async fn storage_failure_skips_attribution() {
+        let sent = Arc::new(Sent::default());
+        let output = RecordingChatOutput::new();
+        let services = KernelServices {
+            chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
+            chat_output_factory: Arc::new(ChannelRecordingFactory { sent: Arc::clone(&sent) }),
+            invite_directory: FakeInviteDirectory::new(vec![directory("only-one", 4)])
+                as Arc<dyn InviteDirectoryPort>,
+            guild_storage: Some(
+                crate::test_support::FailingStorage.guild_scoped("test", GuildId(1)),
+            ),
+            plugin_storage: crate::test_support::test_plugin_storage(),
+            platform_info: crate::test_support::test_platform_info(),
+        };
+        let plugin = UserActivityTrackerPlugin::new(
+            InMemoryEventBus::new(),
+            Arc::new(InMemoryCommandRegistry::new()),
+        );
+
+        let attributed = plugin.attribute(&origin(Some(1)), &services).await;
+
+        assert!(attributed.is_none(), "a backend failure must not fabricate an attribution");
+    }
+
+    /// A malformed stored map starts fresh (corruption must not wedge
+    /// future joins) - but a backend error surfaces as `Err` instead of
+    /// pretending the map is empty.
+    #[tokio::test]
+    async fn load_invites_splits_corruption_from_backend_failure() {
+        let corrupt = InMemoryStorage::new();
+        corrupt.seed("test", GuildId(1), NAMESPACE, INVITES_KEY, serde_json::json!("garbage"));
+        let corrupt_view = corrupt.guild_scoped("test", GuildId(1));
+        let fresh =
+            load_invites(&corrupt_view).await.expect("corruption falls back to a fresh map");
+        assert!(fresh.is_empty());
+
+        let failing = crate::test_support::FailingStorage.guild_scoped("test", GuildId(1));
+        assert!(
+            load_invites(&failing).await.is_err(),
+            "a backend error must surface, not reset the attribution state"
+        );
     }
 
     #[tokio::test]
