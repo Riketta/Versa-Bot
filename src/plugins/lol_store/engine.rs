@@ -633,7 +633,7 @@ impl<B: EventBusPort> StoreEngine<B> {
                 tracing::warn!(%err, guild = guild_id.get(), "failed to record store announcement");
             }
             for kind in &kinds {
-                self.bus.publish(Arc::new(LolStoreAnnounced { guild_id, kind: *kind }));
+                self.bus.publish(LolStoreAnnounced { guild_id, kind: *kind });
             }
         }
 
@@ -1344,6 +1344,7 @@ impl<B: EventBusPort> Job for PollJob<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::models::BusEvent;
     use crate::kernel::plugin_ports::EventHandler;
     use crate::kernel::spi_ports::PluginStoragePort;
     use crate::plugins::lol_store::lcu::{
@@ -1373,17 +1374,17 @@ mod tests {
     }
 
     impl EventBusPort for RecorderBus {
-        fn publish(&self, event: Arc<dyn crate::kernel::models::Event>) {
+        fn publish<E: crate::kernel::models::BusEvent>(&self, event: E) {
             if let Some(announced) = event.as_any().downcast_ref::<LolStoreAnnounced>() {
                 self.events.lock().push((
-                    "lol_store.announced",
+                    LolStoreAnnounced::EVENT_NAME,
                     announced.guild_id.get(),
                     announced.kind.as_str(),
                 ));
             }
         }
 
-        fn subscribe<E: crate::kernel::models::Event + 'static>(
+        fn subscribe<E: crate::kernel::models::BusEvent + 'static>(
             &self,
             _handler: Arc<dyn EventHandler<E>>,
         ) -> crate::kernel::plugin_ports::EventBusSubscription {

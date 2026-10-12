@@ -2,9 +2,7 @@
 //! produced an announcement. Bus-only plugins may react to store activity
 //! without joining any pipeline; the bus contract is the type import only.
 
-use std::any::Any;
-
-use crate::kernel::models::GuildId;
+use crate::{bus_event, kernel::models::GuildId};
 
 /// Which tracker produced the announcement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,22 +25,15 @@ impl StoreEventKind {
     }
 }
 
-/// Store updates were announced to a guild's assigned channel. Fields are
-/// payload for future bus subscribers (the bus contract is the type import,
-/// not field reads - see `audit_log` -> `tracker`); none exists yet, hence
-/// the allow.
-#[allow(dead_code)]
-pub struct LolStoreAnnounced {
-    pub guild_id: GuildId,
-    pub kind: StoreEventKind,
-}
-
-impl crate::kernel::models::Event for LolStoreAnnounced {
-    fn name(&self) -> &'static str {
-        "lol_store.announced"
+crate::bus_event! {
+    /// Store updates were announced to a guild's assigned channel. Fields
+    /// are payload for future bus subscribers (the bus contract is the type
+    /// import, not field reads - see `audit_log` -> `tracker`); none exists
+    /// yet, hence the allow.
+    #[allow(dead_code)]
+    pub struct LolStoreAnnounced {
+        pub guild_id: GuildId,
+        pub kind: StoreEventKind,
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
+    => ("lol_store", "announced");
 }

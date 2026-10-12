@@ -8,7 +8,7 @@ mod request_context;
 mod storage_error;
 
 pub use event::{
-    AttachmentPayload, CommandPayload, Event, EventKind, EventPayload, MemberPayload,
+    AttachmentPayload, BusEvent, CommandPayload, Event, EventKind, EventPayload, MemberPayload,
     MessagePayload, Origin,
 };
 pub use ids::{ChannelId, GuildId, MessageId, UserId};

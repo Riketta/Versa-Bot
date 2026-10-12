@@ -175,8 +175,8 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, || {
             plugin.init().expect("init expected to succeed");
-            bus.publish(Arc::new(joined_event()));
-            bus.publish(Arc::new(left_event()));
+            bus.publish(joined_event());
+            bus.publish(left_event());
         });
 
         let log = String::from_utf8(capture.0.lock().clone()).expect("log expected to be utf8");
@@ -209,7 +209,7 @@ mod tests {
         plugin.init().expect("first init expected to succeed");
         plugin.init().expect("second init expected to succeed");
 
-        let log = captured(|| bus.publish(Arc::new(joined_event())));
+        let log = captured(|| bus.publish(joined_event()));
         assert_eq!(
             log.matches("user joined the guild").count(),
             1,
@@ -227,7 +227,7 @@ mod tests {
         plugin.init().expect("init expected to succeed");
         plugin.stop().expect("stop expected to succeed");
 
-        let log = captured(|| bus.publish(Arc::new(joined_event())));
+        let log = captured(|| bus.publish(joined_event()));
         assert_eq!(
             log.matches("user joined the guild").count(),
             0,
@@ -235,7 +235,7 @@ mod tests {
         );
 
         plugin.init().expect("re-init expected to succeed");
-        let log = captured(|| bus.publish(Arc::new(joined_event())));
+        let log = captured(|| bus.publish(joined_event()));
         assert_eq!(
             log.matches("user joined the guild").count(),
             1,

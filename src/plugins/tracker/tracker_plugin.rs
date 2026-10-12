@@ -5,9 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::command_reply;
 use crate::kernel::{
-    models::{
-        ChannelId, Event, EventKind, EventPayload, OutboundMessage, PluginError, RequestContext,
-    },
+    models::{ChannelId, EventKind, EventPayload, OutboundMessage, PluginError, RequestContext},
     plugin_ports::{
         AccessTier, CommandArgs, CommandDescriptor, CommandHandler, CommandRegistryPort,
         EventBusPort, MiddlewarePluginPort, Next, PluginPort,
@@ -123,20 +121,19 @@ impl<B: EventBusPort> MiddlewarePluginPort for UserActivityTrackerPlugin<B> {
         // The domain fact is published for EVERY guild member event,
         // regardless of policy-config readability: bus subscribers react to
         // what happened, not to whether the audit log could be written.
-        let derived: Arc<dyn Event> = if joined {
-            Arc::new(UserJoinedGuild {
+        if joined {
+            self.bus.publish(UserJoinedGuild {
                 guild_id,
                 user_id: event.origin.user_id,
                 username: username.clone(),
-            })
+            });
         } else {
-            Arc::new(UserLeftGuild {
+            self.bus.publish(UserLeftGuild {
                 guild_id,
                 user_id: event.origin.user_id,
                 username: username.clone(),
-            })
-        };
-        self.bus.publish(derived);
+            });
+        }
 
         // The audit message is best effort and secondary: an unreadable
         // config (storage failure, malformed document, missing or invalid
@@ -262,8 +259,8 @@ mod tests {
     use super::*;
     use crate::kernel::{
         models::{
-            ChannelId as ChannelIdModel, CommandPayload, GuildId, MemberPayload, MessageId, Origin,
-            UserId,
+            BusEvent, ChannelId as ChannelIdModel, CommandPayload, GuildId, MemberPayload,
+            MessageId, Origin, UserId,
         },
         plugin_ports::EventHandler,
         spi_ports::{
@@ -349,11 +346,11 @@ mod tests {
 
     // --- bus recorder ---
 
-    struct Recorder<E: Event + Clone + Send + Sync> {
+    struct Recorder<E: BusEvent + Clone + Send + Sync> {
         events: Mutex<Vec<E>>,
     }
 
-    impl<E: Event + Clone + Send + Sync> EventHandler<E> for Recorder<E> {
+    impl<E: BusEvent + Clone + Send + Sync> EventHandler<E> for Recorder<E> {
         fn handle(&self, event: &E) {
             self.events.lock().push(event.clone());
         }

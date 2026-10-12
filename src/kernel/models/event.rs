@@ -134,12 +134,71 @@ pub struct MemberPayload {
     pub username: Option<String>,
 }
 
-/// Base trait for plugin-owned domain events published over `EventBusPort`.
-/// Plugins own their events (e.g. `UserJoinedGuild` lives in the tracker
-/// plugin); the kernel routes them but never defines their meaning.
-/// The bus never carries raw inbound events - only these derived events.
+/// Erasure base for plugin-owned domain events published over `EventBusPort`:
+/// downcast support only - identity lives on [`BusEvent`]. Plugins own their
+/// events (e.g. `UserJoinedGuild` lives in the tracker plugin); the kernel
+/// routes them but never defines their meaning. The bus never carries raw
+/// inbound events - only these derived events.
 pub trait Event: Any + Send + Sync {
-    fn name(&self) -> &'static str;
-
     fn as_any(&self) -> &dyn Any;
+}
+
+/// Marker every bus event must implement: an [`Event`] with a plugin-scoped,
+/// process-unique identity. `EventBusPort::publish`/`subscribe` accept only
+/// `BusEvent` impls, so unrelated internal types cannot ride the bus.
+///
+/// Names follow `<plugin-slug>.<event>` (e.g. `tracker.user_joined_guild`);
+/// the bus adapter enforces uniqueness fail-fast at registration time - on
+/// first subscribe (plugin `init()`, aborting the boot) or first publish.
+/// Declare events with the [`bus_event!`] macro, which derives both impls
+/// from the `(slug, event)` name pair.
+pub trait BusEvent: Event {
+    /// Owning plugin slug - the scope prefix of [`Self::EVENT_NAME`].
+    const EVENT_SLUG: &'static str;
+
+    /// Fully qualified, process-unique event name: `"<slug>.<event>"`.
+    const EVENT_NAME: &'static str;
+}
+
+/// Defines a plugin-owned bus event: declares the struct and derives its
+/// [`Event`](crate::kernel::models::Event) and
+/// [`BusEvent`](crate::kernel::models::BusEvent) impls from one
+/// `(slug, event)` name pair - the qualified event name becomes
+/// `"<slug>.<event>"`. Doc comments and attributes are forwarded to the
+/// struct.
+///
+/// ```ignore
+/// crate::bus_event! {
+///     /// Domain event published by the tracker when a member joins.
+///     #[derive(Debug, Clone)]
+///     pub struct UserJoinedGuild {
+///         pub guild_id: GuildId,
+///         pub user_id: UserId,
+///     }
+///     => ("tracker", "user_joined_guild");
+/// }
+/// ```
+#[macro_export]
+macro_rules! bus_event {
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident { $($field:tt)* }
+        => ($slug:literal, $event:literal);
+    ) => {
+        $(#[$meta])*
+        $vis struct $name {
+            $($field)*
+        }
+
+        impl $crate::kernel::models::BusEvent for $name {
+            const EVENT_SLUG: &'static str = $slug;
+            const EVENT_NAME: &'static str = ::core::concat!($slug, ".", $event);
+        }
+
+        impl $crate::kernel::models::Event for $name {
+            fn as_any(&self) -> &dyn ::core::any::Any {
+                self
+            }
+        }
+    };
 }

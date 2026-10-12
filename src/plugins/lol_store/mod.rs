@@ -499,9 +499,9 @@ mod tests {
     struct RecordingBus;
 
     impl EventBusPort for RecordingBus {
-        fn publish(&self, _event: Arc<dyn crate::kernel::models::Event>) {}
+        fn publish<E: crate::kernel::models::BusEvent>(&self, _event: E) {}
 
-        fn subscribe<E: crate::kernel::models::Event + 'static>(
+        fn subscribe<E: crate::kernel::models::BusEvent + 'static>(
             &self,
             _handler: Arc<dyn crate::kernel::plugin_ports::EventHandler<E>>,
         ) -> crate::kernel::plugin_ports::EventBusSubscription {

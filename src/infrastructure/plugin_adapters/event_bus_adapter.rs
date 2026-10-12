@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 
 use crate::common::panic_message;
 use crate::kernel::{
-    models::Event,
+    models::{BusEvent, Event},
     plugin_ports::{EventBusPort, EventBusSubscription, EventHandler},
 };
 
@@ -28,12 +28,22 @@ struct Slot {
 /// with a live slot, whatever the subscribe/unsubscribe interleaving.
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Catalog entry for an event type ever registered on this bus: qualified
+/// name and the Rust type path for diagnostics. Append-only and
+/// process-lifetime (bounded by distinct event types, like per-channel
+/// plugin state) - name uniqueness is checked against it.
+struct RegisteredEvent {
+    name: &'static str,
+    type_path: &'static str,
+}
+
 /// Subscription bookkeeping, shared by every bus clone so a cancellation
 /// handle can clear exactly its own slot: per event type, `None` marks an
-/// unsubscribed handler.
+/// unsubscribed handler. The catalog never shrinks - it only records types.
 #[derive(Default)]
 struct Inner {
     subscribers: RwLock<HashMap<TypeId, Vec<Option<Slot>>>>,
+    catalog: RwLock<HashMap<TypeId, RegisteredEvent>>,
 }
 
 /// The single active `EventBusPort` adapter: in-memory, topic-keyed by event
@@ -44,6 +54,10 @@ struct Inner {
 /// cannot crash the publisher, the pipeline, or other subscribers. Delivery
 /// isolation, cross-task ordering, and backpressure (external broker) are
 /// deliberately deferred until a real consumer needs them.
+///
+/// Every published or subscribed type joins the bus catalog (logged at
+/// `info`, matching the command registration trail); duplicate event names
+/// fail fast there.
 #[derive(Clone, Default)]
 pub struct InMemoryEventBus {
     inner: Arc<Inner>,
@@ -54,28 +68,69 @@ impl InMemoryEventBus {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Adds the event type to the process-lifetime catalog, fail-fast on a
+    /// name collision. Delivery itself is `TypeId`-keyed and could never
+    /// misroute between same-named types - uniqueness keeps the event
+    /// registry and its audit trail unambiguous (and defends a future
+    /// name-keyed broker). A collision aborts the boot when it surfaces at
+    /// subscription time (plugin `init()`); on first publish it fails the
+    /// publishing event (the pipeline logs and drops it - fail closed).
+    /// Re-registering an already catalogued type is a no-op (stop/`init`
+    /// cycling, repeated publishes).
+    fn register_event<E: BusEvent>(catalog: &RwLock<HashMap<TypeId, RegisteredEvent>>) {
+        let type_id = TypeId::of::<E>();
+        let mut catalog = catalog.write();
+        if catalog.contains_key(&type_id) {
+            return;
+        }
+        if let Some(clash) = catalog.values().find(|known| known.name == E::EVENT_NAME) {
+            panic!(
+                "bus event name `{}` is claimed by both `{}` and `{}` - event names must be unique",
+                E::EVENT_NAME,
+                clash.type_path,
+                ::core::any::type_name::<E>()
+            );
+        }
+        catalog.insert(
+            type_id,
+            RegisteredEvent { name: E::EVENT_NAME, type_path: ::core::any::type_name::<E>() },
+        );
+        tracing::info!(
+            plugin = E::EVENT_SLUG,
+            event = E::EVENT_NAME,
+            type = ::core::any::type_name::<E>(),
+            "bus event type registered"
+        );
+    }
 }
 
 impl EventBusPort for InMemoryEventBus {
-    fn publish(&self, event: Arc<dyn Event>) {
+    fn publish<E: BusEvent>(&self, event: E) {
+        // First publish of a type joins the catalog too - a read-lock probe
+        // keeps the common (already-registered) path cheap.
+        if !self.inner.catalog.read().contains_key(&TypeId::of::<E>()) {
+            Self::register_event::<E>(&self.inner.catalog);
+        }
+
         // Snapshot the live handlers, skipping unsubscribed (`None`) slots.
         let handlers: Vec<ErasedHandler> = {
             let subscribers = self.inner.subscribers.read();
             subscribers
-                .get(&event.as_any().type_id())
+                .get(&TypeId::of::<E>())
                 .map(|slots| slots.iter().flatten().map(|slot| Arc::clone(&slot.handler)).collect())
                 .unwrap_or_default()
         };
 
+        // No Arc: the event outlives the inline dispatch on this task's
+        // stack, handlers get only read access (`&E` unsizes to `&dyn
+        // Event`), so a unwind recovery cannot corrupt the bus or the event.
         for handler in handlers {
-            // Panic isolation: handlers get only read access to the event,
-            // so recovering from a unwind cannot leave the bus or the event
-            // in a corrupted state.
             let delivery =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(event.as_ref())));
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&event)));
             if let Err(panic) = delivery {
                 tracing::error!(
-                    event = event.name(),
+                    event = E::EVENT_NAME,
                     panic = panic_message(&panic),
                     "event bus handler panicked"
                 );
@@ -83,7 +138,7 @@ impl EventBusPort for InMemoryEventBus {
         }
     }
 
-    fn subscribe<E: Event + 'static>(
+    fn subscribe<E: BusEvent + 'static>(
         &self,
         handler: Arc<dyn EventHandler<E>>,
     ) -> EventBusSubscription {
@@ -94,6 +149,7 @@ impl EventBusPort for InMemoryEventBus {
         });
 
         let type_id = TypeId::of::<E>();
+        Self::register_event::<E>(&self.inner.catalog);
         let id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
         {
             let mut subscribers = self.inner.subscribers.write();
@@ -140,11 +196,12 @@ mod tests {
 
     struct PingPublished;
 
-    impl Event for PingPublished {
-        fn name(&self) -> &'static str {
-            "ping_published"
-        }
+    impl BusEvent for PingPublished {
+        const EVENT_SLUG: &'static str = "test";
+        const EVENT_NAME: &'static str = "test.ping_published";
+    }
 
+    impl Event for PingPublished {
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -152,14 +209,36 @@ mod tests {
 
     struct UnheardEvent;
 
-    impl Event for UnheardEvent {
-        fn name(&self) -> &'static str {
-            "unheard_event"
-        }
+    impl BusEvent for UnheardEvent {
+        const EVENT_SLUG: &'static str = "test";
+        const EVENT_NAME: &'static str = "test.unheard_event";
+    }
 
+    impl Event for UnheardEvent {
         fn as_any(&self) -> &dyn Any {
             self
         }
+    }
+
+    /// Second type claiming `test.ping_published` - the name collides with
+    /// [`PingPublished`] although the types differ.
+    struct NameCollisionEvent;
+
+    impl BusEvent for NameCollisionEvent {
+        const EVENT_SLUG: &'static str = "test";
+        const EVENT_NAME: &'static str = "test.ping_published";
+    }
+
+    impl Event for NameCollisionEvent {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    struct NoopHandler;
+
+    impl EventHandler<NameCollisionEvent> for NoopHandler {
+        fn handle(&self, _event: &NameCollisionEvent) {}
     }
 
     /// Appends its label to a shared log - the fixture that makes WHEN a
@@ -200,8 +279,8 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         bus.subscribe(Arc::new(CountingHandler(Arc::clone(&counter))));
 
-        bus.publish(Arc::new(PingPublished));
-        bus.publish(Arc::new(PingPublished));
+        bus.publish(PingPublished);
+        bus.publish(PingPublished);
 
         assert_eq!(
             counter.load(Ordering::SeqCst),
@@ -220,7 +299,7 @@ mod tests {
         bus.subscribe(Arc::new(OrderedHandler { label: "first", log: Arc::clone(&log) }));
         bus.subscribe(Arc::new(OrderedHandler { label: "second", log: Arc::clone(&log) }));
 
-        bus.publish(Arc::new(PingPublished));
+        bus.publish(PingPublished);
 
         assert_eq!(*log.lock(), vec!["first", "second"], "handlers must run in subscription order");
     }
@@ -242,7 +321,7 @@ mod tests {
         // slot; the second call must be a no-op, not a cancellation.
         stale.unsubscribe();
 
-        bus.publish(Arc::new(PingPublished));
+        bus.publish(PingPublished);
 
         assert_eq!(stale_counter.load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -259,9 +338,9 @@ mod tests {
 
         bus.subscribe(Arc::new(CountingHandler(Arc::clone(&counter))));
 
-        bus.publish(Arc::new(PingPublished));
-        bus.publish(Arc::new(UnheardEvent));
-        bus.publish(Arc::new(PingPublished));
+        bus.publish(PingPublished);
+        bus.publish(UnheardEvent);
+        bus.publish(PingPublished);
 
         assert_eq!(
             counter.load(Ordering::SeqCst),
@@ -279,9 +358,9 @@ mod tests {
         let detach = bus.subscribe(Arc::new(CountingHandler(Arc::clone(&counter))));
         bus.subscribe(Arc::new(CountingHandler(Arc::clone(&counter))));
 
-        bus.publish(Arc::new(PingPublished));
+        bus.publish(PingPublished);
         detach.unsubscribe();
-        bus.publish(Arc::new(PingPublished));
+        bus.publish(PingPublished);
 
         assert_eq!(
             counter.load(Ordering::SeqCst),
@@ -302,12 +381,57 @@ mod tests {
         detach.unsubscribe();
         detach.unsubscribe();
 
-        bus.publish(Arc::new(PingPublished));
+        bus.publish(PingPublished);
 
         assert_eq!(
             counter.load(Ordering::SeqCst),
             1,
             "the surviving subscriber must be unaffected by the double unsubscribe"
+        );
+    }
+
+    /// Contract: `<slug>.<event>` names are process-unique - a second event
+    /// type claiming a taken name must fail loudly at registration time
+    /// (which runs in plugin `init()` for subscribers, so this aborts the
+    /// boot) instead of polluting the registry and its audit trail.
+    #[test]
+    fn duplicate_event_name_fails_fast() {
+        let bus = InMemoryEventBus::new();
+        bus.subscribe(Arc::new(CountingHandler(Arc::new(AtomicUsize::new(0)))));
+
+        let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bus.subscribe(Arc::new(NoopHandler))
+        })) else {
+            panic!("a duplicate event name must panic");
+        };
+        let message = panic_message(&panic);
+        assert!(
+            message.contains("test.ping_published"),
+            "panic must name the colliding event: {message}"
+        );
+        assert!(
+            message.contains("NameCollisionEvent"),
+            "panic must name the second type: {message}"
+        );
+    }
+
+    /// Contract: `stop()`/`init()` cycling (bus-only plugins unsubscribe in
+    /// `stop()`, resubscribe in `init()`) re-registers the same type without
+    /// a name collision, and delivery resumes.
+    #[test]
+    fn resubscribing_a_type_does_not_collide() {
+        let bus = InMemoryEventBus::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let detach = bus.subscribe(Arc::new(CountingHandler(Arc::clone(&counter))));
+        detach.unsubscribe();
+
+        let _resubscribed = bus.subscribe(Arc::new(CountingHandler(Arc::clone(&counter))));
+
+        bus.publish(PingPublished);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "delivery must resume after the resubscription"
         );
     }
 }

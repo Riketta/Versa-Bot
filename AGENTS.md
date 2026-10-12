@@ -126,7 +126,10 @@ Dockerfile, and local dev.
 **Communication:** kernel -> plugin via lifecycle calls and the pipeline;
 plugin -> kernel via injected service ports; plugin -> plugin never
 directly, always via `EventBusPort` (derived domain events only - the bus
-never carries raw inbound events). The kernel routes the bus but never
+never carries raw inbound events). Events are `BusEvent` impls with
+process-unique `<plugin-slug>.<event>` names - a collision fails fast at
+first registration: at subscription time it aborts the boot, on first
+publish it fails the publishing event. The kernel routes the bus but never
 defines event meanings; the emitting plugin owns the event type.
 
 **Kernel lifecycle:** `KernelService::boot()` runs `init()` on all

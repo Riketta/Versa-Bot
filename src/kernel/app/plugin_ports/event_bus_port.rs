@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use crate::kernel::models::Event;
+use crate::kernel::models::BusEvent;
 
 /// Handler subscribed to a specific event type on the bus.
-pub trait EventHandler<E: Event + 'static>: Send + Sync {
+pub trait EventHandler<E: BusEvent + 'static>: Send + Sync {
     fn handle(&self, event: &E);
 }
 
@@ -33,6 +33,11 @@ impl EventBusSubscription {
 /// event meanings. It never carries raw inbound events - a middleware plugin
 /// that processed an inbound event MAY publish a DERIVED domain event onto it.
 ///
+/// Events must implement [`BusEvent`](crate::kernel::models::BusEvent):
+/// plugin-scoped (`<slug>.<event>`), process-unique names. The active
+/// adapter enforces uniqueness when a handler subscribes, so a collision
+/// fails fast instead of misrouting deliveries.
+///
 /// Cardinality: a single active adapter, a single instance per kernel, shared
 /// with plugins via injection (the adapter is `Clone`; each plugin receives
 /// its own clone at construction).
@@ -41,9 +46,9 @@ impl EventBusSubscription {
 /// subscription order - they must stay fast and non-blocking; implementations
 /// must isolate panicking handlers instead of letting the unwind escape.
 pub trait EventBusPort: Send + Sync + 'static {
-    fn publish(&self, event: Arc<dyn Event>);
+    fn publish<E: BusEvent>(&self, event: E);
 
-    fn subscribe<E: Event + 'static>(
+    fn subscribe<E: BusEvent + 'static>(
         &self,
         handler: Arc<dyn EventHandler<E>>,
     ) -> EventBusSubscription;
