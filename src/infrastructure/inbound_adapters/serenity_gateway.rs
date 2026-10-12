@@ -319,8 +319,15 @@ fn message_event(
     }
     // System notices (member joins, pins, boosts) ride MESSAGE_CREATE with
     // empty content and a human author - they are not conversation turns
-    // and must not be captured as one.
-    if message.kind != MessageType::Regular {
+    // and must not be captured as one. Three non-Regular types ARE
+    // conversation turns: a user reply (`InlineReply`, 19), the opening
+    // turn of a composer-created thread (`ThreadStarterMessage`, 21), and
+    // plain messages (0). Dropping any of them blacks the feature out at
+    // the gateway - silence with no logs.
+    if !matches!(
+        message.kind,
+        MessageType::Regular | MessageType::InlineReply | MessageType::ThreadStarterMessage
+    ) {
         return None;
     }
 
@@ -948,10 +955,13 @@ mod tests {
 
     /// `reply_to` comes from `message_reference` and survives the
     /// referenced message being uncached or deleted
-    /// (`referenced_message` stays `None`).
+    /// (`referenced_message` stays `None`). Real Discord replies carry
+    /// their own message type (`InlineReply`, 19) - the shape below must
+    /// stay truthful or the type filter would silently drop them again.
     #[test]
     fn reply_reference_is_captured_as_reply_to() {
         let mut message = plain_message("a reply");
+        message.kind = MessageType::InlineReply;
         message.message_reference = Some(
             MessageReference::new(MessageReferenceKind::Default, SerenityChannelId::new(2000))
                 .message_id(SerenityMessageId::new(555)),
@@ -959,6 +969,43 @@ mod tests {
 
         let event = message_event(&message, 99, 0, None, &no_names).expect("event expected");
 
+        assert_eq!(message_payload(event).reply_to, Some(MessageId(555)));
+    }
+
+    /// Regression guard for the reply blackout: `InlineReply` (19) is a
+    /// conversation turn, not a system notice - only the notice types are
+    /// dropped. Filtering on `Regular` alone produced "no event at all"
+    /// for every user reply.
+    #[test]
+    fn reply_message_produces_an_event() {
+        let mut message = plain_message("answering the bot");
+        message.kind = MessageType::InlineReply;
+        message.message_reference = Some(
+            MessageReference::new(MessageReferenceKind::Default, SerenityChannelId::new(2000))
+                .message_id(SerenityMessageId::new(555)),
+        );
+
+        let event =
+            message_event(&message, 99, 0, None, &no_names).expect("reply must become an event");
+        assert_eq!(event.kind, EventKind::MessageReceived);
+        assert_eq!(message_payload(event).reply_to, Some(MessageId(555)));
+    }
+
+    /// Same guard for threads: the opening turn of a composer-created
+    /// thread is `ThreadStarterMessage` (21), a real human turn whose
+    /// reference points at the thread-created notice in the parent.
+    #[test]
+    fn thread_starter_message_produces_an_event() {
+        let mut message = plain_message("kicking the thread off");
+        message.kind = MessageType::ThreadStarterMessage;
+        message.message_reference = Some(
+            MessageReference::new(MessageReferenceKind::Default, SerenityChannelId::new(2000))
+                .message_id(SerenityMessageId::new(555)),
+        );
+
+        let event = message_event(&message, 99, 0, None, &no_names)
+            .expect("thread starter must become an event");
+        assert_eq!(event.kind, EventKind::MessageReceived);
         assert_eq!(message_payload(event).reply_to, Some(MessageId(555)));
     }
 
