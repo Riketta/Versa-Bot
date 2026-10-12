@@ -16,7 +16,8 @@ use crate::kernel::{
     plugin_ports::{EventBusPort, MiddlewarePluginPort, Next, PluginPort},
     services::KernelServices,
     spi_ports::{
-        ChatOutputFactoryPort, PlatformInfoPort, PluginStorage, PluginStoragePort, StoragePort,
+        ChatOutputFactoryPort, InviteDirectoryPort, PlatformInfoPort, PluginStorage,
+        PluginStoragePort, StoragePort,
     },
 };
 
@@ -32,6 +33,10 @@ pub struct KernelService<E: EventBusPort> {
     #[allow(dead_code)]
     event_bus: E,
     chat_output_factory: Arc<dyn ChatOutputFactoryPort>,
+    /// The platform's invite directory (Discord: REST guild-invite
+    /// listings); wired at the composition root, shared into every event's
+    /// service context. Empty on platforms without the concept.
+    invite_directory: Arc<dyn InviteDirectoryPort>,
     storage: Arc<dyn StoragePort>,
     /// Plugin-global document store, pre-bound to the deployment's platform
     /// slug at construction - the same instance every event's service
@@ -62,6 +67,7 @@ impl<E: EventBusPort> KernelService<E> {
         middleware: Vec<Arc<dyn MiddlewarePluginPort>>,
         event_bus: E,
         chat_output_factory: Arc<dyn ChatOutputFactoryPort>,
+        invite_directory: Arc<dyn InviteDirectoryPort>,
         storage: Arc<dyn StoragePort>,
         plugin_storage: Arc<dyn PluginStoragePort>,
         platform_info: Arc<dyn PlatformInfoPort>,
@@ -71,6 +77,7 @@ impl<E: EventBusPort> KernelService<E> {
             middleware,
             event_bus,
             chat_output_factory,
+            invite_directory,
             storage,
             plugin_storage: plugin_storage.plugin_scoped(platform_info.slug()),
             platform_info,
@@ -274,6 +281,7 @@ impl<E: EventBusPort> KernelService<E> {
         KernelServices {
             chat_output: self.chat_output_factory.chat_output(origin),
             chat_output_factory: Arc::clone(&self.chat_output_factory),
+            invite_directory: Arc::clone(&self.invite_directory),
             guild_storage: origin
                 .guild_id
                 .map(|guild_id| self.storage.guild_scoped(self.platform_info.slug(), guild_id)),
@@ -666,6 +674,7 @@ mod tests {
             .middleware(middleware)
             .event_bus(TestEventBus)
             .chat_output_factory(RecordingChatOutputFactory::new(Arc::clone(&output)).boxed())
+            .invite_directory(crate::test_support::test_invite_directory())
             .storage(storage)
             .plugin_storage(Arc::new(crate::test_support::InMemoryPluginStorage::new())
                 as Arc<dyn PluginStoragePort>)

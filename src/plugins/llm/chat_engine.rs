@@ -2410,6 +2410,7 @@ mod tests {
         let services = Arc::new(KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
+            invite_directory: crate::test_support::test_invite_directory(),
             guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
@@ -2670,6 +2671,7 @@ mod tests {
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
+            invite_directory: crate::test_support::test_invite_directory(),
             guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
@@ -2800,6 +2802,7 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::new(DegradedStreamFactory { output: Arc::clone(&output) })
                 as Arc<dyn ChatOutputFactoryPort>,
+            invite_directory: crate::test_support::test_invite_directory(),
             guild_storage: Some(ctx.storage.guild_scoped("test", GuildId(1))),
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
@@ -2827,6 +2830,7 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::new(FailingDeliveryFactory { output: Arc::clone(&output) })
                 as Arc<dyn ChatOutputFactoryPort>,
+            invite_directory: crate::test_support::test_invite_directory(),
             guild_storage: Some(ctx.storage.guild_scoped("test", GuildId(1))),
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
@@ -3164,6 +3168,7 @@ mod tests {
         let services = KernelServices {
             chat_output: Arc::clone(&ctx.output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::clone(&ctx.factory) as Arc<dyn ChatOutputFactoryPort>,
+            invite_directory: crate::test_support::test_invite_directory(),
             guild_storage: Some(Arc::clone(&counting) as Arc<dyn GuildStorage>),
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
@@ -3820,6 +3825,7 @@ mod tests {
             chat_output_factory: Arc::new(crate::test_support::RecordingChatOutputFactory::new(
                 Arc::clone(&output),
             )),
+            invite_directory: crate::test_support::test_invite_directory(),
             guild_storage: Some(
                 crate::test_support::FailingStorage.guild_scoped("test", GuildId(1)),
             ),
@@ -5192,6 +5198,7 @@ mod tests {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::new(FailingReactionFactory { output: Arc::clone(&output) })
                 as Arc<dyn ChatOutputFactoryPort>,
+            invite_directory: crate::test_support::test_invite_directory(),
             guild_storage: Some(ctx.storage.guild_scoped("test", GuildId(1))),
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),

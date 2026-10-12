@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use crate::kernel::app::spi_ports::{
-    ChatOutputFactoryPort, ChatOutputPort, GuildStorage, PlatformInfoPort, PluginStorage,
+    ChatOutputFactoryPort, ChatOutputPort, GuildStorage, InviteDirectoryPort, PlatformInfoPort,
+    PluginStorage,
 };
 
 /// Kernel-owned service context injected into pipeline hooks. Rebuilt per
@@ -18,6 +19,10 @@ use crate::kernel::app::spi_ports::{
 pub struct KernelServices {
     pub chat_output: Arc<dyn ChatOutputPort>,
     pub chat_output_factory: Arc<dyn ChatOutputFactoryPort>,
+    /// The origin guild's invite directory as the platform sees it - empty
+    /// on platforms without the concept or without the permission to read
+    /// it. Consumers treat emptiness as "no signal", never as failure.
+    pub invite_directory: Arc<dyn InviteDirectoryPort>,
     pub guild_storage: Option<Arc<dyn GuildStorage>>,
     pub plugin_storage: Arc<dyn PluginStorage>,
     pub platform_info: Arc<dyn PlatformInfoPort>,

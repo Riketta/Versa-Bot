@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use serenity::all::{
     ChannelId as SerenityChannelId, CommandDataOption, CommandDataOptionValue, CommandDataResolved,
-    Context, EventHandler, GuildId as SerenityGuildId, Interaction, Member, Message, MessageType,
-    Permissions, Ready, RoleId as SerenityRoleId, User, UserId as SerenityUserId,
+    Context, EventHandler, GuildId as SerenityGuildId, Interaction, InviteCreateEvent,
+    InviteDeleteEvent, Member, Message, MessageType, Permissions, Ready, RoleId as SerenityRoleId,
+    User, UserId as SerenityUserId,
 };
 use serenity::async_trait;
 
@@ -13,7 +14,7 @@ use crate::kernel::{
     api_ports::RequestHandlerPort,
     models::{
         AttachmentPayload, ChannelId, CommandPayload, EventKind, EventPayload, GuildId,
-        MemberPayload, MessageId, Origin, RequestContext, UserId,
+        InvitePayload, MemberPayload, MessageId, Origin, RequestContext, UserId,
     },
     spi_ports::PlatformInfoPort,
 };
@@ -224,6 +225,18 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
         self.handler.handle(event).await;
     }
 
+    async fn invite_create(&self, _ctx: Context, data: InviteCreateEvent) {
+        if let Some(event) = invite_created_event(&data) {
+            self.handler.handle(event).await;
+        }
+    }
+
+    async fn invite_delete(&self, _ctx: Context, data: InviteDeleteEvent) {
+        if let Some(event) = invite_deleted_event(&data) {
+            self.handler.handle(event).await;
+        }
+    }
+
     async fn ready(&self, ctx: Context, ready: Ready) {
         // Flushes a presence queued before connect - the first rotation
         // status lands exactly when the bot comes online.
@@ -241,6 +254,69 @@ fn member_origin(guild_id: SerenityGuildId, user: &User) -> Origin {
         message_id: None,
         reply_token: None,
     }
+}
+
+/// Origin for invite lifecycle events: pointed at the invite's target
+/// channel, with the creator as the acting user where the platform reports
+/// one (deletions do not). `UserId(0)` = no acting user - nothing consumes
+/// it on these events, and the code is the identity that matters.
+fn invite_origin(
+    guild_id: SerenityGuildId,
+    channel_id: SerenityChannelId,
+    creator_id: Option<SerenityUserId>,
+) -> Origin {
+    Origin {
+        guild_id: Some(GuildId(guild_id.get())),
+        channel_id: ChannelId(channel_id.get()),
+        user_id: UserId(creator_id.map_or(0, |user| user.get())),
+        message_id: None,
+        reply_token: None,
+    }
+}
+
+/// INVITE_CREATE normalized: the payload names the code, target channel and
+/// creator directly. Guild-less payloads (never seen in practice) are
+/// dropped - the event is meaningless without a guild to scope it to.
+fn invite_created_event(data: &InviteCreateEvent) -> Option<RequestContext> {
+    let guild_id = data.guild_id?;
+    Some(RequestContext {
+        kind: EventKind::InviteCreated,
+        origin: invite_origin(
+            guild_id,
+            data.channel_id,
+            data.inviter.as_ref().map(|u| u.id.clone()),
+        ),
+        payload: EventPayload::Invite(InvitePayload {
+            code: data.code.clone(),
+            channel_id: Some(ChannelId(data.channel_id.get())),
+            creator_id: data.inviter.as_ref().map(|user| UserId(user.id.get())),
+            creator_name: data
+                .inviter
+                .as_ref()
+                .map(|user| user.global_name.clone().unwrap_or_else(|| user.name.clone())),
+            max_uses: Some(u64::from(data.max_uses)),
+            temporary: Some(data.temporary),
+        }),
+    })
+}
+
+/// INVITE_DELETE normalized: the platform reports only code and channel -
+/// creator and limits stay unknown (the tracker's stored record fills the
+/// gaps in its audit line).
+fn invite_deleted_event(data: &InviteDeleteEvent) -> Option<RequestContext> {
+    let guild_id = data.guild_id?;
+    Some(RequestContext {
+        kind: EventKind::InviteDeleted,
+        origin: invite_origin(guild_id, data.channel_id, None),
+        payload: EventPayload::Invite(InvitePayload {
+            code: data.code.clone(),
+            channel_id: Some(ChannelId(data.channel_id.get())),
+            creator_id: None,
+            creator_name: None,
+            max_uses: None,
+            temporary: None,
+        }),
+    })
 }
 
 /// The acknowledgement sent for every slash-command interaction: a deferred
@@ -649,6 +725,74 @@ mod tests {
     #[test]
     fn resolved_names_are_sanitized_against_brackets() {
         assert_eq!(normalize_mention_tags("<@77>", &resolver), "[weirdname]<@77>");
+    }
+
+    // ---- Invite lifecycle normalization ----
+
+    fn invite_create_fixture() -> InviteCreateEvent {
+        serde_json::from_value(serde_json::json!({
+            "channel_id": "55",
+            "code": "abc123",
+            "created_at": "2026-10-12T12:00:00Z",
+            "guild_id": "1",
+            "inviter": { "id": "7", "username": "rikk" },
+            "max_age": 86400,
+            "max_uses": 1,
+            "temporary": false,
+            "uses": 0,
+        }))
+        .expect("invite create fixture deserializes")
+    }
+
+    /// INVITE_CREATE arrives with code, target channel and creator - the
+    /// taxonomy event carries all three platform-blind.
+    #[test]
+    fn invite_create_normalizes_code_channel_and_creator() {
+        let event = invite_created_event(&invite_create_fixture()).expect("guild-scoped event");
+        assert_eq!(event.kind, EventKind::InviteCreated);
+        assert_eq!(event.origin.guild_id, Some(GuildId(1)));
+        assert_eq!(event.origin.user_id, UserId(7));
+        let EventPayload::Invite(invite) = &event.payload else {
+            panic!("invite payload expected, got {:?}", event.payload);
+        };
+        assert_eq!(invite.code, "abc123");
+        assert_eq!(invite.channel_id, Some(ChannelId(55)));
+        assert_eq!(invite.creator_id, Some(UserId(7)));
+        assert_eq!(invite.creator_name.as_deref(), Some("rikk"));
+        assert_eq!(invite.max_uses, Some(1));
+        assert_eq!(invite.temporary, Some(false));
+    }
+
+    /// INVITE_DELETE reports only code and channel - creator and limits
+    /// stay unknown, and the acting user degrades to the `UserId(0)`
+    /// sentinel.
+    #[test]
+    fn invite_delete_normalizes_code_only() {
+        let data: InviteDeleteEvent = serde_json::from_value(serde_json::json!({
+            "channel_id": "55",
+            "guild_id": "1",
+            "code": "abc123",
+        }))
+        .expect("invite delete fixture deserializes");
+
+        let event = invite_deleted_event(&data).expect("guild-scoped event");
+        assert_eq!(event.kind, EventKind::InviteDeleted);
+        assert_eq!(event.origin.user_id, UserId(0));
+        let EventPayload::Invite(invite) = &event.payload else {
+            panic!("invite payload expected, got {:?}", event.payload);
+        };
+        assert_eq!(invite.code, "abc123");
+        assert_eq!(invite.creator_id, None);
+        assert_eq!(invite.max_uses, None);
+    }
+
+    /// Guild-less invite payloads (never seen in practice) are dropped -
+    /// the event is meaningless without a guild to scope it to.
+    #[test]
+    fn guildless_invite_events_are_dropped() {
+        let mut data = invite_create_fixture();
+        data.guild_id = None;
+        assert!(invite_created_event(&data).is_none());
     }
 
     // ---- Reaction token parsing (the react tool's adapter half) ----

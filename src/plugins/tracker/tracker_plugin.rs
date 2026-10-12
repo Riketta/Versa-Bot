@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -5,15 +6,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::common::command_reply;
 use crate::kernel::{
-    models::{ChannelId, EventKind, EventPayload, OutboundMessage, PluginError, RequestContext},
+    models::{
+        ChannelId, EventKind, EventPayload, InvitePayload, MemberPayload, Origin, OutboundMessage,
+        PluginError, RequestContext, StorageError,
+    },
     plugin_ports::{
         AccessTier, CommandArgs, CommandDescriptor, CommandHandler, CommandRegistryPort,
         EventBusPort, MiddlewarePluginPort, Next, PluginPort,
     },
     services::KernelServices,
+    spi_ports::{GuildStorage, InviteDirectoryPort},
 };
 
 use super::events::{UserJoinedGuild, UserLeftGuild};
+use super::invites::{INVITES_KEY, InviteDoc, attribute_join};
 
 /// Guild storage namespace owned by this plugin (the plugin's slug).
 const NAMESPACE: &str = "tracker";
@@ -31,16 +37,23 @@ pub struct TrackerConfig {
     pub audit_channel_id: Option<String>,
 }
 
-/// User activity tracker: observes member lifecycle events in the pipeline
-/// and turns each into two things:
+/// User activity tracker: observes member lifecycle and invite events in
+/// the pipeline and turns each into two things:
 ///
-/// - a plugin-owned domain event on the bus ([`UserJoinedGuild`] /
+/// - plugin-owned domain events on the bus ([`UserJoinedGuild`] /
 ///   [`UserLeftGuild`]), published for EVERY guild member event regardless
 ///   of policy-config readability, so bus-only plugins can react without
 ///   joining the pipeline themselves, and
 /// - an audit message in the guild's configured channel (best effort - an
 ///   unconfigured or unreadable config or a broken destination skips only
 ///   the log line; it never blocks the pipeline or the publication).
+///
+/// Invite tracking rides the same audit channel: creates and deletes are
+/// logged as the platform reports them, and joins are attributed to their
+/// invite via a uses-count diff against the stored directory observations
+/// ([`attribute_join`]). Attribution needs the platform's invite-directory
+/// read permission (Discord: Manage Server) - without it the diff degrades
+/// to plain join notices, never to an error.
 ///
 /// Passive middleware: always `Continue` - tracking observes, never gates.
 /// Policy contrasts with auth: a malformed config here fails *open* (skip
@@ -53,12 +66,16 @@ pub struct TrackerConfig {
 pub struct UserActivityTrackerPlugin<B: EventBusPort> {
     bus: B,
     registry: Arc<dyn CommandRegistryPort>,
+    /// Serializes the per-guild invite-map read-modify-write (create upserts
+    /// and join diffs mutate one stored document). Process-lifetime; only
+    /// this plugin writes the document, so an instance lock suffices.
+    invites_lock: tokio::sync::Mutex<()>,
 }
 
 impl<B: EventBusPort> UserActivityTrackerPlugin<B> {
     #[must_use]
     pub fn new(bus: B, registry: Arc<dyn CommandRegistryPort>) -> Self {
-        Self { bus, registry }
+        Self { bus, registry, invites_lock: tokio::sync::Mutex::new(()) }
     }
 }
 
@@ -103,83 +120,275 @@ impl<B: EventBusPort> PluginPort for UserActivityTrackerPlugin<B> {
 #[async_trait]
 impl<B: EventBusPort> MiddlewarePluginPort for UserActivityTrackerPlugin<B> {
     async fn pre(&self, event: &mut RequestContext, services: &KernelServices) -> Next {
-        let (joined, username) = match (&event.kind, &event.payload) {
-            (EventKind::MemberJoined, EventPayload::Member(member)) => {
-                (true, member.username.clone())
+        match (&event.kind, &event.payload) {
+            (EventKind::InviteCreated, EventPayload::Invite(invite)) => {
+                self.invite_created(&event.origin, services, invite).await;
             }
-            (EventKind::MemberLeft, EventPayload::Member(member)) => {
-                (false, member.username.clone())
+            (EventKind::InviteDeleted, EventPayload::Invite(invite)) => {
+                self.invite_deleted(&event.origin, services, invite).await;
             }
-            _ => return Next::Continue,
-        };
+            (kind, EventPayload::Member(member))
+                if matches!(kind, EventKind::MemberJoined | EventKind::MemberLeft) =>
+            {
+                self.member_lifecycle(
+                    &event.origin,
+                    services,
+                    member,
+                    kind == &EventKind::MemberJoined,
+                )
+                .await;
+            }
+            _ => {}
+        }
+        Next::Continue
+    }
+}
 
+impl<B: EventBusPort> UserActivityTrackerPlugin<B> {
+    /// The member lifecycle flow: the domain event is published for EVERY
+    /// guild member event, regardless of policy-config readability; the
+    /// audit message is best effort and secondary. Joins carry invite
+    /// attribution when the platform's directory yields a signal.
+    async fn member_lifecycle(
+        &self,
+        origin: &Origin,
+        services: &KernelServices,
+        member: &MemberPayload,
+        joined: bool,
+    ) {
         // Direct messages: nothing to track.
-        let Some(guild_id) = event.origin.guild_id else {
-            return Next::Continue;
+        let Some(guild_id) = origin.guild_id else {
+            return;
         };
-
-        // The domain fact is published for EVERY guild member event,
-        // regardless of policy-config readability: bus subscribers react to
-        // what happened, not to whether the audit log could be written.
         if joined {
             self.bus.publish(UserJoinedGuild {
                 guild_id,
-                user_id: event.origin.user_id,
-                username: username.clone(),
+                user_id: origin.user_id,
+                username: member.username.clone(),
             });
         } else {
             self.bus.publish(UserLeftGuild {
                 guild_id,
-                user_id: event.origin.user_id,
-                username: username.clone(),
+                user_id: origin.user_id,
+                username: member.username.clone(),
             });
         }
 
-        // The audit message is best effort and secondary: an unreadable
-        // config (storage failure, malformed document, missing or invalid
-        // channel) skips only the log line below, never the publication above.
-        let Some(storage) = &services.guild_storage else {
-            return Next::Continue;
+        let Some(channel_id) = self.audit_channel(services).await else {
+            return;
         };
+        let display =
+            member.username.clone().unwrap_or_else(|| format!("user {}", origin.user_id.get()));
+        let line = if joined {
+            match self.attribute(origin, services).await {
+                Some((code, creator)) => {
+                    format!("📥 **{display}** joined via `{code}` (created by {creator})")
+                }
+                None => format!("📥 **{display}** joined the guild"),
+            }
+        } else {
+            format!("📤 **{display}** left the guild")
+        };
+        self.deliver(origin, services, channel_id, &line).await;
+    }
 
+    /// `INVITE_CREATE`: record the invite (creator, limits, fresh uses
+    /// baseline) and log the creation. Best effort like every audit line.
+    async fn invite_created(
+        &self,
+        origin: &Origin,
+        services: &KernelServices,
+        invite: &InvitePayload,
+    ) {
+        let Some(storage) = services.guild_storage.as_ref() else {
+            return;
+        };
+        let _guard = self.invites_lock.lock().await;
+        let mut invites = load_invites(storage).await;
+        invites.insert(
+            invite.code.clone(),
+            InviteDoc {
+                code: invite.code.clone(),
+                channel_id: invite.channel_id.map(|channel| channel.get().to_string()),
+                creator_id: invite.creator_id.map(|user| user.get().to_string()),
+                creator_name: invite.creator_name.clone(),
+                max_uses: invite.max_uses,
+                temporary: invite.temporary,
+                // The create event reports a fresh counter (Discord: always
+                // 0) - the baseline the first attribution diff diffs from.
+                last_seen_uses: Some(0),
+                deleted: false,
+            },
+        );
+        if let Err(err) = save_invites(storage, &invites).await {
+            tracing::warn!(namespace = NAMESPACE, %err, "failed to persist invite record");
+        }
+        drop(_guard);
+
+        let Some(channel_id) = self.audit_channel(services).await else {
+            return;
+        };
+        let creator = invite
+            .creator_name
+            .clone()
+            .or_else(|| invite.creator_id.map(|user| format!("user {}", user.get())))
+            .unwrap_or_else(|| "unknown creator".to_owned());
+        let limits = match invite.max_uses {
+            Some(1) => " (single-use)".to_owned(),
+            Some(n) if n > 1 => format!(" (up to {n} uses)"),
+            _ => String::new(),
+        };
+        let line = format!("🎟️ Invite `{}` created by {creator}{limits}", invite.code);
+        self.deliver(origin, services, channel_id, &line).await;
+    }
+
+    /// `INVITE_DELETE`: mark the stored record deleted (kept for its audit
+    /// trail and creator attribution) and log the deletion.
+    async fn invite_deleted(
+        &self,
+        origin: &Origin,
+        services: &KernelServices,
+        invite: &InvitePayload,
+    ) {
+        let Some(storage) = services.guild_storage.as_ref() else {
+            return;
+        };
+        let _guard = self.invites_lock.lock().await;
+        let mut invites = load_invites(storage).await;
+        match invites.get_mut(&invite.code) {
+            Some(doc) => doc.deleted = true,
+            None => {
+                invites.insert(
+                    invite.code.clone(),
+                    InviteDoc { code: invite.code.clone(), deleted: true, ..InviteDoc::default() },
+                );
+            }
+        }
+        if let Err(err) = save_invites(storage, &invites).await {
+            tracing::warn!(namespace = NAMESPACE, %err, "failed to persist invite deletion");
+        }
+        drop(_guard);
+
+        let Some(channel_id) = self.audit_channel(services).await else {
+            return;
+        };
+        let line = format!("🗑️ Invite `{}` deleted", invite.code);
+        self.deliver(origin, services, channel_id, &line).await;
+    }
+
+    /// Join attribution under the invite-map write lock: fetch the
+    /// directory, diff uses against the stored baseline, persist the new
+    /// baseline (and freshly learned creators). `None` = no signal -
+    /// directory unreadable (missing permission), empty, ambiguous, or no
+    /// growth; the audit line degrades to the plain join notice.
+    async fn attribute(
+        &self,
+        origin: &Origin,
+        services: &KernelServices,
+    ) -> Option<(String, String)> {
+        let storage = services.guild_storage.as_ref()?;
+        let _guard = self.invites_lock.lock().await;
+        let fetched = services.invite_directory.invites(origin).await;
+        if fetched.is_empty() {
+            return None;
+        }
+        let mut invites = load_invites(storage).await;
+        let attributed = attribute_join(&invites, &fetched);
+        for invite in &fetched {
+            let doc = invites
+                .entry(invite.code.clone())
+                .or_insert_with(|| InviteDoc::from_directory(invite));
+            if let Some(uses) = invite.uses {
+                doc.last_seen_uses = Some(uses);
+            }
+            // A first-time listing fills in creators the gateway event
+            // never showed (invites created before this feature shipped).
+            if doc.creator_id.is_none() {
+                doc.creator_id = invite.creator_id.map(|user| user.get().to_string());
+                doc.creator_name = invite.creator_name.clone();
+            }
+        }
+        if let Err(err) = save_invites(storage, &invites).await {
+            tracing::warn!(namespace = NAMESPACE, %err, "failed to persist invite baseline");
+        }
+        attributed.map(|code| {
+            let creator = invites
+                .get(&code)
+                .map(|doc| doc.creator_display())
+                .unwrap_or_else(|| "unknown creator".to_owned());
+            (code, creator)
+        })
+    }
+
+    /// The guild's configured audit channel, if any is readable and valid.
+    async fn audit_channel(&self, services: &KernelServices) -> Option<ChannelId> {
+        let storage = services.guild_storage.as_ref()?;
         let raw = match storage.get(NAMESPACE, CONFIG_KEY).await {
             Ok(Some(raw)) => raw,
             // Unconfigured = audit off for this guild (the event is out already).
-            Ok(None) => return Next::Continue,
+            Ok(None) => return None,
             Err(err) => {
                 tracing::warn!(namespace = NAMESPACE, %err, "tracker config unreadable - audit skipped");
-                return Next::Continue;
+                return None;
             }
         };
         let Ok(config) = serde_json::from_value::<TrackerConfig>(raw) else {
             tracing::warn!(namespace = NAMESPACE, "tracker config is malformed - skipping");
-            return Next::Continue;
+            return None;
         };
         let channel_id = match config.audit_channel_id.as_deref().map(str::parse::<u64>) {
             Some(Ok(channel_id)) => channel_id,
             Some(Err(_)) | None => {
                 tracing::warn!(namespace = NAMESPACE, "tracker audit channel missing or invalid");
-                return Next::Continue;
+                return None;
             }
         };
+        Some(ChannelId(channel_id))
+    }
 
-        let display = username.unwrap_or_else(|| format!("user {}", event.origin.user_id.get()));
-        let announcement = if joined {
-            format!("📥 **{display}** joined the guild")
-        } else {
-            format!("📤 **{display}** left the guild")
-        };
-
-        // Best effort: deliver to the configured audit channel; a broken
-        // destination is logged, never propagated - the pipeline keeps going.
-        let output =
-            services.chat_output_factory.channel_output(&event.origin, ChannelId(channel_id));
-        if let Err(err) = output.send(OutboundMessage::text(announcement)).await {
+    /// Best effort: deliver to the configured audit channel; a broken
+    /// destination is logged, never propagated - the pipeline keeps going.
+    async fn deliver(
+        &self,
+        origin: &Origin,
+        services: &KernelServices,
+        channel_id: ChannelId,
+        line: &str,
+    ) {
+        let output = services.chat_output_factory.channel_output(origin, channel_id);
+        if let Err(err) = output.send(OutboundMessage::text(line)).await {
             tracing::warn!(%err, "failed to deliver member audit message");
         }
-
-        Next::Continue
     }
+}
+
+/// The guild's stored invite map, fresh on any read failure - the map is
+/// attribution state, and a malformed document must not wedge future joins.
+async fn load_invites(storage: &Arc<dyn GuildStorage>) -> HashMap<String, InviteDoc> {
+    match storage.get(NAMESPACE, INVITES_KEY).await {
+        Ok(Some(raw)) => serde_json::from_value(raw).unwrap_or_else(|err| {
+            tracing::warn!(namespace = NAMESPACE, %err, "stored invite map unreadable - starting fresh");
+            HashMap::new()
+        }),
+        Ok(None) => HashMap::new(),
+        Err(err) => {
+            tracing::warn!(namespace = NAMESPACE, %err, "stored invite map unreadable - starting fresh");
+            HashMap::new()
+        }
+    }
+}
+
+async fn save_invites(
+    storage: &Arc<dyn GuildStorage>,
+    invites: &HashMap<String, InviteDoc>,
+) -> Result<(), StorageError> {
+    storage
+        .set(
+            NAMESPACE,
+            INVITES_KEY,
+            serde_json::to_value(invites).expect("invite map expected to serialize"),
+        )
+        .await
 }
 
 /// `/assign_tracker`: the channel the command is run in becomes the guild's
@@ -259,16 +468,16 @@ mod tests {
     use super::*;
     use crate::kernel::{
         models::{
-            BusEvent, ChannelId as ChannelIdModel, CommandPayload, GuildId, MemberPayload,
-            MessageId, Origin, UserId,
+            BusEvent, ChannelId as ChannelIdModel, CommandPayload, GuildId, InvitePayload,
+            MemberPayload, MessageId, Origin, UserId,
         },
         plugin_ports::EventHandler,
         spi_ports::{
-            ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard, GUILD_SETTINGS,
-            StoragePort,
+            ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard,
+            DirectoryInvite, GUILD_SETTINGS, InviteDirectoryPort, StoragePort,
         },
     };
-    use crate::test_support::{InMemoryStorage, RecordingChatOutput};
+    use crate::test_support::{FakeInviteDirectory, InMemoryStorage, RecordingChatOutput};
     use crate::{
         infrastructure::plugin_adapters::{InMemoryCommandRegistry, InMemoryEventBus},
         kernel::models::OutboundError,
@@ -393,6 +602,7 @@ mod tests {
         output: Arc<RecordingChatOutput>,
         joined: Arc<Recorder<UserJoinedGuild>>,
         left: Arc<Recorder<UserLeftGuild>>,
+        directory: Arc<FakeInviteDirectory>,
     }
 
     fn fixture(
@@ -406,16 +616,18 @@ mod tests {
 
         let sent = Arc::new(Sent::default());
         let output = RecordingChatOutput::new();
+        let directory = FakeInviteDirectory::new(Vec::new());
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::new(ChannelRecordingFactory { sent: Arc::clone(&sent) }),
+            invite_directory: Arc::clone(&directory) as Arc<dyn InviteDirectoryPort>,
             guild_storage: storage.map(|storage| storage.guild_scoped("test", GuildId(1))),
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
 
         let plugin = UserActivityTrackerPlugin::new(bus, Arc::new(InMemoryCommandRegistry::new()));
-        (plugin, services, Fixture { sent, output, joined, left })
+        (plugin, services, Fixture { sent, output, joined, left, directory })
     }
 
     // --- tests ---
@@ -494,6 +706,7 @@ mod tests {
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: Arc::new(ChannelRecordingFactory { sent: Arc::clone(&sent) }),
+            invite_directory: FakeInviteDirectory::new(Vec::new()) as Arc<dyn InviteDirectoryPort>,
             guild_storage: Some(
                 crate::test_support::FailingStorage.guild_scoped("test", GuildId(1)),
             ),
@@ -532,6 +745,189 @@ mod tests {
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
         assert!(fixture.sent.messages.lock().is_empty());
         assert!(fixture.joined.events.lock().is_empty());
+    }
+
+    // --- invite tracking ---
+
+    fn invite_event(kind: EventKind, code: &str) -> RequestContext {
+        RequestContext {
+            kind,
+            origin: origin(Some(1)),
+            payload: EventPayload::Invite(InvitePayload {
+                code: code.to_owned(),
+                channel_id: Some(ChannelIdModel(55)),
+                creator_id: Some(UserId(7)),
+                creator_name: Some("rikk".to_owned()),
+                max_uses: Some(1),
+                temporary: Some(false),
+            }),
+        }
+    }
+
+    fn directory(code: &str, uses: u64) -> DirectoryInvite {
+        DirectoryInvite {
+            code: code.to_owned(),
+            channel_id: None,
+            creator_id: Some(UserId(7)),
+            creator_name: Some("rikk".to_owned()),
+            uses: Some(uses),
+            max_uses: None,
+        }
+    }
+
+    async fn stored_invites(storage: &InMemoryStorage) -> serde_json::Value {
+        storage
+            .guild_scoped("test", GuildId(1))
+            .get(NAMESPACE, INVITES_KEY)
+            .await
+            .expect("invite map readable")
+            .expect("invite map present")
+    }
+
+    /// One stored doc field, with a loud failure naming what is missing.
+    fn field<'a>(map: &'a serde_json::Value, code: &str, key: &str) -> &'a serde_json::Value {
+        map.get(code)
+            .unwrap_or_else(|| panic!("invite doc `{code}` expected: {map}"))
+            .get(key)
+            .unwrap_or_else(|| panic!("field `{key}` expected on `{code}`: {map}"))
+    }
+
+    /// `INVITE_CREATE` logs the creator and limits, and records the invite
+    /// with a fresh uses baseline for the attribution diff.
+    #[tokio::test]
+    async fn invite_create_is_logged_and_recorded() {
+        let storage = configured_storage("777");
+        let (plugin, services, fixture) = fixture(Some(Arc::clone(&storage)));
+        let mut event = invite_event(EventKind::InviteCreated, "abc123");
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+
+        assert_eq!(
+            fixture.sent.messages.lock().clone(),
+            vec![(777, "🎟️ Invite `abc123` created by rikk (single-use)".to_owned())]
+        );
+        let map = stored_invites(&storage).await;
+        assert_eq!(field(&map, "abc123", "creator_name"), "rikk");
+        assert_eq!(field(&map, "abc123", "last_seen_uses"), 0);
+        assert_eq!(field(&map, "abc123", "deleted"), false);
+    }
+
+    /// `INVITE_DELETE` logs the code and marks the stored record deleted -
+    /// the record stays for its audit trail and creator attribution.
+    #[tokio::test]
+    async fn invite_delete_is_logged_and_marked() {
+        let storage = configured_storage("777");
+        let (plugin, services, fixture) = fixture(Some(Arc::clone(&storage)));
+        let mut created = invite_event(EventKind::InviteCreated, "abc123");
+        plugin.pre(&mut created, &services).await;
+        let mut deleted = invite_event(EventKind::InviteDeleted, "abc123");
+
+        assert!(matches!(plugin.pre(&mut deleted, &services).await, Next::Continue));
+
+        assert_eq!(
+            fixture.sent.messages.lock().clone(),
+            vec![
+                (777, "🎟️ Invite `abc123` created by rikk (single-use)".to_owned()),
+                (777, "🗑️ Invite `abc123` deleted".to_owned()),
+            ]
+        );
+        let map = stored_invites(&storage).await;
+        assert_eq!(field(&map, "abc123", "deleted"), true);
+    }
+
+    /// A delete for an invite the bot never saw is still marked (and kept).
+    #[tokio::test]
+    async fn unknown_invite_delete_still_records_the_code() {
+        let storage = configured_storage("777");
+        let (plugin, services, _fixture) = fixture(Some(Arc::clone(&storage)));
+        let mut deleted = invite_event(EventKind::InviteDeleted, "ghost");
+
+        assert!(matches!(plugin.pre(&mut deleted, &services).await, Next::Continue));
+
+        let map = stored_invites(&storage).await;
+        assert_eq!(field(&map, "ghost", "deleted"), true);
+        assert_eq!(field(&map, "ghost", "creator_id"), &serde_json::Value::Null);
+    }
+
+    /// Attribution: one code grew by exactly one since the create baseline
+    /// - the join line names it and its creator, and the baseline moves.
+    #[tokio::test]
+    async fn join_attributes_through_the_uses_diff() {
+        let storage = configured_storage("777");
+        let (plugin, services, fixture) = fixture(Some(Arc::clone(&storage)));
+        let mut created = invite_event(EventKind::InviteCreated, "abc123");
+        plugin.pre(&mut created, &services).await;
+        fixture.directory.set(vec![directory("abc123", 1)]);
+        let mut event = member_event(EventKind::MemberJoined, Some(1), "someone");
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+
+        assert_eq!(
+            fixture.sent.messages.lock().last().expect("join line expected").clone(),
+            (777, "📥 **someone** joined via `abc123` (created by rikk)".to_owned())
+        );
+        let map = stored_invites(&storage).await;
+        assert_eq!(field(&map, "abc123", "last_seen_uses"), 1);
+    }
+
+    /// Two codes grew in the same window (offline catch-up, concurrent
+    /// joins): the diff refuses to guess - plain line, but the baseline
+    /// resyncs so later joins attribute again.
+    #[tokio::test]
+    async fn ambiguous_growth_keeps_the_plain_join_and_resyncs() {
+        let storage = configured_storage("777");
+        let (plugin, services, fixture) = fixture(Some(Arc::clone(&storage)));
+        for code in ["a", "b"] {
+            let mut created = invite_event(EventKind::InviteCreated, code);
+            plugin.pre(&mut created, &services).await;
+        }
+        fixture.directory.set(vec![directory("a", 1), directory("b", 1)]);
+        let mut event = member_event(EventKind::MemberJoined, Some(1), "someone");
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+
+        assert_eq!(
+            fixture.sent.messages.lock().last().expect("join line expected").clone(),
+            (777, "📥 **someone** joined the guild".to_owned())
+        );
+        let map = stored_invites(&storage).await;
+        assert_eq!(field(&map, "a", "last_seen_uses"), 1);
+        assert_eq!(field(&map, "b", "last_seen_uses"), 1);
+    }
+
+    /// No directory signal (no permission, empty listing): the plain join
+    /// notice - attribution degrades, never fails.
+    #[tokio::test]
+    async fn empty_directory_degrades_to_the_plain_join() {
+        let (plugin, services, fixture) = fixture(Some(configured_storage("777")));
+        let mut event = member_event(EventKind::MemberJoined, Some(1), "someone");
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+
+        assert_eq!(
+            fixture.sent.messages.lock().clone(),
+            vec![(777, "📥 **someone** joined the guild".to_owned())]
+        );
+    }
+
+    /// A directory listing also fills in creators for invites the bot
+    /// never saw created (shipped before the feature, created offline).
+    #[tokio::test]
+    async fn directory_listing_enriches_unknown_creators() {
+        let storage = configured_storage("777");
+        let (plugin, services, fixture) = fixture(Some(Arc::clone(&storage)));
+        fixture.directory.set(vec![directory("pre-historic", 5)]);
+        let mut event = member_event(EventKind::MemberJoined, Some(1), "someone");
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+
+        // Unknown code with uses: attributed - the code exists and was used.
+        assert_eq!(
+            fixture.sent.messages.lock().last().expect("join line expected").clone(),
+            (777, "📥 **someone** joined via `pre-historic` (created by rikk)".to_owned())
+        );
+        let map = stored_invites(&storage).await;
+        assert_eq!(field(&map, "pre-historic", "last_seen_uses"), 5);
     }
 
     #[tokio::test]

@@ -22,8 +22,8 @@ use versa_bot::kernel::{
     plugin_ports::{CommandRegistryPort, Job, MiddlewarePluginPort, PluginPort, SchedulerPort},
     services::KernelService,
     spi_ports::{
-        ChatOutputFactoryPort, ConfigChangeHandler, ConfigPort, NicknamePort, PlatformInfoPort,
-        PluginStoragePort, PresencePort, StoragePort,
+        ChatOutputFactoryPort, ConfigChangeHandler, ConfigPort, InviteDirectoryPort, NicknamePort,
+        PlatformInfoPort, PluginStoragePort, PresencePort, StoragePort,
     },
 };
 use versa_bot::plugins::audit::AuditLogPlugin;
@@ -97,9 +97,10 @@ async fn main() -> ExitCode {
         Arc::new(build_http(&config.discord.token, config.discord.proxy.clone(), Some(app_id)));
 
     // One shared outbound factory for event-scoped sends AND poll-driven
-    // sends (the store watcher has no inbound event to scope from).
-    let chat_factory: Arc<dyn ChatOutputFactoryPort> =
-        Arc::new(SerenityChatOutputFactory::new(Arc::clone(&http)));
+    // sends (the store watcher has no inbound event to scope from). The same
+    // instance also serves the invite directory: REST guild-invite listings
+    // feed the tracker's join attribution.
+    let chat_factory = Arc::new(SerenityChatOutputFactory::new(Arc::clone(&http)));
 
     let storage = Arc::new(
         SqlxStorage::connect(&config.storage.url)
@@ -220,7 +221,7 @@ async fn main() -> ExitCode {
         Arc::new(lcu_client) as Arc<dyn versa_bot::plugins::lol_store::lcu::LcuPort>,
         Arc::clone(&storage) as Arc<dyn StoragePort>,
         storage.plugin_scoped(platform_info.slug()),
-        Arc::clone(&chat_factory),
+        Arc::clone(&chat_factory) as Arc<dyn ChatOutputFactoryPort>,
         event_bus.clone(),
         Arc::clone(&platform_info),
         lol_settings,
@@ -304,7 +305,8 @@ async fn main() -> ExitCode {
                 Arc::clone(&llm) as Arc<dyn MiddlewarePluginPort>,
             ])
             .event_bus(event_bus)
-            .chat_output_factory(Arc::clone(&chat_factory))
+            .chat_output_factory(Arc::clone(&chat_factory) as Arc<dyn ChatOutputFactoryPort>)
+            .invite_directory(Arc::clone(&chat_factory) as Arc<dyn InviteDirectoryPort>)
             .storage(Arc::clone(&storage) as Arc<dyn StoragePort>)
             .plugin_storage(Arc::clone(&storage) as Arc<dyn PluginStoragePort>)
             .platform_info(Arc::clone(&platform_info))
@@ -325,9 +327,12 @@ async fn main() -> ExitCode {
     // "Server Members Intent" and "Message Content Intent" in the Developer
     // Portal, or the gateway disconnects on start. MESSAGE_CONTENT is
     // consumed by the LLM plugin, which reads guild message content for
-    // conversation history.
+    // conversation history. GUILD_INVITES feeds the tracker's invite audit
+    // (needs the Manage Channels permission on top, or the events never
+    // arrive).
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
+        | GatewayIntents::GUILD_INVITES
         | GatewayIntents::GUILD_MEMBERS
         | GatewayIntents::MESSAGE_CONTENT;
 

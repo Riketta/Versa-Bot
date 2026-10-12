@@ -32,9 +32,10 @@ pub struct Origin {
 /// they care about and ignore the rest.
 ///
 /// Currently emitted kinds: `MessageReceived`, `MemberJoined`, `MemberLeft`,
-/// `CommandInvoked`. The remaining variants are reserved for future adapters
-/// - no adapter emits them yet, so a plugin matching on them never fires
-/// (listed here so the taxonomy is not read as a false contract).
+/// `CommandInvoked`, `InviteCreated`, `InviteDeleted`. The remaining variants
+/// are reserved for future adapters - no adapter emits them yet, so a plugin
+/// matching on them never fires (listed here so the taxonomy is not read as
+/// a false contract).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventKind {
@@ -55,6 +56,11 @@ pub enum EventKind {
     /// Prefix parsing for platforms without native commands is an adapter
     /// concern - it synthesizes this kind too, so the dispatcher is shared.
     CommandInvoked,
+    /// An invite to a guild was created. Emitted when the platform reports
+    /// invite lifecycle; platforms without the concept never emit it.
+    InviteCreated,
+    /// An invite to a guild was deleted or revoked.
+    InviteDeleted,
 }
 
 /// Normalized per-kind event data.
@@ -65,8 +71,32 @@ pub enum EventPayload {
     Member(MemberPayload),
     /// A native platform command invocation (see [`EventKind::CommandInvoked`]).
     Command(CommandPayload),
+    /// An invite lifecycle event (`InviteCreated` / `InviteDeleted`); see
+    /// [`InvitePayload`].
+    Invite(InvitePayload),
     /// Kinds that carry no normalized payload yet (e.g. `PresenceUpdate`).
     Empty,
+}
+
+/// One invite lifecycle fact, normalized platform-blind. `InviteDeleted`
+/// carries only what a deletion reports (the code; the creator only when the
+/// platform repeats it) - every absent field degrades to `None`, and the
+/// invite's stored record fills the gaps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvitePayload {
+    /// The platform's invite code (opaque, stable while the invite lives).
+    pub code: String,
+    /// Channel the invite points at, when the platform reports one.
+    pub channel_id: Option<ChannelId>,
+    /// Invite creator, when the platform reports one.
+    pub creator_id: Option<UserId>,
+    /// Creator display name at event time (best effort).
+    pub creator_name: Option<String>,
+    /// Maximum use count (`0`/`None` = unlimited on platforms with the
+    /// concept; deletion events never carry it).
+    pub max_uses: Option<u64>,
+    /// Whether membership through the invite is temporary, when reported.
+    pub temporary: Option<bool>,
 }
 
 /// A resolved native command: its registered name and string arguments.

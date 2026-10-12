@@ -38,7 +38,9 @@ commands, permission tiers - lives in [Plugins](#plugins).
   above every guild-side rank and are injected via the root `owners`
   config key - never modifiable through the bot.
 - User activity tracker: logs member joins/leaves to a guild audit
-  channel and publishes membership events on the plugin bus.
+  channel, tracks invite creates/deletes and attributes joins to their
+  invite code (permission-gated), and publishes membership events on the
+  plugin bus.
 - LoL store tracker: watches the locally running League client's store
   (sales, new skins, Mythic Shop rotations, Your Shop start) and announces
   changes to a per-guild assigned channel.
@@ -141,7 +143,7 @@ compiler CI and the Docker image use.
    bot comes online.
 
 3. Invite the bot with the `bot` + `applications.commands` scopes so slash
-   commands appear, granting permission integer `274945297472` - the
+   commands appear, granting permission integer `274945297488` - the
    minimal set, documented in [Bot permissions](#bot-permissions). Global
    commands can take up to an hour to propagate on first registration.
    Once they do, wire the bot up in Discord - the
@@ -151,7 +153,7 @@ The authorization URL (Application ID from Developer Portal → General
 Information):
 
 ```text
-https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot+applications.commands&permissions=274945297472
+https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot+applications.commands&permissions=274945297488
 ```
 
 **Private bots.** With the Developer Portal's **Public Bot** toggle
@@ -221,6 +223,7 @@ by a concrete plugin or core feature:
 | `GUILD_MESSAGES` | regular | Core message intake: guild messages flow through the pipeline (the auth gate) |
 | `DIRECT_MESSAGES` | regular | Core DM intake: DM events flow with no guild scope |
 | `GUILD_MEMBERS` | **privileged** | `tracker` plugin: member join/leave events (`/assign_tracker` audit) |
+| `GUILD_INVITES` | regular | `tracker` plugin: invite create/delete events for the invite audit - delivered only where the bot holds Manage Channels |
 | `MESSAGE_CONTENT` | **privileged** | the LLM chat plugin reads guild message content for conversation history - enable "Message Content Intent" in the Developer Portal |
 
 So exactly two portal toggles are needed today (Developer Portal → Bot),
@@ -232,8 +235,10 @@ the status rotator sets the bot's own presence, which needs no intent.
 
 The bot's entire Discord write surface is sending messages (including
 interaction followups), editing its own messages (streaming), adding
-reactions, changing its own nickname, and typing indicators. Seven guild
-permissions cover it completely - invite integer `274945297472`:
+reactions, changing its own nickname, and typing indicators; the only
+read beyond messages is the invite directory (tracker attribution).
+Eight guild permissions cover it completely - invite integer
+`274945297488`:
 
 | Permission | Requested for |
 |---|---|
@@ -244,6 +249,7 @@ permissions cover it completely - invite integer `274945297472`:
 | Add Reactions | the react tool and random chime reacts |
 | Use External Emojis | reacting with emojis from other servers |
 | Change Nickname | `/set_guild_name` (the self-nickname endpoint) |
+| Manage Channels | invite tracking: the `INVITE_CREATE`/`INVITE_DELETE` gateway events require it (tracker) |
 
 Grant nothing beyond the list above:
 
@@ -257,6 +263,11 @@ Grant nothing beyond the list above:
   **Ban Members**: moderation data lives in the bot's own storage; auth
   bans are bot-internal tiers, not Discord bans; `/set_guild_name` renames
   the bot itself, not other members.
+- **Manage Server** stays absent by default, and it is the one optional
+  grant: the only feature behind it is the tracker's join attribution
+  (reading the guild's invite directory). Grant it additionally if you
+  want `joined via CODE` audit lines; without it those degrade to plain
+  join notices and nothing else changes.
 - No **Bypass Slowmode**: streaming edits the bot's own messages, which is
   not slowmode-gated. No voice, polls, TTS, stickers, or attachments are
   ever sent.
@@ -424,6 +435,29 @@ posts a short join/leave notice there. The assignment is per guild,
 self-service: run `/assign_tracker` in the channel that should become
 the audit channel. Needs the privileged `GUILD_MEMBERS` intent (see
 [Gateway intents](#gateway-intents)).
+
+**Invite tracking** rides the same audit channel, always on:
+
+- **Creates and deletes**: `🎟️ Invite CODE created by <user> (single-use)`
+  and `🗑️ Invite CODE deleted` are logged as the platform reports them.
+  Needs the `GUILD_INVITES` intent plus the bot holding **Manage
+  Channels** - without that permission the events never arrive and
+  nothing is logged.
+- **Join attribution**: joins whose invite can be pinned down are logged
+  as `📥 **<user>** joined via CODE (created by <creator>)`. Discord
+  never names the invite on a join, so the tracker diffs the guild's
+  invite directory (cumulative uses per code) against its last
+  observation: one code that grew by exactly one - or an unknown code
+  that already carries uses - is the one used; zero or several
+  candidates (joins while the bot was offline, simultaneous joins) stay
+  unattributed and the baseline resyncs. The directory read needs the
+  bot to hold **Manage Server** - without it every join degrades to the
+  plain notice, and nothing else changes.
+
+Invite edits (changed use limits) are invisible on Discord - only
+create, delete, and use-count changes exist. Vanity URLs
+(`discord.gg/<slug>`) are a separate endpoint and not part of
+attribution.
 
 | Command | Tier | Effect |
 |---|---|---|

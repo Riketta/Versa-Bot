@@ -17,8 +17,9 @@ use crate::kernel::{
         CommandDescriptor, CommandHandler, CommandRegistryPort, Job, JobHandle, SchedulerPort,
     },
     spi_ports::{
-        ChatOutputFactoryPort, ChatOutputPort, ChatTypingGuard, GUILD_SETTINGS, GuildStorage,
-        PlatformInfoPort, PluginStorage, PluginStoragePort, StoragePort, StoredRecord,
+        ChatOutputFactoryPort, ChatOutputPort, ChatTypingGuard, DirectoryInvite, GUILD_SETTINGS,
+        GuildStorage, InviteDirectoryPort, PlatformInfoPort, PluginStorage, PluginStoragePort,
+        StoragePort, StoredRecord,
     },
 };
 
@@ -908,10 +909,42 @@ impl ChatOutputFactoryPort for RecordingChatOutputFactory {
 /// with (empty by default - no emojis, like a guild without any).
 struct StaticGuildEmojis(Vec<crate::kernel::spi_ports::ReactableEmoji>);
 
-#[async_trait::async_trait]
+#[async_trait]
 impl crate::kernel::spi_ports::GuildEmojiPort for StaticGuildEmojis {
     async fn list(&self) -> Vec<crate::kernel::spi_ports::ReactableEmoji> {
         self.0.clone()
+    }
+}
+
+/// Empty invite directory - the default fixture: attribution has no signal,
+/// like a deployment without the platform's directory permission.
+#[must_use]
+pub fn test_invite_directory() -> Arc<dyn InviteDirectoryPort> {
+    Arc::new(crate::kernel::spi_ports::EmptyInviteDirectoryPort)
+}
+
+/// [`InviteDirectoryPort`] test double with a scriptable listing - the
+/// tracker's attribution tests drive joins through [`Self::set`].
+pub struct FakeInviteDirectory {
+    invites: Mutex<Vec<DirectoryInvite>>,
+}
+
+impl FakeInviteDirectory {
+    #[must_use]
+    pub fn new(invites: Vec<DirectoryInvite>) -> Arc<Self> {
+        Arc::new(Self { invites: Mutex::new(invites) })
+    }
+
+    /// Replaces the served listing - the next `invites` call sees it.
+    pub fn set(&self, invites: Vec<DirectoryInvite>) {
+        *self.invites.lock() = invites;
+    }
+}
+
+#[async_trait]
+impl InviteDirectoryPort for FakeInviteDirectory {
+    async fn invites(&self, _origin: &crate::kernel::models::Origin) -> Vec<DirectoryInvite> {
+        self.invites.lock().clone()
     }
 }
 

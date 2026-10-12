@@ -975,6 +975,7 @@ mod tests {
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: factory,
+            invite_directory: crate::test_support::test_invite_directory(),
             guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
@@ -1004,6 +1005,7 @@ mod tests {
         KernelServices {
             chat_output: Arc::clone(output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(output)).boxed(),
+            invite_directory: crate::test_support::test_invite_directory(),
             guild_storage: None,
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
@@ -2303,6 +2305,7 @@ mod tests {
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
+            invite_directory: crate::test_support::test_invite_directory(),
             guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
@@ -2354,6 +2357,7 @@ mod tests {
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
+            invite_directory: crate::test_support::test_invite_directory(),
             guild_storage: Some(storage.guild_scoped("test", GuildId(1))),
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
@@ -2492,6 +2496,7 @@ mod tests {
         let services = KernelServices {
             chat_output: Arc::clone(&output) as Arc<dyn ChatOutputPort>,
             chat_output_factory: RecordingChatOutputFactory::new(Arc::clone(&output)).boxed(),
+            invite_directory: crate::test_support::test_invite_directory(),
             guild_storage: Some(FailingStorage.guild_scoped("test", GuildId(1))),
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),

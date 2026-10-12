@@ -114,6 +114,7 @@ mod tests {
         KernelServices {
             chat_output: output.clone(),
             chat_output_factory: factory.clone(),
+            invite_directory: crate::test_support::test_invite_directory(),
             guild_storage: None,
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),

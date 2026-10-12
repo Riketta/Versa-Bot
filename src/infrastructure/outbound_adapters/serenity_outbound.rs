@@ -10,13 +10,15 @@ use serenity::all::{
     MessageReferenceKind, ReactionType,
 };
 use serenity::async_trait;
+use serenity::model::invite::RichInvite;
 use tokio_util::sync::CancellationToken;
 
 use crate::kernel::{
-    models::{ChannelId, Embed, MessageId, Origin, OutboundError, OutboundMessage},
+    models::{ChannelId, Embed, MessageId, Origin, OutboundError, OutboundMessage, UserId},
     spi_ports::{
-        ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard, GuildEmojiPort,
-        ReactableEmoji, ReactionPort, UndeliverableGuildEmojiPort, UndeliverableReactionPort,
+        ChatOutputFactoryPort, ChatOutputPort, ChatStreamPort, ChatTypingGuard, DirectoryInvite,
+        GuildEmojiPort, InviteDirectoryPort, ReactableEmoji, ReactionPort,
+        UndeliverableGuildEmojiPort, UndeliverableReactionPort,
     },
 };
 
@@ -242,6 +244,45 @@ impl<T: ChatApi> ChatOutputFactoryPort for SerenityChatOutputFactory<T> {
             http: Arc::clone(&self.http),
             emoji_cache: Arc::clone(&self.emoji_cache),
         })
+    }
+}
+
+/// Guild-bound invite directory: one REST `get_guild_invites` listing per
+/// call, mapped platform-blind. Reading the directory needs the bot to hold
+/// Manage Server - every failure (permission, network) degrades to an empty
+/// listing, which attribution callers read as "no signal".
+#[async_trait]
+impl<T: ChatApi> InviteDirectoryPort for SerenityChatOutputFactory<T> {
+    async fn invites(&self, origin: &Origin) -> Vec<DirectoryInvite> {
+        let Some(guild_id) = origin.guild_id else {
+            return Vec::new();
+        };
+        match self.http.get_guild_invites(SerenityGuildId::new(guild_id.get())).await {
+            Ok(invites) => invites.iter().map(directory_invite).collect(),
+            Err(err) => {
+                tracing::debug!(
+                    guild = guild_id.get(),
+                    error = %err,
+                    "invite directory listing failed - attribution degraded"
+                );
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// One platform invite as a kernel directory entry.
+fn directory_invite(invite: &RichInvite) -> DirectoryInvite {
+    DirectoryInvite {
+        code: invite.code.clone(),
+        channel_id: Some(ChannelId(invite.channel.id.get())),
+        creator_id: invite.inviter.as_ref().map(|user| UserId(user.id.get())),
+        creator_name: invite
+            .inviter
+            .as_ref()
+            .map(|user| user.global_name.clone().unwrap_or_else(|| user.name.clone())),
+        uses: Some(invite.uses),
+        max_uses: Some(u64::from(invite.max_uses)),
     }
 }
 
@@ -722,6 +763,10 @@ trait ChatApi: InteractionApi + 'static {
     /// Mirrors `Http::get_application_emojis`.
     async fn get_application_emojis(&self) -> Result<Vec<Emoji>, String>;
 
+    /// Mirrors `Http::get_guild_invites`.
+    async fn get_guild_invites(&self, guild_id: SerenityGuildId)
+    -> Result<Vec<RichInvite>, String>;
+
     /// Keeps serenity's typing indicator refreshing on the channel until
     /// `cancel` fires: spawns the bridge task that holds serenity's `Typing`
     /// handle and drops it on cancellation (which stops the refresh loop).
@@ -775,6 +820,13 @@ impl ChatApi for Http {
 
     async fn get_application_emojis(&self) -> Result<Vec<Emoji>, String> {
         Http::get_application_emojis(self).await.map_err(|err| err.to_string())
+    }
+
+    async fn get_guild_invites(
+        &self,
+        guild_id: SerenityGuildId,
+    ) -> Result<Vec<RichInvite>, String> {
+        Http::get_guild_invites(self, guild_id).await.map_err(|err| err.to_string())
     }
 
     fn run_typing(self: &Arc<Self>, channel_id: SerenityChannelId, cancel: CancellationToken) {
@@ -1366,6 +1418,13 @@ mod tests {
                 Ok(Vec::new())
             }
 
+            async fn get_guild_invites(
+                &self,
+                _guild_id: SerenityGuildId,
+            ) -> Result<Vec<RichInvite>, String> {
+                Ok(Vec::new())
+            }
+
             fn run_typing(
                 self: &Arc<Self>,
                 _channel_id: SerenityChannelId,
@@ -1463,6 +1522,13 @@ mod tests {
             }
 
             async fn get_application_emojis(&self) -> Result<Vec<Emoji>, String> {
+                Ok(Vec::new())
+            }
+
+            async fn get_guild_invites(
+                &self,
+                _guild_id: SerenityGuildId,
+            ) -> Result<Vec<RichInvite>, String> {
                 Ok(Vec::new())
             }
 
@@ -1565,6 +1631,13 @@ mod tests {
                 Ok(vec![RecordingApi::emoji("gaben", 5)])
             }
 
+            async fn get_guild_invites(
+                &self,
+                _guild_id: SerenityGuildId,
+            ) -> Result<Vec<RichInvite>, String> {
+                Ok(Vec::new())
+            }
+
             fn run_typing(
                 self: &Arc<Self>,
                 _channel_id: SerenityChannelId,
@@ -1620,6 +1693,8 @@ mod tests {
         /// Application emoji list fetch (prompt injection + bare-name
         /// fallback).
         GetApplicationEmojis,
+        /// Guild invite directory fetch (join attribution).
+        GetGuildInvites { guild: SerenityGuildId },
         /// Interaction followup create.
         CreateFollowup { token: String, body: serde_json::Value },
         /// Interaction followup delete.
@@ -1636,6 +1711,7 @@ mod tests {
         calls: std::sync::Mutex<Vec<RecordedCall>>,
         emojis: Vec<Emoji>,
         own_emojis: Vec<Emoji>,
+        guild_invites: Vec<RichInvite>,
         failures: ApiFailures,
     }
 
@@ -1646,6 +1722,7 @@ mod tests {
         edit: bool,
         reaction: bool,
         emojis: bool,
+        directory: bool,
     }
 
     impl RecordingApi {
@@ -1653,13 +1730,24 @@ mod tests {
             Self::with_own_emojis(emojis, Vec::new())
         }
 
-        /// Scripts both catalogs: the guild listing and the application's
-        /// own emojis.
+        /// Scripts both emoji catalogs: the guild listing and the
+        /// application's own emojis.
         fn with_own_emojis(emojis: Vec<Emoji>, own_emojis: Vec<Emoji>) -> Self {
+            Self::with_directory(emojis, own_emojis, Vec::new())
+        }
+
+        /// Scripts everything read-side: both emoji catalogs and the guild
+        /// invite directory.
+        fn with_directory(
+            emojis: Vec<Emoji>,
+            own_emojis: Vec<Emoji>,
+            guild_invites: Vec<RichInvite>,
+        ) -> Self {
             Self {
                 calls: std::sync::Mutex::new(Vec::new()),
                 emojis,
                 own_emojis,
+                guild_invites,
                 failures: ApiFailures::default(),
             }
         }
@@ -1681,6 +1769,22 @@ mod tests {
                 "user": null,
             }))
             .expect("emoji fixture deserializes")
+        }
+
+        /// Builds one guild invite fixture from its wire shape.
+        fn invite(code: &str, creator_id: u64, creator_name: &str, uses: u64) -> RichInvite {
+            serde_json::from_value(serde_json::json!({
+                "code": code,
+                "channel": { "id": "55", "name": "general", "type": 0 },
+                "created_at": "2026-10-12T12:00:00Z",
+                "guild": null,
+                "inviter": { "id": creator_id.to_string(), "username": creator_name },
+                "max_age": 86400,
+                "max_uses": 0,
+                "temporary": false,
+                "uses": uses,
+            }))
+            .expect("invite fixture deserializes")
         }
     }
 
@@ -1779,6 +1883,17 @@ mod tests {
             Ok(self.own_emojis.clone())
         }
 
+        async fn get_guild_invites(
+            &self,
+            guild_id: SerenityGuildId,
+        ) -> Result<Vec<RichInvite>, String> {
+            self.record(RecordedCall::GetGuildInvites { guild: guild_id });
+            if self.failures.directory {
+                return Err("invite directory transport failed".to_owned());
+            }
+            Ok(self.guild_invites.clone())
+        }
+
         fn run_typing(self: &Arc<Self>, channel: SerenityChannelId, _cancel: CancellationToken) {
             self.record(RecordedCall::RunTyping { channel });
         }
@@ -1796,6 +1911,7 @@ mod tests {
             calls: std::sync::Mutex::new(Vec::new()),
             emojis: Vec::new(),
             own_emojis: Vec::new(),
+            guild_invites: Vec::new(),
             failures,
         })
     }
@@ -2186,6 +2302,49 @@ mod tests {
             .filter(|call| matches!(call, RecordedCall::GetApplicationEmojis))
             .count();
         assert_eq!(fetches, 1, "the second listing rides the TTL cache");
+    }
+
+    /// The invite directory maps wire invites onto kernel entries; a failed
+    /// listing (missing Manage Server, transport) degrades to empty - never
+    /// an error - and DM origins never call at all.
+    #[tokio::test]
+    async fn invite_directory_lists_maps_and_degrades() {
+        let api = Arc::new(RecordingApi::with_directory(
+            vec![],
+            vec![],
+            vec![RecordingApi::invite("xyz", 9, "rikk", 3)],
+        ));
+        let factory = delivery_factory(&api);
+
+        let listed = factory.invites(&origin(Some(7), 5, None)).await;
+        assert_eq!(
+            listed,
+            vec![DirectoryInvite {
+                code: "xyz".to_owned(),
+                channel_id: Some(ChannelId(55)),
+                creator_id: Some(UserId(9)),
+                creator_name: Some("rikk".to_owned()),
+                uses: Some(3),
+                max_uses: Some(0),
+            }]
+        );
+
+        let outside = factory.invites(&origin(None, 5, None)).await;
+        assert!(outside.is_empty(), "no guild - no directory");
+        let fetches = api
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, RecordedCall::GetGuildInvites { .. }))
+            .count();
+        assert_eq!(fetches, 1, "the DM call never reached the transport");
+    }
+
+    #[tokio::test]
+    async fn invite_directory_failure_degrades_to_empty() {
+        let api = failing_api(ApiFailures { directory: true, ..ApiFailures::default() });
+        let factory = delivery_factory(&api);
+
+        assert!(factory.invites(&origin(Some(7), 5, None)).await.is_empty());
     }
 
     /// A reply-token origin routes every send onto the interaction followup
