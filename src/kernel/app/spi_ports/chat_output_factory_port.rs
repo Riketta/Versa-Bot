@@ -72,6 +72,17 @@ pub trait ChatOutputFactoryPort: Send + Sync + 'static {
         let _ = origin;
         Arc::new(UndeliverableGuildEmojiPort)
     }
+
+    /// The platform identity's own application-level emojis (Discord: the
+    /// ones uploaded on the bot's application via the developer portal) -
+    /// independent of any guild, usable everywhere the bot itself can
+    /// react. For plugins that offer a guaranteed-usable decoration set
+    /// alongside the guild's ([`reactable_emojis`]). Platforms without the
+    /// concept yield the undeliverable default; the same `name`/`token`
+    /// contract applies.
+    fn own_emojis(&self) -> Arc<dyn GuildEmojiPort> {
+        Arc::new(UndeliverableGuildEmojiPort)
+    }
 }
 
 /// RAII token for a platform typing indicator: dropping it stops the

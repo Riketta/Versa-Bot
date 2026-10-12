@@ -233,6 +233,16 @@ impl<T: ChatApi> ChatOutputFactoryPort for SerenityChatOutputFactory<T> {
             guild_id: SerenityGuildId::new(guild_id.get()),
         })
     }
+
+    /// The application's own emojis: origin-free - the catalog is the same
+    /// for every guild (and would be for DMs, if reactions existed there).
+    /// One cached `get_application_emojis` per TTL window.
+    fn own_emojis(&self) -> Arc<dyn GuildEmojiPort> {
+        Arc::new(SerenityOwnEmojis {
+            http: Arc::clone(&self.http),
+            emoji_cache: Arc::clone(&self.emoji_cache),
+        })
+    }
 }
 
 struct SerenityChatOutput<T: ChatApi = Http> {
@@ -286,8 +296,8 @@ impl ChatOutputPort for UndeliverableChatOutput {
 
 /// Reaction port bound to one origin: applies emoji reactions to messages
 /// in the origin channel. Custom `:name:` tokens resolve against the
-/// guild's cached emoji list (shared with prompt injection - see
-/// [`GuildEmojiCache`]).
+/// guild's cached emoji list, then the application's own emojis (shared
+/// with prompt injection - see [`GuildEmojiCache`]).
 struct SerenityReaction<T: ChatApi = Http> {
     http: Arc<T>,
     channel_id: SerenityChannelId,
@@ -295,11 +305,12 @@ struct SerenityReaction<T: ChatApi = Http> {
     emoji_cache: Arc<GuildEmojiCache>,
 }
 
-/// Shared, TTL-cached guild emoji catalog: prompt injection and the
-/// bare-name reaction resolver consume one `get_emojis` per guild per TTL
-/// window instead of hammering the REST endpoint. A failed listing is
-/// cached empty under a short TTL - self-heals without hammering a down
-/// endpoint.
+/// Shared, TTL-cached emoji catalogs - the per-guild listings and the
+/// application's own emojis (sentinel key [`OWN_EMOJIS_KEY`]): prompt
+/// injection and the bare-name reaction resolver consume one REST call per
+/// catalog per TTL window instead of hammering the endpoints. A failed
+/// listing is cached empty under a short TTL - self-heals without
+/// hammering a down endpoint.
 struct GuildEmojiCache {
     entries: Mutex<HashMap<u64, CachedEmojis>>,
     /// Per-guild fetch serialization (singleflight): concurrent cold misses
@@ -319,6 +330,26 @@ struct CachedEmojis {
     ok: bool,
 }
 
+/// Sentinel cache key for the application's own emoji catalog - real guild
+/// keys are snowflakes and never 0.
+const OWN_EMOJIS_KEY: u64 = 0;
+
+/// Which emoji catalog a cache operation addresses.
+#[derive(Clone, Copy)]
+enum EmojiCatalog {
+    Guild(SerenityGuildId),
+    Own,
+}
+
+impl EmojiCatalog {
+    fn key(self) -> u64 {
+        match self {
+            Self::Guild(guild_id) => guild_id.get(),
+            Self::Own => OWN_EMOJIS_KEY,
+        }
+    }
+}
+
 impl GuildEmojiCache {
     fn new() -> Self {
         Self { entries: Mutex::new(HashMap::new()), fetches: Mutex::new(HashMap::new()) }
@@ -326,38 +357,51 @@ impl GuildEmojiCache {
 
     /// Warm entry under its TTL (successes keep the full window, failures
     /// the short retry one).
-    fn cached(&self, guild: u64) -> Option<Arc<Vec<Emoji>>> {
+    fn cached(&self, key: u64) -> Option<Arc<Vec<Emoji>>> {
         let entries = self.entries.lock();
-        let cached = entries.get(&guild)?;
+        let cached = entries.get(&key)?;
         let ttl = if cached.ok { EMOJI_TTL } else { EMOJI_FAILURE_TTL };
         (cached.fetched_at.elapsed() < ttl).then(|| Arc::clone(&cached.emojis))
     }
 
     async fn emojis<T: ChatApi>(&self, http: &T, guild_id: SerenityGuildId) -> Arc<Vec<Emoji>> {
-        if let Some(emojis) = self.cached(guild_id.get()) {
+        self.catalog_emojis(http, EmojiCatalog::Guild(guild_id)).await
+    }
+
+    /// The application's own emojis - one global catalog under the sentinel
+    /// key, same TTL/singleflight/failure contract as the guild listings.
+    async fn application_emojis<T: ChatApi>(&self, http: &T) -> Arc<Vec<Emoji>> {
+        self.catalog_emojis(http, EmojiCatalog::Own).await
+    }
+
+    async fn catalog_emojis<T: ChatApi>(&self, http: &T, catalog: EmojiCatalog) -> Arc<Vec<Emoji>> {
+        let key = catalog.key();
+        if let Some(emojis) = self.cached(key) {
             return emojis;
         }
-        // Singleflight: the per-guild fetch lock makes concurrent cold
+        // Singleflight: the per-catalog fetch lock makes concurrent cold
         // misses one REST call plus cache hits.
         let fetch = {
             let mut fetches = self.fetches.lock();
-            Arc::clone(fetches.entry(guild_id.get()).or_default())
+            Arc::clone(fetches.entry(key).or_default())
         };
         let _guard = fetch.lock().await;
         // Re-check under the lock: the fetch we waited for may have just
         // filled the cache.
-        if let Some(emojis) = self.cached(guild_id.get()) {
+        if let Some(emojis) = self.cached(key) {
             return emojis;
         }
-        let (emojis, ok) = match http.get_emojis(guild_id).await {
-            Ok(emojis) => (Arc::new(emojis), true),
-            Err(err) => {
-                tracing::warn!(guild = guild_id.get(), error = %err, "guild emoji listing failed");
-                (Arc::new(Vec::new()), false)
-            }
-        };
+        let (emojis, ok) = match catalog {
+            EmojiCatalog::Guild(guild_id) => http.get_emojis(guild_id).await,
+            EmojiCatalog::Own => http.get_application_emojis().await,
+        }
+        .map(|emojis| (Arc::new(emojis), true))
+        .unwrap_or_else(|err| {
+            tracing::warn!(catalog = key, error = %err, "emoji catalog listing failed");
+            (Arc::new(Vec::new()), false)
+        });
         self.entries.lock().insert(
-            guild_id.get(),
+            key,
             CachedEmojis { fetched_at: Instant::now(), emojis: Arc::clone(&emojis), ok },
         );
         emojis
@@ -371,6 +415,20 @@ struct SerenityGuildEmojis<T: ChatApi = Http> {
     guild_id: SerenityGuildId,
 }
 
+/// One cached emoji as a prompt/reaction token: named emojis only, exact
+/// wire form `<:name:id>` (or `<a:name:id>` when animated).
+fn as_reactable(emoji: &Emoji) -> Option<ReactableEmoji> {
+    let name = emoji.name.as_str();
+    if name.is_empty() {
+        return None;
+    }
+    let brackets = if emoji.animated { ("<a:", ">") } else { ("<:", ">") };
+    Some(ReactableEmoji {
+        name: name.to_owned(),
+        token: format!("{}{}:{}{}", brackets.0, name, emoji.id, brackets.1),
+    })
+}
+
 #[async_trait]
 impl<T: ChatApi> GuildEmojiPort for SerenityGuildEmojis<T> {
     async fn list(&self) -> Vec<ReactableEmoji> {
@@ -378,17 +436,26 @@ impl<T: ChatApi> GuildEmojiPort for SerenityGuildEmojis<T> {
             .emojis(self.http.as_ref(), self.guild_id)
             .await
             .iter()
-            .filter_map(|emoji| {
-                let name = emoji.name.as_str();
-                if name.is_empty() {
-                    return None;
-                }
-                let brackets = if emoji.animated { ("<a:", ">") } else { ("<:", ">") };
-                Some(ReactableEmoji {
-                    name: name.to_owned(),
-                    token: format!("{}{}:{}{}", brackets.0, name, emoji.id, brackets.1),
-                })
-            })
+            .filter_map(as_reactable)
+            .collect()
+    }
+}
+
+/// Guild-independent listing of the application's own emojis - the
+/// developer-portal uploads, usable in every guild the bot can react in.
+struct SerenityOwnEmojis<T: ChatApi = Http> {
+    http: Arc<T>,
+    emoji_cache: Arc<GuildEmojiCache>,
+}
+
+#[async_trait]
+impl<T: ChatApi> GuildEmojiPort for SerenityOwnEmojis<T> {
+    async fn list(&self) -> Vec<ReactableEmoji> {
+        self.emoji_cache
+            .application_emojis(self.http.as_ref())
+            .await
+            .iter()
+            .filter_map(as_reactable)
             .collect()
     }
 }
@@ -404,13 +471,19 @@ impl<T: ChatApi> ReactionPort for SerenityReaction<T> {
     }
 }
 
+/// A known cached emoji as an exact custom reaction.
+fn custom_from_known(known: &Emoji) -> ReactionType {
+    ReactionType::Custom { animated: known.animated, id: known.id, name: Some(known.name.clone()) }
+}
+
 impl<T: ChatApi> SerenityReaction<T> {
     /// Maps a raw protocol token onto a Discord reaction type. Fully
     /// qualified forms (`<:name:id>`, `<a:name:id>`, `:name:id`, and the
     /// trailing-colon blend `:name:id:`) build the custom reaction
-    /// directly; bare `:name:` needs the guild emoji list; anything else is
-    /// a Unicode emoji (tokens the plugin already validated - an
-    /// unparseable token here fails per-token, by design).
+    /// directly; bare `:name:` resolves against the guild emoji list, then
+    /// the application's own emojis (reactable everywhere the bot is);
+    /// anything else is a Unicode emoji (tokens the plugin already
+    /// validated - an unparseable token here fails per-token, by design).
     async fn resolve(&self, emoji: &str) -> Result<ReactionType, OutboundError> {
         let parsed = parse_reaction_token(emoji);
         match parsed {
@@ -419,17 +492,19 @@ impl<T: ChatApi> SerenityReaction<T> {
             }
             ParsedReaction::Name(name) => {
                 let emojis = self.emoji_cache.emojis(self.http.as_ref(), self.guild_id).await;
-                emojis
-                    .iter()
+                if let Some(known) =
+                    emojis.iter().find(|known| known.name.as_str() == name.as_str())
+                {
+                    return Ok(custom_from_known(known));
+                }
+                let own = self.emoji_cache.application_emojis(self.http.as_ref()).await;
+                own.iter()
                     .find(|known| known.name.as_str() == name.as_str())
-                    .map(|known| ReactionType::Custom {
-                        animated: known.animated,
-                        id: known.id,
-                        name: Some(known.name.clone()),
-                    })
+                    .map(custom_from_known)
                     .ok_or_else(|| {
                         OutboundError::Reaction(format!(
-                            "custom emoji `:{name}:` not found in this server"
+                            "custom emoji `:{name}:` not found in this server or the bot's own \
+                             emojis"
                         ))
                     })
             }
@@ -644,6 +719,9 @@ trait ChatApi: InteractionApi + 'static {
     /// Mirrors `Http::get_emojis`.
     async fn get_emojis(&self, guild_id: SerenityGuildId) -> Result<Vec<Emoji>, String>;
 
+    /// Mirrors `Http::get_application_emojis`.
+    async fn get_application_emojis(&self) -> Result<Vec<Emoji>, String>;
+
     /// Keeps serenity's typing indicator refreshing on the channel until
     /// `cancel` fires: spawns the bridge task that holds serenity's `Typing`
     /// handle and drops it on cancellation (which stops the refresh loop).
@@ -693,6 +771,10 @@ impl ChatApi for Http {
 
     async fn get_emojis(&self, guild_id: SerenityGuildId) -> Result<Vec<Emoji>, String> {
         Http::get_emojis(self, guild_id).await.map_err(|err| err.to_string())
+    }
+
+    async fn get_application_emojis(&self) -> Result<Vec<Emoji>, String> {
+        Http::get_application_emojis(self).await.map_err(|err| err.to_string())
     }
 
     fn run_typing(self: &Arc<Self>, channel_id: SerenityChannelId, cancel: CancellationToken) {
@@ -1280,6 +1362,10 @@ mod tests {
                 Ok(vec![RecordingApi::emoji("dorkiS", 1)])
             }
 
+            async fn get_application_emojis(&self) -> Result<Vec<Emoji>, String> {
+                Ok(Vec::new())
+            }
+
             fn run_typing(
                 self: &Arc<Self>,
                 _channel_id: SerenityChannelId,
@@ -1376,6 +1462,10 @@ mod tests {
                 Err("emoji endpoint down".to_owned())
             }
 
+            async fn get_application_emojis(&self) -> Result<Vec<Emoji>, String> {
+                Ok(Vec::new())
+            }
+
             fn run_typing(
                 self: &Arc<Self>,
                 _channel_id: SerenityChannelId,
@@ -1399,6 +1489,106 @@ mod tests {
         assert_eq!(api.peak.load(Ordering::SeqCst), 1, "never two fetches in flight");
         assert!(left.is_empty(), "both callers get the cached failure");
         assert!(right.is_empty());
+    }
+
+    /// The singleflight covers the application's own catalog too: two
+    /// concurrent cold misses share one `get_application_emojis`.
+    #[tokio::test]
+    async fn concurrent_own_emoji_fetches_share_one_rest_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct GatingAppApi {
+            calls: AtomicUsize,
+            in_flight: AtomicUsize,
+            peak: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl InteractionApi for GatingAppApi {
+            async fn create_followup(
+                &self,
+                _token: &str,
+                _body: &serde_json::Value,
+            ) -> Result<SerenityMessageId, String> {
+                Err("unused in this test".to_owned())
+            }
+
+            async fn delete_followup(
+                &self,
+                _token: &str,
+                _id: SerenityMessageId,
+            ) -> Result<(), String> {
+                Err("unused in this test".to_owned())
+            }
+        }
+
+        #[async_trait]
+        impl ChatApi for GatingAppApi {
+            async fn send_message(
+                &self,
+                _channel_id: SerenityChannelId,
+                _files: Vec<CreateAttachment>,
+                _builder: &CreateMessage,
+            ) -> Result<SerenityMessageId, String> {
+                Err("unused in this test".to_owned())
+            }
+
+            async fn edit_message(
+                &self,
+                _channel_id: SerenityChannelId,
+                _message_id: SerenityMessageId,
+                _builder: &EditMessage,
+                _new_attachments: Vec<CreateAttachment>,
+            ) -> Result<SerenityMessageId, String> {
+                Err("unused in this test".to_owned())
+            }
+
+            async fn create_reaction(
+                &self,
+                _channel_id: SerenityChannelId,
+                _message_id: SerenityMessageId,
+                _reaction_type: &ReactionType,
+            ) -> Result<(), String> {
+                Err("unused in this test".to_owned())
+            }
+
+            async fn get_emojis(&self, _guild_id: SerenityGuildId) -> Result<Vec<Emoji>, String> {
+                Ok(Vec::new())
+            }
+
+            async fn get_application_emojis(&self) -> Result<Vec<Emoji>, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(vec![RecordingApi::emoji("gaben", 5)])
+            }
+
+            fn run_typing(
+                self: &Arc<Self>,
+                _channel_id: SerenityChannelId,
+                _cancel: tokio_util::sync::CancellationToken,
+            ) {
+            }
+        }
+
+        let api = Arc::new(GatingAppApi {
+            calls: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let cache = GuildEmojiCache::new();
+
+        let (left, right) = tokio::join!(
+            cache.application_emojis(api.as_ref()),
+            cache.application_emojis(api.as_ref())
+        );
+
+        assert_eq!(api.calls.load(Ordering::SeqCst), 1, "exactly one REST call");
+        assert_eq!(api.peak.load(Ordering::SeqCst), 1, "never two fetches in flight");
+        assert_eq!(left.len(), 1);
+        assert_eq!(right.len(), 1);
     }
 
     // --- Delivery half: plain sends, streaming, reactions, factory routing ---
@@ -1427,6 +1617,9 @@ mod tests {
         },
         /// Guild emoji list fetch (bare `:name:` resolution).
         GetEmojis { guild: SerenityGuildId },
+        /// Application emoji list fetch (prompt injection + bare-name
+        /// fallback).
+        GetApplicationEmojis,
         /// Interaction followup create.
         CreateFollowup { token: String, body: serde_json::Value },
         /// Interaction followup delete.
@@ -1442,6 +1635,7 @@ mod tests {
     struct RecordingApi {
         calls: std::sync::Mutex<Vec<RecordedCall>>,
         emojis: Vec<Emoji>,
+        own_emojis: Vec<Emoji>,
         failures: ApiFailures,
     }
 
@@ -1456,9 +1650,16 @@ mod tests {
 
     impl RecordingApi {
         fn new(emojis: Vec<Emoji>) -> Self {
+            Self::with_own_emojis(emojis, Vec::new())
+        }
+
+        /// Scripts both catalogs: the guild listing and the application's
+        /// own emojis.
+        fn with_own_emojis(emojis: Vec<Emoji>, own_emojis: Vec<Emoji>) -> Self {
             Self {
                 calls: std::sync::Mutex::new(Vec::new()),
                 emojis,
+                own_emojis,
                 failures: ApiFailures::default(),
             }
         }
@@ -1570,6 +1771,14 @@ mod tests {
             Ok(self.emojis.clone())
         }
 
+        async fn get_application_emojis(&self) -> Result<Vec<Emoji>, String> {
+            self.record(RecordedCall::GetApplicationEmojis);
+            if self.failures.emojis {
+                return Err("emoji transport failed".to_owned());
+            }
+            Ok(self.own_emojis.clone())
+        }
+
         fn run_typing(self: &Arc<Self>, channel: SerenityChannelId, _cancel: CancellationToken) {
             self.record(RecordedCall::RunTyping { channel });
         }
@@ -1586,6 +1795,7 @@ mod tests {
         Arc::new(RecordingApi {
             calls: std::sync::Mutex::new(Vec::new()),
             emojis: Vec::new(),
+            own_emojis: Vec::new(),
             failures,
         })
     }
@@ -1774,8 +1984,39 @@ mod tests {
         );
     }
 
-    /// A bare `:name:` the guild does not have fails per-token with no
-    /// reaction call - cosmetic by contract, callers log and continue.
+    /// A bare `:name:` the guild does not have falls back to the
+    /// application's own emoji catalog - the guaranteed-usable set.
+    #[tokio::test]
+    async fn bare_names_fall_back_to_the_own_emoji_catalog() {
+        let api = Arc::new(RecordingApi::with_own_emojis(
+            vec![RecordingApi::emoji("other", 3)],
+            vec![RecordingApi::emoji("gaben", 99)],
+        ));
+        let reaction = delivery_reaction(&api);
+
+        reaction.add_reaction(MessageId(42), ":gaben:").await.expect("own emoji reacts");
+
+        assert_eq!(
+            api.calls(),
+            vec![
+                RecordedCall::GetEmojis { guild: SerenityGuildId::new(7) },
+                RecordedCall::GetApplicationEmojis,
+                RecordedCall::CreateReaction {
+                    channel: SerenityChannelId::new(5),
+                    message: SerenityMessageId::new(42),
+                    reaction: ReactionType::Custom {
+                        animated: false,
+                        id: EmojiId::new(99),
+                        name: Some("gaben".to_owned()),
+                    },
+                },
+            ],
+            "guild lookup misses, the own catalog answers"
+        );
+    }
+
+    /// A bare `:name:` neither set carries fails per-token with no reaction
+    /// call - both lookups happen, then the cosmetic failure surfaces.
     #[tokio::test]
     async fn reaction_unknown_bare_name_fails_per_token_without_a_reaction_call() {
         let api = delivery_api(vec![RecordingApi::emoji("other", 3)]);
@@ -1786,8 +2027,11 @@ mod tests {
         assert!(matches!(result, Err(OutboundError::Reaction(_))));
         assert_eq!(
             api.calls(),
-            vec![RecordedCall::GetEmojis { guild: SerenityGuildId::new(7) }],
-            "only the lookup happens - no reaction is attempted"
+            vec![
+                RecordedCall::GetEmojis { guild: SerenityGuildId::new(7) },
+                RecordedCall::GetApplicationEmojis,
+            ],
+            "both lookups happen - no reaction is attempted"
         );
     }
 
@@ -1907,6 +2151,41 @@ mod tests {
         let outside = factory.reactable_emojis(&origin(None, 5, None)).list().await;
         assert!(outside.is_empty(), "no guild - nothing to list");
         assert_eq!(api.calls().len(), fetches, "the undeliverable port never fetches");
+    }
+
+    /// `own_emojis` lists the application's own emojis as exact wire forms
+    /// - origin-free, and TTL-cached: repeated listings ride one fetch.
+    #[tokio::test]
+    async fn own_emojis_lists_wire_forms_and_caches_the_catalog() {
+        let animated: Emoji = serde_json::from_value(serde_json::json!({
+            "id": "7",
+            "name": "ashuu",
+            "animated": true,
+            "user": null,
+        }))
+        .expect("emoji fixture deserializes");
+        let api = Arc::new(RecordingApi::with_own_emojis(
+            vec![],
+            vec![RecordingApi::emoji("gaben", 12), animated],
+        ));
+        let factory = delivery_factory(&api);
+
+        let listed = factory.own_emojis().list().await;
+        assert_eq!(
+            listed,
+            vec![
+                ReactableEmoji { name: "gaben".to_owned(), token: "<:gaben:12>".to_owned() },
+                ReactableEmoji { name: "ashuu".to_owned(), token: "<a:ashuu:7>".to_owned() },
+            ]
+        );
+        factory.own_emojis().list().await;
+
+        let fetches = api
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, RecordedCall::GetApplicationEmojis))
+            .count();
+        assert_eq!(fetches, 1, "the second listing rides the TTL cache");
     }
 
     /// A reply-token origin routes every send onto the interaction followup

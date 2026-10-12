@@ -808,12 +808,19 @@ pub struct RecordingChatOutputFactory {
     /// Custom emojis `reactable_emojis` serves (default: none) - the
     /// prompt-injection and add-validation source for emoji tests.
     emojis: Vec<crate::kernel::spi_ports::ReactableEmoji>,
+    /// Own emojis `own_emojis` serves (default: none).
+    own_emojis: Vec<crate::kernel::spi_ports::ReactableEmoji>,
 }
 
 impl RecordingChatOutputFactory {
     #[must_use]
     pub fn new(output: Arc<RecordingChatOutput>) -> Self {
-        Self { output, typing_starts: AtomicUsize::new(0), emojis: Vec::new() }
+        Self {
+            output,
+            typing_starts: AtomicUsize::new(0),
+            emojis: Vec::new(),
+            own_emojis: Vec::new(),
+        }
     }
 
     /// Serves custom emojis from `reactable_emojis` (exact wire forms - the
@@ -823,7 +830,17 @@ impl RecordingChatOutputFactory {
         output: Arc<RecordingChatOutput>,
         emojis: Vec<crate::kernel::spi_ports::ReactableEmoji>,
     ) -> Self {
-        Self { output, typing_starts: AtomicUsize::new(0), emojis }
+        Self { output, typing_starts: AtomicUsize::new(0), emojis, own_emojis: Vec::new() }
+    }
+
+    /// Serves own emojis from `own_emojis` (exact wire forms - the same
+    /// shape the real adapter builds).
+    #[must_use]
+    pub fn with_own_emojis(
+        output: Arc<RecordingChatOutput>,
+        own_emojis: Vec<crate::kernel::spi_ports::ReactableEmoji>,
+    ) -> Self {
+        Self { output, typing_starts: AtomicUsize::new(0), emojis: Vec::new(), own_emojis }
     }
 
     /// How many times the typing indicator was started (the Discord adapter
@@ -880,6 +897,10 @@ impl ChatOutputFactoryPort for RecordingChatOutputFactory {
         _origin: &crate::kernel::models::Origin,
     ) -> Arc<dyn crate::kernel::spi_ports::GuildEmojiPort> {
         Arc::new(StaticGuildEmojis(self.emojis.clone()))
+    }
+
+    fn own_emojis(&self) -> Arc<dyn crate::kernel::spi_ports::GuildEmojiPort> {
+        Arc::new(StaticGuildEmojis(self.own_emojis.clone()))
     }
 }
 

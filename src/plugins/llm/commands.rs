@@ -58,6 +58,7 @@ pub(super) const SET_KEYS: &[&str] = &[
     "image_max_side",
     "react",
     "react_emoji_inject",
+    "react_own_emojis",
     "chime_reply_chance",
     "chime_react_chance",
     "chime_cooldown",
@@ -211,7 +212,7 @@ fn apply_flag(
     key: &str,
     value: &str,
 ) -> Option<Result<String, String>> {
-    if !matches!(key, "streaming" | "compaction" | "images" | "react") {
+    if !matches!(key, "streaming" | "compaction" | "images" | "react" | "react_own_emojis") {
         return None;
     }
     let Some(enabled) = parse_bool(value) else {
@@ -237,6 +238,14 @@ fn apply_flag(
             config.react = enabled;
             Some(Ok(format!(
                 "`react` turned {} (the model may add emoji reactions to the message it replies to).",
+                if enabled { "on" } else { "off" }
+            )))
+        }
+        "react_own_emojis" => {
+            config.react_own_emojis = enabled;
+            Some(Ok(format!(
+                "`react_own_emojis` turned {} (the bot's own emojis join the react tool's emoji \
+                 list).",
                 if enabled { "on" } else { "off" }
             )))
         }
@@ -1051,7 +1060,7 @@ fn images_label(config: &ChannelConfig, settings: &LlmSettings) -> String {
 /// `/llm_status` label of the reaction tool state: off, or on with the
 /// silent-react chime chance when it is enabled.
 fn react_label(config: &ChannelConfig, emoji_inject: Option<&str>) -> String {
-    if !config.react && config.react_emoji_inject == EmojiInject::None {
+    if !config.react && config.react_emoji_inject == EmojiInject::None && !config.react_own_emojis {
         return "off".to_owned();
     }
     let mut parts = Vec::new();
@@ -1067,6 +1076,9 @@ fn react_label(config: &ChannelConfig, emoji_inject: Option<&str>) -> String {
             Some(detail) => format!("emoji inject whitelist ({detail})"),
             None => "emoji inject whitelist (no list)".to_owned(),
         }),
+    }
+    if config.react_own_emojis {
+        parts.push("own emojis on".to_owned());
     }
     if config.react && config.random_react_chance_percent > 0.0 {
         parts.push(format!("{:.1}% silent-react", config.random_react_chance_percent));
@@ -2226,6 +2238,7 @@ const DUMP_LAYOUT: &[DumpItem] = &[
     DumpItem::Gap,
     DumpItem::Key("react"),
     DumpItem::Key("react_emoji_inject"),
+    DumpItem::Key("react_own_emojis"),
     DumpItem::Gap,
     DumpItem::Key("chime_reply_chance"),
     DumpItem::Key("chime_react_chance"),
@@ -2337,6 +2350,7 @@ fn current_value(config: &ChannelConfig, key: &str, settings: &LlmSettings) -> O
         "streaming" => Some(on_off(config.streaming)),
         "react" => Some(on_off(config.react)),
         "react_emoji_inject" => Some(config.react_emoji_inject.as_str().to_owned()),
+        "react_own_emojis" => Some(on_off(config.react_own_emojis)),
         "capture" => Some(match config.capture {
             CaptureMode::BotRelated => "bot_related".to_owned(),
             CaptureMode::AllMessages => "all_messages".to_owned(),
@@ -3536,22 +3550,25 @@ mod tests {
     }
 
     /// The reactions status label: off stays plain, the inject mode shows
-    /// with its effective whitelist source, and a react-off channel with an
+    /// with its effective whitelist source, a react-off channel with an
     /// inject set says why nothing lands (the `whitelist` default included -
-    /// its empty-list no-op is visible as "(no list)").
+    /// its empty-list no-op is visible as "(no list)"), and the own-emoji
+    /// toggle shows whenever it would reach the model.
     #[test]
     fn react_label_covers_inject_modes() {
         let mut config = ChannelConfig::assigned("local/gemma".to_owned());
         config.react_emoji_inject = EmojiInject::None;
+        config.react_own_emojis = false;
         assert_eq!(react_label(&config, None), "off");
 
-        // The storage default: whitelist with no list anywhere - inert, but
-        // the status still names the mode so admins can see it.
+        // The storage default: whitelist with no list anywhere, own emojis
+        // on - inert, but the status names every switch so admins can see it.
         let defaulted = ChannelConfig::assigned("local/gemma".to_owned());
         assert_eq!(defaulted.react_emoji_inject, EmojiInject::Whitelist);
         assert_eq!(
             react_label(&defaulted, None),
-            "off (the emoji list would not reach the model) · emoji inject whitelist (no list)"
+            "off (the emoji list would not reach the model) · emoji inject whitelist (no list) · \
+             own emojis on"
         );
 
         config.react_emoji_inject = EmojiInject::All;
@@ -3566,21 +3583,58 @@ mod tests {
             react_label(&config, None),
             "on · emoji inject whitelist (no list) · 10.0% silent-react"
         );
+
+        // Own emojis on join the label wherever they would reach the model.
+        config.react_own_emojis = true;
+        assert_eq!(
+            react_label(&config, None),
+            "on · emoji inject whitelist (no list) · own emojis on · 10.0% silent-react"
+        );
         assert_eq!(
             react_label(&config, Some("guild, 3")),
-            "on · emoji inject whitelist (guild, 3) · 10.0% silent-react"
+            "on · emoji inject whitelist (guild, 3) · own emojis on · 10.0% silent-react"
         );
 
         config.random_react_chance_percent = 10.0;
         assert_eq!(
             react_label(&config, Some("channel, 1")),
-            "on · emoji inject whitelist (channel, 1) · 10.0% silent-react"
+            "on · emoji inject whitelist (channel, 1) · own emojis on · 10.0% silent-react"
         );
-        // React off: the silent-react chance is irrelevant and hidden.
+        // React off: the silent-react chance is irrelevant and hidden, the
+        // emoji switches stay visible with the why-nothing-lands note.
         config.react = false;
         assert_eq!(
             react_label(&config, Some("channel, 1")),
-            "off (the emoji list would not reach the model) · emoji inject whitelist (channel, 1)"
+            "off (the emoji list would not reach the model) · emoji inject whitelist (channel, 1) · \
+             own emojis on"
+        );
+    }
+
+    /// The `react_own_emojis` flag grammar: on and off apply, garbage
+    /// claims the key with usage.
+    #[test]
+    fn react_own_emojis_flag_grammar() {
+        let mut config = ChannelConfig::assigned("local/gemma".to_owned());
+        assert!(config.react_own_emojis, "on by default");
+
+        assert_eq!(
+            apply_set(&mut config, "react_own_emojis", "off", None, CHUNK_FLOOR, IMAGE_CAP)
+                .expect("off applies"),
+            "`react_own_emojis` turned off (the bot's own emojis join the react tool's emoji \
+             list)."
+        );
+        assert!(!config.react_own_emojis);
+
+        assert_eq!(
+            apply_set(&mut config, "react_own_emojis", "on", None, CHUNK_FLOOR, IMAGE_CAP)
+                .expect("on applies"),
+            "`react_own_emojis` turned on (the bot's own emojis join the react tool's emoji list)."
+        );
+        assert!(config.react_own_emojis);
+
+        assert!(
+            apply_set(&mut config, "react_own_emojis", "maybe", None, CHUNK_FLOOR, IMAGE_CAP)
+                .is_err()
         );
     }
 

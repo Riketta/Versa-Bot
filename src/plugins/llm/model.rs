@@ -279,13 +279,18 @@ pub struct ChannelConfig {
     /// prompt appendix (exact wire forms; `whitelist` filters by the
     /// guild/channel emoji whitelist). Setting this does not require
     /// `react` - the line simply never joins the prompt while `react` is
-    /// off. `whitelist` by default: a no-op while the effective whitelist
-    /// is empty (nothing to inject, prompt byte-identical to `none`), so
-    /// filling the whitelist is the opt-in - and once entries exist the
-    /// line costs prompt space and invalidates provider caches when the
-    /// emoji set or whitelist changes.
+    /// off. `whitelist` by default: no server emojis reach the prompt while
+    /// the effective whitelist is empty, so filling the whitelist is the
+    /// opt-in - and once entries exist the line costs prompt space and
+    /// invalidates provider caches when the emoji set or whitelist changes.
     #[serde(default)]
     pub react_emoji_inject: EmojiInject,
+    /// The bot's own application emojis (uploaded via the developer portal)
+    /// join the react tool's emoji list - independent of the server list
+    /// and its inject mode, usable everywhere the bot can react. On by
+    /// default; the line only exists while `react` is on.
+    #[serde(default = "default_true")]
+    pub react_own_emojis: bool,
     /// Chance the bot silently reacts (no reply) to an unrelated captured
     /// message, percent (`0` = off). Independent of
     /// `random_reply_chance_percent` and its own cooldown - the two rolls
@@ -346,6 +351,7 @@ impl ChannelConfig {
             image_max_side: default_image_max_side(),
             react: false,
             react_emoji_inject: EmojiInject::default(),
+            react_own_emojis: true,
             random_react_chance_percent: default_random_react_chance(),
         }
     }
@@ -506,6 +512,7 @@ mod tests {
         assert_eq!(config.image_model, None);
         assert!(!config.react);
         assert_eq!(config.react_emoji_inject, EmojiInject::Whitelist);
+        assert!(config.react_own_emojis);
         assert!((config.random_react_chance_percent - 10.0).abs() < f64::EPSILON);
     }
 
@@ -528,6 +535,9 @@ mod tests {
         // Stored before whitelist became the default: the empty-whitelist
         // no-op makes that migration behavior-free.
         assert_eq!(config.react_emoji_inject, EmojiInject::Whitelist);
+        // Stored before the toggle existed: the on default matches the
+        // feature intent (own emojis are the guaranteed-usable set).
+        assert!(config.react_own_emojis);
         assert!((config.random_react_chance_percent - 10.0).abs() < f64::EPSILON);
     }
 
