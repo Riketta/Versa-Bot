@@ -33,11 +33,11 @@ use super::vision::DEFAULT_IMAGE_PROMPT;
 /// Recognized `/llm_set` keys, in display order (grouped: identity and
 /// delivery mode, sampling, capture/context, compaction, images, reactions,
 /// chime-ins, delivery). Doubles as the Discord choices dropdown for the `key`
-/// argument. Channel prompts are NOT keys - they have their own command
-/// (`/llm_set_prompt`), which keeps this list AT Discord's 25-choice cap
-/// - a 26th key needs a dropdown redesign.
+/// argument - the list is exactly Discord's 25-choice cap. The chat model is
+/// deliberately NOT a key: like the channel prompts (own command
+/// `/llm_set_prompt`), it has a dedicated command (`/llm_assign`), and a
+/// 26th key would have to drop the dropdown entirely.
 pub(super) const SET_KEYS: &[&str] = &[
-    "model",
     "reasoning_effort",
     "streaming",
     "temperature",
@@ -141,10 +141,6 @@ fn apply_set(
         return result;
     }
     match key {
-        "model" if !cleared && !value.is_empty() => {
-            config.model = value.to_string();
-            Ok(format!("`model` set to `{value}`."))
-        }
         "reasoning_effort" => {
             if cleared {
                 config.params.reasoning_effort = None;
@@ -197,11 +193,22 @@ fn apply_set(
             }
             Ok(reply)
         }
-        "model" | "context_messages" => {
-            Err(format!("`{key}` cannot be cleared - assign a value or use `/llm_unassign`."))
+        "context_messages" => {
+            Err("`context_messages` cannot be cleared - assign a value or use `/llm_unassign`."
+                .to_owned())
         }
-        other => Err(format!("Unknown key `{other}`. Keys: {}.", SET_KEYS.join(", "))),
+        other => Err(unknown_key_reply(other)),
     }
+}
+
+/// Usage reply for an unrecognized `/llm_set`/`/llm_get` key. The chat model
+/// is deliberately absent from the key set (Discord caps dropdowns at 25 and
+/// the assignment has its own command), so the reply points there.
+fn unknown_key_reply(key: &str) -> String {
+    format!(
+        "Unknown key `{key}`. Keys: {}. The chat model is `/llm_assign`'s job.",
+        SET_KEYS.join(", ")
+    )
 }
 
 /// On/off settings. `None` = the key is not a flag (caller continues
@@ -1833,10 +1840,10 @@ impl CommandHandler for SetLlmHandler {
             return Ok(());
         };
         // Same registry boundary as `/llm_assign`: only declared models are
-        // legal - chat, image, AND compaction refs alike. Clear-words are
-        // not assignments - `apply_set` answers them with its own "cannot
-        // be cleared" usage.
-        if matches!(key, "model" | "image_model" | "compaction_model")
+        // legal - image and compaction refs alike (the chat model cannot
+        // arrive here anymore; it has no key). Clear-words are not
+        // assignments - `apply_set` answers them with its own usage.
+        if matches!(key, "image_model" | "compaction_model")
             && !matches!(value, "clear" | "none" | "default")
             && let Err(reply) = validate_model_ref(self.engine.settings(), value)
         {
@@ -2105,20 +2112,17 @@ impl CommandHandler for GetLlmHandler {
                     services.chat_output.send(command_reply(format!("`{key}`: {value}"))).await?;
                 }
                 None => {
-                    services
-                        .chat_output
-                        .send(command_reply(format!(
-                            "Unknown key `{key}`. Keys: {}.",
-                            SET_KEYS.join(", ")
-                        )))
-                        .await?;
+                    services.chat_output.send(command_reply(unknown_key_reply(key))).await?;
                 }
             },
-            // No key: every setting, one line each. Long free-text values
-            // render as shapes - the full text is one `/llm_get key` away.
+            // No key: every setting, one line each - the model first (it is
+            // not a `/llm_set` key, but it is the assignment worth seeing).
+            // Long free-text values render as shapes - the full text is one
+            // `/llm_get key` away.
             None => {
-                let lines: Vec<String> = SET_KEYS
-                    .iter()
+                let lines: Vec<String> = ["model"]
+                    .into_iter()
+                    .chain(SET_KEYS.iter().copied())
                     .map(|key| {
                         let value = current_value(&config, key, self.engine.settings())
                             .unwrap_or_else(|| "?".to_owned());
@@ -2202,12 +2206,13 @@ enum DumpItem {
 }
 
 /// `/llm_dump` display order, grouped: identity and delivery mode, sampling,
-/// capture/context, compaction, images, reactions, chime-ins, delivery. The three
+/// capture/context, compaction, images, reactions, chime-ins, delivery. The
+/// model leads (it is the assignment, not a `/llm_set` key). The three
 /// prompts ride with their feature - set-or-not and size only; the text is
 /// one `/llm_set_prompt kind` away. Every key appears exactly once - the
-/// `dump_layout_covers_the_key_set` test pins parity with `SET_KEYS`, so a
-/// key added there without a layout entry fails a test instead of silently
-/// vanishing from the dump.
+/// `dump_layout_covers_the_key_set` test pins parity with `SET_KEYS` (plus
+/// the model), so a key added there without a layout entry fails a test
+/// instead of silently vanishing from the dump.
 const DUMP_LAYOUT: &[DumpItem] = &[
     DumpItem::Key("model"),
     DumpItem::Key("reasoning_effort"),
@@ -2303,11 +2308,14 @@ impl CommandHandler for DumpLlmHandler {
                 }
             })
             .collect();
+        // The body renders one line per DUMP_LAYOUT key (model included) -
+        // the header counts those, not the `/llm_set` key set.
+        let key_count = DUMP_LAYOUT.iter().filter(|item| matches!(item, DumpItem::Key(_))).count();
         services
             .chat_output
             .send(command_reply(format!(
-                "Channel settings ({} keys + 3 prompts; `*` differs from the default):\n```\n{}\n```",
-                SET_KEYS.len(),
+                "Channel settings ({} settings + 3 prompts; `*` differs from the default):\n```\n{}\n```",
+                key_count,
                 lines.join("\n")
             )))
             .await?;
@@ -3376,10 +3384,19 @@ mod tests {
             apply_set(&mut config, "vibes", "maximum", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
                 .unwrap_err();
         assert!(unknown.contains("Unknown key"));
-        assert!(
-            apply_set(&mut config, "model", "clear", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
-                .is_err()
-        );
+        // The model is not a key at all - the reply points at `/llm_assign`.
+        let model = apply_set(
+            &mut config,
+            "model",
+            "zai/glm-5.3-flash",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+            IMAGE_CAP,
+        )
+        .unwrap_err();
+        assert!(model.contains("Unknown key"), "unexpected: {model}");
+        assert!(model.contains("/llm_assign"), "unexpected: {model}");
+        assert_eq!(config.model, "m", "the failed set must not mutate");
         assert!(
             apply_set(
                 &mut config,
@@ -3389,18 +3406,9 @@ mod tests {
                 CHUNK_FLOOR,
                 IMAGE_CAP
             )
-            .is_err()
+            .unwrap_err()
+            .contains("cannot be cleared")
         );
-        apply_set(
-            &mut config,
-            "model",
-            "zai/glm-5.3-flash",
-            PLATFORM_LIMIT,
-            CHUNK_FLOOR,
-            IMAGE_CAP,
-        )
-        .expect("model expected");
-        assert_eq!(config.model, "zai/glm-5.3-flash");
     }
 
     /// A recognized flag key with a bad value answers usage - it must not
@@ -3500,7 +3508,10 @@ mod tests {
             })
             .collect();
         dumped.sort_unstable();
-        let mut expected = SET_KEYS.to_vec();
+        // The model leads the dump but is not a `/llm_set` key - the
+        // assignment has its own command.
+        let mut expected =
+            ["model"].iter().copied().chain(SET_KEYS.iter().copied()).collect::<Vec<_>>();
         expected.sort_unstable();
         assert_eq!(dumped, expected);
     }

@@ -89,8 +89,8 @@ pub struct LlmSettings {
     /// Declared providers (`[llm.providers.<name]`).
     pub providers: BTreeMap<String, ProviderSettings>,
     /// Declared model capabilities (`[llm.models."<provider/model>"]`).
-    /// This registry is also the legal assignment set: `/llm_assign` and
-    /// `/llm_set model=` reject refs absent from here. Configs stored before
+    /// This registry is also the legal assignment set: `/llm_assign` rejects
+    /// refs absent from here. Configs stored before
     /// that validation may still reference undeclared models - they run
     /// with default (no reasoning) capabilities, warn-once.
     pub models: BTreeMap<String, ModelSettings>,

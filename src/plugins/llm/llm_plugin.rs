@@ -2098,7 +2098,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_model_undeclared_is_rejected_and_saves_nothing() {
+    async fn set_image_model_undeclared_is_rejected_and_saves_nothing() {
         let (plugin, fixture) = fixture();
         plugin.init().expect("init expected to succeed");
         seed_config_in(&fixture.storage);
@@ -2107,7 +2107,7 @@ mod tests {
             .invoke(
                 &command_event(Some(1)),
                 &CommandArgs(vec![
-                    ("key".to_owned(), "model".to_owned()),
+                    ("key".to_owned(), "image_model".to_owned()),
                     ("value".to_owned(), "nope/model".to_owned()),
                 ]),
                 &fixture.services,

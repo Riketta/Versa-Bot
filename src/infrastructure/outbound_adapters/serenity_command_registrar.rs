@@ -7,6 +7,11 @@ use crate::kernel::{
     plugin_ports::{ArgKind, CommandDescriptor},
 };
 
+/// Discord caps an option's choice list at 25 entries (Invalid Form Body
+/// above that). Plugins should keep their own dropdowns at or under this -
+/// the adapter only enforces it as a boot-safety net.
+const MAX_DISCORD_CHOICES: usize = 25;
+
 /// Pushes the aggregated command descriptors to Discord as global
 /// application (slash) commands. Discord-specific by design: no universal
 /// registration port exists; each platform adapter wires this itself at its
@@ -65,11 +70,27 @@ fn application_command_json(descriptor: &CommandDescriptor) -> serde_json::Value
             // logged and dropped.
             if let Some(choices) = &argument.choices {
                 if argument.kind == ArgKind::String {
-                    let rendered: Vec<serde_json::Value> = choices
-                        .iter()
-                        .map(|choice| serde_json::json!({ "name": choice, "value": choice }))
-                        .collect();
-                    option.insert("choices".to_owned(), serde_json::json!(rendered));
+                    // Discord also caps a choice list at 25. An oversized
+                    // dropdown is dropped rather than truncated: choices are
+                    // exhaustive (Discord rejects any other input), so a
+                    // truncation would silently make valid values unsettable.
+                    // Without choices the argument is free text and the
+                    // plugin's handler keeps validating.
+                    if choices.len() > MAX_DISCORD_CHOICES {
+                        tracing::warn!(
+                            command = %descriptor.name,
+                            argument = %argument.name,
+                            count = choices.len(),
+                            cap = MAX_DISCORD_CHOICES,
+                            "choices dropped: Discord accepts at most 25 per string argument"
+                        );
+                    } else {
+                        let rendered: Vec<serde_json::Value> = choices
+                            .iter()
+                            .map(|choice| serde_json::json!({ "name": choice, "value": choice }))
+                            .collect();
+                        option.insert("choices".to_owned(), serde_json::json!(rendered));
+                    }
                 } else {
                     tracing::warn!(
                         command = %descriptor.name,
@@ -299,5 +320,49 @@ mod tests {
         assert!(action.get("choices").is_some());
         let user = options.get(1).expect("user option expected");
         assert!(user.get("choices").is_none());
+    }
+
+    /// Discord caps a choice list at 25: an oversized dropdown must degrade
+    /// to a free-text argument (warn + drop) instead of failing the whole
+    /// bulk sync at boot. Dropping - not truncating - because choices are
+    /// exhaustive: a truncation would silently make valid values unsettable.
+    #[test]
+    fn oversized_choices_degrade_to_free_text_instead_of_failing_boot() {
+        let oversized: Vec<String> = (0..26).map(|index| format!("choice{index}")).collect();
+        let descriptor = CommandDescriptor {
+            plugin_id: "test".to_owned(),
+            name: "x".to_owned(),
+            description: "test".to_owned(),
+            arguments: vec![
+                ArgDescriptor {
+                    name: "within".to_owned(),
+                    description: "at the cap".to_owned(),
+                    required: true,
+                    kind: ArgKind::String,
+                    choices: Some(oversized.iter().take(MAX_DISCORD_CHOICES).cloned().collect()),
+                },
+                ArgDescriptor {
+                    name: "over".to_owned(),
+                    description: "past the cap".to_owned(),
+                    required: false,
+                    kind: ArgKind::String,
+                    choices: Some(oversized),
+                },
+            ],
+            required_permission: None,
+            required_tier: Some(AccessTier::User),
+            guild_only: false,
+        };
+
+        let json = application_command_json(&descriptor);
+        let options = json.get("options").and_then(|o| o.as_array()).expect("options expected");
+        let within = options.first().expect("within option expected");
+        assert_eq!(
+            within.get("choices").and_then(|c| c.as_array()).map(Vec::len),
+            Some(MAX_DISCORD_CHOICES),
+            "at the cap the dropdown ships"
+        );
+        let over = options.get(1).expect("over option expected");
+        assert!(over.get("choices").is_none(), "past the cap the dropdown is dropped");
     }
 }

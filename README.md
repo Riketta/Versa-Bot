@@ -565,9 +565,9 @@ split of responsibilities is deliberate:
 - **Guild moderators** assign the bot to channels and tune each channel
   via slash commands - picking among the declared models, never
   configuring endpoints. Only declared models are legal: `/llm_assign`
-  and `/llm_set model=` reject anything else, and `/llm_models` lists
-  the catalog. Keys never appear in config files or guild storage; they
-  are resolved from environment variables at boot.
+  rejects anything else, and `/llm_models` lists the catalog. Keys never
+  appear in config files or guild storage; they are resolved from
+  environment variables at boot.
 
 Needs the privileged `MESSAGE_CONTENT` intent (see
 [Gateway intents](#gateway-intents)) - this plugin is the only consumer
@@ -832,19 +832,21 @@ plugin](#authorization-auth-plugin)).
 | `/llm_admin_clear` | moderator | stop service notices |
 
 **`/llm_set` keys.** Every key takes one value; `clear`, `none` or
-`default` as the value resets the key to its default - the two keys
-without a default (`model`, `context_messages`) refuse and point at
+`default` as the value resets the key to its default - the one key
+without a default (`context_messages`) refuses and points at
 `/llm_unassign`. On/off keys accept `on`/`off` (also
 `true`/`yes`/`1` and `false`/`no`/`0`). Invalid values are answered
-with usage and never saved. `/llm_get` reads the same keys back. The
-three channel prompts (system persona, compaction and image
-instructions) are deliberately not keys here - they have their own
-command, `/llm_set_prompt`, which also reads them back and accepts
-uploaded files for long texts.
+with usage and never saved. `/llm_get` reads the same keys back (and
+lists the model too). The chat model is deliberately not a key here -
+Discord caps command dropdowns at 25 choices, and the model has its
+own command, `/llm_assign`. The same holds for the three channel
+prompts (system persona, compaction and image instructions): they have
+their own command, `/llm_set_prompt`, which also reads them back and
+accepts uploaded files for long texts.
 
 | Key | Values | Default | Meaning |
 |---|---|---|---|
-| `model` | declared model ref | set by `/llm_assign` | switch this channel's chat model; unknown refs are rejected with the declared list |
+| `model` | declared model ref | set by `/llm_assign` | the channel's chat model - not a `/llm_set` key (the assignment has its own command); shown by `/llm_get` and `/llm_dump` for the full picture |
 | `reasoning_effort` | free string, or `off` | `min` | reasoning hint, sent only when the model declares `reasoning = true`. Any other value is sent as-is to effort-style providers (Z.ai GLM: `min`/`low`/`high`/`max`) and enables thinking on switch-style ones. `off` renders an explicit disable on switch-style providers (GLM-4.5-5.2); effort-style endpoints have no off wire value, so their default applies - on Z.ai GLM that default is `max`, and GLM-5.3 thinks forcibly regardless, so throttle it with `min` (the default) or `low`. `clear` sends nothing at all |
 | `streaming` | on / off | off | stream the answer live from the provider (SSE): the message appears with the first tokens and is edited at `stream_interval_ms` |
 | `temperature` `top_p` `top_k` `min_p` `frequency_penalty` `presence_penalty` | finite number | not sent | sampling knobs, one per key - tune per-channel tone (an educational channel can run low temperature, an entertainment one high); cleared = not sent |
