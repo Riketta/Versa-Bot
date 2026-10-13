@@ -334,7 +334,7 @@ tier on a seven-step ladder -
 | `guest` | talk to the bot (chat interactions), no commands |
 | `user` | basic commands (`/ping`, `/help`, `/llm_status`, `/llm_models`) |
 | `moderator` | every service command (`/assign_tracker`, `/llm_assign`, `/llm_set`, ...), plus the member-facing slice of `/auth`: a limited `show` and tier writes on members ranked below moderator |
-| `admin` | everything except writes touching admins: role grants, the default tier, `/auth` management of moderators and below |
+| `admin` | everything except writes touching admins: role grants and the default tier below their own rank, `/auth` management of moderators and below |
 | `guild admin` | like admin, plus appointing and removing bot admins - the guild's top authority over the bot |
 | `owner` | everything, plus operator-reserved surfaces (never assignable in any guild) |
 
@@ -343,7 +343,14 @@ the role grants at least that tier), and a **default tier** for everyone
 else. The effective tier is the best of what applies. Overrides sit
 above the stored data:
 
-- An explicit `banned` user assignment beats every role grant.
+- An explicit `banned` user assignment beats every role grant - including
+  a role mapped to `banned`.
+- A role mapped to `banned` bans everyone holding it **without an
+  explicit user assignment**: wire an existing `@Banned`-style Discord
+  role into the bot, and members carrying it are ignored silently -
+  unless an admin deliberately assigned them a tier (a deliberate
+  per-user decision outranks role-derived data), or a permission clamp
+  below applies.
 - **Members with the Manage Server permission are always `guild admin`**,
   by construction - the clamp cannot be removed, so the server owner
   (who always carries Manage Server) can never be locked out. Discord
@@ -368,6 +375,11 @@ Two resolution rules that surprise people:
   above it. A member assigned `guest` who holds a role granting
   `moderator` is a `moderator`. Only `banned` (above) overrides role
   grants.
+- With `default tier: admin`, every unlisted member's stored rank is
+  `admin` - so admins can no longer rewrite anyone's assignment (all
+  targets rank at their own level), yet an admin can still flip the
+  default back down, moving everyone at once. The guild admin clamp is
+  always the way out of a mis-set default.
 
 A fresh guild starts open (default tier `user`), so the commands that
 configure the bot are usable on day one. The policy is stored in the
@@ -397,15 +409,19 @@ Robustness rules:
   auth decides who may *use* the bot, not what happens in the guild.
 
 **Capability matrix.** `/auth` writes never touch a tier or a member at
-or above the invoker's own rank, and nobody can change their own tier:
+or above the invoker's own rank - user assignments, role grants, and the
+default tier alike - and nobody can change their own tier:
 
 - A `moderator` gets a limited `show` (the default tier when it sits at
   or below moderator, user rows at or below moderator - higher ranks and
   the roles section stay hidden) and may assign `banned`/`guest`/`user`
   to members ranked below moderator. Role grants and the default tier
-  are admin-only.
+  are admin-only, bounded by the same rule: an admin grants tiers below
+  their own rank only.
 - An `admin` manages moderators and below - including role grants and
-  the default tier - but cannot reassign another admin.
+  the default tier - but cannot reassign another admin, and cannot mint
+  admin rank through a role grant or the default tier: appointing
+  admins is exactly what `guild admin` is for.
 - A `guild admin` appoints and removes admins; an `owner` is
   unrestricted.
 - Self-writes are refused for every rank, server owner included: ranks
@@ -421,16 +437,28 @@ the invoker.
 |---|---|---|
 | `/auth action:show` | moderator (limited view) / admin and above (full) | show the current policy: default tier, user and role assignments |
 | `/auth action:set tier:<tier> user:@member` | moderator and above, bounded by rank | assign a tier to a user (below the invoker's own rank only) |
-| `/auth action:set tier:<tier> role:@role` | admin and above | grant a tier to everyone holding the role |
+| `/auth action:set tier:<tier> role:@role` | admin and above, bounded by rank | grant a tier to everyone holding the role (below the invoker's own rank only) |
 | `/auth action:clear user:@member` | moderator and above, bounded by rank | remove a user's assignment |
-| `/auth action:clear role:@role` | admin and above | remove a role grant |
-| `/auth action:default tier:<tier>` | admin and above | set the default tier for unlisted members |
+| `/auth action:clear role:@role` | admin and above, bounded by the grant's rank | remove a role grant (an admin-tier grant needs a guild admin) |
+| `/auth action:default tier:<tier>` | admin and above, bounded by rank | set the default tier for unlisted members (below the invoker's own rank only) |
 
 Specify either `user` or `role`, never both. Bot owners cannot be
-targeted: `set`/`clear` refuse with an ephemeral notice. Changing your
+targeted: `set`/`clear` refuse with an ephemeral notice (the refusal is
+intentionally distinct feedback, not an access check - probing it only
+tells a moderator what they could not change anyway). For invokers below
+admin, refusals keep the target's exact rank hidden - probing arbitrary
+ids enumerates nothing that the limited `show` hides. Changing your
 own tier is refused for every rank - the bootstrap path is built in:
 the server owner is a `guild admin` by construction and appoints bot
 admins from there.
+
+One boundary worth knowing: the member-write bound reads **stored**
+assignments only - the handler cannot see another member's Discord
+roles. A member whose admin rank comes from a role grant (not a user
+assignment) presents the default tier to that bound, so an admin can
+still assign them a tier or a ban, and a ban on them sticks (bans are
+checked before role lifts). Permission-clamped ranks (guild admin,
+owner) are unreachable by stored writes regardless.
 
 ### Command demo (`command` plugin)
 

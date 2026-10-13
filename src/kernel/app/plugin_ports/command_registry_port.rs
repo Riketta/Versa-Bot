@@ -85,7 +85,11 @@ pub struct CommandDescriptor {
 /// server managers up to `GuildAdmin`, and sanitization keeps stored tiers
 /// at `Admin` - those guarantees live there, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+// `snake_case`, not `lowercase`: single-word variants are unaffected, and
+// it keeps the JSON spelling of `GuildAdmin` equal to [`AccessTier::as_str`]
+// (`guild_admin`) - hand-edited policy documents using the documented
+// spelling must deserialize.
+#[serde(rename_all = "snake_case")]
 pub enum AccessTier {
     /// Ignored entirely in guild contexts: messages and commands are
     /// dropped without any output - bans never announce themselves. DMs
@@ -180,8 +184,9 @@ pub enum ArgKind {
     Attachment,
 }
 
-/// A native platform permission name (`manage_guild` so far), mapped by
-/// adapters onto platform mechanics (Discord: `default_member_permissions`)
+/// A native platform permission name, mapped by adapters onto platform
+/// mechanics (Discord: `default_member_permissions`). No core command
+/// declares one today - see [`CommandDescriptor::required_permission`].
 /// to gate command *presentation*. Kernel-side access control is not this -
 /// it is `required_tier`, enforced by the auth plugin.
 #[derive(Debug, Clone)]

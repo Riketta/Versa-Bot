@@ -49,12 +49,15 @@ pub struct AuthConfig {
     /// deny the very commands that configure it.
     pub default_tier: AccessTier,
     /// Explicit per-user tier assignments (platform user IDs as strings).
-    /// A `Banned` assignment wins over every role grant - the one exception
-    /// is Discord's administrator clamp, which resolves such a member to
-    /// `Admin` regardless.
+    /// A `Banned` assignment wins over every role grant - including a role
+    /// mapped to `banned` - and the permission clamps (Manage Server →
+    /// `GuildAdmin`, Discord's Administrator permission → `Admin`) outrank
+    /// it regardless.
     pub users: BTreeMap<String, AccessTier>,
-    /// Per-role tier assignments (platform role IDs as strings): holding the
-    /// role grants at least that tier.
+    /// Per-role tier assignments (platform role IDs as strings): holding
+    /// the role grants at least that tier. A role mapped to `banned` inverts
+    /// this: it bans holders without an explicit user assignment - guilds
+    /// can wire an existing @Banned-style role into the bot.
     pub roles: BTreeMap<String, AccessTier>,
 }
 
@@ -316,15 +319,16 @@ impl PluginPort for AuthPlugin {
                             .to_owned(),
                         required: false,
                         kind: ArgKind::String,
+                        // Derived from the parser's own list, so the
+                        // dropdown can never drift from what `set` accepts.
                         // `owner` deliberately absent: config-injected rank,
                         // never offered as a choice or accepted by the parser.
-                        choices: Some(vec![
-                            "banned".to_owned(),
-                            "guest".to_owned(),
-                            "user".to_owned(),
-                            "moderator".to_owned(),
-                            "admin".to_owned(),
-                        ]),
+                        choices: Some(
+                            command::all_tiers()
+                                .iter()
+                                .map(|tier| tier.as_str().to_owned())
+                                .collect(),
+                        ),
                     },
                     ArgDescriptor {
                         name: "user".to_owned(),
@@ -541,7 +545,7 @@ impl AuthPlugin {
         Embed {
             title: "⛔ Not authorized".to_owned(),
             description: format!(
-                "Command `/{command_name}` requires the {required} tier (you have {effective}).\nAsk a moderator if you think this is a mistake."
+                "Command `/{command_name}` requires the {required} tier (you have {effective}).\nAsk someone with a higher tier if you think this is a mistake."
             ),
         }
     }
@@ -561,7 +565,10 @@ impl AuthPlugin {
 /// - A member carrying only the bare administrator bit (no Manage Server -
 ///   possible only with synthetic or degraded permission data) falls back
 ///   to the historical `Admin` clamp.
-/// - An explicit `Banned` user assignment wins over every role grant.
+/// - An explicit `Banned` user assignment wins over every role grant -
+///   including a role mapped to `banned`.
+/// - A role mapped to `banned` bans holders without an explicit user
+///   assignment; permission clamps still win.
 /// - Otherwise: the user's assignment (or the guild default) lifted by
 ///   the best qualifying role - an explicit assignment below the
 ///   default (e.g. `Guest`) stays below it until a role lifts it.
@@ -590,8 +597,17 @@ pub(crate) fn resolve_tier(
     if config.users.get(user_id) == Some(&AccessTier::Banned) {
         return AccessTier::Banned;
     }
-
-    let base = config.users.get(user_id).copied().unwrap_or(config.default_tier);
+    let explicit = config.users.get(user_id);
+    // A role mapped to `banned` bans holders without an explicit user
+    // assignment: guilds can reuse an existing @Banned-style role. A
+    // deliberate per-user decision keeps winning over role-derived data,
+    // and the permission clamps above outrank everything anyway.
+    if explicit.is_none()
+        && author_roles.iter().any(|role| config.roles.get(role) == Some(&AccessTier::Banned))
+    {
+        return AccessTier::Banned;
+    }
+    let base = explicit.copied().unwrap_or(config.default_tier);
     let role_tier = author_roles.iter().filter_map(|role| config.roles.get(role)).copied().max();
     base.max(role_tier.unwrap_or(base))
 }
@@ -1462,6 +1478,37 @@ mod tests {
         assert!(output.messages().is_empty());
     }
 
+    /// A role mapped to `banned` bans holders without an explicit user
+    /// assignment: guilds can wire an existing @Banned-style role into the
+    /// bot. The drop is silent, like every ban.
+    #[tokio::test]
+    async fn banned_role_bans_members_without_an_assignment() {
+        let storage = configured_storage(AccessTier::User, &[], &[("42", AccessTier::Banned)]);
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin(&[("ping", AccessTier::User)]);
+        let mut event = message_event(3, &["42"]);
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
+        assert!(output.messages().is_empty());
+    }
+
+    /// A deliberate per-user decision outranks role-derived data: an
+    /// explicit `user` assignment keeps a holder of a banned role talking.
+    #[tokio::test]
+    async fn explicit_assignment_beats_banned_role() {
+        let storage = configured_storage(
+            AccessTier::User,
+            &[("3", AccessTier::User)],
+            &[("42", AccessTier::Banned)],
+        );
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin(&[("ping", AccessTier::User)]);
+        let mut event = message_event(3, &["42"]);
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+        assert!(output.messages().is_empty());
+    }
+
     /// The Guild Admin clamp beats role grants as well: an explicit `guest`
     /// assignment plus a `banned` role cannot pull a server manager down.
     #[tokio::test]
@@ -1723,17 +1770,46 @@ mod tests {
     }
 
     /// `guild_admin` is derived, never stored: a hand-edited policy entry
-    /// deserializes (serde is additive) but resolves at most to Admin -
-    /// only the platform permission can produce the real tier.
+    /// using the documented `as_str` spelling deserializes and resolves at
+    /// most to Admin - the clamped member passes admin-gated commands and
+    /// fails owner-gated ones. (Passing the admin gate is load-bearing: it
+    /// distinguishes the clamp from the malformed-policy fail-closed path,
+    /// which stops everything.)
     #[tokio::test]
     async fn hand_edited_guild_admin_assignment_clamps_to_admin() {
         let storage = configured_storage(AccessTier::User, &[("3", AccessTier::GuildAdmin)], &[]);
-        let (services, _output) = test_services(&storage);
-        // An Owner-gated command: the clamped member must not pass it.
-        let plugin = test_plugin(&[("owner_tool", AccessTier::Owner)]);
-        let mut command = command_event(3, "owner_tool", &[]);
+        let (services, output) = test_services(&storage);
+        let plugin =
+            test_plugin(&[("owner_tool", AccessTier::Owner), ("admin_tool", AccessTier::Admin)]);
 
-        assert!(matches!(plugin.pre(&mut command, &services).await, Next::Stop));
+        let mut owner_gated = command_event(3, "owner_tool", &[]);
+        assert!(matches!(plugin.pre(&mut owner_gated, &services).await, Next::Stop));
+
+        let mut admin_gated = command_event(3, "admin_tool", &[]);
+        assert!(matches!(plugin.pre(&mut admin_gated, &services).await, Next::Continue));
+        assert!(output.messages().is_empty());
+    }
+
+    /// The enum's serde spelling and `as_str` agree for every tier: a
+    /// policy document round-trips through the documented spelling, and a
+    /// hand edit with `guild_admin` parses instead of failing closed.
+    #[test]
+    fn tier_json_spelling_matches_as_str() {
+        for tier in [
+            AccessTier::Banned,
+            AccessTier::Guest,
+            AccessTier::User,
+            AccessTier::Moderator,
+            AccessTier::Admin,
+            AccessTier::GuildAdmin,
+            AccessTier::Owner,
+        ] {
+            let json = serde_json::to_string(&tier).expect("serialize expected to succeed");
+            assert_eq!(json, format!("\"{}\"", tier.as_str()));
+            let parsed: AccessTier =
+                serde_json::from_str(&json).expect("deserialize expected to succeed");
+            assert_eq!(parsed, tier);
+        }
     }
 
     /// Config strings are trimmed, empties dropped, duplicates collapsed;

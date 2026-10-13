@@ -168,12 +168,20 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
             .map(|member| member.roles.iter().map(|role| role.get().to_string()).collect())
             .unwrap_or_default();
 
-        // Same best-effort contract as the message path above.
-        let author_permissions = command
-            .member
-            .as_ref()
-            .and_then(|member| member.permissions)
-            .map_or(0, |permissions| permissions.bits());
+        // Guild-scoped ranks: Discord scopes the interaction payload's
+        // permission bits to the invoking channel (overwrites included),
+        // so a channel overwrite must neither mint nor strip a rank - the
+        // cache's guild-level union is preferred, payload bits only as the
+        // best effort left when the guild is not cached. The cache guard is
+        // scoped: it must be dropped before the pipeline await below.
+        let author_permissions = {
+            let cached_guild = command.guild_id.and_then(|guild_id| ctx.cache.guild(guild_id));
+            interaction_author_permissions(
+                cached_guild.as_deref(),
+                command.member.as_ref().and_then(|member| member.permissions),
+                command.user.id,
+            )
+        };
 
         let origin = Origin {
             guild_id: command.guild_id.map(|guild_id| GuildId(guild_id.get())),
@@ -513,12 +521,11 @@ fn resolve_author_permissions(ctx: &Context, message: &Message) -> u64 {
 }
 
 /// Message-path permission resolution, pure over its inputs: the payload's
-/// permission bits when the platform included them (interaction-shaped
-/// payloads do), otherwise the gateway-cache result - owner => everything,
-/// else @everyone + member roles union. `cached_guild` is `None` for DMs
-/// and for guilds the cache has not seen. 0 = unknown (no bits, no cached
-/// guild): authorization treats unknown as "no admin clamp", never as a
-/// hard failure.
+/// permission bits when the platform included them, otherwise the
+/// gateway-cache result - owner => everything, else @everyone + member
+/// roles union. `cached_guild` is `None` for DMs and for guilds the cache
+/// has not seen. 0 = unknown (no bits, no cached guild): authorization
+/// treats unknown as "no admin clamp", never as a hard failure.
 fn permissions_from_payload_or_cache(
     payload_permissions: Option<u64>,
     cached_guild: Option<&serenity::all::Guild>,
@@ -530,6 +537,21 @@ fn permissions_from_payload_or_cache(
     match cached_guild {
         Some(guild) => cached_author_permissions(author_id, guild),
         None => 0,
+    }
+}
+
+/// Interaction-path permission resolution: the cache's guild-level union
+/// when the guild is cached (the payload's bits are channel-scoped), the
+/// payload bits as the best effort left, 0 = unknown otherwise. Same
+/// fail-closed reading of unknown as the message path.
+fn interaction_author_permissions(
+    cached_guild: Option<&serenity::all::Guild>,
+    payload_permissions: Option<Permissions>,
+    author_id: SerenityUserId,
+) -> u64 {
+    match cached_guild {
+        Some(guild) => cached_author_permissions(author_id, guild),
+        None => payload_permissions.map_or(0, |permissions| permissions.bits()),
     }
 }
 
@@ -565,9 +587,10 @@ fn cached_author_permissions(
 
 /// Effective Discord permissions of a guild member from the gateway cache:
 /// the owner gets everything, anyone else the union of the @everyone role
-/// and their member roles (Discord's own algorithm minus channel
-/// overwrites - sufficient for the admin-bit check the auth plugin makes).
-/// Pure so the owner/union rules stay testable without a live cache.
+/// and their member roles - with Discord's administrator rule applied (a
+/// role carrying ADMINISTRATOR implies every permission), which the auth
+/// plugin's rank clamps rely on. Pure so the owner/union rules stay
+/// testable without a live cache.
 fn unioned_member_permissions(
     owner_id: u64,
     user_id: u64,
@@ -580,6 +603,9 @@ fn unioned_member_permissions(
     let mut permissions = Permissions::from_bits_truncate(everyone.unwrap_or(0));
     for bits in member_role_bits {
         permissions |= Permissions::from_bits_truncate(*bits);
+    }
+    if permissions.contains(Permissions::ADMINISTRATOR) {
+        return Permissions::all().bits();
     }
     permissions.bits()
 }
@@ -817,6 +843,53 @@ mod tests {
     fn unioned_permissions_unknown_member_is_zero() {
         assert_eq!(unioned_member_permissions(1, 2, None, &[]), 0);
         assert_eq!(unioned_member_permissions(1, 2, Some(0x400), &[]), 0x400);
+    }
+
+    /// Discord's administrator rule: a role carrying ADMINISTRATOR implies
+    /// every permission - the auth plugin's rank clamps rely on this.
+    #[test]
+    fn unioned_permissions_administrator_implies_everything() {
+        let bits = unioned_member_permissions(
+            1,
+            2,
+            Some(Permissions::VIEW_CHANNEL.bits()),
+            &[Permissions::ADMINISTRATOR.bits()],
+        );
+        assert_eq!(bits, Permissions::all().bits());
+    }
+
+    /// Interaction permissions are guild-scoped: the cache's union wins
+    /// over the payload's channel-scoped bits; without a cached guild the
+    /// payload bits are the best effort left; without either, unknown = 0.
+    #[test]
+    fn interaction_permissions_prefer_guild_cache_over_payload() {
+        let mut guild = serenity::all::Guild::default();
+        guild.id = SerenityGuildId::new(7);
+        guild.owner_id = SerenityUserId::new(1);
+        let mut everyone = serenity::all::Role::default();
+        everyone.id = SerenityRoleId::new(7);
+        everyone.permissions = Permissions::VIEW_CHANNEL;
+        guild.roles.insert(everyone.id, everyone);
+
+        // Cached guild: the payload's channel-scoped Manage Server bit is
+        // ignored in favor of the guild-level computation.
+        let bits = interaction_author_permissions(
+            Some(&guild),
+            Some(Permissions::MANAGE_GUILD),
+            SerenityUserId::new(2),
+        );
+        assert_eq!(bits, Permissions::VIEW_CHANNEL.bits());
+
+        // No cache: the payload bits are all that is left.
+        let bits = interaction_author_permissions(
+            None,
+            Some(Permissions::MANAGE_GUILD),
+            SerenityUserId::new(2),
+        );
+        assert_eq!(bits, Permissions::MANAGE_GUILD.bits());
+
+        // Neither: unknown, treated as no clamp.
+        assert_eq!(interaction_author_permissions(None, None, SerenityUserId::new(2)), 0);
     }
 
     /// The snowflake's embedded birth time drives the age: a snowflake born

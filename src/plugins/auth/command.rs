@@ -8,6 +8,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::common::command_reply as text;
 use crate::kernel::{
     models::{Embed, EventPayload, OutboundMessage, RequestContext},
     plugin_ports::{AccessTier, CommandArgs, CommandHandler},
@@ -87,7 +88,7 @@ impl CommandHandler for AuthCommandHandler {
         // Tier resolution ignores guild-side entries for owners anyway; this
         // is the explicit feedback that the write did not happen.
         match args.get("action") {
-            Some("set") | Some("clear")
+            Some("set" | "clear")
                 if args.get("user").is_some_and(|user| self.owners.contains(user)) =>
             {
                 return reply(
@@ -185,7 +186,11 @@ enum Target {
 /// The assignable tiers. [`AccessTier::Owner`] is deliberately absent: it
 /// is config-injected and must never be offered - not in the `/auth`
 /// dropdown, not accepted by [`parse_tier`].
-fn all_tiers() -> [AccessTier; 5] {
+/// The assignable tiers, in ladder order: the `/auth` dropdown and the
+/// parser are derived from this one list, so they cannot drift apart
+/// (`owner` and `guild_admin` are deliberately absent - config-injected
+/// and platform-derived ranks are never assignable).
+pub(super) fn all_tiers() -> [AccessTier; 5] {
     [
         AccessTier::Banned,
         AccessTier::Guest,
@@ -252,23 +257,42 @@ fn member_write_denial(
     }
     let current = stored_user_tier(policy, target_id);
     (current >= invoker.tier).then(|| {
-        format!(
-            "<@{target_id}> currently ranks as {current} - only {} can change their tier.",
-            senior_rank(invoker.tier)
-        )
+        if invoker.tier >= AccessTier::Admin {
+            format!(
+                "<@{target_id}> currently ranks as {current} - only {} can change their tier.",
+                senior_rank(invoker.tier)
+            )
+        } else {
+            // Below Admin the exact rank stays hidden: probing arbitrary
+            // IDs must not enumerate what the limited `show` collapses
+            // into a count.
+            format!("<@{target_id}> can only be changed by an Admin or above.")
+        }
     })
 }
 
-/// Role grants decide tiers for whole membership slices - Admins only.
-fn role_write_denial(invoker: &Invoker) -> Option<String> {
-    (invoker.tier < AccessTier::Admin)
-        .then(|| "Assigning tiers to roles is reserved for Admins and above.".to_owned())
+/// Role grants decide tiers for whole membership slices - Admins only, and
+/// the written tier stays strictly below the invoker's own rank, exactly
+/// like user writes: appointing admins through a role is a Guild Admin's
+/// power. `clear` passes the existing grant's tier - without one there is
+/// nothing to demote and no bound applies.
+fn role_write_denial(invoker: &Invoker, tier: Option<AccessTier>) -> Option<String> {
+    if invoker.tier < AccessTier::Admin {
+        return Some("Assigning tiers to roles is reserved for Admins and above.".to_owned());
+    }
+    tier.filter(|tier| *tier >= invoker.tier).map(|tier| {
+        format!("Only {} can manage the {tier} tier on roles.", senior_rank(invoker.tier))
+    })
 }
 
-/// The guild-wide fallback tier shapes every unlisted member - Admins only.
-fn default_write_denial(invoker: &Invoker) -> Option<String> {
-    (invoker.tier < AccessTier::Admin)
-        .then(|| "Changing the default tier is reserved for Admins and above.".to_owned())
+/// The guild-wide fallback tier shapes every unlisted member - Admins only,
+/// bounded by the invoker's own rank like every other write.
+fn default_write_denial(invoker: &Invoker, tier: AccessTier) -> Option<String> {
+    if invoker.tier < AccessTier::Admin {
+        return Some("Changing the default tier is reserved for Admins and above.".to_owned());
+    }
+    (tier >= invoker.tier)
+        .then(|| format!("Only {} can set the default tier to {tier}.", senior_rank(invoker.tier)))
 }
 
 /// The `tier` argument, required by `set` and `default`.
@@ -316,57 +340,63 @@ async fn set_tier(
         return Ok(());
     };
     // One write at a time: set is a document read-modify-write, and two
-    // concurrent invocations must not lose one update.
-    let _write = policy_writes.lock().await;
+    // concurrent invocations must not lose one update. The guard scopes to
+    // this block so the reply is awaited after it is dropped - a slow send
+    // must not stall the next admin's write.
+    let answer = {
+        let _write = policy_writes.lock().await;
 
-    let mut policy = match read_policy(storage).await {
-        Ok(policy) => policy,
-        Err(message) => return reply(services, message).await,
-    };
+        match read_policy(storage).await {
+            Err(message) => message,
+            Ok(mut policy) => {
+                let invoker = Invoker::resolve(&policy, owners, event);
+                let denial = match &target {
+                    Target::User(id) => member_write_denial(&policy, &invoker, Some(tier), id),
+                    Target::Role(_) => role_write_denial(&invoker, Some(tier)),
+                };
+                if let Some(denial) = denial {
+                    text(denial)
+                } else {
+                    let (map, mention) = match &target {
+                        Target::User(id) => (&mut policy.users, format!("<@{id}>")),
+                        Target::Role(id) => (&mut policy.roles, format!("<@&{id}>")),
+                    };
+                    let id = match &target {
+                        Target::User(id) | Target::Role(id) => id.clone(),
+                    };
 
-    let invoker = Invoker::resolve(&policy, owners, event);
-    let denial = match &target {
-        Target::User(id) => member_write_denial(&policy, &invoker, Some(tier), id),
-        Target::Role(_) => role_write_denial(&invoker),
-    };
-    if let Some(denial) = denial {
-        return reply(services, text(denial)).await;
-    }
+                    let mut answer = if map.get(&id) == Some(&tier) {
+                        format!("{mention} already has the {tier} tier.")
+                    } else {
+                        map.insert(id, tier);
+                        storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
+                        policy_cache.invalidate_all();
+                        match &target {
+                            Target::User(_) => format!("✅ User {mention} is now {tier}."),
+                            Target::Role(_) => format!("✅ Role {mention} now grants {tier}."),
+                        }
+                    };
 
-    let (map, mention) = match &target {
-        Target::User(id) => (&mut policy.users, format!("<@{id}>")),
-        Target::Role(id) => (&mut policy.roles, format!("<@&{id}>")),
-    };
-    let id = match &target {
-        Target::User(id) | Target::Role(id) => id.clone(),
-    };
-
-    let mut answer = if map.get(&id) == Some(&tier) {
-        format!("{mention} already has the {tier} tier.")
-    } else {
-        map.insert(id, tier);
-        storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
-        policy_cache.invalidate_all();
-        match &target {
-            Target::User(_) => format!("✅ User {mention} is now {tier}."),
-            Target::Role(_) => format!("✅ Role {mention} now grants {tier}."),
+                    // A banned assignment on a target that carries a
+                    // permission clamp never takes effect - server managers
+                    // resolve to Guild Admin and Discord administrators to
+                    // at least Admin (pinned by tests). The handler cannot
+                    // see the target's permission bits, so the caveat is
+                    // unconditional on this one tier: a success reply must
+                    // not claim a ban that may not hold.
+                    if tier == AccessTier::Banned {
+                        answer.push_str(
+                            "\n⚠️ Members with Manage Server or Discord's Administrator permission \
+                             always rank above this assignment.",
+                        );
+                    }
+                    text(answer)
+                }
+            }
         }
     };
 
-    // A banned assignment on a target that carries a permission clamp never
-    // takes effect - server managers resolve to Guild Admin and Discord
-    // administrators to at least Admin (pinned by tests). The handler
-    // cannot see the target's permission bits, so the caveat is
-    // unconditional on this one tier: a success reply must not claim a ban
-    // that may not hold.
-    if tier == AccessTier::Banned {
-        answer.push_str(
-            "\n⚠️ Members with Manage Server or Discord's Administrator permission always rank \
-             above this assignment.",
-        );
-    }
-
-    reply(services, text(answer)).await
+    reply(services, answer).await
 }
 
 async fn clear_target(
@@ -385,40 +415,45 @@ async fn clear_target(
         Err(message) => return reply(services, message).await,
     };
     // One write at a time: clear is a document read-modify-write, and two
-    // concurrent invocations must not lose one update.
-    let _write = policy_writes.lock().await;
+    // concurrent invocations must not lose one update. Guard scoped to the
+    // block - the reply is awaited after it is dropped.
+    let answer = {
+        let _write = policy_writes.lock().await;
 
-    let mut policy = match read_policy(storage).await {
-        Ok(policy) => policy,
-        Err(message) => return reply(services, message).await,
+        match read_policy(storage).await {
+            Err(message) => message,
+            Ok(mut policy) => {
+                let invoker = Invoker::resolve(&policy, owners, event);
+                let denial = match &target {
+                    Target::User(id) => member_write_denial(&policy, &invoker, None, id),
+                    // Clearing a grant demotes its holders: the existing
+                    // grant's tier is the bound. No grant - no bound.
+                    Target::Role(id) => role_write_denial(&invoker, policy.roles.get(id).copied()),
+                };
+                if let Some(denial) = denial {
+                    text(denial)
+                } else {
+                    let (map, mention) = match &target {
+                        Target::User(id) => (&mut policy.users, format!("<@{id}>")),
+                        Target::Role(id) => (&mut policy.roles, format!("<@&{id}>")),
+                    };
+                    let id = match &target {
+                        Target::User(id) | Target::Role(id) => id.clone(),
+                    };
+
+                    if map.remove(&id).is_some() {
+                        storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
+                        policy_cache.invalidate_all();
+                        text(format!("✅ Removed the tier assignment for {mention}."))
+                    } else {
+                        text(format!("{mention} has no tier assignment."))
+                    }
+                }
+            }
+        }
     };
 
-    let invoker = Invoker::resolve(&policy, owners, event);
-    let denial = match &target {
-        Target::User(id) => member_write_denial(&policy, &invoker, None, id),
-        Target::Role(_) => role_write_denial(&invoker),
-    };
-    if let Some(denial) = denial {
-        return reply(services, text(denial)).await;
-    }
-
-    let (map, mention) = match &target {
-        Target::User(id) => (&mut policy.users, format!("<@{id}>")),
-        Target::Role(id) => (&mut policy.roles, format!("<@&{id}>")),
-    };
-    let id = match &target {
-        Target::User(id) | Target::Role(id) => id.clone(),
-    };
-
-    let answer = if map.remove(&id).is_some() {
-        storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
-        policy_cache.invalidate_all();
-        format!("✅ Removed the tier assignment for {mention}.")
-    } else {
-        format!("{mention} has no tier assignment.")
-    };
-
-    reply(services, text(answer)).await
+    reply(services, answer).await
 }
 
 async fn set_default_tier(
@@ -433,37 +468,41 @@ async fn set_default_tier(
     let Ok(tier) = tier_of(services, args).await else {
         return Ok(());
     };
-    let _write = policy_writes.lock().await;
+    // Guard scoped to the block - the reply is awaited after it is dropped.
+    let answer = {
+        let _write = policy_writes.lock().await;
 
-    let mut policy = match read_policy(storage).await {
-        Ok(policy) => policy,
-        Err(message) => return reply(services, message).await,
-    };
+        match read_policy(storage).await {
+            Err(message) => message,
+            Ok(mut policy) => {
+                let invoker = Invoker::resolve(&policy, owners, event);
+                if let Some(denial) = default_write_denial(&invoker, tier) {
+                    text(denial)
+                } else if policy.default_tier == tier {
+                    text(format!("The default tier is already {tier}."))
+                } else {
+                    policy.default_tier = tier;
+                    storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
+                    policy_cache.invalidate_all();
 
-    let invoker = Invoker::resolve(&policy, owners, event);
-    if let Some(denial) = default_write_denial(&invoker) {
-        return reply(services, text(denial)).await;
-    }
-
-    if policy.default_tier == tier {
-        return reply(services, text(format!("The default tier is already {tier}."))).await;
-    }
-    policy.default_tier = tier;
-    storage.set(NAMESPACE, CONFIG_KEY, serde_json::to_value(&policy)?).await?;
-    policy_cache.invalidate_all();
-
-    // Legal but destructive settings get an explicit consequence line: the
-    // reply is ephemeral, so the warning costs nothing but an oversight.
-    let warning = match policy.default_tier {
-        AccessTier::Admin => {
-            "\n⚠️ Every member - including strangers - can now run admin commands."
+                    // Legal but destructive settings get an explicit
+                    // consequence line: the reply is ephemeral, so the
+                    // warning costs nothing but an oversight.
+                    let warning = match policy.default_tier {
+                        AccessTier::Admin => {
+                            "\n⚠️ Every member - including strangers - can now run admin commands."
+                        }
+                        AccessTier::Banned => {
+                            "\n⚠️ The whole guild is now ignored silently: no replies, no denials."
+                        }
+                        _ => "",
+                    };
+                    text(format!("✅ Default tier is now {tier}.{warning}"))
+                }
+            }
         }
-        AccessTier::Banned => {
-            "\n⚠️ The whole guild is now ignored silently: no replies, no denials."
-        }
-        _ => "",
     };
-    reply(services, text(format!("✅ Default tier is now {}.{}", tier, warning))).await
+    reply(services, answer).await
 }
 
 async fn show_policy(
@@ -556,8 +595,10 @@ fn render_assignments(
     render_rows(assignments.iter(), assignments.len(), mention)
 }
 
-/// The moderator's slice of a section: rows at or below `Moderator` render;
-/// higher ranks collapse into a count (admin-level detail stays hidden).
+/// The moderator's slice of a section: rows at or below `Moderator` render
+/// (bans included - a moderator must see who they banned); rows above it -
+/// admin tier after sanitization - collapse into a count, so probing the
+/// limited view cannot enumerate hidden assignments.
 fn render_limited_assignments(
     assignments: &BTreeMap<String, AccessTier>,
     mention: fn(&str) -> String,
@@ -565,13 +606,15 @@ fn render_limited_assignments(
     let visible: Vec<(&String, &AccessTier)> =
         assignments.iter().filter(|(_, tier)| **tier <= AccessTier::Moderator).collect();
     let hidden = assignments.len() - visible.len();
-    let mut rendered = render_rows(visible.into_iter(), assignments.len(), mention);
+    if visible.is_empty() {
+        return if hidden > 0 { format!(" none ({hidden} hidden)") } else { " none".to_owned() };
+    }
+    // The cap counts visible rows only: hidden rows are accounted by the
+    // trailing line, never by the "and N more" remainder.
+    let visible_len = visible.len();
+    let mut rendered = render_rows(visible.into_iter(), visible_len, mention);
     if hidden > 0 {
-        if rendered == " none" {
-            rendered = format!(" none ({hidden} higher ranks hidden)");
-        } else {
-            rendered.push_str(&format!("\n…and {hidden} higher ranks hidden"));
-        }
+        rendered.push_str(&format!("\n…and {hidden} hidden (admin tier)"));
     }
     rendered
 }
@@ -625,10 +668,6 @@ fn usage() -> OutboundMessage {
 }
 
 /// Every `/auth` answer is ephemeral - visible to the invoking admin only.
-fn text(content: impl Into<String>) -> OutboundMessage {
-    OutboundMessage::text(content).ephemeral()
-}
-
 async fn reply(services: &KernelServices, message: OutboundMessage) -> anyhow::Result<()> {
     services.chat_output.send(message).await?;
     Ok(())
@@ -1461,7 +1500,7 @@ mod tests {
         assert!(message.contains("Default tier: Guest"));
         assert!(message.contains("<@3>: Moderator"));
         assert!(message.contains("<@42>: Guest"));
-        assert!(message.contains("1 higher ranks hidden"), "admin row hidden: {message}");
+        assert!(message.contains("\n…and 1 hidden (admin tier)"), "admin row hidden: {message}");
         assert!(!message.contains("<@43>"), "no admin row: {message}");
         assert!(message.contains("(hidden - ask an Admin or above)"), "roles hidden: {message}");
         assert!(!message.contains("<@&7>"), "no role rows: {message}");
@@ -1492,6 +1531,76 @@ mod tests {
         let message = output.messages().into_iter().next().expect("reply expected");
         assert!(message.contains("Default tier: (hidden"));
         assert!(!message.contains("Default tier: Admin"));
+    }
+
+    /// The limited view's cap counts visible rows only: the "and N more"
+    /// remainder never absorbs the hidden rows - they get their own count.
+    #[tokio::test]
+    async fn limited_show_caps_visible_rows_without_double_counting() {
+        let (storage, services, output) = fixture();
+        let mut users = serde_json::Map::new();
+        // 25 moderator rows (visible) + 3 admin rows (hidden).
+        for id in 1..=25 {
+            users.insert(format!("u{id:02}"), serde_json::json!("moderator"));
+        }
+        for id in ["a1", "a2", "a3"] {
+            users.insert(id.to_owned(), serde_json::json!("admin"));
+        }
+        storage.seed(
+            "test",
+            GuildId(1),
+            NAMESPACE,
+            CONFIG_KEY,
+            serde_json::json!({ "default_tier": "user", "users": users, "roles": {} }),
+        );
+
+        AuthCommandHandler::default()
+            .invoke(
+                &command_event_with_permissions(9, 0),
+                &auth_args("show", None, None, None),
+                &services,
+            )
+            .await
+            .expect("show expected to succeed");
+
+        let message = output.messages().into_iter().next().expect("reply expected");
+        assert!(message.contains("\n…and 5 more"), "visible remainder: {message}");
+        assert!(message.contains("\n…and 3 hidden (admin tier)"), "hidden count: {message}");
+        assert!(!message.contains("and 8 more"), "no double counting: {message}");
+    }
+
+    /// A section whose every row is hidden renders the count behind a
+    /// `none` anchor - and never leaks a row. (The roles section is always
+    /// fully hidden for non-admins, so this shape arrives via the users
+    /// section: an invoker with no visible row.)
+    #[tokio::test]
+    async fn limited_show_all_hidden_section_renders_none() {
+        let (storage, services, output) = fixture();
+        storage.seed(
+            "test",
+            GuildId(1),
+            NAMESPACE,
+            CONFIG_KEY,
+            serde_json::json!({
+                "default_tier": "guest",
+                "users": { "43": "admin", "44": "admin" },
+                "roles": {}
+            }),
+        );
+
+        AuthCommandHandler::default()
+            .invoke(
+                &command_event_with_permissions(9, 0),
+                &auth_args("show", None, None, None),
+                &services,
+            )
+            .await
+            .expect("show expected to succeed");
+
+        let message = output.messages().into_iter().next().expect("reply expected");
+        assert!(message.contains(" none (2 hidden)"), "users section: {message}");
+        assert!(!message.contains("<@43>"), "no admin row: {message}");
+        assert!(!message.contains("<@44>"), "no admin row: {message}");
     }
 
     /// A moderator manages members below their own rank only - both bounds
@@ -1544,8 +1653,7 @@ mod tests {
             .await
             .expect("invoke expected to succeed");
         assert!(output.messages().into_iter().last().is_some_and(|message| {
-            message
-                .contains("<@43> currently ranks as Moderator - only an Admin or above can change their tier.")
+            message.contains("<@43> can only be changed by an Admin or above.")
         }));
 
         // Clear hits the same bound.
@@ -1558,7 +1666,7 @@ mod tests {
             .await
             .expect("invoke expected to succeed");
         assert!(output.messages().into_iter().last().is_some_and(|message| {
-            message.contains("only an Admin or above can change their tier")
+            message.contains("can only be changed by an Admin or above")
         }));
     }
 
@@ -1681,6 +1789,212 @@ mod tests {
             Some(&serde_json::json!({ "42": "admin" })),
             "no write landed"
         );
+    }
+
+    /// The whole-guild levers obey the same bound: an admin cannot mint
+    /// Admin-rank through a role grant or the default tier, nor clear an
+    /// existing admin-tier role grant - appointing admins is exactly what
+    /// the rank above them is for.
+    #[tokio::test]
+    async fn admin_cannot_mint_admin_via_roles_or_default() {
+        let (storage, services, output) = fixture();
+        storage.seed(
+            "test",
+            GuildId(1),
+            NAMESPACE,
+            CONFIG_KEY,
+            serde_json::json!({
+                "default_tier": "user",
+                "users": {},
+                "roles": { "7": "admin" }
+            }),
+        );
+        // 0x8 alone: the bare administrator clamp resolves to Admin.
+        let invoker = command_event_with_permissions(3, 0x8);
+
+        AuthCommandHandler::default()
+            .invoke(&invoker, &auth_args("set", Some("admin"), None, Some("9")), &services)
+            .await
+            .expect("invoke expected to succeed");
+        assert!(output.messages().into_iter().last().is_some_and(|message| {
+            message.contains("Only a Guild Admin or above can manage the Admin tier on roles.")
+        }));
+
+        // Clearing the existing admin-tier grant demotes its holders -
+        // the same bound, now via the grant's tier.
+        AuthCommandHandler::default()
+            .invoke(&invoker, &auth_args("clear", None, None, Some("7")), &services)
+            .await
+            .expect("invoke expected to succeed");
+        assert!(output.messages().into_iter().last().is_some_and(|message| {
+            message.contains("Only a Guild Admin or above can manage the Admin tier on roles.")
+        }));
+
+        AuthCommandHandler::default()
+            .invoke(&invoker, &auth_args("default", Some("admin"), None, None), &services)
+            .await
+            .expect("invoke expected to succeed");
+        assert!(output.messages().into_iter().last().is_some_and(|message| {
+            message.contains("Only a Guild Admin or above can set the default tier to Admin.")
+        }));
+
+        assert_eq!(
+            stored_policy(&storage).await.as_ref().and_then(|policy| policy.get("roles")),
+            Some(&serde_json::json!({ "7": "admin" })),
+            "no role write landed"
+        );
+        assert_eq!(
+            stored_policy(&storage).await.as_ref().and_then(|policy| policy.get("default_tier")),
+            Some(&serde_json::json!("user")),
+            "no default write landed"
+        );
+    }
+
+    /// The bound is not over-tight: below their own rank an admin still
+    /// manages roles and the default tier freely.
+    #[tokio::test]
+    async fn admin_still_manages_lower_tier_roles_and_default() {
+        let (storage, services, output) = fixture();
+        storage.seed(
+            "test",
+            GuildId(1),
+            NAMESPACE,
+            CONFIG_KEY,
+            serde_json::json!({ "default_tier": "moderator", "users": {}, "roles": {} }),
+        );
+        let invoker = command_event_with_permissions(3, 0x8);
+
+        AuthCommandHandler::default()
+            .invoke(&invoker, &auth_args("set", Some("moderator"), None, Some("7")), &services)
+            .await
+            .expect("set expected to succeed");
+        assert!(output.messages().into_iter().any(|message| message.contains("now grants")));
+
+        AuthCommandHandler::default()
+            .invoke(&invoker, &auth_args("default", Some("user"), None, None), &services)
+            .await
+            .expect("default expected to succeed");
+        assert!(
+            output
+                .messages()
+                .into_iter()
+                .any(|message| message.contains("Default tier is now User"))
+        );
+
+        assert_eq!(
+            stored_policy(&storage).await.as_ref().and_then(|policy| policy.get("roles")),
+            Some(&serde_json::json!({ "7": "moderator" }))
+        );
+    }
+
+    /// The Manage Server clamp lifts a stored rank past the written-tier
+    /// bound: a stored moderator carrying 0x20 resolves to Guild Admin and
+    /// may write the moderator tier - impossible without the clamp.
+    #[tokio::test]
+    async fn manage_guild_lifts_a_stored_moderator_past_the_written_bound() {
+        let (storage, services, output) = fixture();
+        storage.seed(
+            "test",
+            GuildId(1),
+            NAMESPACE,
+            CONFIG_KEY,
+            serde_json::json!({ "default_tier": "user", "users": { "3": "moderator" }, "roles": {} }),
+        );
+
+        AuthCommandHandler::default()
+            .invoke(
+                &command_event_with_permissions(3, 0x20),
+                &auth_args("set", Some("moderator"), Some("42"), None),
+                &services,
+            )
+            .await
+            .expect("invoke expected to succeed");
+
+        assert!(output.messages().into_iter().any(|message| message.contains("is now Moderator")));
+        assert_eq!(
+            stored_policy(&storage).await.as_ref().and_then(|policy| policy.get("users")),
+            Some(&serde_json::json!({ "3": "moderator", "42": "moderator" }))
+        );
+    }
+
+    /// The config-managed owner guard fires even for an owner invoker:
+    /// no rank retargets an owner through the bot.
+    #[tokio::test]
+    async fn owner_invoker_cannot_retarget_an_owner() {
+        let (storage, services, output) = fixture();
+        let handler = handler_with_owners(&["3", "7"]);
+
+        handler
+            .invoke(
+                &command_event_with_permissions(3, 0x20),
+                &auth_args("set", Some("guest"), Some("7"), None),
+                &services,
+            )
+            .await
+            .expect("invoke expected to succeed");
+
+        assert!(output.messages().into_iter().last().is_some_and(|message| {
+            message.contains("Bot owners are managed in the bot's configuration")
+        }));
+        assert_eq!(
+            stored_policy(&storage).await.as_ref().and_then(|policy| policy.get("users")),
+            None,
+            "no write landed"
+        );
+    }
+
+    /// `guild_admin` is derived, never assignable: submitting it directly
+    /// is rejected like any unknown tier.
+    #[tokio::test]
+    async fn set_with_guild_admin_tier_is_rejected() {
+        let (_storage, services, output) = fixture();
+
+        AuthCommandHandler::default()
+            .invoke(
+                &command_event(),
+                &auth_args("set", Some("guild_admin"), Some("42"), None),
+                &services,
+            )
+            .await
+            .expect("invoke expected to succeed");
+
+        assert!(
+            output
+                .messages()
+                .into_iter()
+                .next()
+                .is_some_and(|message| message.contains("Unknown tier `guild_admin`"))
+        );
+    }
+
+    /// A banned assignment carries the unconditional clamp caveat - the
+    /// one user-facing claim that the assignment may not fully hold.
+    #[tokio::test]
+    async fn set_banned_assignment_carries_the_clamp_caveat() {
+        let (storage, services, output) = fixture();
+        storage.seed(
+            "test",
+            GuildId(1),
+            NAMESPACE,
+            CONFIG_KEY,
+            serde_json::json!({ "default_tier": "user", "users": { "3": "moderator" }, "roles": {} }),
+        );
+
+        AuthCommandHandler::default()
+            .invoke(
+                &command_event_with_permissions(3, 0),
+                &auth_args("set", Some("banned"), Some("42"), None),
+                &services,
+            )
+            .await
+            .expect("invoke expected to succeed");
+
+        let message = output.messages().into_iter().last().expect("reply expected");
+        assert!(message.contains("is now Banned"));
+        assert!(message.contains(
+            "Members with Manage Server or Discord's Administrator permission always rank above \
+             this assignment"
+        ));
     }
 
     /// The step above admin: a Manage Server invoker appoints and removes
