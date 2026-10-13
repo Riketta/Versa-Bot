@@ -128,10 +128,12 @@ pub fn records_namespace(channel_id: u64) -> String {
 pub enum CaptureMode {
     /// Only messages related to the bot: mentions, replies into the captured
     /// conversation, and the bot's own turns. The rest of the channel stays
-    /// untracked - the privacy-friendly default for multi-purpose channels.
-    #[default]
+    /// untracked - the privacy-friendly choice for multi-purpose channels.
     BotRelated,
-    /// Every non-bot message in the channel enters the history.
+    /// Every non-bot message in the channel enters the history. The default:
+    /// chime-ins have material everywhere, at the cost of tracking the whole
+    /// channel.
+    #[default]
     AllMessages,
 }
 
@@ -170,6 +172,7 @@ impl EmojiInject {
 /// Sampling/behavior parameters sent with completion requests. Absent fields
 /// are simply not sent to the provider, so strict endpoints reject nothing.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GenParams {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
@@ -184,6 +187,9 @@ pub struct GenParams {
     /// supports one; `None` sends no reasoning parameter at all - the
     /// provider default applies (Z.ai GLM defaults to `max` effort). Sent
     /// only when the requested model declares reasoning support.
+    /// Channel default: `min` (see [`default_reasoning_effort`]) - the bare
+    /// [`Default`] stays all-unset for knob-free requests like compaction.
+    #[serde(default = "default_reasoning_effort")]
     pub reasoning_effort: Option<String>,
 }
 
@@ -196,7 +202,7 @@ pub struct ChannelConfig {
     /// operator-declared model registry at request time - guild admins pick
     /// among operator-configured models, never configure endpoints.
     pub model: String,
-    #[serde(default)]
+    #[serde(default = "default_gen_params")]
     pub params: GenParams,
     /// Channel system prompt; `None` = plugin-wide default.
     #[serde(default)]
@@ -222,7 +228,7 @@ pub struct ChannelConfig {
     #[serde(default)]
     pub streaming: bool,
     /// Chance the bot chimes in on an unrelated user message, percent
-    /// (`0` = off).
+    /// (`0` = off, the default - the bot answers when addressed).
     #[serde(default = "default_random_reply_chance")]
     pub random_reply_chance_percent: f64,
     /// Minimum seconds between random chime-ins in this channel; `0` =
@@ -251,9 +257,11 @@ pub struct ChannelConfig {
     /// Image recognition for this channel's captured messages:
     /// attachments are described by the image model at capture time and
     /// the descriptions are baked into the records. Requires the operator
-    /// to have configured `[llm] image_model`. Off by default - image-
-    /// flooded channels are the reason this is a per-channel choice.
-    #[serde(default)]
+    /// to have configured `[llm] image_model` - without one, images still
+    /// capture as undescribed placeholders, so the default never breaks
+    /// capture. On by default; an image-flooded channel can turn it off to
+    /// skip recognition calls entirely.
+    #[serde(default = "default_true")]
     pub images: bool,
     /// Recognition model override; `None` = plugin-wide `image_model`.
     #[serde(default)]
@@ -271,9 +279,10 @@ pub struct ChannelConfig {
     pub image_max_side: u32,
     /// Emoji-reaction tool for this channel: the model may decorate the
     /// message it replies to by emitting a `[[react: ...]]` marker, which is
-    /// stripped before delivery (see `tools`). Off by default - the marker
-    /// instruction joins the system prompt only where the feature is on.
-    #[serde(default)]
+    /// stripped before delivery (see `tools`). On by default - the marker
+    /// instruction joins the system prompt only where the feature is on,
+    /// and turning it off drops that prompt appendix.
+    #[serde(default = "default_true")]
     pub react: bool,
     /// Server custom emojis offered to the model inside the react tool's
     /// prompt appendix (exact wire forms; `whitelist` filters by the
@@ -332,7 +341,7 @@ impl ChannelConfig {
     pub fn assigned(model: String) -> Self {
         Self {
             model,
-            params: GenParams::default(),
+            params: default_gen_params(),
             system_prompt: None,
             compaction_enabled: true,
             compaction_model: None,
@@ -345,11 +354,11 @@ impl ChannelConfig {
             split_length: None,
             turn_template: None,
             context_tokens: None,
-            images: false,
+            images: true,
             image_model: None,
             image_prompt: None,
             image_max_side: default_image_max_side(),
-            react: false,
+            react: true,
             react_emoji_inject: EmojiInject::default(),
             react_own_emojis: true,
             random_react_chance_percent: default_random_react_chance(),
@@ -418,12 +427,31 @@ pub(crate) fn default_image_max_side() -> u32 {
     512
 }
 
-fn default_random_reply_chance() -> f64 {
-    2.0
+/// Channel default of `GenParams::reasoning_effort` (`min`: the lightest
+/// reasoning tier). A free string that only matters for models declaring
+/// reasoning support - other providers see it only if the operator declares
+/// such a model, so an unknown tier fails at request time, not boot.
+fn default_reasoning_effort() -> Option<String> {
+    Some("min".to_owned())
 }
 
-/// Plugin default of the per-channel silent-react chime chance - higher than
-/// the reply chime: an emoji is a much lighter interruption than a message.
+/// Channel default of the whole `params` block: sampling knobs unset,
+/// reasoning effort at the bot default. Used by fresh assignments and when
+/// a stored config doc carries no `params` object at all - distinct from
+/// the bare [`GenParams::default`], which stays all-unset for knob-free
+/// requests like compaction.
+fn default_gen_params() -> GenParams {
+    GenParams { reasoning_effort: default_reasoning_effort(), ..GenParams::default() }
+}
+
+/// Random reply chime-ins are opt-in: the bot answers when addressed.
+fn default_random_reply_chance() -> f64 {
+    0.0
+}
+
+/// Plugin default of the per-channel silent-react chime chance - an emoji
+/// is a much lighter interruption than a message, so this may stay on even
+/// where the reply chime is off (which is the default).
 fn default_random_react_chance() -> f64 {
     10.0
 }
@@ -504,13 +532,14 @@ mod tests {
         assert_eq!(config, back);
         assert_eq!(config.context_messages, 100);
         assert!(config.compaction_enabled);
-        assert!((config.random_reply_chance_percent - 2.0).abs() < f64::EPSILON);
+        assert_eq!(config.params.reasoning_effort.as_deref(), Some("min"));
+        assert!((config.random_reply_chance_percent - 0.0).abs() < f64::EPSILON);
         assert_eq!(config.random_cooldown_secs, 5);
-        assert_eq!(config.capture, CaptureMode::BotRelated);
+        assert_eq!(config.capture, CaptureMode::AllMessages);
         assert_eq!(config.context_tokens, None);
-        assert!(!config.images);
+        assert!(config.images);
         assert_eq!(config.image_model, None);
-        assert!(!config.react);
+        assert!(config.react);
         assert_eq!(config.react_emoji_inject, EmojiInject::Whitelist);
         assert!(config.react_own_emojis);
         assert!((config.random_react_chance_percent - 10.0).abs() < f64::EPSILON);
@@ -523,15 +552,18 @@ mod tests {
         }))
         .expect("minimal config expected to deserialize");
         assert_eq!(config.model, "zai/glm-5.3-flash");
-        assert_eq!(config.params, GenParams::default());
+        assert_eq!(config.params, default_gen_params());
         assert_eq!(config.context_messages, 100);
         assert!(config.compaction_enabled);
         assert!(!config.streaming);
-        assert!((config.random_reply_chance_percent - 2.0).abs() < f64::EPSILON);
+        assert!((config.random_reply_chance_percent - 0.0).abs() < f64::EPSILON);
         assert_eq!(config.random_cooldown_secs, 5);
         assert_eq!(config.split_length, None);
-        // Stored before the feature existed: serde defaults keep it loadable.
-        assert!(!config.react);
+        // Stored before the feature defaulted on: serde defaults keep it
+        // loadable, and without an image model the records degrade to
+        // undescribed placeholders instead of breaking capture.
+        assert!(config.images);
+        assert!(config.react);
         // Stored before whitelist became the default: the empty-whitelist
         // no-op makes that migration behavior-free.
         assert_eq!(config.react_emoji_inject, EmojiInject::Whitelist);

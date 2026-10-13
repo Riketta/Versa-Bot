@@ -1040,7 +1040,7 @@ mod tests {
             .expect("set expected to succeed");
 
         let mut source = ChannelConfig::assigned("local/gemma".to_owned());
-        source.capture = crate::plugins::llm::model::CaptureMode::AllMessages;
+        source.capture = crate::plugins::llm::model::CaptureMode::BotRelated;
         source.params.temperature = Some(0.5);
         source.system_prompt = Some("be brief".to_owned());
         f.storage
@@ -1076,7 +1076,7 @@ mod tests {
             .expect("target config expected");
         let updated = ChannelConfig::from_stored(stored, 100).expect("config expected to parse");
         assert_eq!(updated.model, "local/gemma", "the assignment travels");
-        assert_eq!(updated.capture, crate::plugins::llm::model::CaptureMode::AllMessages);
+        assert_eq!(updated.capture, crate::plugins::llm::model::CaptureMode::BotRelated);
         assert_eq!(updated.params.temperature, Some(0.5));
         assert_eq!(updated.system_prompt.as_deref(), Some("be brief"));
         assert_eq!(updated.split_length, Some(500), "non-delta settings keep the target's values");
@@ -1630,7 +1630,7 @@ mod tests {
             .expect("get expected to succeed");
         let reply = fixture.output.messages().last().expect("reply expected").clone();
         assert!(reply.contains("Channel settings:"), "unexpected: {reply}");
-        assert!(reply.contains("`react`: off"), "unexpected: {reply}");
+        assert!(reply.contains("`react`: on"), "unexpected: {reply}");
         assert!(reply.contains("`model`: local/gemma"), "unexpected: {reply}");
         assert!(reply.contains("plugin default"), "unexpected: {reply}");
     }
@@ -1922,7 +1922,7 @@ mod tests {
         assert!(reply.contains("* compaction_prompt = <set,"), "unexpected: {reply}");
         // ... the assignment baseline and untouched defaults do not.
         assert!(reply.contains("\nmodel = local/gemma"), "unexpected: {reply}");
-        assert!(reply.contains("\nreact = off"), "unexpected: {reply}");
+        assert!(reply.contains("\nreact = on"), "unexpected: {reply}");
         assert!(reply.contains("\nstreaming = off"), "unexpected: {reply}");
         assert!(reply.contains("image_prompt = <plugin default>"), "unexpected: {reply}");
         assert!(!reply.contains("* depth ="), "untouched default must not be marked");

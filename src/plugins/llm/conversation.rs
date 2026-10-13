@@ -513,11 +513,13 @@ mod tests {
     }
 
     /// Mechanics tests render turns through the flat `{sender}: {message}`
-    /// template, so their exact-string assertions stay about the mechanic
-    /// under test - not about the (tag-styled) default template.
+    /// template and keep the react tool block out, so their exact-string
+    /// assertions stay about the mechanic under test - not about the
+    /// (tag-styled) default template or the on-by-default react appendix.
     fn flat_turn_config() -> ChannelConfig {
         ChannelConfig {
             turn_template: Some("{sender}: {message}".to_owned()),
+            react: false,
             ..ChannelConfig::assigned("m".to_owned())
         }
     }
@@ -720,10 +722,8 @@ mod tests {
 
     #[test]
     fn summary_replaces_the_placeholder_and_prompt_overrides_apply() {
-        let config = ChannelConfig {
-            system_prompt: Some("custom prompt".to_owned()),
-            ..ChannelConfig::assigned("m".to_owned())
-        };
+        let config =
+            ChannelConfig { system_prompt: Some("custom prompt".to_owned()), ..flat_turn_config() };
         let settings = LlmSettings::default();
         let state = ConversationState {
             summary: Some("the gist".to_owned()),
@@ -1013,7 +1013,7 @@ mod tests {
     }
 
     fn no_compaction_config() -> ChannelConfig {
-        let mut config = ChannelConfig::assigned("p/m".to_owned());
+        let mut config = flat_turn_config();
         config.compaction_enabled = false;
         config.context_messages = 100;
         config
@@ -1242,6 +1242,9 @@ mod tests {
         ];
         let config = ChannelConfig {
             context_messages: 10,
+            // The react appendix would inflate the fixed slots and break the
+            // byte math in the comment above.
+            react: false,
             ..ChannelConfig::assigned("local/gemma".to_owned())
         };
 

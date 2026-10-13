@@ -184,11 +184,8 @@ the target channel.
 
 /llm_models                                  # what this deployment offers
 /llm_assign model:local/gemma                # in #bot-chat: bind the assistant here
-/llm_set reasoning_effort min                # lightest reasoning
-/llm_set capture all_messages                # track everything - also what enables random chime-ins
-/llm_set images on                           # describe attached images (needs operator [llm] image_model)
-/llm_set react on                            # the model may react to the message it answers
-/llm_set streaming on                        # the answer live-edits while it generates
+# bot defaults: reasoning_effort=min, capture=all_messages, images/react on
+/llm_set streaming on                        # optional: the answer live-edits while it generates
 /llm_set_prompt kind:system prompt:...       # persona; long prompts ride as an attached file
 /llm_status                                  # verify the whole setup at a glance
 /llm_admin                                   # in #staff: LLM error notices land here
@@ -930,13 +927,14 @@ extra_body = { chat_template_kwargs = { enable_thinking = "${enable_reasoning}" 
 
 **How conversations work.**
 
-- **Capture** decides what enters the channel's history. `bot_related`
-  (default) tracks only bot-related messages: mentions and replies into
-  the captured conversation. `all_messages` tracks everything. The
-  bot's own answers are recorded at send time. Chime-ins only roll on
-  captured messages - in `bot_related` mode that is essentially never
-  captured non-triggering messages are rare), so random answers need
-  `capture = all_messages`.
+- **Capture** decides what enters the channel's history. `all_messages`
+  (default) tracks everything. `bot_related` tracks only bot-related
+  messages: mentions and replies into the captured conversation - the
+  privacy-friendly choice for multi-purpose channels. The bot's own
+  answers are recorded at send time. Chime-ins only roll on captured
+  messages - in `bot_related` mode non-triggering material is rarely
+  captured, so random answers need `capture = all_messages` (which is
+  the default).
 - **Trigger** decides when the bot answers: an explicit mention or a
   direct reply to one of the bot's own messages. Replies between users
   are captured but do not trigger (`chime_reply_chance` below is the
@@ -1097,23 +1095,23 @@ uploaded files for long texts.
 | Key | Values | Default | Meaning |
 |---|---|---|---|
 | `model` | declared model ref | set by `/llm_assign` | switch this channel's chat model; unknown refs are rejected with the declared list |
-| `reasoning_effort` | free string, or `off` | none - no parameter sent | reasoning hint, sent only when the model declares `reasoning = true`. Any other value is sent as-is to effort-style providers (Z.ai GLM: `low`/`high`/`max`) and enables thinking on switch-style ones. `off` renders an explicit disable on switch-style providers (GLM-4.5-5.2); effort-style endpoints have no off wire value, so their default applies - on Z.ai GLM that default is `max`, and GLM-5.3 thinks forcibly regardless, so throttle it with `low` |
+| `reasoning_effort` | free string, or `off` | `min` | reasoning hint, sent only when the model declares `reasoning = true`. Any other value is sent as-is to effort-style providers (Z.ai GLM: `min`/`low`/`high`/`max`) and enables thinking on switch-style ones. `off` renders an explicit disable on switch-style providers (GLM-4.5-5.2); effort-style endpoints have no off wire value, so their default applies - on Z.ai GLM that default is `max`, and GLM-5.3 thinks forcibly regardless, so throttle it with `min` (the default) or `low`. `clear` sends nothing at all |
 | `streaming` | on / off | off | stream the answer live from the provider (SSE): the message appears with the first tokens and is edited at `stream_interval_ms` |
 | `temperature` `top_p` `top_k` `min_p` `frequency_penalty` `presence_penalty` | finite number | not sent | sampling knobs, one per key - tune per-channel tone (an educational channel can run low temperature, an entertainment one high); cleared = not sent |
 | `max_tokens` | whole number | not sent | completion size cap |
-| `capture` | `bot_related` or `all_messages` | `bot_related` | what enters the channel's history: only messages mentioning or replying the bot, or everything (random chime-ins need `all_messages` to have material) |
+| `capture` | `bot_related` or `all_messages` | `all_messages` | what enters the channel's history: everything, or only messages mentioning or replying the bot (`bot_related` - chime-ins then have almost no material) |
 | `context_messages` | whole number >= 1 | 100 | live-window size in messages; reaching it triggers compaction |
 | `context_tokens` | whole number of tokens | auto | prompt-side token budget. Auto = the model's declared `context_window` minus the completion reserve and a margin, active once the endpoint has reported its first usage (before that, count-only filling by `context_messages`) |
 | `turn_template` | template containing `{sender}` and `{message}` | `[{sender}](<@{user_id}>): {message}` | how user turns render into the model context; fields: `{sender}`, `{user_id}`, `{guild_name}`, `{time}` (unix), `{message}` |
 | `compaction` | on / off | on | summarize-and-cutoff when the window outgrows `context_messages` |
 | `compaction_model` | declared model ref | plugin `[llm] compaction_model`, else the channel's chat model | which model writes the summaries |
-| `images` | on / off | off | describe attached images on captured messages via the recognition model; needs an operator `[llm] image_model` |
+| `images` | on / off | on | describe attached images on captured messages via the recognition model; needs an operator `[llm] image_model` - without one, images still capture as undescribed placeholders |
 | `image_model` | declared model ref | plugin `[llm] image_model` | recognition model override for this channel |
 | `image_max_side` | whole number >= 1, clamped to `[llm] image_max_side_cap` | 512 | max side (aspect kept) recognition images are rescaled to; smaller images pass through untouched |
-| `react` | on / off | off | emoji-reaction tool: the model may decorate the message it replies to by emitting a `[[react: ...]]` marker, stripped before the answer is shown |
+| `react` | on / off | on | emoji-reaction tool: the model may decorate the message it replies to by emitting a `[[react: ...]]` marker, stripped before the answer is shown |
 | `react_emoji_inject` | none / all / whitelist | whitelist | list the server's custom emojis as exact forms inside the react tool's prompt (`whitelist` filters by `/llm_emoji_whitelist`, channel list over the guild baseline); an empty whitelist injects no server emojis - filling it is the opt-in; needs `react` on to reach the model; changes invalidate provider prompt caches |
 | `react_own_emojis` | on / off | on | the bot's own application emojis (developer-portal uploads) join the react tool's emoji list alongside the server set - usable everywhere the bot can react, no whitelist or inject mode involved; needs `react` on to reach the model |
-| `chime_reply_chance` | 0-100 (clamped) | 2 | percent chance to chime in on a captured non-trigger message; 0 = off |
+| `chime_reply_chance` | 0-100 (clamped) | 0 (off) | percent chance to chime in on a captured non-trigger message; the bot answers when addressed unless you raise this |
 | `chime_react_chance` | 0-100 (clamped) | 10 | percent chance for a silent react (emoji only, no reply) on a captured non-trigger message; independent of `chime_reply_chance`; needs `react` on |
 | `chime_cooldown` | whole seconds | 5 | minimum seconds between chime-ins - the reply and silent-react rolls each keep their own tracker behind it; 0 = none |
 | `split_length` | `min_split_length` (default 100) up to the platform's message limit | `max_message_length` | per-channel reply-splitting limit; smaller chunks would flood the channel |

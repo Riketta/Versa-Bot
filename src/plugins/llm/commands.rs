@@ -3131,7 +3131,7 @@ mod tests {
         assert_eq!(keys, ["model"], "a pristine source's only cargo is its model");
 
         let mut source = ChannelConfig::assigned("local/gemma".to_owned());
-        source.capture = CaptureMode::AllMessages;
+        source.capture = CaptureMode::BotRelated;
         source.compaction_enabled = false;
         source.params.temperature = Some(0.5);
         source.random_reply_chance_percent = 7.0;
@@ -3146,7 +3146,7 @@ mod tests {
         target.params.top_k = Some(40.0);
         let updated = apply_delta(&target, &delta, 100).expect("overlay expected to parse");
         assert_eq!(updated.model, "local/gemma", "the assignment travels");
-        assert_eq!(updated.capture, CaptureMode::AllMessages);
+        assert_eq!(updated.capture, CaptureMode::BotRelated);
         assert!(!updated.compaction_enabled);
         assert_eq!(updated.params.temperature, Some(0.5));
         assert_eq!(updated.params.top_k, Some(40.0), "the target's own knob survives");
@@ -3428,29 +3428,26 @@ mod tests {
             current_value(&config, "temperature", &settings).as_deref(),
             Some("not sent (provider default)")
         );
-        assert_eq!(
-            current_value(&config, "reasoning_effort", &settings).as_deref(),
-            Some("not sent (provider default)")
-        );
+        assert_eq!(current_value(&config, "reasoning_effort", &settings).as_deref(), Some("`min`"));
         assert_eq!(
             current_value(&config, "context_messages", &settings).as_deref(),
             Some("100 messages")
         );
         assert_eq!(current_value(&config, "context_tokens", &settings).as_deref(), Some("auto"));
         assert_eq!(current_value(&config, "streaming", &settings).as_deref(), Some("off"));
-        assert_eq!(current_value(&config, "capture", &settings).as_deref(), Some("bot_related"));
+        assert_eq!(current_value(&config, "capture", &settings).as_deref(), Some("all_messages"));
         assert_eq!(current_value(&config, "compaction", &settings).as_deref(), Some("on"));
         assert!(
             current_value(&config, "compaction_model", &settings)
                 .expect("compaction_model expected")
                 .contains("chat model")
         );
-        assert_eq!(current_value(&config, "images", &settings).as_deref(), Some("off"));
+        assert_eq!(current_value(&config, "images", &settings).as_deref(), Some("on"));
         assert_eq!(current_value(&config, "image_max_side", &settings).as_deref(), Some("512 px"));
-        assert_eq!(current_value(&config, "react", &settings).as_deref(), Some("off"));
+        assert_eq!(current_value(&config, "react", &settings).as_deref(), Some("on"));
         assert_eq!(
             current_value(&config, "chime_reply_chance", &settings).as_deref(),
-            Some("2.0%")
+            Some("0.0%")
         );
         assert_eq!(
             current_value(&config, "chime_react_chance", &settings).as_deref(),
@@ -3472,7 +3469,7 @@ mod tests {
         config.params.reasoning_effort = Some("off".to_owned());
         config.context_tokens = Some(4096);
         config.streaming = true;
-        config.react = true;
+        config.react = false;
         config.random_reply_chance_percent = 7.5;
         config.split_length = Some(500);
         assert_eq!(current_value(&config, "temperature", &settings).as_deref(), Some("0.7"));
@@ -3482,7 +3479,7 @@ mod tests {
             Some("4096 tokens")
         );
         assert_eq!(current_value(&config, "streaming", &settings).as_deref(), Some("on"));
-        assert_eq!(current_value(&config, "react", &settings).as_deref(), Some("on"));
+        assert_eq!(current_value(&config, "react", &settings).as_deref(), Some("off"));
         assert_eq!(
             current_value(&config, "chime_reply_chance", &settings).as_deref(),
             Some("7.5%")
@@ -3514,6 +3511,7 @@ mod tests {
     #[test]
     fn react_emoji_inject_grammar_and_react_hint() {
         let mut config = ChannelConfig::assigned("local/gemma".to_owned());
+        config.react = false; // the hint only fires while react is off
 
         assert_eq!(
             apply_set(&mut config, "react_emoji_inject", "all", None, CHUNK_FLOOR, IMAGE_CAP)
@@ -3557,13 +3555,15 @@ mod tests {
     #[test]
     fn react_label_covers_inject_modes() {
         let mut config = ChannelConfig::assigned("local/gemma".to_owned());
+        config.react = false;
         config.react_emoji_inject = EmojiInject::None;
         config.react_own_emojis = false;
         assert_eq!(react_label(&config, None), "off");
 
         // The storage default: whitelist with no list anywhere, own emojis
         // on - inert, but the status names every switch so admins can see it.
-        let defaulted = ChannelConfig::assigned("local/gemma".to_owned());
+        let defaulted =
+            ChannelConfig { react: false, ..ChannelConfig::assigned("local/gemma".to_owned()) };
         assert_eq!(defaulted.react_emoji_inject, EmojiInject::Whitelist);
         assert_eq!(
             react_label(&defaulted, None),

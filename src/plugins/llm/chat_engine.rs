@@ -2877,13 +2877,14 @@ mod tests {
     }
 
     fn assigned_config() -> ChannelConfig {
-        // Chime chance is zero unless a test opts in: the chime-path tests
+        // Chime chances are zero unless a test opts in: the chime-path tests
         // set an explicit percent next to their FixedRandom. Every other
-        // untriggered capture then skips the roll entirely - the default
-        // ctx() wires a real 2% coin (RandRandom), which made capture tests
-        // flake when the coin landed.
+        // untriggered capture then skips the rolls entirely - the default
+        // ctx() wires a real coin (RandRandom), which made capture tests
+        // flake when a coin landed (the react chime has its own die).
         ChannelConfig {
             random_reply_chance_percent: 0.0,
+            random_react_chance_percent: 0.0,
             ..ChannelConfig::assigned("local/gemma".to_owned())
         }
     }
@@ -3121,16 +3122,11 @@ mod tests {
     #[tokio::test]
     async fn unrelated_message_is_ignored_in_bot_related_mode() {
         let ctx = ctx(vec![]);
-        seed_config(&ctx.storage, &assigned_config());
+        let config = ChannelConfig { capture: CaptureMode::BotRelated, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
 
         ctx.engine
-            .handle_message(
-                &origin(),
-                &payload(false, None),
-                &assigned_config(),
-                &ctx.services,
-                None,
-            )
+            .handle_message(&origin(), &payload(false, None), &config, &ctx.services, None)
             .await;
 
         assert!(ctx.fake.requests().is_empty());
@@ -3173,7 +3169,7 @@ mod tests {
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
-        let config = assigned_config(); // bot_related (the default)
+        let config = ChannelConfig { capture: CaptureMode::BotRelated, ..assigned_config() };
         seed_config(&ctx.storage, &config);
 
         ctx.engine.handle_message(&origin(), &payload(false, None), &config, &services, None).await;
@@ -4433,16 +4429,11 @@ mod tests {
         // bot_related mode, no mention, no reply link: the message is not
         // even in the context - chiming in would look like answering nothing.
         let ctx = ctx_random(LlmSettings::default(), Arc::new(FixedRandom(true)), vec![]);
-        seed_config(&ctx.storage, &assigned_config());
+        let config = ChannelConfig { capture: CaptureMode::BotRelated, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
 
         ctx.engine
-            .handle_message(
-                &origin(),
-                &payload(false, None),
-                &assigned_config(),
-                &ctx.services,
-                None,
-            )
+            .handle_message(&origin(), &payload(false, None), &config, &ctx.services, None)
             .await;
 
         assert!(ctx.fake.requests().is_empty());
@@ -5218,8 +5209,8 @@ mod tests {
     /// but fires nothing.
     #[tokio::test]
     async fn react_disabled_strips_markers_but_never_fires() {
-        let ctx = ctx(vec![Ok("text [[react: 🤓]]".to_owned())]);
-        let config = assigned_config();
+        let ctx = ctx(vec![Ok("text [[react: \u{1f913}]]".to_owned())]);
+        let config = ChannelConfig { react: false, ..assigned_config() };
         seed_config(&ctx.storage, &config);
 
         ctx.engine
@@ -5373,16 +5364,13 @@ mod tests {
             cached_tokens: None,
             reasoning_tokens: None,
         }));
-        seed_config(&ctx.storage, &assigned_config());
+        // React appendix off: the ratio math below counts on the bare
+        // default prompt's character count.
+        let config = ChannelConfig { react: false, ..assigned_config() };
+        seed_config(&ctx.storage, &config);
 
         ctx.engine
-            .handle_message(
-                &origin(),
-                &payload(true, None),
-                &assigned_config(),
-                &ctx.services,
-                None,
-            )
+            .handle_message(&origin(), &payload(true, None), &config, &ctx.services, None)
             .await;
 
         let stats_raw = ctx
