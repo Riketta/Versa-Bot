@@ -554,256 +554,6 @@ ephemeral notice.
 |---|---|---|
 | `/set_guild_name name:<text>` | moderator | rename the bot in this server (max 32 characters); omitting `name` resets to the bot's real name |
 
-### LoL store tracker (`lol_store` plugin)
-
-Announces League of Legends store events - new sales, newly listed
-skins, Mythic Shop rotation changes, Your Shop starts - from the
-**locally running League client** to a per-guild assigned channel. The
-client's REST API is read-only here: your logged-in account is only the
-API key, and no account data (wallet, inventory, purchases) is ever
-read or announced. Because there is no purchase-history endpoint, every
-event is detected by diffing store snapshots - two changes inside one
-poll window merge into a single line. Listings print cheapest-first
-(priceless items last); sales keep their end-date grouping (soonest
-date first, price order within a date).
-
-Setup: point `[lol_store]` at the client's `lockfile` (the bot reads the
-per-start port and token from it, so client restarts self-heal), enable
-per guild with `/lol_store_enable`, and assign the announcement channel
-With `/lol_store_assign`. Announcements render as one embed per poll
-cycle - sales grouped under their end date with the percent off, skins,
-each Mythic rotation, Your Shop - and split across several embeds when
-one would overflow, so every deal prints; nothing is cut. The champion
-itself going on sale is not store news and is skipped. The first
-successful poll after a restart is a catch-up (announcing what changed
-while the bot was down) or, with no stored state, a silent baseline.
-Delivery is at-most-once: a guild whose send fails gets a log line, not
-a replay - the poll state still advances so nothing is announced twice.
-`/lol_store_dump` and
-`/lol_client_status` show the bot-global watcher state (there is one
-League client per bot), which may differ from what an individual guild
-received.
-
-**Persistence and history.** The watcher's state and the last raw store
-snapshot live in one plugin-global store document, written whenever
-anything changed - so a restart catches up on what it missed, and
-`/lol_store_dump` renders **all current deals** even before the first
-poll of a fresh boot (e.g. the client is still offline). Each dump also
-persists its snapshot as the baseline for the next one: entries the
-previous dump did not show (a new sale, a swapped Mythic rotation
-entry, a rotation that was not there) render bold under a
-`Bold = new since the previous dump` legend, so a fresh dump is
-distinguishable from the last one at a glance. On top of that,
-each observed UTC day's deal set is kept as a per-day digest (names and
-prices frozen at capture time - English names preferred - retention
-`history_days` counting today, `0` disables recording), and
-`/lol_store_history` answers "when was skin X or champion Y on sale / in
-the Mythic rotation" by folding those days into deal windows: windows
-merge across days the bot could not observe (client offline) and close
-on the first recorded day the deal was absent from. Your Shop is
-deliberately absent from history - its offers are the operator's
-personal shop, not shareable store state.
-
-| Command | Tier | Effect |
-|---|---|---|
-| `/lol_client_status` | moderator | watcher health: client link, last poll, tracked counts, announce flags (ephemeral) |
-| `/lol_store_enable` | admin | enable store tracking for this guild |
-| `/lol_store_disable` | admin | disable store tracking for this guild (the channel binding is kept) |
-| `/lol_store_assign` | moderator | post store events in this channel (run it in the target channel) |
-| `/lol_store_unassign` | moderator | stop posting store events in this guild |
-| `/lol_store_role` | moderator | tag this role on store announcements - the subscription role (run without the argument to clear) |
-| `/lol_store_dump` | moderator | force-post all current store deals (sales, Mythic rotations, Your Shop) in the current channel - the live state, not the last update; entries the previous dump did not show render bold (public, no role tag) |
-| `/lol_store_history` | user | show when a skin or champion was on sale / in the Mythic Shop rotation, grouped into deal windows over the retention window (ephemeral) |
-| `/lol_store_watch` | user | watch a skin or a champion for sales, Mythic Shop rotations, new releases (ephemeral) |
-| `/lol_store_unwatch` | user | remove one own watch by its list id, or every own watch with `all` (ephemeral) |
-| `/lol_store_watchlist` | user | list your own watches (private, ephemeral) |
-
-The `/lol_store_role` subscription pattern: create a mentionable role
-(e.g. `Store Pings`), let members join it, and bind it once - every
-announcement then tags the role, so only opted-in members are pinged.
-The tag rides the message content (embeds never notify on Discord); the
-role must be marked "allow anyone to mention", or the bot needs the
-mention-everyone permission.
-
-**Per-user watches.** Beyond the guild-wide role, any member can
-subscribe personally with `/lol_store_watch`: either a specific skin
-line (`target: skin`, e.g. *Blood Moon Evelynn*) or a champion's whole skin
-line (`target: champion`, e.g. *Evelynn* - future skins are caught by
-construction). The `kinds` argument selects what fires: `sale`,
-`mythic`, `release`, or `all` (default - all three categories). Matching runs on the same
-store deltas the announcements use, so catch-up after a restart covers
-watches too, and the per-guild announce flags (`announce_sales`, ...)
-never suppress personal watches. When something fires, the assigned
-announcement channel gets one embed with the matched items, and every
-watcher is tagged in the message content (never the announcement role).
-
-Watch notes:
-
-- Name resolution searches the last known store catalog, so subscribing
-  requires the League client to have been reachable; matching afterwards
-  is pure id/name comparison. An ambiguous name replies with a candidate
-  list - re-run it with the exact name. The live champion table lists
-  some champions twice (live + Classic variants share one display name);
-  a watch binds to the id the store catalog can actually reach, and when
-  several ids qualify the candidates carry their ids - re-run with the
-  id (pasting the candidate line works) to pick one. Same-named variant
-  skins are listed with their item ids the same way.
-- `/lol_store_watch` reports current activity in its confirmation
-  ("currently on sale", "currently in the mythic rotation"). Firing is
-  edge-based: a skin already on sale when you subscribe will not notify
-  until its next sale starts.
-- The `release` kind only ever fires for champion watches - a skin the
-  catalog can resolve is by definition already released.
-- Watchlists are private (`/lol_store_watchlist` shows only your own),
-  watches are guild-scoped, and a leaver's stale watch is inert (tags
-  just do not resolve). Caps: `watch_user_cap` per member,
-  `watch_guild_cap` per guild.
-
-Operator configuration lives in the optional `[lol_store]` section. An
-absent section, an empty `lockfile_path`, or a zero `poll_secs` keep the
-watcher off (**startup-only** - enabling or disabling needs a restart);
-when enabled at boot, the announce flags, watch caps, and `history_days`
-hot-reload, while `lockfile_path`, `address`, and `poll_secs` stay
-boot-frozen:
-
-| Key | Type | Default | Meaning |
-|---|---|---|---|
-| `lockfile_path` | string | *(empty)* | path to the client's `lockfile`; empty = watcher disabled |
-| `address` | string | `"127.0.0.1"` | host the client API listens on (the port always comes from the lockfile) |
-| `poll_secs` | integer | `300` | poll cadence in seconds; `0` disables |
-| `announce_sales` | bool | `true` | announce new sales (name, % off, RP price, end date) |
-| `announce_new_skins` | bool | `true` | announce newly listed skins (champion, skin, RP price) |
-| `announce_mythic_rotation` | bool | `true` | announce Mythic Shop rotation changes (skin, Mythic Essence price, rotation end) |
-| `announce_yourshop` | bool | `true` | announce Your Shop starts (start and end times) |
-| `watch_user_cap` | integer | `20` | maximum `/lol_store_watch` subscriptions per member per guild |
-| `watch_guild_cap` | integer | `300` | maximum `/lol_store_watch` subscriptions per guild |
-| `history_days` | integer | `90` | days of store history retained for `/lol_store_history` (today included); `0` disables recording (hot-reloadable) |
-
-Announced trackers that are toggled off still update the watcher's
-state, so re-enabling never replays old events. The watcher publishes
-`lol_store.announced` events on the plugin bus for other plugins.
-
-Maintainer notes - how to explore the League client's local API (the
-`/help` schema crawl, the vector-parameter encoding trap, a verified
-endpoint cheat sheet) - live in
-[`src/plugins/lol_store/README.md`](src/plugins/lol_store/README.md).
-
-Deployment note: the League client only listens on the machine's own
-loopback, so the watcher requires the bot to run **on the same Windows
-instance as the client** (natively, or in a container with host-level
-networking plus a read-only mount of the lockfile's *directory* - the
-file itself is rewritten on every client start).
-
-### LoL leaderboard (`lol_leaderboard` plugin)
-
-Dumps aggregated ranked-leaderboard statistics on demand: role
-distribution per region and pooled across regions (TOP 300 / TOP 1000
-rows), and the most picked champions per role - the kind of summary
-analytics sites publish, delivered where the question is asked. The
-data comes from a pluggable source behind the plugin's port (the built
-in adapter reads DeepLoL's public API - no auth, no League client
-needed); the data source is startup-only config, and there is **no
-per-guild setup**: the command answers wherever it is invoked.
-
-The bot parses at most `parse_depth` players per configured region,
-sequentially and rate-limited; the champion tables pool each region's
-highest-ranked `champ_pool_depth` players. Results are cached for
-`cache_ttl` - and the complete dump persists to the plugin's storage
-after every refresh cycle, so a restart keeps serving the last parsed
-data (the `data age` line tells you how old it is) instead of paying a
-full re-parse: a restart inside the TTL answers without touching the
-source at all, an older dump serves stale until a refresh cycle lands.
-Storage writes are best-effort - a failed write only means the next
-restart re-parses, never a failed command.
-
-**Background refresh (default on):** a scheduler job re-parses stale
-regions off the user path - first run at boot (the warm-up starts before
-the gateway even connects), then once per `cache_ttl` (a TTL hot reload
-reschedules the job). The command serves whatever is cached, however old
-(the dump's `data age` line is the honest label) and never *drives* a
-parse; only a region with no cached data at all (the boot race) parses
-inline, under a configurable wall-clock budget (`inline_refresh_budget_secs`,
-default 180 s): regions past the budget keep their cached data or are
-named as failed in the dump instead of parking the invoker. A command
-landing while the background job is mid-cycle shares that cycle
-(singleflight) instead of starting a second parse; a failed champion-names
-fetch is retried inline at most once per 30 s. With
-`background_refresh = false` the plugin falls back to on-demand mode:
-a stale cache re-parses before the reply (the typing indicator shows
-during the parse; a cold multi-region parse takes tens of seconds),
-under the same budget. Concurrent invocations share any in-flight
-refresh but each gets its own full dump. Mind the ceiling either way: a
-parse walks `parse_depth` / 100 source pages per region at the
-configured request pace - keep the worst case comfortably inside the
-platform's interaction window (about 15 minutes on Discord).
-
-The output
-leads with a coverage line (`Parsed 2941/3000 players from 3 regions ·
-data age 2h`), renders a bucket row only when the parses actually cover
-it, degrades holes (a player without role/champion data leaves that
-table but never breaks the answer), and splits across messages on line
-boundaries. A region whose *command-path* refresh failed is named in the
-dump and served from cache when possible; a region that failed in a
-background cycle is simply absent from the coverage (the age line stays
-honest) and recovers on the next successful cycle. Only a total failure
-replies with an error.
-
-| Command | Tier | Effect |
-|---|---|---|
-| `/lol_leaderboard` | user | post the leaderboard statistics in the current channel (public) |
-
-Operator configuration lives in the optional `[lol_leaderboard]`
-section (an absent section - or no regions served by the source - keeps
-the command in "not configured" mode; the background job is scheduled
-anyway, so regions hot-reloaded in later start warming immediately).
-`regions`, `parse_depth`, `cache_ttl_secs`, and the display knobs
-hot-reload (a TTL change reschedules the job); `proxy`,
-`request_interval_secs` (the source pacing), `background_refresh`, and
-`inline_refresh_budget_secs` are **startup-only** and need a restart. A
-section that degrades (absent or a zeroed knob) maps the live engine to
-the same "not configured" mode as at boot:
-
-| Key | Type | Default | Meaning |
-|---|---|---|---|
-| `regions` | string array | *(empty)* | regions to aggregate: `kr`, `euw`, `eun`, `na`, `jp`, `br`, `tr`, `tw`, `vn`, `sea`; empty = plugin off |
-| `request_interval_secs` | integer | `3` | minimum delay between source requests (sequential, rate-limit politeness); `0` disables the plugin |
-| `background_refresh` | boolean | `true` | scheduler job keeps the cache warm (ticks at `cache_ttl_secs`, first run at boot, scheduled even with no regions yet); the command serves cached data as-is and never drives a parse itself; `false` = on-demand mode where a stale cache re-parses before the reply |
-| `inline_refresh_budget_secs` | integer | `180` | wall-clock budget for a command-driven (inline) parse: regions past it keep cached data or are named as failed; `0` = unbounded; the background job is not budgeted |
-| `parse_depth` | integer | `1000` | top players parsed per region (clamped to what the source's board has); `0` disables; capped at 10 000 |
-| `display_buckets` | integer array | `[300, 1000]` | player-count rows for the role tables; values are clamped to `parse_depth`, sorted, deduplicated; empty = a single full-depth row |
-| `champ_pool_depth` | integer | `1000` | per-region player pool (highest ranked first) behind the champion tables; clamped to `parse_depth` |
-| `champs_per_role` | integer | `5` | champions listed per role |
-| `cache_ttl_secs` | integer | `64800` (18h) | how long cached data stays fresh; `0` disables |
-| `proxy` | string | *(none)* | optional proxy for source requests (`socks5://` or `http://`); the Discord proxy does not apply |
-
-Example output shape (abridged):
-
-````markdown
-# LoL Leaderboard Statistics
-
-Parsed 3000/3000 players from 3 regions · data age 2h 5m old
-
-## Role distribution in average
-
-**TOP 300:** Top: 18.67% | Jungle: 26.33% | Middle: 19.67% | Bot: 24.67% | Supporter: 10.67%
-
-## Role distribution in KR
-
-**TOP 300:** Top: 18.67% | Jungle: 26.33% | Middle: 19.67% | Bot: 24.67% | Supporter: 10.67%
-
-## Most picked champions per role
-
-**Top** - 540 players
-
-1. Ambessa - 14.8%
-2. Rumble - 14.4%
-````
-
-Maintainer notes - how to explore and re-verify the data source (the
-platform-id gotcha, the lane enum, pagination, the champion info
-endpoint) - live in
-[`src/plugins/lol_leaderboard/README.md`](src/plugins/lol_leaderboard/README.md).
-
 ### LLM chat bot (`llm` plugin)
 
 A per-channel chat assistant driven by OpenAI-compatible endpoints. The
@@ -1218,6 +968,256 @@ reasoning parameter made it onto the wire) and what the endpoint returned
 adapter). DEBUG stays on stdout and never ships to Sentry/GlitchTip, but
 the bodies carry full conversation content: operator diagnostic, off by
 default, flip it off when done.
+
+### LoL store tracker (`lol_store` plugin)
+
+Announces League of Legends store events - new sales, newly listed
+skins, Mythic Shop rotation changes, Your Shop starts - from the
+**locally running League client** to a per-guild assigned channel. The
+client's REST API is read-only here: your logged-in account is only the
+API key, and no account data (wallet, inventory, purchases) is ever
+read or announced. Because there is no purchase-history endpoint, every
+event is detected by diffing store snapshots - two changes inside one
+poll window merge into a single line. Listings print cheapest-first
+(priceless items last); sales keep their end-date grouping (soonest
+date first, price order within a date).
+
+Setup: point `[lol_store]` at the client's `lockfile` (the bot reads the
+per-start port and token from it, so client restarts self-heal), enable
+per guild with `/lol_store_enable`, and assign the announcement channel
+With `/lol_store_assign`. Announcements render as one embed per poll
+cycle - sales grouped under their end date with the percent off, skins,
+each Mythic rotation, Your Shop - and split across several embeds when
+one would overflow, so every deal prints; nothing is cut. The champion
+itself going on sale is not store news and is skipped. The first
+successful poll after a restart is a catch-up (announcing what changed
+while the bot was down) or, with no stored state, a silent baseline.
+Delivery is at-most-once: a guild whose send fails gets a log line, not
+a replay - the poll state still advances so nothing is announced twice.
+`/lol_store_dump` and
+`/lol_client_status` show the bot-global watcher state (there is one
+League client per bot), which may differ from what an individual guild
+received.
+
+**Persistence and history.** The watcher's state and the last raw store
+snapshot live in one plugin-global store document, written whenever
+anything changed - so a restart catches up on what it missed, and
+`/lol_store_dump` renders **all current deals** even before the first
+poll of a fresh boot (e.g. the client is still offline). Each dump also
+persists its snapshot as the baseline for the next one: entries the
+previous dump did not show (a new sale, a swapped Mythic rotation
+entry, a rotation that was not there) render bold under a
+`Bold = new since the previous dump` legend, so a fresh dump is
+distinguishable from the last one at a glance. On top of that,
+each observed UTC day's deal set is kept as a per-day digest (names and
+prices frozen at capture time - English names preferred - retention
+`history_days` counting today, `0` disables recording), and
+`/lol_store_history` answers "when was skin X or champion Y on sale / in
+the Mythic rotation" by folding those days into deal windows: windows
+merge across days the bot could not observe (client offline) and close
+on the first recorded day the deal was absent from. Your Shop is
+deliberately absent from history - its offers are the operator's
+personal shop, not shareable store state.
+
+| Command | Tier | Effect |
+|---|---|---|
+| `/lol_client_status` | moderator | watcher health: client link, last poll, tracked counts, announce flags (ephemeral) |
+| `/lol_store_enable` | admin | enable store tracking for this guild |
+| `/lol_store_disable` | admin | disable store tracking for this guild (the channel binding is kept) |
+| `/lol_store_assign` | moderator | post store events in this channel (run it in the target channel) |
+| `/lol_store_unassign` | moderator | stop posting store events in this guild |
+| `/lol_store_role` | moderator | tag this role on store announcements - the subscription role (run without the argument to clear) |
+| `/lol_store_dump` | moderator | force-post all current store deals (sales, Mythic rotations, Your Shop) in the current channel - the live state, not the last update; entries the previous dump did not show render bold (public, no role tag) |
+| `/lol_store_history` | user | show when a skin or champion was on sale / in the Mythic Shop rotation, grouped into deal windows over the retention window (ephemeral) |
+| `/lol_store_watch` | user | watch a skin or a champion for sales, Mythic Shop rotations, new releases (ephemeral) |
+| `/lol_store_unwatch` | user | remove one own watch by its list id, or every own watch with `all` (ephemeral) |
+| `/lol_store_watchlist` | user | list your own watches (private, ephemeral) |
+
+The `/lol_store_role` subscription pattern: create a mentionable role
+(e.g. `Store Pings`), let members join it, and bind it once - every
+announcement then tags the role, so only opted-in members are pinged.
+The tag rides the message content (embeds never notify on Discord); the
+role must be marked "allow anyone to mention", or the bot needs the
+mention-everyone permission.
+
+**Per-user watches.** Beyond the guild-wide role, any member can
+subscribe personally with `/lol_store_watch`: either a specific skin
+line (`target: skin`, e.g. *Blood Moon Evelynn*) or a champion's whole skin
+line (`target: champion`, e.g. *Evelynn* - future skins are caught by
+construction). The `kinds` argument selects what fires: `sale`,
+`mythic`, `release`, or `all` (default - all three categories). Matching runs on the same
+store deltas the announcements use, so catch-up after a restart covers
+watches too, and the per-guild announce flags (`announce_sales`, ...)
+never suppress personal watches. When something fires, the assigned
+announcement channel gets one embed with the matched items, and every
+watcher is tagged in the message content (never the announcement role).
+
+Watch notes:
+
+- Name resolution searches the last known store catalog, so subscribing
+  requires the League client to have been reachable; matching afterwards
+  is pure id/name comparison. An ambiguous name replies with a candidate
+  list - re-run it with the exact name. The live champion table lists
+  some champions twice (live + Classic variants share one display name);
+  a watch binds to the id the store catalog can actually reach, and when
+  several ids qualify the candidates carry their ids - re-run with the
+  id (pasting the candidate line works) to pick one. Same-named variant
+  skins are listed with their item ids the same way.
+- `/lol_store_watch` reports current activity in its confirmation
+  ("currently on sale", "currently in the mythic rotation"). Firing is
+  edge-based: a skin already on sale when you subscribe will not notify
+  until its next sale starts.
+- The `release` kind only ever fires for champion watches - a skin the
+  catalog can resolve is by definition already released.
+- Watchlists are private (`/lol_store_watchlist` shows only your own),
+  watches are guild-scoped, and a leaver's stale watch is inert (tags
+  just do not resolve). Caps: `watch_user_cap` per member,
+  `watch_guild_cap` per guild.
+
+Operator configuration lives in the optional `[lol_store]` section. An
+absent section, an empty `lockfile_path`, or a zero `poll_secs` keep the
+watcher off (**startup-only** - enabling or disabling needs a restart);
+when enabled at boot, the announce flags, watch caps, and `history_days`
+hot-reload, while `lockfile_path`, `address`, and `poll_secs` stay
+boot-frozen:
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `lockfile_path` | string | *(empty)* | path to the client's `lockfile`; empty = watcher disabled |
+| `address` | string | `"127.0.0.1"` | host the client API listens on (the port always comes from the lockfile) |
+| `poll_secs` | integer | `300` | poll cadence in seconds; `0` disables |
+| `announce_sales` | bool | `true` | announce new sales (name, % off, RP price, end date) |
+| `announce_new_skins` | bool | `true` | announce newly listed skins (champion, skin, RP price) |
+| `announce_mythic_rotation` | bool | `true` | announce Mythic Shop rotation changes (skin, Mythic Essence price, rotation end) |
+| `announce_yourshop` | bool | `true` | announce Your Shop starts (start and end times) |
+| `watch_user_cap` | integer | `20` | maximum `/lol_store_watch` subscriptions per member per guild |
+| `watch_guild_cap` | integer | `300` | maximum `/lol_store_watch` subscriptions per guild |
+| `history_days` | integer | `90` | days of store history retained for `/lol_store_history` (today included); `0` disables recording (hot-reloadable) |
+
+Announced trackers that are toggled off still update the watcher's
+state, so re-enabling never replays old events. The watcher publishes
+`lol_store.announced` events on the plugin bus for other plugins.
+
+Maintainer notes - how to explore the League client's local API (the
+`/help` schema crawl, the vector-parameter encoding trap, a verified
+endpoint cheat sheet) - live in
+[`src/plugins/lol_store/README.md`](src/plugins/lol_store/README.md).
+
+Deployment note: the League client only listens on the machine's own
+loopback, so the watcher requires the bot to run **on the same Windows
+instance as the client** (natively, or in a container with host-level
+networking plus a read-only mount of the lockfile's *directory* - the
+file itself is rewritten on every client start).
+
+### LoL leaderboard (`lol_leaderboard` plugin)
+
+Dumps aggregated ranked-leaderboard statistics on demand: role
+distribution per region and pooled across regions (TOP 300 / TOP 1000
+rows), and the most picked champions per role - the kind of summary
+analytics sites publish, delivered where the question is asked. The
+data comes from a pluggable source behind the plugin's port (the built
+in adapter reads DeepLoL's public API - no auth, no League client
+needed); the data source is startup-only config, and there is **no
+per-guild setup**: the command answers wherever it is invoked.
+
+The bot parses at most `parse_depth` players per configured region,
+sequentially and rate-limited; the champion tables pool each region's
+highest-ranked `champ_pool_depth` players. Results are cached for
+`cache_ttl` - and the complete dump persists to the plugin's storage
+after every refresh cycle, so a restart keeps serving the last parsed
+data (the `data age` line tells you how old it is) instead of paying a
+full re-parse: a restart inside the TTL answers without touching the
+source at all, an older dump serves stale until a refresh cycle lands.
+Storage writes are best-effort - a failed write only means the next
+restart re-parses, never a failed command.
+
+**Background refresh (default on):** a scheduler job re-parses stale
+regions off the user path - first run at boot (the warm-up starts before
+the gateway even connects), then once per `cache_ttl` (a TTL hot reload
+reschedules the job). The command serves whatever is cached, however old
+(the dump's `data age` line is the honest label) and never *drives* a
+parse; only a region with no cached data at all (the boot race) parses
+inline, under a configurable wall-clock budget (`inline_refresh_budget_secs`,
+default 180 s): regions past the budget keep their cached data or are
+named as failed in the dump instead of parking the invoker. A command
+landing while the background job is mid-cycle shares that cycle
+(singleflight) instead of starting a second parse; a failed champion-names
+fetch is retried inline at most once per 30 s. With
+`background_refresh = false` the plugin falls back to on-demand mode:
+a stale cache re-parses before the reply (the typing indicator shows
+during the parse; a cold multi-region parse takes tens of seconds),
+under the same budget. Concurrent invocations share any in-flight
+refresh but each gets its own full dump. Mind the ceiling either way: a
+parse walks `parse_depth` / 100 source pages per region at the
+configured request pace - keep the worst case comfortably inside the
+platform's interaction window (about 15 minutes on Discord).
+
+The output
+leads with a coverage line (`Parsed 2941/3000 players from 3 regions ·
+data age 2h`), renders a bucket row only when the parses actually cover
+it, degrades holes (a player without role/champion data leaves that
+table but never breaks the answer), and splits across messages on line
+boundaries. A region whose *command-path* refresh failed is named in the
+dump and served from cache when possible; a region that failed in a
+background cycle is simply absent from the coverage (the age line stays
+honest) and recovers on the next successful cycle. Only a total failure
+replies with an error.
+
+| Command | Tier | Effect |
+|---|---|---|
+| `/lol_leaderboard` | user | post the leaderboard statistics in the current channel (public) |
+
+Operator configuration lives in the optional `[lol_leaderboard]`
+section (an absent section - or no regions served by the source - keeps
+the command in "not configured" mode; the background job is scheduled
+anyway, so regions hot-reloaded in later start warming immediately).
+`regions`, `parse_depth`, `cache_ttl_secs`, and the display knobs
+hot-reload (a TTL change reschedules the job); `proxy`,
+`request_interval_secs` (the source pacing), `background_refresh`, and
+`inline_refresh_budget_secs` are **startup-only** and need a restart. A
+section that degrades (absent or a zeroed knob) maps the live engine to
+the same "not configured" mode as at boot:
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `regions` | string array | *(empty)* | regions to aggregate: `kr`, `euw`, `eun`, `na`, `jp`, `br`, `tr`, `tw`, `vn`, `sea`; empty = plugin off |
+| `request_interval_secs` | integer | `3` | minimum delay between source requests (sequential, rate-limit politeness); `0` disables the plugin |
+| `background_refresh` | boolean | `true` | scheduler job keeps the cache warm (ticks at `cache_ttl_secs`, first run at boot, scheduled even with no regions yet); the command serves cached data as-is and never drives a parse itself; `false` = on-demand mode where a stale cache re-parses before the reply |
+| `inline_refresh_budget_secs` | integer | `180` | wall-clock budget for a command-driven (inline) parse: regions past it keep cached data or are named as failed; `0` = unbounded; the background job is not budgeted |
+| `parse_depth` | integer | `1000` | top players parsed per region (clamped to what the source's board has); `0` disables; capped at 10 000 |
+| `display_buckets` | integer array | `[300, 1000]` | player-count rows for the role tables; values are clamped to `parse_depth`, sorted, deduplicated; empty = a single full-depth row |
+| `champ_pool_depth` | integer | `1000` | per-region player pool (highest ranked first) behind the champion tables; clamped to `parse_depth` |
+| `champs_per_role` | integer | `5` | champions listed per role |
+| `cache_ttl_secs` | integer | `64800` (18h) | how long cached data stays fresh; `0` disables |
+| `proxy` | string | *(none)* | optional proxy for source requests (`socks5://` or `http://`); the Discord proxy does not apply |
+
+Example output shape (abridged):
+
+````markdown
+# LoL Leaderboard Statistics
+
+Parsed 3000/3000 players from 3 regions · data age 2h 5m old
+
+## Role distribution in average
+
+**TOP 300:** Top: 18.67% | Jungle: 26.33% | Middle: 19.67% | Bot: 24.67% | Supporter: 10.67%
+
+## Role distribution in KR
+
+**TOP 300:** Top: 18.67% | Jungle: 26.33% | Middle: 19.67% | Bot: 24.67% | Supporter: 10.67%
+
+## Most picked champions per role
+
+**Top** - 540 players
+
+1. Ambessa - 14.8%
+2. Rumble - 14.4%
+````
+
+Maintainer notes - how to explore and re-verify the data source (the
+platform-id gotcha, the lane enum, pagination, the champion info
+endpoint) - live in
+[`src/plugins/lol_leaderboard/README.md`](src/plugins/lol_leaderboard/README.md).
 
 ## Docker
 
