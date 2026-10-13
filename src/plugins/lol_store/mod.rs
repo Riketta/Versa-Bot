@@ -161,7 +161,7 @@ impl<B: EventBusPort> PluginPort for LolStorePlugin<B> {
             CommandDescriptor {
                 plugin_id: self.name().to_owned(),
                 name: "lol_store_dump".to_owned(),
-                description: "Post the current LoL store deals in this channel".to_owned(),
+                description: "Post the current LoL store deals here (new ones bold)".to_owned(),
                 arguments: Vec::new(),
                 required_permission: None,
                 required_tier: Some(AccessTier::Moderator),

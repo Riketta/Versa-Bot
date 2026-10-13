@@ -31,10 +31,10 @@ use crate::kernel::spi_ports::{
 };
 
 use super::diff::{
-    self, LastSeen, Snapshot, StoreDelta, YourShopStart, rotation_delta, rotation_stores,
+    self, DumpMarks, LastSeen, Snapshot, StoreDelta, YourShopStart, rotation_delta, rotation_stores,
 };
 use super::events::{LolStoreAnnounced, StoreEventKind};
-use super::format::{NameIndex, announce_pages, champion_map};
+use super::format::{NameIndex, announce_pages, champion_map, dump_pages};
 use super::history::{self, DayDigest};
 use super::lcu::LcuPort;
 use super::watch::{self, StoreSearch, WatchDoc, WatchTarget};
@@ -47,6 +47,10 @@ pub const CONFIG_KEY: &str = "config";
 /// snapshot, written whenever either changed - boot catch-up source and the
 /// `/lol_store_dump` fallback.
 pub const STORE_DUMP_KEY: &str = "store_dump";
+/// The snapshot `/lol_store_dump` rendered last - the baseline the next
+/// dump marks new entries against. Plugin-global like the store document
+/// (the store is deployment-wide).
+pub const LAST_DUMP_KEY: &str = "last_dump";
 /// Legacy boot catch-up document (pre-consolidation: a compacted copy per
 /// enabled guild). Migrated into [`STORE_DUMP_KEY`] on first boot and then
 /// deleted; never written again.
@@ -1210,23 +1214,38 @@ impl<B: EventBusPort> StoreEngine<B> {
     /// rotations, an active Your Shop), not the last delta. Skins are
     /// omitted because "new in store" is a diff concept a lone snapshot
     /// cannot provide (the alternative would print the whole catalog).
-    pub async fn current_store_pages(&self) -> Vec<String> {
-        let Some(snapshot) = self.last_snapshot.lock().clone() else { return Vec::new() };
-        self.render_current(&snapshot).await
+    /// Falls back to the persisted store document when this process has
+    /// not captured a snapshot yet (fresh boot, the client still offline);
+    /// champion names degrade to the synthetic fallback there - same as a
+    /// failed in-cycle fetch. Entries the previous dump's snapshot does
+    /// not carry render bold under a legend line, and the rendered state
+    /// becomes the next dump's baseline (also healing an unreadable one;
+    /// an unrenderable snapshot leaves it alone).
+    pub async fn store_dump_pages(&self) -> Vec<String> {
+        // The guard must drop before the fallback's await - parking_lot
+        // guards are not Send.
+        let in_memory = self.last_snapshot.lock().clone();
+        let snapshot = match in_memory {
+            Some(snapshot) => snapshot,
+            None => match self.load_persisted_doc().await {
+                Some(doc) => doc.snapshot,
+                None => return Vec::new(),
+            },
+        };
+        let previous = self.load_dump_baseline().await;
+        let pages = self.render_current(&snapshot, previous.as_ref()).await;
+        if !pages.is_empty() {
+            self.persist_dump_baseline(&snapshot).await;
+        }
+        pages
     }
 
-    /// `/lol_store_dump`'s fallback: renders the persisted store document
-    /// when this process has not captured a snapshot yet (fresh boot, the
-    /// client still offline). Champion names degrade to the synthetic
-    /// fallback when the champion table is unreachable - same as a failed
-    /// in-cycle fetch.
-    pub async fn persisted_store_pages(&self) -> Vec<String> {
-        let Some(doc) = self.load_persisted_doc().await else { return Vec::new() };
-        self.render_current(&doc.snapshot).await
-    }
-
-    /// The shared current-state renderer (see [`Self::current_store_pages`]).
-    async fn render_current(&self, snapshot: &Snapshot) -> Vec<String> {
+    /// The shared current-state renderer (see [`Self::store_dump_pages`]).
+    async fn render_current(
+        &self,
+        snapshot: &Snapshot,
+        previous: Option<&Snapshot>,
+    ) -> Vec<String> {
         if !has_renderable_data(snapshot) {
             return Vec::new();
         }
@@ -1237,6 +1256,7 @@ impl<B: EventBusPort> StoreEngine<B> {
             );
         }
         let index = self.name_index(snapshot).await;
+        let marks = DumpMarks::compute(previous, snapshot);
         let mut delta = StoreDelta::default();
         if let Some(sales) = &snapshot.sales {
             delta.sales = sales.clone();
@@ -1256,7 +1276,37 @@ impl<B: EventBusPort> StoreEngine<B> {
                 });
             }
         }
-        announce_pages(&delta, &index, self.embed_budget())
+        dump_pages(&delta, &index, self.embed_budget(), &marks)
+    }
+
+    /// Reads the previous dump's snapshot - the marking baseline. A
+    /// malformed or unreadable baseline is no baseline: the dump renders
+    /// unmarked and the current state re-arms it.
+    async fn load_dump_baseline(&self) -> Option<Snapshot> {
+        match self.plugin_storage.get(NAMESPACE, LAST_DUMP_KEY).await {
+            Ok(Some(raw)) => match serde_json::from_value::<Snapshot>(raw) {
+                Ok(snapshot) => Some(snapshot),
+                Err(err) => {
+                    tracing::warn!(%err, "persisted dump baseline malformed - dumping unmarked");
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!(%err, "persisted dump baseline unreadable - dumping unmarked");
+                None
+            }
+        }
+    }
+
+    async fn persist_dump_baseline(&self, snapshot: &Snapshot) {
+        let Ok(value) = serde_json::to_value(snapshot) else {
+            tracing::warn!("failed to serialize the dump baseline");
+            return;
+        };
+        if let Err(err) = self.plugin_storage.set(NAMESPACE, LAST_DUMP_KEY, value).await {
+            tracing::warn!(%err, "failed to persist the dump baseline");
+        }
     }
 
     /// The recorded deal history for a watch-shaped target: one row per
@@ -1644,6 +1694,13 @@ mod tests {
     }
 
     fn rotation_store(name: &str, ids: &[&str]) -> RotationStore {
+        let named: Vec<(&str, &str)> = ids.iter().map(|id| (*id, "entry")).collect();
+        rotation_store_entries(name, &named)
+    }
+
+    /// A rotation whose entries carry distinct display names - the generic
+    /// `rotation_store` names every entry "entry".
+    fn rotation_store_entries(name: &str, entries: &[(&str, &str)]) -> RotationStore {
         use crate::plugins::lol_store::diff::MYTHIC_SHOP_ID;
         use crate::plugins::lol_store::lcu::{DisplayMetadata, RotatingMetadata, ShoppefrontMeta};
         RotationStore {
@@ -1659,11 +1716,11 @@ mod tests {
                 curr_rotation_start_time: Some("2026-10-01T00:00:00.000Z".to_owned()),
                 next_rotation_start_time: Some("2026-10-08T00:00:00.000Z".to_owned()),
             }),
-            catalog_entries: ids
+            catalog_entries: entries
                 .iter()
-                .map(|id| StoreEntry {
+                .map(|(id, entry_name)| StoreEntry {
                     id: Some((*id).to_owned()),
-                    name: Some("entry".to_owned()),
+                    name: Some((*entry_name).to_owned()),
                     end_time: None,
                     purchase_units: Vec::new(),
                 })
@@ -1712,7 +1769,7 @@ mod tests {
     async fn fresh_launch_dump_renders_the_current_store_without_skins() {
         let f = fixture(FakeLcu::online()).await;
         enable_guild(&f.storage, GUILD, Some("55")).await;
-        assert!(f.engine.current_store_pages().await.is_empty(), "no poll yet");
+        assert!(f.engine.store_dump_pages().await.is_empty(), "no poll yet");
 
         *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
         *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
@@ -1720,7 +1777,7 @@ mod tests {
         f.engine.tick().await; // silent baseline
         assert!(f.engine.last_announcement_pages().is_empty());
 
-        let text = f.engine.current_store_pages().await.join("\n\n");
+        let text = f.engine.store_dump_pages().await.join("\n\n");
         assert!(text.contains("New sales"), "current sales show: {text}");
         assert!(text.contains("Mythic rotation"), "current rotation shows: {text}");
         assert!(!text.contains("New in store"), "skins need history: {text}");
@@ -1736,9 +1793,55 @@ mod tests {
         *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
         f.engine.tick().await; // silent baseline keeps only the skin sale
 
-        let text = f.engine.current_store_pages().await.join("\n\n");
+        let text = f.engine.store_dump_pages().await.join("\n\n");
         assert!(text.contains("Foxfire Ahri"), "skin sale present: {text}");
         assert!(!text.contains("Champion 799"), "champion sale excluded: {text}");
+    }
+
+    /// The dump marks entries the previous dump did not show: a new sale
+    /// and a swapped rotation entry render bold under the legend, while
+    /// carried-over entries stay plain. The first dump (no baseline)
+    /// renders unmarked and arms the baseline.
+    #[tokio::test]
+    async fn dump_marks_entries_new_since_the_previous_dump() {
+        let f = fixture(FakeLcu::online()).await;
+        enable_guild(&f.storage, GUILD, Some("55")).await;
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        *f.lcu.catalog.lock() = Some(vec![skin_item_named(1031, 975, "Old Deal Ahri")]);
+        *f.lcu.rotations.lock() = Some(vec![rotation_store_entries(
+            "WEEKLY",
+            &[("e1", "Kept Entry"), ("e2", "Gone Entry")],
+        )]);
+        f.engine.tick().await; // silent baseline
+
+        let first = f.engine.store_dump_pages().await.join("\n");
+        assert!(first.contains("Old Deal Ahri"), "first dump renders: {first}");
+        assert!(!first.contains("Bold ="), "no baseline, no legend: {first}");
+        assert!(!first.contains("- **"), "no baseline, nothing bold: {first}");
+
+        // A new sale and a swapped rotation entry arrive; one entry stays.
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031), skin_sale(2, 1032)]);
+        *f.lcu.catalog.lock() = Some(vec![
+            skin_item_named(1031, 975, "Old Deal Ahri"),
+            skin_item_named(1032, 520, "Fresh Deal Jinx"),
+        ]);
+        *f.lcu.rotations.lock() = Some(vec![rotation_store_entries(
+            "WEEKLY",
+            &[("e1", "Kept Entry"), ("e3", "New Entry")],
+        )]);
+        f.engine.tick().await;
+
+        let second = f.engine.store_dump_pages().await.join("\n");
+        assert!(second.contains("Bold = new since the previous dump"), "legend present: {second}");
+        assert!(second.contains("- **Ahri — Fresh Deal Jinx"), "new sale bold: {second}");
+        assert!(second.contains("- Ahri — Old Deal Ahri"), "carried-over sale plain: {second}");
+        assert!(second.contains("- **New Entry"), "new rotation entry bold: {second}");
+        assert!(second.contains("- Kept Entry"), "kept rotation entry plain: {second}");
+
+        // Dumping again with unchanged data marks nothing: the previous
+        // dump IS the new baseline now.
+        let third = f.engine.store_dump_pages().await.join("\n");
+        assert!(!third.contains("Bold ="), "unchanged dump stays unmarked: {third}");
     }
 
     #[tokio::test]
@@ -2021,14 +2124,13 @@ mod tests {
         ));
 
         // Before any poll: the document fallback renders the last dump.
-        let from_doc = engine2.persisted_store_pages().await.join("\n");
+        let from_doc = engine2.store_dump_pages().await.join("\n");
         assert!(from_doc.contains("Foxfire Ahri"), "document fallback renders: {from_doc}");
-        assert!(engine2.current_store_pages().await.is_empty(), "nothing in memory yet");
 
         // The offline tick still adopts + restores (the catch-up runs
         // before the fetch).
         engine2.tick().await;
-        let restored = engine2.current_store_pages().await.join("\n");
+        let restored = engine2.store_dump_pages().await.join("\n");
         assert!(restored.contains("Foxfire Ahri"), "restored snapshot renders: {restored}");
         // Name search works off the restored catalog.
         let search = engine2.search_store("Foxfire").await.expect("search expected");

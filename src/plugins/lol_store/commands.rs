@@ -809,9 +809,10 @@ impl CommandHandler for WatchlistHandler {
 }
 
 /// `/lol_store_dump`: post all current store deals into the invoking
-/// channel (moderator, public - a dump is meant to be seen). Rendered from
-/// the retained snapshot; falls back to the persisted store document when
-/// this process has not polled yet (fresh boot, client offline); an
+/// channel (moderator, public - a dump is meant to be seen). Entries the
+/// previous dump did not show render bold under a legend line. Rendered
+/// from the retained snapshot; falls back to the persisted store document
+/// when this process has not polled yet (fresh boot, client offline); an
 /// ephemeral placeholder explains it when neither has data.
 pub struct DumpHandler<B: crate::kernel::plugin_ports::EventBusPort> {
     pub engine: Arc<StoreEngine<B>>,
@@ -831,10 +832,7 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for DumpHandle
             return reply_guild_only(services).await;
         }
         let title = "LoL Store - current state";
-        let mut pages = self.engine.current_store_pages().await;
-        if pages.is_empty() {
-            pages = self.engine.persisted_store_pages().await;
-        }
+        let pages = self.engine.store_dump_pages().await;
         if pages.is_empty() {
             services
                 .chat_output

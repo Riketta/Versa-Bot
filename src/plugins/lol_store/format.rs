@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::diff::StoreDelta;
+use super::diff::{DumpMarks, StoreDelta};
 use super::lcu::CatalogItem;
 
 /// Lines shown per section before the "+N more" cut.
@@ -212,7 +212,18 @@ fn by_price(price: Option<u64>) -> u64 {
 /// and repeating it per line burns embed budget. Groups sort by date
 /// ascending; within a group by sale price ascending (priceless last);
 /// undated sales land in a trailing untitled group in the same order.
-fn sales_sections(sales: &[super::lcu::Sale], index: &NameIndex) -> Vec<Section> {
+fn sales_sections(
+    sales: &[super::lcu::Sale],
+    index: &NameIndex,
+    marks: Option<&DumpMarks>,
+) -> Vec<Section> {
+    let line = |sale: &super::lcu::Sale| -> String {
+        let rendered = sale_line(sale, index, false);
+        match marks {
+            Some(marks) if marks.is_new_sale(sale) => bolden(rendered),
+            _ => rendered,
+        }
+    };
     let mut dated: BTreeMap<String, Vec<&super::lcu::Sale>> = BTreeMap::new();
     let mut undated: Vec<&super::lcu::Sale> = Vec::new();
     for sale in sales {
@@ -225,28 +236,42 @@ fn sales_sections(sales: &[super::lcu::Sale], index: &NameIndex) -> Vec<Section>
         .into_iter()
         .map(|(day, mut group)| {
             group.sort_by_key(|sale| by_price(rp_price(&sale.sale.prices)));
-            let lines = group.iter().map(|sale| sale_line(sale, index, false)).collect();
+            let lines = group.iter().map(|sale| line(sale)).collect();
             Section::new(format!("New sales \u{b7} until {day}"), lines)
         })
         .collect();
     if !undated.is_empty() {
         undated.sort_by_key(|sale| by_price(rp_price(&sale.sale.prices)));
-        let lines = undated.iter().map(|sale| sale_line(sale, index, false)).collect();
+        let lines = undated.iter().map(|sale| line(sale)).collect();
         sections.push(Section::new("New sales", lines));
     }
     sections
 }
 
-/// Renders the full announcement into embed-sized pages - every section,
-/// every line: sales grouped by end date, new skins, each mythic rotation,
-/// the Your Shop start - items within a section cheapest first (priceless
-/// last). Nothing is dropped or cut (a page pack that would overflow
-/// starts a new page instead). Empty when nothing renders.
-#[must_use]
-pub fn announce_pages(delta: &StoreDelta, index: &NameIndex, page_budget: usize) -> Vec<String> {
+/// Renders a line bold: `- rest` becomes `- **rest**` - the dump's
+/// "new since the previous dump" marking.
+fn bolden(line: String) -> String {
+    match line.strip_prefix("- ") {
+        Some(rest) => format!("- **{rest}**"),
+        None => format!("**{line}**"),
+    }
+}
+
+/// The shared page builder: sales grouped by end date, new skins, each
+/// mythic rotation, the Your Shop start - items within a section cheapest
+/// first (priceless last). With marks, entries the previous dump did not
+/// show render bold under a legend line; without, everything renders as
+/// an announcement does. Nothing is dropped or cut (a page pack that
+/// would overflow starts a new page instead). Empty when nothing renders.
+fn build_pages(
+    delta: &StoreDelta,
+    index: &NameIndex,
+    page_budget: usize,
+    marks: Option<&DumpMarks>,
+) -> Vec<String> {
     let mut sections: Vec<Section> = Vec::new();
     if !delta.sales.is_empty() {
-        sections.extend(sales_sections(&delta.sales, index));
+        sections.extend(sales_sections(&delta.sales, index, marks));
     }
     if !delta.skins.is_empty() {
         let mut skins: Vec<&CatalogItem> = delta.skins.iter().collect();
@@ -257,7 +282,16 @@ pub fn announce_pages(delta: &StoreDelta, index: &NameIndex, page_budget: usize)
     for rotation in &delta.rotations {
         let mut entries: Vec<&super::diff::MythicEntry> = rotation.entries.iter().collect();
         entries.sort_by_key(|entry| by_price(entry.mythic_price));
-        let lines: Vec<String> = entries.into_iter().map(mythic_line).collect();
+        let lines: Vec<String> = entries
+            .into_iter()
+            .map(|entry| {
+                let rendered = mythic_line(entry);
+                match marks {
+                    Some(marks) if marks.is_new_entry(&rotation.name, entry) => bolden(rendered),
+                    _ => rendered,
+                }
+            })
+            .collect();
         if lines.is_empty() {
             continue;
         }
@@ -277,7 +311,33 @@ pub fn announce_pages(delta: &StoreDelta, index: &NameIndex, page_budget: usize)
         }
         sections.push(Section::bare(line));
     }
+    if marks.is_some_and(|marks| !marks.is_empty()) && !sections.is_empty() {
+        sections.insert(0, Section::bare("Bold = new since the previous dump".to_owned()));
+    }
     paginate(sections, page_budget)
+}
+
+/// Renders the full announcement into embed-sized pages - every section,
+/// every line: sales grouped by end date, new skins, each mythic rotation,
+/// the Your Shop start - items within a section cheapest first (priceless
+/// last). Nothing is dropped or cut (a page pack that would overflow
+/// starts a new page instead). Empty when nothing renders.
+#[must_use]
+pub fn announce_pages(delta: &StoreDelta, index: &NameIndex, page_budget: usize) -> Vec<String> {
+    build_pages(delta, index, page_budget, None)
+}
+
+/// Renders the `/lol_store_dump` pages: the same layout as an
+/// announcement, but entries the previous dump did not show render bold
+/// under a leading legend line.
+#[must_use]
+pub fn dump_pages(
+    delta: &StoreDelta,
+    index: &NameIndex,
+    page_budget: usize,
+    marks: &DumpMarks,
+) -> Vec<String> {
+    build_pages(delta, index, page_budget, Some(marks))
 }
 
 /// Rendered byte length of `**{title}**\n{lines joined by newline}` (or
@@ -644,6 +704,7 @@ mod tests {
                 }],
             }],
             rotations: vec![super::super::diff::RotationDelta {
+                name: "WEEKLY".to_owned(),
                 label: "weekly".to_owned(),
                 rotation_start: None,
                 next_rotation: None,
@@ -774,6 +835,7 @@ mod tests {
         let delta = StoreDelta {
             skins: vec![skin(20_002, Some(1350)), skin(10_002, Some(520)), skin(30_002, None)],
             rotations: vec![super::super::diff::RotationDelta {
+                name: "WEEKLY".to_owned(),
                 label: "weekly".to_owned(),
                 rotation_start: None,
                 next_rotation: None,
@@ -848,6 +910,7 @@ mod tests {
     fn rotation_section_title_shows_when_it_ends() {
         let delta = StoreDelta {
             rotations: vec![super::super::diff::RotationDelta {
+                name: "WEEKLY".to_owned(),
                 label: "weekly".to_owned(),
                 rotation_start: None,
                 next_rotation: Some("2026-10-08T00:00:00.000Z".to_owned()),
@@ -869,6 +932,7 @@ mod tests {
     fn empty_rotation_end_omits_the_ends_suffix() {
         let delta = StoreDelta {
             rotations: vec![super::super::diff::RotationDelta {
+                name: "FEATURED".to_owned(),
                 label: "featured".to_owned(),
                 rotation_start: None,
                 next_rotation: Some("   ".to_owned()),
@@ -954,6 +1018,7 @@ mod tests {
     #[test]
     fn oversized_announcements_split_into_pages() {
         let fat_rotation = |label: &str| super::super::diff::RotationDelta {
+            name: label.to_owned(),
             label: label.to_owned(),
             rotation_start: None,
             next_rotation: None,

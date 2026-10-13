@@ -539,7 +539,12 @@ received.
 snapshot live in one plugin-global store document, written whenever
 anything changed - so a restart catches up on what it missed, and
 `/lol_store_dump` renders **all current deals** even before the first
-poll of a fresh boot (e.g. the client is still offline). On top of that,
+poll of a fresh boot (e.g. the client is still offline). Each dump also
+persists its snapshot as the baseline for the next one: entries the
+previous dump did not show (a new sale, a swapped Mythic rotation
+entry, a rotation that was not there) render bold under a
+`Bold = new since the previous dump` legend, so a fresh dump is
+distinguishable from the last one at a glance. On top of that,
 each observed UTC day's deal set is kept as a per-day digest (names and
 prices frozen at capture time - English names preferred - retention
 `history_days` counting today, `0` disables recording), and
@@ -558,7 +563,7 @@ personal shop, not shareable store state.
 | `/lol_store_assign` | moderator | post store events in this channel (run it in the target channel) |
 | `/lol_store_unassign` | moderator | stop posting store events in this guild |
 | `/lol_store_role` | moderator | tag this role on store announcements - the subscription role (run without the argument to clear) |
-| `/lol_store_dump` | moderator | force-post all current store deals (sales, Mythic rotations, Your Shop) in the current channel - the live state, not the last update (public, no role tag) |
+| `/lol_store_dump` | moderator | force-post all current store deals (sales, Mythic rotations, Your Shop) in the current channel - the live state, not the last update; entries the previous dump did not show render bold (public, no role tag) |
 | `/lol_store_history` | user | show when a skin or champion was on sale / in the Mythic Shop rotation, grouped into deal windows over the retention window (ephemeral) |
 | `/lol_store_watch` | user | watch a skin or a champion for sales, Mythic Shop rotations, new releases (ephemeral) |
 | `/lol_store_unwatch` | user | remove one own watch by its list id, or every own watch with `all` (ephemeral) |

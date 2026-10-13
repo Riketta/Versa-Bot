@@ -4,7 +4,7 @@
 //! [`Snapshot`] is one poll cycle's raw data (the same document's dump
 //! half), [`StoreDelta`] is what a diff announces.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +58,9 @@ pub struct LastSeen {
 /// One rotation's worth of newly listed Mythic Shop entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotationDelta {
+    /// The rotation store's name - the identity the diff keys on and the
+    /// dump's new-against-previous-dump marks join against.
+    pub name: String,
     /// Human label (`weekly`, `biweekly`, `daily`).
     pub label: String,
     pub rotation_start: Option<String>,
@@ -141,6 +144,7 @@ pub(crate) fn rotation_delta(store: &RotationStore) -> Option<RotationDelta> {
         return None;
     }
     Some(RotationDelta {
+        name: store.name.clone().unwrap_or_default(),
         label: store.category_label().unwrap_or_else(|| "rotation".to_owned()),
         rotation_start: store
             .rotating_store_metadata
@@ -360,6 +364,88 @@ pub(crate) fn mythic_entry(entry: &StoreEntry) -> MythicEntry {
         .find(|payment| payment.name.as_deref() == Some("lol_mythic_essence"))
         .and_then(|payment| payment.final_delta);
     MythicEntry { entry_id, name, mythic_price }
+}
+
+/// The entries a dump should mark as new against the previous dump:
+/// present now but absent from the previous dump's snapshot. A block the
+/// previous dump did not observe (`None` - its source failed then) marks
+/// nothing: an unknown baseline must not bold half the dump.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DumpMarks {
+    sale_ids: HashSet<u64>,
+    /// Per rotation store name: entry ids new since the last dump.
+    rotation_entries: HashMap<String, HashSet<String>>,
+}
+
+impl DumpMarks {
+    /// Diffs the snapshot about to be rendered against the snapshot the
+    /// previous dump rendered (`None` = first dump or unreadable baseline:
+    /// nothing is marked).
+    #[must_use]
+    pub fn compute(previous: Option<&Snapshot>, current: &Snapshot) -> Self {
+        let Some(previous) = previous else { return Self::default() };
+        let mut marks = Self::default();
+        if let Some(previous_sales) = &previous.sales {
+            let previous_ids: HashSet<u64> = previous_sales.iter().map(|sale| sale.id).collect();
+            if let Some(sales) = &current.sales {
+                marks.sale_ids = sales
+                    .iter()
+                    .map(|sale| sale.id)
+                    .filter(|id| !previous_ids.contains(id))
+                    .collect();
+            }
+        }
+        if let Some(previous_stores) = &previous.rotations {
+            let previous: HashMap<String, HashSet<String>> = rotation_stores(previous_stores)
+                .into_iter()
+                .filter_map(|store| {
+                    let name = store.name.clone()?;
+                    let ids: HashSet<String> =
+                        store.catalog_entries.iter().filter_map(|entry| entry.id.clone()).collect();
+                    Some((name, ids))
+                })
+                .collect();
+            if let Some(stores) = &current.rotations {
+                for store in rotation_stores(stores) {
+                    let Some(name) = store.name.clone() else { continue };
+                    let ids: HashSet<String> =
+                        store.catalog_entries.iter().filter_map(|entry| entry.id.clone()).collect();
+                    let new_ids = match previous.get(&name) {
+                        // The rotation was not in the last dump: everything
+                        // it carries arrived since then.
+                        None => ids,
+                        Some(previous_ids) => {
+                            ids.into_iter().filter(|id| !previous_ids.contains(id)).collect()
+                        }
+                    };
+                    marks.rotation_entries.insert(name, new_ids);
+                }
+            }
+        }
+        marks
+    }
+
+    /// Was this sale absent from the previous dump?
+    #[must_use]
+    pub fn is_new_sale(&self, sale: &Sale) -> bool {
+        self.sale_ids.contains(&sale.id)
+    }
+
+    /// Was this rotation entry absent from the previous dump's same-named
+    /// rotation? Id-less entries have no identity to compare - never new.
+    #[must_use]
+    pub fn is_new_entry(&self, store: &str, entry: &MythicEntry) -> bool {
+        match (&entry.entry_id, self.rotation_entries.get(store)) {
+            (Some(id), Some(ids)) => ids.contains(id),
+            _ => false,
+        }
+    }
+
+    /// Whether any rendered entry would be marked.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sale_ids.is_empty() && self.rotation_entries.values().all(HashSet::is_empty)
+    }
 }
 
 #[cfg(test)]
@@ -796,5 +882,79 @@ mod tests {
         // And with no previous state at all, null is just "inactive".
         let merged = merge(&LastSeen::default(), &null_status);
         assert!(!merged.yourshop.as_ref().is_some_and(|state| state.active));
+    }
+
+    /// Dump marking: entries present now but absent from the previous
+    /// dump's snapshot are new; id-less entries and unknown rotations
+    /// follow the identity rules.
+    #[test]
+    fn dump_marks_entries_absent_from_the_previous_snapshot() {
+        let entry = |id: &str| MythicEntry {
+            entry_id: Some(id.to_owned()),
+            name: None,
+            mythic_price: None,
+        };
+        let previous = Snapshot {
+            sales: Some(vec![sale(1)]),
+            rotations: Some(vec![rotation_store("WEEKLY", &["e1", "e2"])]),
+            ..Default::default()
+        };
+        let current = Snapshot {
+            sales: Some(vec![sale(1), sale(2)]),
+            rotations: Some(vec![rotation_store("WEEKLY", &["e2", "e3"])]),
+            ..Default::default()
+        };
+        let marks = DumpMarks::compute(Some(&previous), &current);
+
+        assert!(marks.is_new_sale(&sale(2)));
+        assert!(!marks.is_new_sale(&sale(1)));
+        assert!(!marks.is_new_entry("WEEKLY", &entry("e2")));
+        assert!(marks.is_new_entry("WEEKLY", &entry("e3")));
+        // An id-less entry has no identity to compare - never new.
+        assert!(!marks.is_new_entry(
+            "WEEKLY",
+            &MythicEntry { entry_id: None, name: None, mythic_price: None }
+        ));
+    }
+
+    /// A block the previous dump did not observe (its source failed then)
+    /// marks nothing: an unknown baseline must not bold half the dump.
+    #[test]
+    fn dump_marks_skip_blocks_the_previous_dump_did_not_observe() {
+        let previous = Snapshot::default();
+        let current = Snapshot {
+            sales: Some(vec![sale(1)]),
+            rotations: Some(vec![rotation_store("WEEKLY", &["e1"])]),
+            ..Default::default()
+        };
+
+        let marks = DumpMarks::compute(Some(&previous), &current);
+        assert!(marks.is_empty(), "unknown blocks must not mark: {marks:?}");
+        assert!(DumpMarks::compute(None, &current).is_empty(), "no previous dump at all");
+    }
+
+    #[test]
+    fn dump_marks_a_rotation_absent_from_the_previous_dump_as_all_new() {
+        let entry = |id: &str| MythicEntry {
+            entry_id: Some(id.to_owned()),
+            name: None,
+            mythic_price: None,
+        };
+        let previous = Snapshot {
+            rotations: Some(vec![rotation_store("WEEKLY", &["e1"])]),
+            ..Default::default()
+        };
+        let current = Snapshot {
+            rotations: Some(vec![
+                rotation_store("WEEKLY", &["e1"]),
+                rotation_store("DAILY", &["d1", "d2"]),
+            ]),
+            ..Default::default()
+        };
+        let marks = DumpMarks::compute(Some(&previous), &current);
+
+        assert!(!marks.is_new_entry("WEEKLY", &entry("e1")));
+        assert!(marks.is_new_entry("DAILY", &entry("d1")));
+        assert!(marks.is_new_entry("DAILY", &entry("d2")));
     }
 }
