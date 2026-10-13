@@ -60,7 +60,10 @@ pub struct CommandDescriptor {
     pub arguments: Vec<ArgDescriptor>,
     /// Platform-presentation gate (`default_member_permissions` on Discord).
     /// Only commands whose audience matches a native platform permission
-    /// (today: only `/auth`) set it; tier-based access uses `required_tier`.
+    /// set it; tier-based access uses `required_tier`. No core command
+    /// declares one today: platform-derived ranks (`GuildAdmin`) are
+    /// enforced by the auth plugin instead, keeping tier-gated commands
+    /// visible to everyone.
     pub required_permission: Option<Permission>,
     /// Kernel-side ACL data: the minimum [`AccessTier`] a caller needs. The
     /// kernel never interprets it - the auth plugin compares it against the
@@ -76,9 +79,11 @@ pub struct CommandDescriptor {
 /// the rank). Declared by plugins on `CommandDescriptor` as ACL data;
 /// interpreted exclusively by the auth plugin, which computes each caller's
 /// effective tier and compares. `Owner` is deployment-global (operator
-/// config), everything below it is per-guild policy; Discord guild
-/// administrators are `Admin` by construction (the auth plugin's resolution
-/// clamps them up) - those guarantees live there, not here.
+/// config) and `GuildAdmin` is derived from the platform's server-management
+/// permission - everything below is per-guild policy. Neither of the two can
+/// be produced by stored guild data: the auth plugin's resolution clamps
+/// server managers up to `GuildAdmin`, and sanitization keeps stored tiers
+/// at `Admin` - those guarantees live there, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AccessTier {
@@ -91,15 +96,24 @@ pub enum AccessTier {
     Guest,
     /// Basic interactions: chat plus read-only/basic commands.
     User,
-    /// Service management: every plugin's operational commands, but no
-    /// access-policy management.
+    /// Service management: every plugin's operational commands, plus the
+    /// limited member-facing slice of `/auth` (limited `show`, tier writes
+    /// to lower-ranked members only).
     Moderator,
-    /// Everything, including `/auth` tier management.
+    /// Everything except policy writes touching `Admin`-ranked members.
     Admin,
+    /// Guild administration, derived from the platform - never stored.
+    /// Holders of the platform's server-management permission (Discord:
+    /// Manage Server; the guild owner has it by construction) resolve here,
+    /// above every stored rank: no `/auth` write can grant or revoke it.
+    /// Never offered as a command requirement - `Admin` is the highest
+    /// assignable tier.
+    GuildAdmin,
     /// Bot deployment owner. Injected from the operator's config (never
     /// guild data), above every guild-side rank: bans, assignments, and the
-    /// admin clamp never reach an owner. Only the config-injected identity
-    /// list can produce this tier - it is not assignable through `/auth`.
+    /// permission clamps never reach an owner. Only the config-injected
+    /// identity list can produce this tier - it is not assignable through
+    /// `/auth`.
     Owner,
 }
 
@@ -113,6 +127,7 @@ impl AccessTier {
             AccessTier::User => "user",
             AccessTier::Moderator => "moderator",
             AccessTier::Admin => "admin",
+            AccessTier::GuildAdmin => "guild_admin",
             AccessTier::Owner => "owner",
         }
     }
@@ -126,6 +141,7 @@ impl fmt::Display for AccessTier {
             AccessTier::User => "User",
             AccessTier::Moderator => "Moderator",
             AccessTier::Admin => "Admin",
+            AccessTier::GuildAdmin => "Guild Admin",
             AccessTier::Owner => "Owner",
         })
     }

@@ -32,11 +32,14 @@ commands, permission tiers - lives in [Plugins](#plugins).
 
 - Native Discord slash commands, auto-registered at startup from plugin
   declarations.
-- Per-guild authorization: a six-tier access ladder (banned / guest /
-  user / moderator / admin / owner) with per-user, per-role and default
-  assignments, administered from Discord via `/auth`. Bot owners sit
-  above every guild-side rank and are injected via the root `owners`
-  config key - never modifiable through the bot.
+- Per-guild authorization: a seven-tier access ladder (banned / guest /
+  user / moderator / admin / guild admin / owner) with per-user, per-role
+  and default assignments, administered from Discord via `/auth` under a
+  rank-bounded capability matrix. Bot owners sit above every guild-side
+  rank and are injected via the root `owners` config key - never
+  modifiable through the bot; guild admins (Manage Server holders, the
+  server owner included) are derived from Discord and just as
+  irrevocable.
 - User activity tracker: logs member joins/leaves to a guild audit
   channel, tracks invite creates/deletes and attributes joins to their
   invite code (permission-gated), and publishes membership events on the
@@ -168,9 +171,9 @@ link can add the bot.
 ### Demo: wiring up a fresh server
 
 A complete first-run configuration, as a guild administrator would type
-it. A fresh guild starts open (default tier `user`, and Discord guild
-administrators are always `admin`), so every command below works on day
-one without touching `/auth`. Commands marked *in #channel* are
+it. A fresh guild starts open (default tier `user`, and Manage Server
+holders always act as `guild admin`), so every command below works on
+day one without touching `/auth`. Commands marked *in #channel* are
 channel-scoped: they bind the channel they are run in, so run them in
 the target channel.
 
@@ -307,14 +310,14 @@ or archive them externally.
 Every capability is a plugin under `src/plugins/`. Each section below is
 the plugin's manual: what it does, its commands, and the access tier
 every command requires. Tiers are the auth plugin's ladder - `banned` <
-`guest` < `user` < `moderator` < `admin` < `owner`. Every command reply,
-denial included, is ephemeral (visible to the invoker alone) unless the
-documentation marks it public - the deliberate exceptions post in the
-channel; a member below a command's tier gets an ephemeral notice naming
-the required and actual tier. Discord guild administrators are always
-`admin`, a configured bot owner is always `owner`, and a fresh guild
-starts with default tier `user`, so configuration commands are usable on
-day one.
+`guest` < `user` < `moderator` < `admin` < `guild admin` < `owner`.
+Every command reply, denial included, is ephemeral (visible to the
+invoker alone) unless the documentation marks it public - the deliberate
+exceptions post in the channel; a member below a command's tier gets an
+ephemeral notice naming the required and actual tier. Members with the
+Manage Server permission always act as `guild admin`, a configured bot
+owner is always `owner`, and a fresh guild starts with default tier
+`user`, so configuration commands are usable on day one.
 
 ### Authorization (`auth` plugin)
 
@@ -323,15 +326,16 @@ middleware pipeline on every guild message and slash command; whatever it
 rejects never reaches the other plugins.
 
 **Policy model.** Per guild, a tier policy: every member has an effective
-tier on a six-step ladder -
+tier on a seven-step ladder -
 
 | Tier | What it allows |
 |---|---|
-| `banned` | nothing in guild contexts - the bot ignores their messages and commands entirely, without any reply (DMs carry no guild policy; Discord administrators always act as `admin` regardless of this tier) |
+| `banned` | nothing in guild contexts - the bot ignores their messages and commands entirely, without any reply (DMs carry no guild policy; the permission clamps below always outrank this tier) |
 | `guest` | talk to the bot (chat interactions), no commands |
 | `user` | basic commands (`/ping`, `/help`, `/llm_status`, `/llm_models`) |
-| `moderator` | every service command (`/assign_tracker`, `/llm_assign`, `/llm_set`, ...) |
-| `admin` | everything, including `/auth` tier management |
+| `moderator` | every service command (`/assign_tracker`, `/llm_assign`, `/llm_set`, ...), plus the member-facing slice of `/auth`: a limited `show` and tier writes on members ranked below moderator |
+| `admin` | everything except writes touching admins: role grants, the default tier, `/auth` management of moderators and below |
+| `guild admin` | like admin, plus appointing and removing bot admins - the guild's top authority over the bot |
 | `owner` | everything, plus operator-reserved surfaces (never assignable in any guild) |
 
 The policy assigns tiers three ways: per **user**, per **role** (holding
@@ -340,15 +344,18 @@ else. The effective tier is the best of what applies. Overrides sit
 above the stored data:
 
 - An explicit `banned` user assignment beats every role grant.
-- **Discord guild administrators are always `admin`**, by construction -
-  the clamp cannot be removed, so an admin can never be locked out.
+- **Members with the Manage Server permission are always `guild admin`**,
+  by construction - the clamp cannot be removed, so the server owner
+  (who always carries Manage Server) can never be locked out. Discord
+  administrators, whose permission set implies Manage Server, ride the
+  same clamp.
 - **A configured bot owner is always `owner`**, above every guild-side
   rank - bans included. The owner list comes from the root `owners`
   config key (platform user IDs, hot-reloadable) and never from guild
   data, so no guild admin can grant, revoke, or ban it: `/auth` refuses
-  to touch owners, and stored tier entries can never mint one. `show`
-  tells an owner their status; the list itself is never rendered in any
-  guild.
+  to touch owners, and stored tier entries can never mint one - they are
+  sanitized to `admin` at most. `show` tells an owner their status; the
+  list itself is never rendered in any guild.
 
 Two resolution rules that surprise people:
 
@@ -382,31 +389,48 @@ Robustness rules:
   anywhere; a pending slash command's loading state clears silently,
   with no reply behind it.
 - Commands carry their required tier in their declaration. The Discord
-  adapter does not hide tier-gated commands (only `/auth` keeps the
-  native Manage Server gate as defense in depth) - enforcement is
-  kernel-side, so a moderator without Discord permissions can still run
-  service commands.
+  adapter does not hide tier-gated commands - no command carries a native
+  permission gate, since derived ranks like guild admin cannot be
+  expressed as one anyway. Enforcement is kernel-side, so a moderator
+  without Discord permissions can still run service commands.
 - Passive events (member joins/leaves, presence) and DMs are not gated:
   auth decides who may *use* the bot, not what happens in the guild.
 
-**Usage.** `/auth` is guild-only, requires the `admin` tier, and is
-additionally hidden behind Discord's **Manage Server** permission
-(defense in depth on top of the tier check). Every answer is ephemeral,
-so policy data stays between the bot and the admin.
+**Capability matrix.** `/auth` writes never touch a tier or a member at
+or above the invoker's own rank, and nobody can change their own tier:
 
-| Command | Tier | Effect |
+- A `moderator` gets a limited `show` (the default tier when it sits at
+  or below moderator, user rows at or below moderator - higher ranks and
+  the roles section stay hidden) and may assign `banned`/`guest`/`user`
+  to members ranked below moderator. Role grants and the default tier
+  are admin-only.
+- An `admin` manages moderators and below - including role grants and
+  the default tier - but cannot reassign another admin.
+- A `guild admin` appoints and removes admins; an `owner` is
+  unrestricted.
+- Self-writes are refused for every rank, server owner included: ranks
+  are changed by the rank above, never by yourself. Every refusal names
+  the rank that can act, in an ephemeral reply.
+
+**Usage.** `/auth` is guild-only and requires the `moderator` tier; it
+stays visible to everyone (the matrix inside decides what each rank may
+do). Every answer is ephemeral, so policy data stays between the bot and
+the invoker.
+
+| Command | Invoker | Effect |
 |---|---|---|
-| `/auth action:show` | admin | show the current policy: default tier, user and role assignments |
-| `/auth action:set tier:<tier> user:@member` | admin | assign a tier to a user |
-| `/auth action:set tier:<tier> role:@role` | admin | grant a tier to everyone holding the role |
-| `/auth action:clear user:@member` or `role:@role` | admin | remove an assignment |
-| `/auth action:default tier:<tier>` | admin | set the default tier for unlisted members |
+| `/auth action:show` | moderator (limited view) / admin and above (full) | show the current policy: default tier, user and role assignments |
+| `/auth action:set tier:<tier> user:@member` | moderator and above, bounded by rank | assign a tier to a user (below the invoker's own rank only) |
+| `/auth action:set tier:<tier> role:@role` | admin and above | grant a tier to everyone holding the role |
+| `/auth action:clear user:@member` | moderator and above, bounded by rank | remove a user's assignment |
+| `/auth action:clear role:@role` | admin and above | remove a role grant |
+| `/auth action:default tier:<tier>` | admin and above | set the default tier for unlisted members |
 
 Specify either `user` or `role`, never both. Bot owners cannot be
-targeted: `set`/`clear` refuse with an ephemeral notice. Lowering your
-own tier is possible and warns in the reply: Discord administrators
-keep `admin` regardless, but without that you may need another admin to
-undo it.
+targeted: `set`/`clear` refuse with an ephemeral notice. Changing your
+own tier is refused for every rank - the bootstrap path is built in:
+the server owner is a `guild admin` by construction and appoints bot
+admins from there.
 
 ### Command demo (`command` plugin)
 

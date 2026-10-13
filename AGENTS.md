@@ -26,7 +26,7 @@ Core capabilities:
 - Commands registered by plugins as native platform commands (Discord
   slash commands) - no prefix parsing in core.
 
-Default plugins: auth (six-tier access ladder, see below), command/ping,
+Default plugins: auth (seven-tier access ladder, see below), command/ping,
 tracker (member lifecycle audit), audit log, status rotator, nickname
 (per-guild bot name via `/set_guild_name`), LoL store
 tracker (poll-driven: watches the local League client's store, plus
@@ -213,15 +213,22 @@ descriptors as native commands and normalizes invocations onto
 `CommandInvoked` (deferring interactions to meet the platform deadline).
 ACL is two-layer: `required_permission` is interpreted platform-side and
 reserved for commands whose audience matches a native platform
-permission; `required_tier` (`AccessTier`: banned < guest < user <
-moderator < admin < owner) is kernel-side data the auth plugin enforces
-with ephemeral denials - tier-gated commands deliberately ship without
+permission (no core command sets one today); `required_tier`
+(`AccessTier`: banned < guest < user < moderator < admin < guild_admin <
+owner) is kernel-side data the auth plugin enforces with ephemeral
+denials - tier-gated commands deliberately ship without
 `required_permission` so the command stays visible. `Owner` is special:
 the deployment's bot owners come from the root `owners` config key
 (hot-reloadable, injected at the composition root) and outrank every
-guild-side rank - guild policy can never grant, revoke, or ban one, and
-stored tier data is sanitized to `Admin` at most. Command replies
-default to ephemeral via the shared `common::command_reply` helper.
+guild-side rank - guild policy can never grant, revoke, or ban one.
+`GuildAdmin` is the derived analogue: holders of the platform's
+server-management permission (Discord Manage Server; the guild owner has
+it by construction) resolve above every stored rank, and stored tier
+data is sanitized to `Admin` at most. The `/auth` handler enforces a
+rank-bounded capability matrix on top of the gate (writes stay below the
+invoker's own rank, self-writes refused, moderators get a limited
+`show`). Command replies default to ephemeral via the shared
+`common::command_reply` helper.
 Descriptions are the users' only in-app documentation: write them as
 self-sufficient mini-docs, keep each within Discord's 100-character cap
 (guarded by `test_support::assert_descriptions_fit_discord`), and keep

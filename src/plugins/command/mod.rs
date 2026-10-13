@@ -879,6 +879,9 @@ mod tests {
             AccessTier::User => true,
             AccessTier::Moderator => true,
             AccessTier::Admin => true,
+            // Derived from the platform, never a declared requirement -
+            // hidden like Banned.
+            AccessTier::GuildAdmin => false,
             AccessTier::Owner => true,
         }
     }
@@ -894,6 +897,7 @@ mod tests {
             AccessTier::User,
             AccessTier::Moderator,
             AccessTier::Admin,
+            AccessTier::GuildAdmin,
             AccessTier::Owner,
         ] {
             let descriptors = vec![CommandDescriptor {

@@ -11,7 +11,7 @@ use crate::kernel::{
     models::{Embed, EventKind, EventPayload, OutboundMessage, PluginError, RequestContext},
     plugin_ports::{
         AccessTier, ArgDescriptor, ArgKind, CommandDescriptor, CommandRegistryPort,
-        MiddlewarePluginPort, Next, Permission, PluginPort,
+        MiddlewarePluginPort, Next, PluginPort,
     },
     services::KernelServices,
     spi_ports::GuildStorage,
@@ -30,6 +30,11 @@ pub(crate) const CONFIG_KEY: &str = "config";
 /// permissions as opaque platform data; this bit value is Discord's, passed
 /// through by the driving adapter, and nothing interprets the other bits.
 const GUILD_ADMINISTRATOR_BIT: u64 = 0x8;
+
+/// Discord's `MANAGE_GUILD` permission bit - the platform fact behind the
+/// derived [`AccessTier::GuildAdmin`]. Same opaque pass-through as the
+/// administrator bit above.
+const MANAGE_GUILD_BIT: u64 = 0x20;
 
 /// Per-guild tier policy, stored as a JSON document in the plugin's guild
 /// storage namespace. The `/auth` management command (same plugin,
@@ -55,9 +60,11 @@ pub struct AuthConfig {
 
 impl AuthConfig {
     /// Clamps every stored tier to [`AccessTier::Admin`]. Guild-side data
-    /// must never mint an [`AccessTier::Owner`]: only the config-injected
-    /// owner list may. A hand-edited policy document containing `"owner"`
-    /// deserializes fine but resolves at most to `Admin`.
+    /// must never mint [`AccessTier::Owner`] or [`AccessTier::GuildAdmin`]:
+    /// the first comes only from the config-injected owner list, the second
+    /// only from the platform's server-management permission. A hand-edited
+    /// policy document containing such a tier deserializes fine but resolves
+    /// at most to `Admin`.
     #[must_use]
     pub fn sanitized(mut self) -> Self {
         self.default_tier = self.default_tier.min(AccessTier::Admin);
@@ -278,14 +285,17 @@ impl PluginPort for AuthPlugin {
     }
 
     fn init(&self) -> Result<(), PluginError> {
-        // The interactive half of this plugin. Discord additionally hides
-        // the command behind Manage Server (`default_member_permissions`) -
-        // defense in depth on top of the `Admin` tier check below.
+        // The interactive half of this plugin. Deliberately visible to
+        // everyone and tier-gated at `Moderator`: the handler enforces the
+        // capability matrix per action, and platform-derived ranks
+        // (`GuildAdmin`) cannot be expressed as a native permission gate
+        // anyway - the guild owner would still see the command while the
+        // kernel-side check decides.
         self.registry.register(
             CommandDescriptor {
                 plugin_id: self.name().to_owned(),
                 name: "auth".to_owned(),
-                description: "Manage member tiers for bot access in this server".to_owned(),
+                description: "Show or manage member tiers for bot access in this server".to_owned(),
                 arguments: vec![
                     ArgDescriptor {
                         name: "action".to_owned(),
@@ -334,8 +344,8 @@ impl PluginPort for AuthPlugin {
                         choices: None,
                     },
                 ],
-                required_permission: Some(Permission { name: "manage_guild".to_owned() }),
-                required_tier: Some(AccessTier::Admin),
+                required_permission: None,
+                required_tier: Some(AccessTier::Moderator),
                 guild_only: true,
             },
             Arc::new(
@@ -477,48 +487,21 @@ impl AuthPlugin {
         })
     }
 
-    /// Effective tier of the event's author:
-    /// - A configured bot owner is [`AccessTier::Owner`], above every
-    ///   guild-side rank: bans, explicit assignments, and the Discord
-    ///   administrator clamp never reach an owner.
-    /// - Discord guild administrators are `Admin` by construction - the
-    ///   clamp IS the "cannot be removed" guarantee; there is no stored
-    ///   entry to lose, and no code path anywhere needs a special case.
-    /// - An explicit `Banned` user assignment wins over every role grant.
-    /// - Otherwise: the user's assignment (or the guild default) lifted by
-    ///   the best qualifying role - an explicit assignment below the
-    ///   default (e.g. `Guest`) stays below it until a role lifts it.
-    ///
-    /// The config arrives pre-sanitized, so stored tiers top out at
-    /// `Admin`: only the owner list can yield `Owner`.
+    /// Effective tier of the event's author (see [`resolve_tier`]). The
+    /// payload parts are extracted here; non-chat payloads carry no
+    /// permission data and resolve to the plain policy default.
     fn effective_tier(
         config: &AuthConfig,
         owners: &OwnerList,
         event: &RequestContext,
     ) -> AccessTier {
         let user_id = event.origin.user_id.get().to_string();
-        if owners.contains(&user_id) {
-            return AccessTier::Owner;
-        }
-
         let (author_roles, author_permissions) = match &event.payload {
             EventPayload::Message(message) => (&message.author_roles, message.author_permissions),
             EventPayload::Command(command) => (&command.author_roles, command.author_permissions),
             _ => return config.default_tier,
         };
-
-        if author_permissions & GUILD_ADMINISTRATOR_BIT != 0 {
-            return AccessTier::Admin;
-        }
-
-        if config.users.get(&user_id) == Some(&AccessTier::Banned) {
-            return AccessTier::Banned;
-        }
-
-        let base = config.users.get(&user_id).copied().unwrap_or(config.default_tier);
-        let role_tier =
-            author_roles.iter().filter_map(|role| config.roles.get(role)).copied().max();
-        base.max(role_tier.unwrap_or(base))
+        resolve_tier(config, owners, &user_id, author_roles, author_permissions)
     }
 
     /// Delivers a denial to transactional events only (slash commands owe
@@ -558,10 +541,69 @@ impl AuthPlugin {
         Embed {
             title: "⛔ Not authorized".to_owned(),
             description: format!(
-                "Command `/{command_name}` requires the {required} tier (you have {effective}).\nAsk a guild admin if you think this is a mistake."
+                "Command `/{command_name}` requires the {required} tier (you have {effective}).\nAsk a moderator if you think this is a mistake."
             ),
         }
     }
+}
+
+/// Tier resolution shared by the gate (the event's author) and the `/auth`
+/// handler (the invoker's rank for the capability matrix):
+/// - A configured bot owner is [`AccessTier::Owner`], above every guild-side
+///   rank: bans, explicit assignments, and the permission clamps never
+///   reach an owner.
+/// - A holder of the platform's server-management permission (Discord:
+///   Manage Server) is [`AccessTier::GuildAdmin`] by construction - the
+///   clamp IS the "cannot be removed" guarantee; there is no stored entry
+///   to lose, and no code path anywhere needs a special case. Discord's
+///   administrator bit implies every permission, so real administrators
+///   ride this clamp too.
+/// - A member carrying only the bare administrator bit (no Manage Server -
+///   possible only with synthetic or degraded permission data) falls back
+///   to the historical `Admin` clamp.
+/// - An explicit `Banned` user assignment wins over every role grant.
+/// - Otherwise: the user's assignment (or the guild default) lifted by
+///   the best qualifying role - an explicit assignment below the
+///   default (e.g. `Guest`) stays below it until a role lifts it.
+///
+/// The config arrives pre-sanitized, so stored tiers top out at `Admin`:
+/// only the owner list can yield `Owner`, only the permission bits can
+/// yield `GuildAdmin`.
+pub(crate) fn resolve_tier(
+    config: &AuthConfig,
+    owners: &OwnerList,
+    user_id: &str,
+    author_roles: &[String],
+    author_permissions: u64,
+) -> AccessTier {
+    if owners.contains(user_id) {
+        return AccessTier::Owner;
+    }
+
+    if author_permissions & MANAGE_GUILD_BIT != 0 {
+        return AccessTier::GuildAdmin;
+    }
+    if author_permissions & GUILD_ADMINISTRATOR_BIT != 0 {
+        return AccessTier::Admin;
+    }
+
+    if config.users.get(user_id) == Some(&AccessTier::Banned) {
+        return AccessTier::Banned;
+    }
+
+    let base = config.users.get(user_id).copied().unwrap_or(config.default_tier);
+    let role_tier = author_roles.iter().filter_map(|role| config.roles.get(role)).copied().max();
+    base.max(role_tier.unwrap_or(base))
+}
+
+/// A member's rank as the policy stores it - without the platform clamps.
+/// The `/auth` handler's view of a *target*: it can never see another
+/// member's permission bits, so demotion checks run against stored data
+/// (same precedent as the unconditional Banned-assignment caveat). Members
+/// above the stored ceiling - server managers, owners - are out of reach of
+/// stored writes by construction anyway.
+pub(crate) fn stored_user_tier(config: &AuthConfig, user_id: &str) -> AccessTier {
+    config.users.get(user_id).copied().unwrap_or(config.default_tier)
 }
 
 #[cfg(test)]
@@ -1010,7 +1052,7 @@ mod tests {
         assert!(matches!(plugin.pre(&mut denied, &services).await, Next::Stop));
         assert!(output.messages().len() == 1, "default tier User denies the moderator command");
 
-        let mut admin = command_event(9, "auth", &[]);
+        let mut admin = command_event_with_permissions(9, 0x20);
         admin.origin.reply_token = Some("token".to_owned());
         let args = CommandArgs(vec![
             ("action".to_owned(), "set".to_owned()),
@@ -1170,7 +1212,7 @@ mod tests {
         }
 
         // The write commits and invalidates while that read is in flight.
-        let mut admin = command_event(9, "auth", &[]);
+        let mut admin = command_event_with_permissions(9, 0x20);
         admin.origin.reply_token = Some("token".to_owned());
         let args = CommandArgs(vec![
             ("action".to_owned(), "set".to_owned()),
@@ -1208,7 +1250,7 @@ mod tests {
             ("tier".to_owned(), "moderator".to_owned()),
         ]);
 
-        let mut admin = command_event(9, "auth", &[]);
+        let mut admin = command_event_with_permissions(9, 0x20);
         admin.origin.reply_token = Some("token".to_owned());
         handler.invoke(&admin, &args, &services).await.expect("first invoke");
         handler.invoke(&admin, &args, &services).await.expect("second invoke");
@@ -1378,9 +1420,11 @@ mod tests {
     }
 
     /// Discord guild administrators are Admin by construction: even a
-    /// policy that never mentions them lets them run `/auth`.
+    /// policy that never mentions them lets them run admin commands. (The
+    /// bare administrator bit resolves to Admin; with Manage Server - which
+    /// real administrators always carry - the clamp is Guild Admin below.)
     #[tokio::test]
-    async fn guild_admin_is_admin_by_construction() {
+    async fn discord_administrator_is_admin_by_construction() {
         let storage = configured_storage(AccessTier::User, &[], &[]);
         let (services, output) = test_services(&storage);
         let plugin = test_plugin(&[("auth", AccessTier::Admin)]);
@@ -1390,8 +1434,57 @@ mod tests {
         assert!(output.messages().is_empty());
     }
 
-    /// The clamp beats an explicit ban, too - removing a guild admin's
-    /// access is impossible by construction, in every code path.
+    /// A Manage Server holder resolves to `GuildAdmin` by construction:
+    /// above every stored rank, so admin-tier commands pass. The guild
+    /// owner always computes all permission bits on interactions and rides
+    /// this clamp - no stored entry can lock them out.
+    #[tokio::test]
+    async fn manage_guild_resolves_to_guild_admin() {
+        let storage = configured_storage(AccessTier::User, &[], &[]);
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin(&[("auth", AccessTier::Admin)]);
+        let mut event = command_event_with_permissions(3, 0x20);
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+        assert!(output.messages().is_empty());
+    }
+
+    /// The Guild Admin clamp beats an explicit ban, too - removing a server
+    /// manager's access is impossible by construction, in every code path.
+    #[tokio::test]
+    async fn manage_guild_clamp_beats_explicit_ban() {
+        let storage = configured_storage(AccessTier::User, &[("3", AccessTier::Banned)], &[]);
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin(&[("auth", AccessTier::Moderator)]);
+        let mut event = command_event_with_permissions(3, 0x20);
+
+        assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
+        assert!(output.messages().is_empty());
+    }
+
+    /// The Guild Admin clamp beats role grants as well: an explicit `guest`
+    /// assignment plus a `banned` role cannot pull a server manager down.
+    #[tokio::test]
+    async fn manage_guild_clamp_beats_assignment_and_roles() {
+        let storage = configured_storage(
+            AccessTier::User,
+            &[("3", AccessTier::Guest)],
+            &[("42", AccessTier::Banned)],
+        );
+        let (services, output) = test_services(&storage);
+        let plugin = test_plugin(&[("ping", AccessTier::User)]);
+        let mut message = command_event_with_permissions(3, 0x20);
+        if let EventPayload::Command(payload) = &mut message.payload {
+            payload.name = "ping".to_owned();
+            payload.author_roles = vec!["42".to_owned()];
+        }
+
+        assert!(matches!(plugin.pre(&mut message, &services).await, Next::Continue));
+        assert!(output.messages().is_empty());
+    }
+
+    /// The old clamp still holds: an administrator (0x8 only) cannot be
+    /// demoted below Admin by a ban.
     #[tokio::test]
     async fn guild_admin_clamp_beats_explicit_ban() {
         let storage = configured_storage(AccessTier::User, &[("3", AccessTier::Banned)], &[]);
@@ -1403,19 +1496,19 @@ mod tests {
         assert!(output.messages().is_empty());
     }
 
-    /// Non-admins cannot run admin-tier commands; the denial names both
-    /// sides of the comparison.
+    /// Non-moderators cannot run `/auth` (now Moderator-gated, visible to
+    /// everyone); the denial names both sides of the comparison.
     #[tokio::test]
     async fn non_admin_cannot_run_auth() {
         let storage = configured_storage(AccessTier::User, &[], &[]);
         let (services, output) = test_services(&storage);
-        let plugin = test_plugin(&[("auth", AccessTier::Admin)]);
+        let plugin = test_plugin(&[("auth", AccessTier::Moderator)]);
         let mut event = command_event(3, "auth", &[]);
         event.origin.reply_token = Some("token".to_owned());
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Stop));
         let text = output.messages().into_iter().next().expect("denial expected");
-        assert!(text.contains("Command `/auth` requires the Admin tier"));
+        assert!(text.contains("Command `/auth` requires the Moderator tier"));
         assert!(text.contains("you have User"));
     }
 
@@ -1612,15 +1705,35 @@ mod tests {
             users: BTreeMap::from([
                 ("3".to_owned(), AccessTier::Owner),
                 ("4".to_owned(), AccessTier::User),
+                ("5".to_owned(), AccessTier::GuildAdmin),
             ]),
-            roles: BTreeMap::from([("9".to_owned(), AccessTier::Owner)]),
+            roles: BTreeMap::from([
+                ("9".to_owned(), AccessTier::Owner),
+                ("10".to_owned(), AccessTier::GuildAdmin),
+            ]),
         }
         .sanitized();
 
         assert_eq!(config.default_tier, AccessTier::Admin);
         assert_eq!(config.users.get("3"), Some(&AccessTier::Admin));
         assert_eq!(config.users.get("4"), Some(&AccessTier::User));
+        assert_eq!(config.users.get("5"), Some(&AccessTier::Admin));
         assert_eq!(config.roles.get("9"), Some(&AccessTier::Admin));
+        assert_eq!(config.roles.get("10"), Some(&AccessTier::Admin));
+    }
+
+    /// `guild_admin` is derived, never stored: a hand-edited policy entry
+    /// deserializes (serde is additive) but resolves at most to Admin -
+    /// only the platform permission can produce the real tier.
+    #[tokio::test]
+    async fn hand_edited_guild_admin_assignment_clamps_to_admin() {
+        let storage = configured_storage(AccessTier::User, &[("3", AccessTier::GuildAdmin)], &[]);
+        let (services, _output) = test_services(&storage);
+        // An Owner-gated command: the clamped member must not pass it.
+        let plugin = test_plugin(&[("owner_tool", AccessTier::Owner)]);
+        let mut command = command_event(3, "owner_tool", &[]);
+
+        assert!(matches!(plugin.pre(&mut command, &services).await, Next::Stop));
     }
 
     /// Config strings are trimmed, empties dropped, duplicates collapsed;
