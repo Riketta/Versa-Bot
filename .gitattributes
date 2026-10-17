@@ -1,0 +1,6 @@
+# Migration files are embedded verbatim via include_str!, and sqlx stores a
+# checksum of the embedded bytes in _sqlx_migrations at first apply. A CRLF
+# checkout would produce different checksums per platform and make binaries
+# reject each other's databases ("migration N was previously applied but has
+# been modified"), so pin LF everywhere.
+migrations/*.sql text eol=lf

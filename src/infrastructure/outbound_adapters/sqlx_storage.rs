@@ -29,19 +29,21 @@ enum Db {
 /// stays CWD-independent (it used to break when launched outside the project
 /// root), and `Migration::new` computes the same checksums the directory
 /// loader did, so already-migrated databases validate cleanly.
+///
+/// `include_str!` embeds the working-tree bytes verbatim, so the checksums
+/// are only stable across platforms if every checkout is LF - pinned by
+/// `.gitattributes` and asserted in the tests below.
+const MIGRATION_1_GUILD_DOCUMENTS: &str =
+    include_str!("../../../migrations/0001_guild_documents.sql");
+const MIGRATION_2_GUILD_RECORDS: &str = include_str!("../../../migrations/0002_guild_records.sql");
+const MIGRATION_3_PLUGIN_DOCUMENTS: &str =
+    include_str!("../../../migrations/0003_plugin_documents.sql");
+
 fn embedded_migrations() -> Vec<Migration> {
     vec![
-        migration(
-            1,
-            "guild_documents",
-            include_str!("../../../migrations/0001_guild_documents.sql"),
-        ),
-        migration(2, "guild_records", include_str!("../../../migrations/0002_guild_records.sql")),
-        migration(
-            3,
-            "plugin_documents",
-            include_str!("../../../migrations/0003_plugin_documents.sql"),
-        ),
+        migration(1, "guild_documents", MIGRATION_1_GUILD_DOCUMENTS),
+        migration(2, "guild_records", MIGRATION_2_GUILD_RECORDS),
+        migration(3, "plugin_documents", MIGRATION_3_PLUGIN_DOCUMENTS),
     ]
 }
 
@@ -973,6 +975,23 @@ mod tests {
         assert_eq!(guild.list_last("llm", 10).await.unwrap().len(), 1);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn embedded_migrations_contain_no_carriage_returns() {
+        // include_str! embeds the working-tree bytes verbatim, and sqlx
+        // checksums those bytes in _sqlx_migrations at first apply. A CRLF
+        // checkout (e.g. Windows autocrlf) would silently produce per-platform
+        // checksums and binaries would reject each other's databases with
+        // "migration N was previously applied but has been modified".
+        // .gitattributes pins LF; this fails loudly if a checkout regresses.
+        for (version, sql) in [
+            (1, super::MIGRATION_1_GUILD_DOCUMENTS),
+            (2, super::MIGRATION_2_GUILD_RECORDS),
+            (3, super::MIGRATION_3_PLUGIN_DOCUMENTS),
+        ] {
+            assert!(!sql.contains('\r'), "migration {version} contains CR bytes");
+        }
     }
 
     #[tokio::test]
