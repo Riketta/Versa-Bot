@@ -277,6 +277,15 @@ Environment variables override the file:
 `VERSABOT__DISCORD__TOKEN`, `VERSABOT__STORAGE__URL`,
 `VERSABOT__SENTRY__DSN`, ...
 
+An optional `.env` file in the working directory (`.env.example` ships
+as a template) is loaded at boot, before the config: its values are
+injected as regular environment variables and flow through the same
+`VERSABOT__*` override mechanism - handy for provider keys
+(`VERSABOT_LLM_ZAI_KEY` and friends, named by `api_key_env`) and for
+bare-metal runs without a service manager. Variables already set in the
+environment always win over the file, and a `.env` that fails to parse
+fails the boot; `RUST_LOG` inside the file is honored too.
+
 ### File logging
 
 Without a `[logging]` section the bot logs to stdout (and Sentry, when
@@ -1279,6 +1288,10 @@ docker run -d --name versa-bot \
 
 For production, point `VERSABOT__STORAGE__URL` at PostgreSQL. To use a
 config file instead of env vars, mount it at `/app/versabot.toml:ro`.
+The bot also loads `/app/.env` if one is mounted (`-v ./.env:/app/.env:ro`),
+though compose `env_file:` / `--env-file` - which inject real environment
+variables - is the more idiomatic container shape and takes precedence
+over the file.
 Set `RUST_LOG` to tune log verbosity (default `info`);
 `RUST_LOG=versa_bot=debug` adds the bot's own breadcrumbs - pipeline
 traversal, LLM request/response traces, chime roll decisions - on top of

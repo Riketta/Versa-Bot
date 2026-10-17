@@ -23,6 +23,7 @@ config = {
     "toml",
   ]
 }
+dotenvy = "0.15"
 parking_lot = "0.12.5"
 rand = "0.9"
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }

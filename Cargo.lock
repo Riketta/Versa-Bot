@@ -3604,6 +3604,7 @@ dependencies = [
  "base64 0.22.1",
  "bon",
  "config",
+ "dotenvy",
  "futures-util",
  "image",
  "parking_lot",

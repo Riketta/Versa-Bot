@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,6 +49,18 @@ use versa_bot::plugins::tracker::UserActivityTrackerPlugin;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Optional `.env` in the working directory, loaded before the config so
+    // its values flow through the same `VERSABOT__*` environment source
+    // (and `RUST_LOG` from the file reaches the subscriber installed
+    // below). dotenvy never overrides a variable already set in the
+    // environment - explicit `docker run -e` / systemd injection wins over
+    // the file. A file that exists but fails to parse fails the boot, same
+    // contract as the TOML config; absence is the normal case.
+    let env_file = Path::new(".env");
+    if env_file.is_file() {
+        dotenvy::from_path(env_file).expect(".env file exists but could not be parsed");
+    }
+
     let config = load_config().expect("config expected to exist and be valid");
 
     // Sentry/GlitchTip endpoint is DSN-driven; absent DSN means stdout only.
