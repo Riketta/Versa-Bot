@@ -10,16 +10,23 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::kernel::{
-    models::{GuildId, PluginError, UserId},
+    models::{ChannelId, GuildId, MessageId, PluginError, UserId},
     plugin_ports::{EventBusPort, EventBusSubscription, EventHandler, PluginPort},
 };
-use crate::plugins::tracker::{UserJoinedGuild, UserLeftGuild};
+use crate::plugins::tracker::{
+    MessageDeleted, MessageEdited, MessagePurged, UserJoinedGuild, UserLeftGuild,
+};
 
-/// Logs membership changes across all guilds as structured `audit` tracing
-/// events - stdout plus Sentry/GlitchTip through the tracing layer, with
-/// origin fields attached, so the trail is queryable without any per-guild
-/// configuration. Discord-side per-guild logging stays the tracker's job;
-/// this plugin observes the domain facts themselves.
+/// Logs membership changes and message edit/delete/purge facts across all
+/// guilds as structured `audit` tracing events - stdout plus Sentry/GlitchTip
+/// through the tracing layer, with origin fields attached, so the trail is
+/// queryable without any per-guild configuration. Discord-side per-guild
+/// logging stays the tracker's job; this plugin observes the domain facts
+/// themselves.
+///
+/// Privacy note: message TEXT is never logged here - only ids and text
+/// lengths. Message content belongs to the tracker's per-guild audit channel
+/// (an operator-configured surface), not to operator telemetry.
 pub struct AuditLogPlugin<B: EventBusPort> {
     bus: B,
     /// Live bus subscriptions; non-empty means `init` already ran. The
@@ -47,11 +54,19 @@ impl<B: EventBusPort> PluginPort for AuditLogPlugin<B> {
         if subscriptions.is_empty() {
             subscriptions.push(
                 self.bus
-                    .subscribe(Arc::new(MembershipAudit) as Arc<dyn EventHandler<UserJoinedGuild>>),
+                    .subscribe(Arc::new(TrackerAudit) as Arc<dyn EventHandler<UserJoinedGuild>>),
             );
             subscriptions.push(
-                self.bus
-                    .subscribe(Arc::new(MembershipAudit) as Arc<dyn EventHandler<UserLeftGuild>>),
+                self.bus.subscribe(Arc::new(TrackerAudit) as Arc<dyn EventHandler<UserLeftGuild>>),
+            );
+            subscriptions.push(
+                self.bus.subscribe(Arc::new(TrackerAudit) as Arc<dyn EventHandler<MessageEdited>>),
+            );
+            subscriptions.push(
+                self.bus.subscribe(Arc::new(TrackerAudit) as Arc<dyn EventHandler<MessageDeleted>>),
+            );
+            subscriptions.push(
+                self.bus.subscribe(Arc::new(TrackerAudit) as Arc<dyn EventHandler<MessagePurged>>),
             );
         }
         Ok(())
@@ -67,18 +82,61 @@ impl<B: EventBusPort> PluginPort for AuditLogPlugin<B> {
     }
 }
 
-/// Reacts to tracker-owned membership events.
-struct MembershipAudit;
+/// Reacts to tracker-owned domain events.
+struct TrackerAudit;
 
-impl EventHandler<UserJoinedGuild> for MembershipAudit {
+impl EventHandler<UserJoinedGuild> for TrackerAudit {
     fn handle(&self, event: &UserJoinedGuild) {
         log_membership("joined the guild", event);
     }
 }
 
-impl EventHandler<UserLeftGuild> for MembershipAudit {
+impl EventHandler<UserLeftGuild> for TrackerAudit {
     fn handle(&self, event: &UserLeftGuild) {
         log_membership("left the guild", event);
+    }
+}
+
+impl EventHandler<MessageEdited> for TrackerAudit {
+    fn handle(&self, event: &MessageEdited) {
+        tracing::info!(
+            target: "audit",
+            guild_id = event.guild_id.get(),
+            channel_id = event.channel_id.get(),
+            message_id = event.message_id.get(),
+            user_id = event.user_id.get(),
+            old_captured = event.old_content.is_some(),
+            old_len = event.old_content.as_ref().map(|text| text.chars().count()),
+            new_len = event.new_content.chars().count(),
+            "message edited"
+        );
+    }
+}
+
+impl EventHandler<MessageDeleted> for TrackerAudit {
+    fn handle(&self, event: &MessageDeleted) {
+        tracing::info!(
+            target: "audit",
+            guild_id = event.guild_id.get(),
+            channel_id = event.channel_id.get(),
+            message_id = event.message_id.get(),
+            user_id = event.user_id.get(),
+            captured = event.content.is_some(),
+            len = event.content.as_ref().map(|text| text.chars().count()),
+            "message deleted"
+        );
+    }
+}
+
+impl EventHandler<MessagePurged> for TrackerAudit {
+    fn handle(&self, event: &MessagePurged) {
+        tracing::info!(
+            target: "audit",
+            guild_id = event.guild_id.get(),
+            channel_id = event.channel_id.get(),
+            count = event.count,
+            "messages purged"
+        );
     }
 }
 
@@ -161,10 +219,37 @@ mod tests {
         UserLeftGuild { guild_id: GuildId(1), user_id: UserId(3), username: None }
     }
 
-    /// `init()` must subscribe both membership event types: publishing on the
+    fn edited_event() -> MessageEdited {
+        MessageEdited {
+            guild_id: GuildId(1),
+            channel_id: ChannelId(2),
+            message_id: MessageId(4),
+            user_id: UserId(3),
+            author_name: Some("someone".to_owned()),
+            old_content: Some("before".to_owned()),
+            new_content: "after".to_owned(),
+        }
+    }
+
+    fn deleted_event() -> MessageDeleted {
+        MessageDeleted {
+            guild_id: GuildId(1),
+            channel_id: ChannelId(2),
+            message_id: MessageId(4),
+            user_id: UserId(3),
+            author_name: Some("someone".to_owned()),
+            content: Some("gone".to_owned()),
+        }
+    }
+
+    fn purged_event() -> MessagePurged {
+        MessagePurged { guild_id: GuildId(1), channel_id: ChannelId(2), count: 7 }
+    }
+
+    /// `init()` must subscribe all tracker event types: publishing on the
     /// same bus afterwards reaches the audit handler.
     #[test]
-    fn init_subscribes_membership_audit() {
+    fn init_subscribes_the_tracker_events() {
         let bus = InMemoryEventBus::new();
         let plugin = AuditLogPlugin::new(bus.clone());
         let capture = Capture::default();
@@ -177,15 +262,29 @@ mod tests {
             plugin.init().expect("init expected to succeed");
             bus.publish(joined_event());
             bus.publish(left_event());
+            bus.publish(edited_event());
+            bus.publish(deleted_event());
+            bus.publish(purged_event());
         });
 
         let log = String::from_utf8(capture.0.lock().clone()).expect("log expected to be utf8");
         assert!(log.contains("user joined the guild"), "log: {log}");
         assert!(log.contains("user left the guild"), "log: {log}");
+        assert!(log.contains("message edited"), "log: {log}");
+        assert!(log.contains("message deleted"), "log: {log}");
+        assert!(log.contains("messages purged"), "log: {log}");
+        assert!(log.contains("count=7"), "log: {log}");
         // fmt quotes string field values.
         assert!(log.contains("guild_id=1"), "log: {log}");
         assert!(log.contains("username=\"someone\""), "log: {log}");
         assert!(log.contains("username=\"unknown\""), "log: {log}");
+        // Message events log ids and text LENGTHS, never the text itself
+        // (message-sized payloads stay out of operator telemetry).
+        assert!(log.contains("old_len=6"), "log: {log}");
+        assert!(log.contains("new_len=5"), "log: {log}");
+        assert!(!log.contains("before"), "text must not be logged: {log}");
+        assert!(!log.contains("after"), "text must not be logged: {log}");
+        assert!(!log.contains("gone"), "text must not be logged: {log}");
     }
 
     /// Captures formatted log lines produced while `f` runs.

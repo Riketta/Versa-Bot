@@ -8,6 +8,7 @@ use super::lol_store::LolStoreConfig;
 use super::sentry::SentryConfig;
 use super::status::StatusConfig;
 use super::storage::StorageConfig;
+use super::tracker::TrackerConfig;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct Configuration {
@@ -44,6 +45,10 @@ pub struct Configuration {
     /// one that degrades) keeps the command in "not configured" mode.
     #[serde(default)]
     pub lol_leaderboard: Option<LolLeaderboardConfig>,
+    /// Audit-notice tuning for the tracker plugin (`[tracker]` section).
+    /// Absent section keeps the defaults; startup-only.
+    #[serde(default)]
+    pub tracker: TrackerConfig,
     /// Deployment-global bot-owner identities (`owners = ["..."]`):
     /// platform user IDs as strings, matched exactly after trimming. Owners
     /// sit above every guild-side access tier and cannot be modified through

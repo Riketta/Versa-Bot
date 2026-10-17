@@ -42,8 +42,9 @@ commands, permission tiers - lives in [Plugins](#plugins).
   irrevocable.
 - User activity tracker: logs member joins/leaves to a guild audit
   channel, tracks invite creates/deletes and attributes joins to their
-  invite code (permission-gated), and publishes membership events on the
-  plugin bus.
+  invite code (permission-gated), reports message edits, deletions and
+  purges (original text quoted when it was captured), and publishes
+  membership/message events on the plugin bus.
 - LoL store tracker: watches the locally running League client's store
   (sales, new skins, Mythic Shop rotations, Your Shop start) and announces
   changes to a per-guild assigned channel.
@@ -180,7 +181,7 @@ the target channel.
 ```text
 /ping                                        # any channel: the loop works
 /set_guild_name name:Versa                   # optional: how this server sees the bot
-/assign_tracker                              # in #audit: join/leave notices land here
+/assign_tracker                              # in #audit: join/leave, invite and message-edit notices land here
 
 /llm_models                                  # what this deployment offers
 /llm_assign model:local/gemma                # in #bot-chat: bind the assistant here
@@ -224,7 +225,7 @@ by a concrete plugin or core feature:
 | `DIRECT_MESSAGES` | regular | Core DM intake: DM events flow with no guild scope |
 | `GUILD_MEMBERS` | **privileged** | `tracker` plugin: member join/leave events (`/assign_tracker` audit) |
 | `GUILD_INVITES` | regular | `tracker` plugin: invite create/delete events for the invite audit - delivered only where the bot holds Manage Channels |
-| `MESSAGE_CONTENT` | **privileged** | the LLM chat plugin reads guild message content for conversation history - enable "Message Content Intent" in the Developer Portal |
+| `MESSAGE_CONTENT` | **privileged** | the LLM chat plugin reads guild message content for conversation history, and the tracker quotes original text in edit/deletion notices - enable "Message Content Intent" in the Developer Portal |
 
 So exactly two portal toggles are needed today (Developer Portal → Bot),
 otherwise the gateway disconnects on start: enable **Server Members Intent**
@@ -514,6 +515,28 @@ create, delete, and use-count changes exist. Vanity URLs
 (`discord.gg/<slug>`) are a separate endpoint and not part of
 attribution.
 
+**Message edit/delete tracking** rides the same audit channel, always
+on, across every channel the bot can read:
+
+- **Edits**: `✏️ **<user>** edited a message in <#channel>` with a jump
+  link and the previous text quoted as `was:` / the new text as `now:`,
+  each in a fenced block so whitespace and markdown stay visible. When
+  the original was never seen (sent before the bot started, or beyond
+  the capture horizon), the notice says so instead of inventing one.
+- **Deletions**: `🗑 **<user>** deleted a message in <#channel>` with the
+  captured text; an uncached message degrades to a plain "a message was
+  deleted" fact.
+- **Purges**: a mass delete is one `🗑️ N messages were purged` notice,
+  never one per message.
+
+Bot and webhook messages (including the bot's own streaming edits) are
+never tracked, and no-op updates (embed unfurls, pin/suppress toggles)
+produce nothing. Quotes are clipped per side at
+`message_notice_limit` (500 characters by default) so a notice always
+fits the platform message limit. Edits and deletions are observation
+only - conversation history recorded by the LLM plugin stays
+append-only and is never rewritten.
+
 | Command | Tier | Effect |
 |---|---|---|
 | `/assign_tracker` | moderator | make this channel the guild's audit channel (one per guild, last write wins) |
@@ -521,11 +544,14 @@ attribution.
 
 ### Audit log (`audit_log` plugin)
 
-The event bus's first consumer: subscribes to the membership events the
-tracker publishes and records each one as a structured `audit` tracing
-event with origin fields - stdout, plus Sentry/GlitchTip when reporting
-is configured (`info` grade). No per-guild configuration and no
-commands; removing the plugin removes only the trail, not the tracking.
+The event bus's first consumer: subscribes to the membership and
+message events the tracker publishes and records each one as a
+structured `audit` tracing event with origin fields - stdout, plus
+Sentry/GlitchTip when reporting is configured (`info` grade). Message
+events log ids and text lengths only, never text - message content
+belongs to the per-guild audit channel. No per-guild configuration and
+no commands; removing the plugin removes only the trail, not the
+tracking.
 
 ### Status rotator (`status_rotator` plugin)
 

@@ -127,6 +127,7 @@ async fn main() -> ExitCode {
     let tracker = Arc::new(UserActivityTrackerPlugin::new(
         event_bus.clone(),
         Arc::clone(&registry) as Arc<dyn CommandRegistryPort>,
+        config.tracker.message_notice_limit,
     ));
     // LLM chat plugin: the conversation engine is live. `[llm]` is
     // startup-only - provider clients and API keys are built once here, so

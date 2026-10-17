@@ -272,3 +272,11 @@ url = "sqlite://versabot.db"
 # cache_ttl_secs = 64800
 # Optional proxy for source requests (socks5:// or http://).
 # proxy = "socks5://192.168.1.35:8081"
+
+# Optional: tracker audit-notice tuning ([tracker] section). The tracker
+# itself needs no config - assign its audit channel per guild with
+# /assign_tracker; this section only tunes the notices. Startup-only.
+# [tracker]
+# Per-side character cap on quoted message text in edit/deletion notices
+# (clamped so a notice always fits the platform message limit).
+# message_notice_limit = 500

@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serenity::all::{
-    ChannelId as SerenityChannelId, CommandDataOption, CommandDataOptionValue, CommandDataResolved,
-    Context, EventHandler, GuildId as SerenityGuildId, Interaction, InviteCreateEvent,
-    InviteDeleteEvent, Member, Message, MessageType, Permissions, Ready, RoleId as SerenityRoleId,
-    User, UserId as SerenityUserId,
+    Attachment, ChannelId as SerenityChannelId, CommandDataOption, CommandDataOptionValue,
+    CommandDataResolved, Context, EventHandler, GuildId as SerenityGuildId, Interaction,
+    InviteCreateEvent, InviteDeleteEvent, Member, Message, MessageId as SerenityMessageId,
+    MessageType, MessageUpdateEvent, Permissions, Ready, RoleId as SerenityRoleId, User,
+    UserId as SerenityUserId,
 };
 use serenity::async_trait;
 
@@ -111,6 +112,93 @@ impl<H: RequestHandlerPort> EventHandler for DiscordGatewayAdapter<H> {
         if let Some(event) = event {
             self.handler.handle(event).await;
         }
+    }
+
+    async fn message_update(
+        &self,
+        ctx: Context,
+        _old_if_available: Option<Message>,
+        _new: Option<Message>,
+        event: MessageUpdateEvent,
+    ) {
+        // MESSAGE_UPDATE carries no guild id: resolve it - and the guild
+        // display name - from the gateway cache through the channel. DM
+        // channels are not cached, degrading to a guild-less event. The
+        // lookup is deprecated in serenity without a reverse (channel ->
+        // guild) replacement, so the deprecation is acknowledged here.
+        // Guards are scoped to this block: they must be dropped before the
+        // pipeline await below.
+        #[allow(deprecated)]
+        let guild_id = ctx.cache.channel(event.channel_id).map(|channel| channel.guild_id);
+        let guild_name =
+            guild_id.and_then(|guild_id| ctx.cache.guild(guild_id)).map(|guild| guild.name.clone());
+        let bot_user_id = ctx.cache.current_user().id.get();
+
+        let event = {
+            let guild = guild_id.and_then(|guild_id| ctx.cache.guild(guild_id));
+            let mentioned: HashMap<u64, &User> = event
+                .mentions
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|user| (user.id.get(), user))
+                .collect();
+            let resolve = |kind: MentionKind, id: u64| {
+                resolve_mention_name(&mentioned, guild.as_deref(), kind, id)
+            };
+            message_edited_event(&event, guild_id, guild_name, bot_user_id, &resolve)
+        };
+        if let Some(event) = event {
+            self.handler.handle(event).await;
+        }
+    }
+
+    async fn message_delete(
+        &self,
+        ctx: Context,
+        channel_id: SerenityChannelId,
+        deleted_message_id: SerenityMessageId,
+        guild_id: Option<SerenityGuildId>,
+    ) {
+        // Best effort: the gateway cache often still holds the deleted
+        // message, so its author is known; otherwise the event identifies
+        // only WHICH message vanished (the tracker keeps its own capture
+        // for the text).
+        let author_id = ctx
+            .cache
+            .message(channel_id, deleted_message_id)
+            .map(|message| message.author.id.get());
+        let event = message_deleted_event(guild_id, channel_id, deleted_message_id, author_id);
+        self.handler.handle(event).await;
+    }
+
+    async fn message_delete_bulk(
+        &self,
+        _ctx: Context,
+        channel_id: SerenityChannelId,
+        multiple_deleted_messages_ids: Vec<SerenityMessageId>,
+        guild_id: Option<SerenityGuildId>,
+    ) {
+        // One purge fact, not one event per message - a bulk delete would
+        // otherwise flood every consumer with duplicates of the same notice.
+        let mut ids = multiple_deleted_messages_ids;
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() {
+            return;
+        }
+        let event = RequestContext::message_purged(
+            Origin {
+                guild_id: guild_id.map(|guild_id| GuildId(guild_id.get())),
+                channel_id: ChannelId(channel_id.get()),
+                // The purge actor is not part of the platform event.
+                user_id: UserId(0),
+                message_id: None,
+                reply_token: None,
+            },
+            ids.len(),
+        );
+        self.handler.handle(event).await;
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
@@ -439,20 +527,7 @@ fn message_event(
         .and_then(|reference| reference.message_id)
         .map(|message_id| MessageId(message_id.get()));
     let mentions_bot = message.mentions.iter().any(|user| user.id.get() == bot_user_id);
-    // Platform-blind attachment DTOs; the URLs are Discord's own CDN
-    // links (the pinned trusted host for plugin-side downloads).
-    let attachments: Vec<AttachmentPayload> = message
-        .attachments
-        .iter()
-        .map(|attachment| AttachmentPayload {
-            url: attachment.url.clone(),
-            content_type: attachment.content_type.clone(),
-            file_name: Some(attachment.filename.clone()),
-            size_bytes: u64::from(attachment.size),
-            width: attachment.width,
-            height: attachment.height,
-        })
-        .collect();
+    let attachments = attachment_dtos(&message.attachments);
 
     let origin = Origin {
         guild_id: message.guild_id.map(|guild_id| GuildId(guild_id.get())),
@@ -476,6 +551,104 @@ fn message_event(
     }
 
     Some(event)
+}
+
+/// Pure core of the MESSAGE_UPDATE handler: maps a message edit onto
+/// [`RequestContext::message_edited`], or `None` when the update is not a
+/// human text edit - machine authors (including this bot's own streaming
+/// edits), webhook authors, system-ish message types, and updates that
+/// carry no text at all (embed unfurls, pin and suppress-embed toggles all
+/// ride MESSAGE_UPDATE). The payload is the NEW snapshot; update payloads
+/// omit unchanged fields, so roles and permission bits stay unknown and
+/// whatever the platform repeats is carried best effort.
+fn message_edited_event(
+    event: &MessageUpdateEvent,
+    guild_id: Option<SerenityGuildId>,
+    guild_name: Option<String>,
+    bot_user_id: u64,
+    resolve: &dyn Fn(MentionKind, u64) -> Option<String>,
+) -> Option<RequestContext> {
+    let author = event.author.as_ref()?;
+    if author.bot || matches!(event.webhook_id, Some(Some(_))) {
+        return None;
+    }
+    let content = event.content.as_deref()?;
+    // Edits arrive for conversation turns only; an absent `type` (common in
+    // update payloads) counts as Regular.
+    if matches!(
+        event.kind,
+        Some(kind)
+            if !matches!(
+                kind,
+                MessageType::Regular | MessageType::InlineReply | MessageType::ThreadStarterMessage
+            )
+    ) {
+        return None;
+    }
+
+    let mentioned: HashMap<u64, &User> =
+        event.mentions.as_deref().unwrap_or(&[]).iter().map(|user| (user.id.get(), user)).collect();
+    let mentions_bot = mentioned.contains_key(&bot_user_id);
+    let reply_to = event
+        .message_reference
+        .as_ref()
+        .and_then(|reference| reference.as_ref())
+        .and_then(|reference| reference.message_id)
+        .map(|message_id| MessageId(message_id.get()));
+
+    let origin = Origin {
+        guild_id: guild_id.map(|guild_id| GuildId(guild_id.get())),
+        channel_id: ChannelId(event.channel_id.get()),
+        user_id: UserId(author.id.get()),
+        message_id: Some(MessageId(event.id.get())),
+        reply_token: None,
+    };
+    let mut edited =
+        RequestContext::message_edited(origin, normalize_mention_tags(content, resolve));
+    if let EventPayload::Message(payload) = &mut edited.payload {
+        payload.author_name = Some(display_name(author));
+        payload.guild_name = guild_name;
+        payload.attachments = attachment_dtos(event.attachments.as_deref().unwrap_or(&[]));
+        payload.reply_to = reply_to;
+        payload.mentions_bot = mentions_bot;
+    }
+    Some(edited)
+}
+
+/// Platform-blind attachment DTOs from Discord attachment payloads - the
+/// URLs are Discord's own CDN links (the pinned trusted host for
+/// plugin-side downloads).
+fn attachment_dtos(attachments: &[Attachment]) -> Vec<AttachmentPayload> {
+    attachments
+        .iter()
+        .map(|attachment| AttachmentPayload {
+            url: attachment.url.clone(),
+            content_type: attachment.content_type.clone(),
+            file_name: Some(attachment.filename.clone()),
+            size_bytes: u64::from(attachment.size),
+            width: attachment.width,
+            height: attachment.height,
+        })
+        .collect()
+}
+
+/// MESSAGE_DELETE normalized: the platform names only WHICH message
+/// vanished - author and text are unknown here (the gateway cache may
+/// still know the author, passed in as `author_id`), so `user_id` degrades
+/// to `UserId(0)`.
+fn message_deleted_event(
+    guild_id: Option<SerenityGuildId>,
+    channel_id: SerenityChannelId,
+    message_id: SerenityMessageId,
+    author_id: Option<u64>,
+) -> RequestContext {
+    RequestContext::message_deleted(Origin {
+        guild_id: guild_id.map(|guild_id| GuildId(guild_id.get())),
+        channel_id: ChannelId(channel_id.get()),
+        user_id: UserId(author_id.unwrap_or(0)),
+        message_id: Some(MessageId(message_id.get())),
+        reply_token: None,
+    })
 }
 
 /// Name behind a mention tag, for content normalization: the message
@@ -1224,6 +1397,128 @@ mod tests {
             .expect("thread starter must become an event");
         assert_eq!(event.kind, EventKind::MessageReceived);
         assert_eq!(message_payload(event).reply_to, Some(MessageId(555)));
+    }
+
+    // ---- Message edit/deletion mapping ----
+
+    /// A realistic MESSAGE_UPDATE payload: Discord repeats most fields and
+    /// omits unchanged ones. Built through the wire shape on purpose.
+    fn update_event(json: &str) -> MessageUpdateEvent {
+        serde_json::from_str::<MessageUpdateEvent>(json).expect("update payload deserializes")
+    }
+
+    fn update_json(extra: &str) -> String {
+        format!(
+            r#"{{
+                "id": "1000",
+                "channel_id": "2000",
+                "author": {{ "id": "42", "username": "human", "discriminator": "1" }},
+                "content": "edited text",
+                {extra}
+                "type": 0
+            }}"#
+        )
+    }
+
+    #[test]
+    fn message_update_maps_onto_the_edit_taxonomy() {
+        let event = message_edited_event(
+            &update_event(&update_json(r#""mentions": [], "#)),
+            Some(SerenityGuildId::new(3000)),
+            Some("Forge".to_owned()),
+            99,
+            &no_names,
+        )
+        .expect("human text edit expected to become an event");
+
+        assert_eq!(event.kind, EventKind::MessageEdited);
+        assert_eq!(event.origin.guild_id, Some(GuildId(3000)));
+        assert_eq!(event.origin.channel_id, ChannelId(2000));
+        assert_eq!(event.origin.user_id, UserId(42));
+        assert_eq!(event.origin.message_id, Some(MessageId(1000)));
+        let payload = message_payload(event);
+        assert_eq!(payload.content, "edited text");
+        assert_eq!(payload.author_name.as_deref(), Some("human"));
+        assert_eq!(payload.guild_name.as_deref(), Some("Forge"));
+        assert!(!payload.mentions_bot);
+    }
+
+    #[test]
+    fn message_update_of_a_bot_or_webhook_produces_no_event() {
+        // The bot's own streaming edits (bot author) must not enter the
+        // pipeline.
+        let bot = serde_json::from_str::<MessageUpdateEvent>(
+            r#"{
+                "id": "1000", "channel_id": "2000",
+                "author": { "id": "42", "username": "robot", "bot": true },
+                "content": "streaming edit", "type": 0
+            }"#,
+        )
+        .expect("bot update deserializes");
+        assert!(message_edited_event(&bot, None, None, 99, &no_names).is_none());
+
+        let webhook = update_event(
+            r#"{
+                "id": "1000", "channel_id": "2000",
+                "author": { "id": "42", "username": "hook" },
+                "content": "hook edit", "webhook_id": "77", "type": 0
+            }"#,
+        );
+        assert!(message_edited_event(&webhook, None, None, 99, &no_names).is_none());
+    }
+
+    #[test]
+    fn message_update_without_text_is_not_an_edit() {
+        // Embed unfurls, pin state and suppress-embed toggles ride
+        // MESSAGE_UPDATE with no `content` field.
+        let no_content = update_event(
+            r#"{
+                "id": "1000", "channel_id": "2000",
+                "author": { "id": "42", "username": "human" },
+                "pinned": true
+            }"#,
+        );
+        assert!(message_edited_event(&no_content, None, None, 99, &no_names).is_none());
+
+        // A missing author (rare partial payload) is likewise unmappable.
+        let no_author = update_event(r#"{ "id": "1000", "channel_id": "2000", "content": "x" }"#);
+        assert!(message_edited_event(&no_author, None, None, 99, &no_names).is_none());
+
+        // System-ish types never arrive as human edits.
+        let system = update_event(
+            r#"{
+                "id": "1000", "channel_id": "2000",
+                "author": { "id": "42", "username": "human" },
+                "content": "x", "type": 7
+            }"#,
+        );
+        assert!(message_edited_event(&system, None, None, 99, &no_names).is_none());
+    }
+
+    #[test]
+    fn message_delete_and_purge_map_onto_the_taxonomy() {
+        let deleted = message_deleted_event(
+            Some(SerenityGuildId::new(3000)),
+            SerenityChannelId::new(2000),
+            SerenityMessageId::new(1000),
+            Some(42),
+        );
+        assert_eq!(deleted.kind, EventKind::MessageDeleted);
+        assert_eq!(deleted.origin.guild_id, Some(GuildId(3000)));
+        assert_eq!(deleted.origin.message_id, Some(MessageId(1000)));
+        assert_eq!(deleted.origin.user_id, UserId(42));
+
+        // Without the gateway cache, the author is unknown - the sentinel
+        // keeps the origin total while the tracker fills the real name.
+        let unknown = message_deleted_event(
+            None,
+            SerenityChannelId::new(2000),
+            SerenityMessageId::new(1000),
+            None,
+        );
+        assert_eq!(unknown.origin.user_id, UserId(0));
+        assert_eq!(unknown.origin.guild_id, None);
+        assert!(matches!(unknown.payload, EventPayload::Empty));
     }
 
     /// Attachments become platform-blind DTOs that preserve the CDN url

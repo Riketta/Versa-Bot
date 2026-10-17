@@ -27,7 +27,8 @@ Core capabilities:
   slash commands) - no prefix parsing in core.
 
 Default plugins: auth (seven-tier access ladder, see below), command/ping,
-tracker (member lifecycle audit), audit log, status rotator, nickname
+tracker (member lifecycle, invite, and message edit/delete audit), audit
+log, status rotator, nickname
 (per-guild bot name via `/set_guild_name`), LoL store
 tracker (poll-driven: watches the local League client's store, plus
 per-user skin/champion watch subscriptions; the one case of a plugin
@@ -179,18 +180,22 @@ absent/empty DSN disables reporting; Sentry SaaS or self-hosted
 GlitchTip). Level contract: `debug` = stdout-only breadcrumbs
 (pipeline traversal, provider traces, job ticks, roll decisions); `info`
 = audit grade, also shipped to Sentry as log items (command dispatch,
-command registration trail, per-completion LLM record). command registration trail, per-completion LLM record). Privacy rule:
+command registration trail, per-completion LLM record). Privacy rule:
 guild data must never cross guild boundaries and never reach
 guild-visible surfaces - no message text, no prompts, no endpoint bodies
-in embeds or channel text. Operator-side telemetry (stdout, log files,
-Sentry) is trusted like storage: it may carry bounded short context
-(ids, settings keys, short admin-set values), never message-sized
-payloads. The single
-explicit exception is the LLM plugin's `[llm] log_raw_traffic` operator
-diagnostic (off by default, stdout only via the dedicated
-`llm_raw_traffic` target, never the Sentry layer, captured to files only
-when the `[logging]` filter names that target). Real metrics would use
-the `metrics` crate facade directly - still no port.
+in embeds or channel text. The one guild-visible exception is the
+tracker's per-guild audit channel: edit/deletion notices quote bounded
+message text - that is their operator-facing moderation purpose (the
+audit_log plugin's telemetry still logs ids and text lengths only).
+Operator-side telemetry (stdout, log files, Sentry) is trusted like
+storage: it may carry bounded short context (ids, settings keys, short
+admin-set values), never message-sized payloads. The explicit exceptions
+are the LLM plugin's `[llm] log_raw_traffic` operator diagnostic (off by
+default, stdout only via the dedicated `llm_raw_traffic` target, never
+the Sentry layer, captured to files only when the `[logging]` filter
+names that target) and the tracker audit channel just named - a
+guild-visible surface, not telemetry. Real metrics would use the
+`metrics` crate facade directly - still no port.
 
 **Inbound events:** `RequestContext` is a chat-agnostic EVENT, not just a
 message: kinds (`MessageReceived`, `MemberJoined`, `CommandInvoked`, ...)

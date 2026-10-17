@@ -31,7 +31,8 @@ pub struct Origin {
 /// platform events onto these kinds; middleware plugins match on the kinds
 /// they care about and ignore the rest.
 ///
-/// Currently emitted kinds: `MessageReceived`, `MemberJoined`, `MemberLeft`,
+/// Currently emitted kinds: `MessageReceived`, `MessageEdited`,
+/// `MessageDeleted`, `MessagePurged`, `MemberJoined`, `MemberLeft`,
 /// `CommandInvoked`, `InviteCreated`, `InviteDeleted`. The remaining variants
 /// are reserved for future adapters - no adapter emits them yet, so a plugin
 /// matching on them never fires (listed here so the taxonomy is not read as
@@ -40,12 +41,21 @@ pub struct Origin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventKind {
     MessageReceived,
-    /// Reserved: no adapter emits this yet. Editing is append-hostile for
-    /// the LLM record log, so a real implementation needs a consumer-driven
-    /// policy (e.g. record rewrites vs. compensating events) first.
+    /// A previously seen message had its text content changed. The payload
+    /// carries the NEW message snapshot; adapters emit this only when the
+    /// platform reports new text. Observation-only contract: consumers note
+    /// the fact, and captured conversation records stay append-only - an
+    /// edit never rewrites recorded history (the LLM plugin ignores this
+    /// kind for exactly that reason).
     MessageEdited,
-    /// Reserved: no adapter emits this yet.
+    /// A single message was deleted. Deletion events carry no content and
+    /// usually no author - the origin names the message; consumers that need
+    /// the text keep their own capture (the tracker plugin does). `user_id`
+    /// is `UserId(0)` when the platform does not identify the author.
     MessageDeleted,
+    /// Many messages were removed at once (mass delete / purge). Only the
+    /// count is reported - platforms do not list the messages.
+    MessagePurged,
     MemberJoined,
     MemberLeft,
     /// Reserved: no adapter emits inbound presence updates yet - the bot
@@ -74,8 +84,19 @@ pub enum EventPayload {
     /// An invite lifecycle event (`InviteCreated` / `InviteDeleted`); see
     /// [`InvitePayload`].
     Invite(InvitePayload),
+    /// A mass deletion (`EventKind::MessagePurged`); see
+    /// [`MessagePurgePayload`].
+    Purge(MessagePurgePayload),
     /// Kinds that carry no normalized payload yet (e.g. `PresenceUpdate`).
     Empty,
+}
+
+/// One mass-deletion fact, normalized platform-blind: how many messages a
+/// purge removed in the origin's channel. Platforms do not identify the
+/// messages (or the actor), so nothing else is reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessagePurgePayload {
+    pub count: usize,
 }
 
 /// One invite lifecycle fact, normalized platform-blind. `InviteDeleted`

@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::common::command_reply;
 use crate::kernel::{
     models::{
-        ChannelId, EventKind, EventPayload, InvitePayload, MemberPayload, Origin, OutboundMessage,
-        PluginError, RequestContext, StorageError,
+        ChannelId, EventKind, EventPayload, InvitePayload, MemberPayload, MessagePayload, Origin,
+        OutboundMessage, PluginError, RequestContext, StorageError,
     },
     plugin_ports::{
         AccessTier, CommandArgs, CommandDescriptor, CommandHandler, CommandRegistryPort,
@@ -18,8 +18,11 @@ use crate::kernel::{
     spi_ports::GuildStorage,
 };
 
-use super::events::{UserJoinedGuild, UserLeftGuild};
+use super::events::{MessageDeleted, MessageEdited, MessagePurged, UserJoinedGuild, UserLeftGuild};
 use super::invites::{INVITES_KEY, InviteDoc, attribute_join};
+use super::messages::{
+    MessageCache, MessageKey, delete_notice, delete_unknown_notice, edit_notice, purge_notice,
+};
 
 /// Guild storage namespace owned by this plugin (the plugin's slug).
 const NAMESPACE: &str = "tracker";
@@ -37,12 +40,13 @@ pub struct TrackerConfig {
     pub audit_channel_id: Option<String>,
 }
 
-/// User activity tracker: observes member lifecycle and invite events in
-/// the pipeline and turns each into two things:
+/// User activity tracker: observes member lifecycle, invite, and message
+/// lifecycle events in the pipeline and turns each into two things:
 ///
 /// - plugin-owned domain events on the bus ([`UserJoinedGuild`] /
-///   [`UserLeftGuild`]), published for EVERY guild member event regardless
-///   of policy-config readability, so bus-only plugins can react without
+///   [`UserLeftGuild`] / [`MessageEdited`] / [`MessageDeleted`] /
+///   [`MessagePurged`]), published for EVERY guild event regardless of
+///   policy-config readability, so bus-only plugins can react without
 ///   joining the pipeline themselves, and
 /// - an audit message in the guild's configured channel (best effort - an
 ///   unconfigured or unreadable config or a broken destination skips only
@@ -55,6 +59,12 @@ pub struct TrackerConfig {
 /// read permission (Discord: Manage Server) - without it the diff degrades
 /// to plain join notices, never to an error.
 ///
+/// Message edit/delete/purge tracking rides the same audit channel too. The
+/// original text of an edit or deletion comes from an in-memory capture of
+/// recent human messages ([`MessageCache`], FIFO-capped) - messages sent
+/// before the bot started (or beyond the cap) are noticed with an explicit
+/// "not seen" placeholder instead of a fabricated original.
+///
 /// Passive middleware: always `Continue` - tracking observes, never gates.
 /// Policy contrasts with auth: a malformed config here fails *open* (skip
 /// the audit line, keep publishing) because observability must not break
@@ -66,6 +76,12 @@ pub struct TrackerConfig {
 pub struct UserActivityTrackerPlugin<B: EventBusPort> {
     bus: B,
     registry: Arc<dyn CommandRegistryPort>,
+    /// Per-side text cap for quoted message text in edit/deletion notices
+    /// (the `[tracker]` `message_notice_limit` config; startup-only).
+    notice_limit: usize,
+    /// Recent human messages, the source for the "was" side of edit and
+    /// deletion notices. Process-lifetime, FIFO-capped by the cache itself.
+    messages: MessageCache,
     /// Serializes the per-guild invite-map read-modify-write (create upserts
     /// and join diffs mutate one stored document). Process-lifetime; only
     /// this plugin writes the document, so an instance lock suffices.
@@ -74,8 +90,14 @@ pub struct UserActivityTrackerPlugin<B: EventBusPort> {
 
 impl<B: EventBusPort> UserActivityTrackerPlugin<B> {
     #[must_use]
-    pub fn new(bus: B, registry: Arc<dyn CommandRegistryPort>) -> Self {
-        Self { bus, registry, invites_lock: tokio::sync::Mutex::new(()) }
+    pub fn new(bus: B, registry: Arc<dyn CommandRegistryPort>, notice_limit: usize) -> Self {
+        Self {
+            bus,
+            registry,
+            notice_limit,
+            messages: MessageCache::new(),
+            invites_lock: tokio::sync::Mutex::new(()),
+        }
     }
 }
 
@@ -89,8 +111,8 @@ impl<B: EventBusPort> PluginPort for UserActivityTrackerPlugin<B> {
             CommandDescriptor {
                 plugin_id: self.name().to_owned(),
                 name: "assign_tracker".to_owned(),
-                description: "Send member join/leave notices to this channel (one audit channel \
-                     per guild)"
+                description: "Send tracker notices: joins, leaves, invites, message edits and \
+                     deletions"
                     .to_owned(),
                 arguments: Vec::new(),
                 // No platform gate: moderators may lack Discord's Manage
@@ -137,6 +159,28 @@ impl<B: EventBusPort> MiddlewarePluginPort for UserActivityTrackerPlugin<B> {
                     kind == &EventKind::MemberJoined,
                 )
                 .await;
+            }
+            // Fresh conversation turns feed the edit/deletion capture; DMs
+            // are never tracked (no guild to scope the audit to).
+            (EventKind::MessageReceived, EventPayload::Message(message)) => {
+                if let (Some(guild_id), Some(message_id)) =
+                    (event.origin.guild_id, event.origin.message_id)
+                {
+                    self.messages.remember(
+                        MessageKey::new(guild_id, event.origin.channel_id, message_id),
+                        message.author_name.clone(),
+                        message.content.clone(),
+                    );
+                }
+            }
+            (EventKind::MessageEdited, EventPayload::Message(message)) => {
+                self.message_edited(&event.origin, services, message).await;
+            }
+            (EventKind::MessageDeleted, EventPayload::Empty) => {
+                self.message_deleted(&event.origin, services).await;
+            }
+            (EventKind::MessagePurged, EventPayload::Purge(purge)) => {
+                self.message_purged(&event.origin, services, purge.count).await;
             }
             _ => {}
         }
@@ -189,6 +233,117 @@ impl<B: EventBusPort> UserActivityTrackerPlugin<B> {
         } else {
             format!("📤 **{display}** left the guild")
         };
+        self.deliver(origin, services, channel_id, &line).await;
+    }
+
+    /// The message-edit flow: identical to the member lifecycle shape - the
+    /// domain event is published for EVERY guild edit (with the captured
+    /// original when it exists), and the audit notice is best effort. A
+    /// no-op edit (content unchanged - embed and pin state also ride the
+    /// platform's update event) publishes nothing at all. The capture is
+    /// revised either way, so successive edits chain their "was" sides.
+    async fn message_edited(
+        &self,
+        origin: &Origin,
+        services: &KernelServices,
+        message: &MessagePayload,
+    ) {
+        // Direct messages: nothing to track.
+        let Some(guild_id) = origin.guild_id else {
+            return;
+        };
+        let Some(message_id) = origin.message_id else {
+            return;
+        };
+        let key = MessageKey::new(guild_id, origin.channel_id, message_id);
+        let previous =
+            self.messages.revise(key, message.author_name.clone(), message.content.clone());
+        if previous.as_deref() == Some(message.content.as_str()) {
+            return;
+        }
+
+        let author_name =
+            message.author_name.clone().unwrap_or_else(|| format!("user {}", origin.user_id.get()));
+        self.bus.publish(MessageEdited {
+            guild_id,
+            channel_id: origin.channel_id,
+            message_id,
+            user_id: origin.user_id,
+            author_name: message.author_name.clone(),
+            old_content: previous.clone(),
+            new_content: message.content.clone(),
+        });
+
+        let Some(channel_id) = self.audit_channel(services).await else {
+            return;
+        };
+        let line = edit_notice(
+            self.notice_limit,
+            &author_name,
+            key,
+            previous.as_deref(),
+            &message.content,
+        );
+        self.deliver(origin, services, channel_id, &line).await;
+    }
+
+    /// The message-deletion flow: the platform names only WHICH message
+    /// vanished, so the quoted text comes from the capture cache when the
+    /// message was seen - and the notice degrades to a plain fact when it
+    /// was not.
+    async fn message_deleted(&self, origin: &Origin, services: &KernelServices) {
+        let Some(guild_id) = origin.guild_id else {
+            return;
+        };
+        let Some(message_id) = origin.message_id else {
+            return;
+        };
+        let key = MessageKey::new(guild_id, origin.channel_id, message_id);
+        let captured = self.messages.forget(key);
+        self.bus.publish(MessageDeleted {
+            guild_id,
+            channel_id: origin.channel_id,
+            message_id,
+            user_id: origin.user_id,
+            author_name: captured.as_ref().and_then(|message| message.author_name.clone()),
+            content: captured.as_ref().map(|message| message.content.clone()),
+        });
+
+        let Some(channel_id) = self.audit_channel(services).await else {
+            return;
+        };
+        let line = match captured {
+            Some(message) => {
+                // Known message: name from the capture, else the reported
+                // author id (`0` = the platform did not identify one).
+                let author = message.author_name.clone().unwrap_or_else(|| {
+                    if origin.user_id.get() == 0 {
+                        "someone".to_owned()
+                    } else {
+                        format!("user {}", origin.user_id.get())
+                    }
+                });
+                delete_notice(self.notice_limit, &author, key, &message.content)
+            }
+            None => delete_unknown_notice(key),
+        };
+        self.deliver(origin, services, channel_id, &line).await;
+    }
+
+    /// The purge flow: a mass deletion reports only a count, so neither a
+    /// per-message quote nor a cache cleanup is possible - capped FIFO
+    /// eviction absorbs the stale entries.
+    async fn message_purged(&self, origin: &Origin, services: &KernelServices, count: usize) {
+        // Direct messages: nothing to track.
+        let Some(guild_id) = origin.guild_id else {
+            return;
+        };
+        self.bus.publish(MessagePurged { guild_id, channel_id: origin.channel_id, count });
+
+        let Some(channel_id) = self.audit_channel(services).await else {
+            return;
+        };
+        let line = purge_notice(count, origin.channel_id);
         self.deliver(origin, services, channel_id, &line).await;
     }
 
@@ -654,6 +809,9 @@ mod tests {
         output: Arc<RecordingChatOutput>,
         joined: Arc<Recorder<UserJoinedGuild>>,
         left: Arc<Recorder<UserLeftGuild>>,
+        edited: Arc<Recorder<MessageEdited>>,
+        deleted: Arc<Recorder<MessageDeleted>>,
+        purged: Arc<Recorder<MessagePurged>>,
         directory: Arc<FakeInviteDirectory>,
     }
 
@@ -663,8 +821,14 @@ mod tests {
         let bus = InMemoryEventBus::new();
         let joined = Arc::new(Recorder::<UserJoinedGuild> { events: Mutex::new(Vec::new()) });
         let left = Arc::new(Recorder::<UserLeftGuild> { events: Mutex::new(Vec::new()) });
+        let edited = Arc::new(Recorder::<MessageEdited> { events: Mutex::new(Vec::new()) });
+        let deleted = Arc::new(Recorder::<MessageDeleted> { events: Mutex::new(Vec::new()) });
+        let purged = Arc::new(Recorder::<MessagePurged> { events: Mutex::new(Vec::new()) });
         bus.subscribe(Arc::clone(&joined) as Arc<dyn EventHandler<UserJoinedGuild>>);
         bus.subscribe(Arc::clone(&left) as Arc<dyn EventHandler<UserLeftGuild>>);
+        bus.subscribe(Arc::clone(&edited) as Arc<dyn EventHandler<MessageEdited>>);
+        bus.subscribe(Arc::clone(&deleted) as Arc<dyn EventHandler<MessageDeleted>>);
+        bus.subscribe(Arc::clone(&purged) as Arc<dyn EventHandler<MessagePurged>>);
 
         let sent = Arc::new(Sent::default());
         let output = RecordingChatOutput::new();
@@ -678,8 +842,13 @@ mod tests {
             platform_info: crate::test_support::test_platform_info(),
         };
 
-        let plugin = UserActivityTrackerPlugin::new(bus, Arc::new(InMemoryCommandRegistry::new()));
-        (plugin, services, Fixture { sent, output, joined, left, directory })
+        let plugin =
+            UserActivityTrackerPlugin::new(bus, Arc::new(InMemoryCommandRegistry::new()), 500);
+        (
+            plugin,
+            services,
+            Fixture { sent, output, joined, left, edited, deleted, purged, directory },
+        )
     }
 
     // --- tests ---
@@ -765,7 +934,8 @@ mod tests {
             plugin_storage: crate::test_support::test_plugin_storage(),
             platform_info: crate::test_support::test_platform_info(),
         };
-        let plugin = UserActivityTrackerPlugin::new(bus, Arc::new(InMemoryCommandRegistry::new()));
+        let plugin =
+            UserActivityTrackerPlugin::new(bus, Arc::new(InMemoryCommandRegistry::new()), 500);
         let mut event = member_event(EventKind::MemberJoined, Some(1), "someone");
 
         assert!(matches!(plugin.pre(&mut event, &services).await, Next::Continue));
@@ -1110,6 +1280,7 @@ mod tests {
         let plugin = UserActivityTrackerPlugin::new(
             InMemoryEventBus::new(),
             Arc::new(InMemoryCommandRegistry::new()),
+            500,
         );
 
         let attributed = plugin.attribute(&origin(Some(1)), &services).await;
@@ -1178,6 +1349,233 @@ mod tests {
             fixture.sent.messages.lock().clone(),
             vec![(777, "📥 **user 3** joined the guild".to_owned())]
         );
+    }
+
+    // --- message edit/deletion tracking ---
+
+    /// A human conversation turn: fixed ids (guild 1, channel 2, author 3)
+    /// with a per-test message id, mirroring the adapter's output shape.
+    fn message_event(
+        kind: EventKind,
+        guild: Option<u64>,
+        message_id: u64,
+        content: &str,
+    ) -> RequestContext {
+        RequestContext {
+            kind,
+            origin: Origin {
+                guild_id: guild.map(GuildId),
+                channel_id: ChannelIdModel(2),
+                user_id: UserId(3),
+                message_id: Some(MessageId(message_id)),
+                reply_token: None,
+            },
+            payload: EventPayload::Message(MessagePayload {
+                content: content.to_owned(),
+                attachments: Vec::new(),
+                author_name: Some("Riketta".to_owned()),
+                guild_name: None,
+                author_roles: Vec::new(),
+                author_permissions: 0,
+                reply_to: None,
+                mentions_bot: false,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_quotes_the_captured_original_and_publishes() {
+        let (plugin, services, fixture) = fixture(Some(configured_storage("777")));
+
+        let mut received = message_event(EventKind::MessageReceived, Some(1), 4, "one");
+        let _ = plugin.pre(&mut received, &services).await;
+        let mut edited = message_event(EventKind::MessageEdited, Some(1), 4, "two");
+        let _ = plugin.pre(&mut edited, &services).await;
+
+        let (channel, line) =
+            fixture.sent.messages.lock().first().expect("edit notice expected").clone();
+        assert_eq!(channel, 777);
+        assert!(line.contains("✏️ **Riketta** edited a message in <#2>"), "line: {line}");
+        assert!(line.contains("https://discord.com/channels/1/2/4"), "line: {line}");
+        assert!(line.contains("was:"), "line: {line}");
+        assert!(line.contains("one"), "line: {line}");
+        assert!(line.contains("now:"), "line: {line}");
+        assert!(line.contains("two"), "line: {line}");
+
+        let published = fixture.edited.events.lock().clone();
+        let first = published.first().expect("edit event expected to be published");
+        assert_eq!(first.old_content.as_deref(), Some("one"));
+        assert_eq!(first.new_content, "two");
+        assert_eq!(first.author_name.as_deref(), Some("Riketta"));
+        assert_eq!(published.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn edit_without_capture_says_so_instead_of_inventing_an_original() {
+        let (plugin, services, fixture) = fixture(Some(configured_storage("777")));
+        let mut edited = message_event(EventKind::MessageEdited, Some(1), 4, "two");
+
+        let _ = plugin.pre(&mut edited, &services).await;
+
+        let (_, line) = fixture.sent.messages.lock().first().expect("edit notice expected").clone();
+        assert!(line.contains("(original not seen - sent before capture or bot restart)"));
+        let first = fixture.edited.events.lock().first().expect("publish expected").clone();
+        assert_eq!(first.old_content, None);
+    }
+
+    #[tokio::test]
+    async fn unchanged_edit_is_neither_published_nor_posted() {
+        let (plugin, services, fixture) = fixture(Some(configured_storage("777")));
+
+        let mut received = message_event(EventKind::MessageReceived, Some(1), 4, "same");
+        let _ = plugin.pre(&mut received, &services).await;
+        let mut edited = message_event(EventKind::MessageEdited, Some(1), 4, "same");
+        let _ = plugin.pre(&mut edited, &services).await;
+
+        assert!(fixture.sent.messages.lock().is_empty());
+        assert!(fixture.edited.events.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn successive_edits_chain_their_was_sides() {
+        let (plugin, services, fixture) = fixture(Some(configured_storage("777")));
+
+        let mut received = message_event(EventKind::MessageReceived, Some(1), 4, "one");
+        let _ = plugin.pre(&mut received, &services).await;
+        let mut first = message_event(EventKind::MessageEdited, Some(1), 4, "two");
+        let _ = plugin.pre(&mut first, &services).await;
+        let mut second = message_event(EventKind::MessageEdited, Some(1), 4, "three");
+        let _ = plugin.pre(&mut second, &services).await;
+
+        let lines = fixture.sent.messages.lock().clone();
+        assert_eq!(lines.len(), 2, "both edits noticed: {lines:?}");
+        let first = lines.first().expect("first edit notice expected");
+        let second = lines.get(1).expect("second edit notice expected");
+        assert!(first.1.contains("one"), "first edit quotes the capture: {}", first.1);
+        assert!(second.1.contains("two"), "second edit quotes the last state: {}", second.1);
+        assert!(second.1.contains("three"), "second edit shows the new state: {}", second.1);
+        assert_eq!(fixture.edited.events.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn deletion_quotes_the_capture_then_degrades_to_the_plain_fact() {
+        let (plugin, services, fixture) = fixture(Some(configured_storage("777")));
+
+        let mut received = message_event(EventKind::MessageReceived, Some(1), 4, "gone soon");
+        let _ = plugin.pre(&mut received, &services).await;
+        // The adapter maps MESSAGE_DELETE onto an Empty payload - only the
+        // origin names the message.
+        let mut deleted = RequestContext {
+            kind: EventKind::MessageDeleted,
+            origin: origin(Some(1)),
+            payload: EventPayload::Empty,
+        };
+        let _ = plugin.pre(&mut deleted, &services).await;
+
+        let lines = fixture.sent.messages.lock().clone();
+        assert_eq!(lines.len(), 1, "one deletion noticed: {lines:?}");
+        let notice = lines.first().expect("deletion notice expected");
+        assert!(notice.1.contains("🗑 **Riketta** deleted a message in <#2>"), "{}", notice.1);
+        assert!(notice.1.contains("gone soon"), "{}", notice.1);
+        let published = fixture.deleted.events.lock().clone();
+        let first = published.first().expect("delete event expected");
+        assert_eq!(first.content.as_deref(), Some("gone soon"));
+
+        // The cache entry was consumed: a second deletion of the same id is
+        // the generic fact (e.g. a re-posted-and-deleted id is unlikely, but
+        // the contract is degradation, not fabrication).
+        let mut again = RequestContext {
+            kind: EventKind::MessageDeleted,
+            origin: origin(Some(1)),
+            payload: EventPayload::Empty,
+        };
+        let _ = plugin.pre(&mut again, &services).await;
+        let lines = fixture.sent.messages.lock().clone();
+        assert_eq!(lines.len(), 2);
+        let second = lines.get(1).expect("second deletion notice expected");
+        assert!(second.1.contains("a message was deleted in <#2>"), "{}", second.1);
+    }
+
+    #[tokio::test]
+    async fn purge_reports_one_count_per_event() {
+        let (plugin, services, fixture) = fixture(Some(configured_storage("777")));
+        let mut event = RequestContext {
+            kind: EventKind::MessagePurged,
+            origin: origin(Some(1)),
+            payload: EventPayload::Purge(crate::kernel::models::MessagePurgePayload { count: 12 }),
+        };
+
+        let _ = plugin.pre(&mut event, &services).await;
+
+        assert_eq!(
+            fixture.sent.messages.lock().clone(),
+            vec![(777, "🗑️ 12 messages were purged in <#2>".to_owned())]
+        );
+        assert_eq!(fixture.purged.events.lock().first().map(|e| e.count), Some(12));
+    }
+
+    #[tokio::test]
+    async fn direct_message_lifecycle_is_never_tracked() {
+        let (plugin, services, fixture) = fixture(Some(configured_storage("777")));
+
+        let mut received = message_event(EventKind::MessageReceived, None, 4, "dm");
+        let _ = plugin.pre(&mut received, &services).await;
+        let mut edited = message_event(EventKind::MessageEdited, None, 4, "dm edited");
+        let _ = plugin.pre(&mut edited, &services).await;
+        let mut deleted = RequestContext {
+            kind: EventKind::MessageDeleted,
+            origin: origin(None),
+            payload: EventPayload::Empty,
+        };
+        let _ = plugin.pre(&mut deleted, &services).await;
+
+        assert!(fixture.sent.messages.lock().is_empty());
+        assert!(fixture.edited.events.lock().is_empty());
+        assert!(fixture.deleted.events.lock().is_empty());
+    }
+
+    /// Publish-always, audit-best-effort - an unconfigured guild still gets
+    /// the domain events, just no Discord-side notice.
+    #[tokio::test]
+    async fn unconfigured_guild_message_edits_publish_without_audit() {
+        let (plugin, services, fixture) = fixture(Some(Arc::new(InMemoryStorage::new())));
+        let mut edited = message_event(EventKind::MessageEdited, Some(1), 4, "two");
+
+        let _ = plugin.pre(&mut edited, &services).await;
+
+        assert!(fixture.sent.messages.lock().is_empty());
+        assert_eq!(fixture.edited.events.lock().len(), 1);
+    }
+
+    /// The configured clip bounds the quoted text per side (plugin-global
+    /// `[tracker] message_notice_limit`).
+    #[tokio::test]
+    async fn notice_limit_clips_quoted_text() {
+        let bus = InMemoryEventBus::new();
+        let edited = Arc::new(Recorder::<MessageEdited> { events: Mutex::new(Vec::new()) });
+        bus.subscribe(Arc::clone(&edited) as Arc<dyn EventHandler<MessageEdited>>);
+        let sent = Arc::new(Sent::default());
+        let services = KernelServices {
+            chat_output: RecordingChatOutput::new() as Arc<dyn ChatOutputPort>,
+            chat_output_factory: Arc::new(ChannelRecordingFactory { sent: Arc::clone(&sent) }),
+            invite_directory: FakeInviteDirectory::new(Vec::new()) as Arc<dyn InviteDirectoryPort>,
+            guild_storage: Some(configured_storage("777").guild_scoped("test", GuildId(1))),
+            plugin_storage: crate::test_support::test_plugin_storage(),
+            platform_info: crate::test_support::test_platform_info(),
+        };
+        let plugin =
+            UserActivityTrackerPlugin::new(bus, Arc::new(InMemoryCommandRegistry::new()), 5);
+
+        let mut received = message_event(EventKind::MessageReceived, Some(1), 4, "short");
+        let _ = plugin.pre(&mut received, &services).await;
+        let long = "x".repeat(50);
+        let mut edited_event = message_event(EventKind::MessageEdited, Some(1), 4, &long);
+        let _ = plugin.pre(&mut edited_event, &services).await;
+
+        let (_, line) = sent.messages.lock().first().expect("edit notice expected").clone();
+        assert!(line.contains("short"), "was side clipped at 5: {line}");
+        assert!(line.contains(&format!("{}…", "x".repeat(5))), "now side clipped at 5: {line}");
+        assert!(!line.contains(&long), "full text must not appear: {line}");
     }
 
     /// `/assign_tracker` run in a channel stores that channel and confirms.
@@ -1269,7 +1667,7 @@ mod tests {
     #[test]
     fn init_registers_tracker_commands() {
         let registry = Arc::new(InMemoryCommandRegistry::new());
-        let plugin = UserActivityTrackerPlugin::new(InMemoryEventBus::new(), registry.clone());
+        let plugin = UserActivityTrackerPlugin::new(InMemoryEventBus::new(), registry.clone(), 500);
 
         plugin.init().expect("init expected to succeed");
 

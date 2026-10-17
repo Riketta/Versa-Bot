@@ -7,6 +7,7 @@ mod lol_store;
 mod sentry;
 mod status;
 mod storage;
+mod tracker;
 mod watcher;
 
 pub use llm::{
