@@ -16,7 +16,7 @@
 //! The per-guild record log receives every announcement and watch ping -
 //! user-facing history, never consulted for detection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -193,6 +193,10 @@ pub struct StoreEngine<B: EventBusPort> {
     /// The announcement as delivered: one entry per embed page. Process
     /// lifetime - a fresh launch has none until the first delta renders.
     last_announcement: Mutex<Option<(Instant, Vec<String>)>>,
+    /// Rotations already warned as overdue, keyed `(name, next_rotation)`:
+    /// one WARN per distinct schedule value per process - the 5-minute poll
+    /// must not repeat it, and a real rotation (new schedule value) re-arms.
+    overdue_warned: Mutex<HashSet<(String, String)>>,
 }
 
 impl<B: EventBusPort> StoreEngine<B> {
@@ -223,6 +227,7 @@ impl<B: EventBusPort> StoreEngine<B> {
             last_poll: Mutex::new(None),
             last_history_day: Mutex::new(None),
             last_announcement: Mutex::new(None),
+            overdue_warned: Mutex::new(HashSet::new()),
         }
     }
 
@@ -516,6 +521,28 @@ impl<B: EventBusPort> StoreEngine<B> {
             // days the store changed).
             self.write_history_digest(false).await
         };
+
+        // Stale-client visibility: a scheduled rotation date in the past
+        // while the entry set sits unchanged means the served snapshot never
+        // refreshed (opening the store tab or restarting the client does).
+        // WARN once per distinct schedule value - the poll cadence must not
+        // repeat it.
+        let today = history::day_key(unix_now());
+        for name in diff::overdue_rotations(&current, &today) {
+            let next = current
+                .rotations
+                .get(&name)
+                .and_then(|rotation| rotation.next_rotation.clone())
+                .unwrap_or_default();
+            if self.overdue_warned.lock().insert((name.clone(), next.clone())) {
+                tracing::warn!(
+                    rotation = %name,
+                    next = %next,
+                    "rotation overdue while its entries are unchanged - the league client may be \
+                     serving stale store data (opening the store tab or restarting it refreshes)"
+                );
+            }
+        }
 
         tracing::debug!(
             sales = current.sales.len(),
@@ -881,8 +908,16 @@ impl<B: EventBusPort> StoreEngine<B> {
             let storage = self.storage.guild_scoped(self.platform.slug(), guild_id);
             let raw = match storage.get(NAMESPACE, CONFIG_KEY).await {
                 Ok(Some(raw)) => raw,
-                // No config document: nothing to fan out to.
-                Ok(None) => continue,
+                // No config document: nothing to fan out to - and the
+                // operator-facing status shows announce flags, not this, so
+                // the skip must be visible in the logs.
+                Ok(None) => {
+                    tracing::debug!(
+                        guild = guild_id.get(),
+                        "store tracker never configured for this guild - skipped"
+                    );
+                    continue;
+                }
                 Err(err) => {
                     tracing::warn!(
                         %err,
@@ -914,6 +949,11 @@ impl<B: EventBusPort> StoreEngine<B> {
                     tracing::debug!(
                         guild = guild_id.get(),
                         "store tracker enabled but channel missing"
+                    );
+                } else {
+                    tracing::debug!(
+                        guild = guild_id.get(),
+                        "store tracker disabled for this guild - skipped"
                     );
                 }
                 continue;
@@ -1146,54 +1186,103 @@ impl<B: EventBusPort> StoreEngine<B> {
         }
     }
 
-    /// Renders the `/lol_client_status` text (ephemeral reply).
-    #[must_use]
-    pub fn status_text(&self) -> String {
-        let state = self.state.lock();
-        let mut lines = vec![format!(
-            "League client: {}",
-            if self.online.load(Ordering::Acquire) { "online" } else { "offline" }
-        )];
-        lines.push(match *self.last_poll.lock() {
-            Some(at) => format!("Last poll: {}s ago", at.elapsed().as_secs()),
-            None => "Last poll: never".to_owned(),
-        });
-        match *self.last_announcement.lock() {
-            Some((at, _)) => {
-                lines.push(format!("Last update rendered: {}s ago", at.elapsed().as_secs()));
+    /// Renders the `/lol_client_status` text (ephemeral reply): the
+    /// bot-global watcher state plus, when a guild handle is given, that
+    /// guild's tracking setup. Both layers are shown because announcements
+    /// gate on both - operator flags alone look green while the guild was
+    /// never enabled or assigned.
+    pub async fn status_text(&self, guild: Option<&dyn GuildStorage>) -> String {
+        // The state guard must drop before the guild config read below -
+        // parking_lot guards are not Send and must never cross an await.
+        let mut lines = {
+            let state = self.state.lock();
+            let mut lines = vec![format!(
+                "League client: {}",
+                if self.online.load(Ordering::Acquire) { "online" } else { "offline" }
+            )];
+            lines.push(match *self.last_poll.lock() {
+                Some(at) => format!("Last poll: {}s ago", at.elapsed().as_secs()),
+                None => "Last poll: never".to_owned(),
+            });
+            match *self.last_announcement.lock() {
+                Some((at, _)) => {
+                    lines.push(format!("Last update rendered: {}s ago", at.elapsed().as_secs()));
+                }
+                None => lines.push("Last update rendered: none yet".to_owned()),
             }
-            None => lines.push("Last update rendered: none yet".to_owned()),
-        }
-        match state.as_ref() {
-            Some(state) => {
-                lines.push(format!("Sales tracked: {}", state.sales.len()));
-                lines.push(format!("Skins tracked: {}", state.skins.len()));
-                if state.rotations.is_empty() {
-                    lines.push("Rotations: none seen yet".to_owned());
-                } else {
-                    for (name, rotation) in &state.rotations {
-                        let next = super::format::non_empty(rotation.next_rotation.as_deref())
-                            .map(super::format::date)
-                            .unwrap_or_else(|| "?".to_owned());
+            match state.as_ref() {
+                Some(state) => {
+                    lines.push(format!("Sales tracked: {}", state.sales.len()));
+                    lines.push(format!("Skins tracked: {}", state.skins.len()));
+                    if state.rotations.is_empty() {
+                        lines.push("Rotations: none seen yet".to_owned());
+                    } else {
+                        for (name, rotation) in &state.rotations {
+                            let next = super::format::non_empty(rotation.next_rotation.as_deref())
+                                .map(super::format::date)
+                                .unwrap_or_else(|| "?".to_owned());
+                            lines.push(format!(
+                                "Rotation {} ({}): next {}",
+                                name,
+                                rotation.entry_ids.len(),
+                                next
+                            ));
+                        }
+                    }
+                    let yourshop = state.yourshop.as_ref().map_or("unknown", |state| {
+                        if state.active { "active" } else { "inactive" }
+                    });
+                    lines.push(format!("Your Shop: {yourshop}"));
+                }
+                None => lines.push("Store state: not captured yet".to_owned()),
+            }
+            lines
+        };
+        match guild {
+            Some(guild) => match guild.get(NAMESPACE, CONFIG_KEY).await {
+                Ok(Some(raw)) => match serde_json::from_value::<GuildConfig>(raw) {
+                    Ok(config) => {
                         lines.push(format!(
-                            "Rotation {} ({}): next {}",
-                            name,
-                            rotation.entry_ids.len(),
-                            next
+                            "Tracking: {}",
+                            if config.enabled { "enabled" } else { "disabled" }
+                        ));
+                        lines.push(format!(
+                            "Channel: {}",
+                            config
+                                .channel_id
+                                .as_deref()
+                                .filter(|id| !id.is_empty())
+                                .unwrap_or("not assigned")
+                        ));
+                        lines.push(format!(
+                            "Ping role: {}",
+                            config.role_id.as_deref().filter(|id| !id.is_empty()).unwrap_or("none")
                         ));
                     }
+                    Err(err) => {
+                        tracing::warn!(%err, "store tracker config unreadable for status");
+                        lines.push(
+                            "Tracking: config unreadable - re-run /lol_store_enable".to_owned(),
+                        );
+                    }
+                },
+                Ok(None) => {
+                    lines.push(
+                        "Tracking: not configured - run /lol_store_enable and /lol_store_assign"
+                            .to_owned(),
+                    );
                 }
-                let yourshop = state
-                    .yourshop
-                    .as_ref()
-                    .map_or("unknown", |state| if state.active { "active" } else { "inactive" });
-                lines.push(format!("Your Shop: {yourshop}"));
-            }
-            None => lines.push("Store state: not captured yet".to_owned()),
+                Err(err) => {
+                    tracing::warn!(%err, "store tracker config read failed for status");
+                    lines.push("Tracking: storage read failed".to_owned());
+                }
+            },
+            // The descriptor is guild_only; a DM context never reaches here.
+            None => lines.push("Tracking: guild context unavailable".to_owned()),
         }
         let flags = self.settings.lock().flags;
         lines.push(format!(
-            "Announce: sales={} skins={} mythic={} yourshop={}",
+            "Announce flags: sales={} skins={} mythic={} yourshop={}",
             on_off(flags.sales),
             on_off(flags.new_skins),
             on_off(flags.mythic_rotation),
@@ -1910,7 +1999,7 @@ mod tests {
             first.contains("**New in store**"),
             "a failed source must not block other sections: {first}"
         );
-        assert!(f.engine.status_text().contains("League client: online"));
+        assert!(f.engine.status_text(None).await.contains("League client: online"));
     }
 
     /// A tracker toggled off must not announce - but the state still
@@ -1928,7 +2017,7 @@ mod tests {
 
         assert!(f.output.messages().is_empty(), "no announcement with the flag off");
         assert!(f.bus.log().is_empty());
-        assert!(f.engine.status_text().contains("Sales tracked: 1"));
+        assert!(f.engine.status_text(None).await.contains("Sales tracked: 1"));
     }
 
     #[tokio::test]
@@ -2054,7 +2143,7 @@ mod tests {
         enable_guild(&f.storage, GUILD, Some("55")).await;
         f.engine.tick().await;
         assert!(f.output.messages().is_empty());
-        assert!(!f.engine.status_text().contains("League client: online"));
+        assert!(!f.engine.status_text(None).await.contains("League client: online"));
     }
 
     #[tokio::test]
@@ -2544,6 +2633,66 @@ mod tests {
         f.engine.tick().await;
 
         assert!(f.output.messages().is_empty(), "no channel assigned - nothing to announce");
+    }
+
+    /// The status must show the per-guild tracking setup next to the
+    /// bot-global announce flags: flags alone look green while the guild
+    /// was never enabled or assigned - the exact blind spot that silences
+    /// announcements without any log evidence.
+    #[tokio::test]
+    async fn status_reports_the_guilds_tracking_setup() {
+        let f = fixture(FakeLcu::online()).await;
+        let scoped = f.storage.guild_scoped("test", GuildId(GUILD));
+
+        let unconfigured = f.engine.status_text(Some(scoped.as_ref())).await;
+        assert!(unconfigured.contains("Tracking: not configured"), "{unconfigured}");
+        assert!(unconfigured.contains("Announce flags: sales=on"), "{unconfigured}");
+
+        enable_guild(&f.storage, GUILD, Some("55")).await;
+        let enabled = f.engine.status_text(Some(scoped.as_ref())).await;
+        assert!(enabled.contains("Tracking: enabled"), "{enabled}");
+        assert!(enabled.contains("Channel: 55"), "{enabled}");
+        assert!(enabled.contains("Ping role: none"), "{enabled}");
+
+        scoped
+            .set(
+                NAMESPACE,
+                CONFIG_KEY,
+                serde_json::json!({ "enabled": false, "channel_id": "55", "role_id": "42" }),
+            )
+            .await
+            .expect("config write expected");
+        let disabled = f.engine.status_text(Some(scoped.as_ref())).await;
+        assert!(disabled.contains("Tracking: disabled"), "{disabled}");
+        assert!(disabled.contains("Channel: 55"), "{disabled}");
+        assert!(disabled.contains("Ping role: 42"), "{disabled}");
+    }
+
+    /// An overdue rotation (scheduled date passed, entries unchanged) warns
+    /// exactly once per distinct schedule value: the repeat poll stays
+    /// quiet, a new schedule value re-arms.
+    #[tokio::test]
+    async fn an_overdue_rotation_warns_once_per_schedule_value() {
+        let f = fixture(FakeLcu::online()).await;
+        let mut store = rotation_store("weekly", &["a", "b"]);
+        if let Some(meta) = store.rotating_store_metadata.as_mut() {
+            meta.next_rotation_start_time = Some("2020-01-01T00:00:00.000Z".to_owned());
+        }
+        *f.lcu.rotations.lock() = Some(vec![store]);
+
+        f.engine.tick().await;
+        assert_eq!(f.engine.overdue_warned.lock().len(), 1, "first observation warns");
+
+        f.engine.tick().await;
+        assert_eq!(f.engine.overdue_warned.lock().len(), 1, "the repeat poll must not re-warn");
+
+        let mut store = rotation_store("weekly", &["a", "b"]);
+        if let Some(meta) = store.rotating_store_metadata.as_mut() {
+            meta.next_rotation_start_time = Some("2020-02-01T00:00:00.000Z".to_owned());
+        }
+        *f.lcu.rotations.lock() = Some(vec![store]);
+        f.engine.tick().await;
+        assert_eq!(f.engine.overdue_warned.lock().len(), 2, "new schedule value warns again");
     }
 
     #[tokio::test]

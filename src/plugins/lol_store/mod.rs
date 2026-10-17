@@ -83,7 +83,9 @@ impl<B: EventBusPort> PluginPort for LolStorePlugin<B> {
             CommandDescriptor {
                 plugin_id: self.name().to_owned(),
                 name: "lol_client_status".to_owned(),
-                description: "Show League client link state and store watcher status".to_owned(),
+                description:
+                    "Show League client link, store watcher status, and this guild's tracking setup"
+                        .to_owned(),
                 arguments: Vec::new(),
                 required_permission: None,
                 required_tier: Some(AccessTier::Moderator),
@@ -1635,6 +1637,9 @@ mod tests {
         let reply = messages.first().expect("reply expected");
         assert!(reply.contains("League client: offline"));
         assert!(reply.contains("Last poll: never"));
-        assert!(reply.contains("Announce: sales=on"));
+        assert!(reply.contains("Announce flags: sales=on"));
+        // The per-guild layer rides along - the operator flags alone do not
+        // answer "why is nothing announced".
+        assert!(reply.contains("Tracking: not configured"));
     }
 }

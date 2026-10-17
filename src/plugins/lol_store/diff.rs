@@ -346,6 +346,38 @@ pub fn compute(previous: &LastSeen, snapshot: &Snapshot) -> StoreDelta {
     delta
 }
 
+/// Rotations whose scheduled `next_rotation` UTC date is strictly before
+/// `today` (an ISO string; the date prefix must parse as `YYYY-MM-DD`, the
+/// shape [`super::history::day_key`] renders). A real rotation advances the
+/// date and swaps the entries in the same payload, so a past date sitting
+/// next to an unchanged entry set is the fingerprint of a stale store
+/// snapshot - the client never refreshed its store data. Absent or
+/// unparseable dates ("next ?") carry no schedule to be late - skipped.
+#[must_use]
+pub fn overdue_rotations(state: &LastSeen, today: &str) -> Vec<String> {
+    // A constant format description cannot fail to parse; `time`'s macro
+    // form is skipped to keep the dependency feature-free.
+    let day_format = time::format_description::parse_borrowed::<1>("[year]-[month]-[day]")
+        .expect("static format parses");
+    let today = time::Date::parse(today, &day_format).ok();
+    state
+        .rotations
+        .iter()
+        .filter(|(_, rotation)| {
+            let due = rotation
+                .next_rotation
+                .as_deref()
+                .map(|iso| iso.split('T').next().unwrap_or(iso))
+                .and_then(|day| time::Date::parse(day, &day_format).ok());
+            match (due, today) {
+                (Some(due), Some(today)) => due < today,
+                _ => false,
+            }
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 /// Projects a store entry onto its raw id, display name and Mythic
 /// Essence price.
 pub(crate) fn mythic_entry(entry: &StoreEntry) -> MythicEntry {
@@ -489,6 +521,51 @@ mod tests {
                 .map(|id| StoreEntry { id: Some((*id).to_owned()), ..Default::default() })
                 .collect(),
         }
+    }
+
+    /// Overdue = the scheduled date parses and is strictly before today.
+    /// Today itself is not late (the rotation may still land), and absent
+    /// or unparseable dates carry no schedule to be late.
+    #[test]
+    fn overdue_rotations_flag_only_dates_strictly_before_today() {
+        let state = LastSeen {
+            rotations: BTreeMap::from([
+                (
+                    "date_only".to_owned(),
+                    RotationState {
+                        next_rotation: Some("2026-10-14".to_owned()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "junk".to_owned(),
+                    RotationState {
+                        next_rotation: Some("nonsense".to_owned()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "past".to_owned(),
+                    RotationState {
+                        next_rotation: Some("2026-10-15T08:00:00.000Z".to_owned()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "today".to_owned(),
+                    RotationState {
+                        next_rotation: Some("2026-10-16T23:59:59.000Z".to_owned()),
+                        ..Default::default()
+                    },
+                ),
+                ("unknown".to_owned(), RotationState { next_rotation: None, ..Default::default() }),
+            ]),
+            ..LastSeen::default()
+        };
+        assert_eq!(
+            overdue_rotations(&state, "2026-10-16"),
+            vec!["date_only".to_owned(), "past".to_owned()]
+        );
     }
 
     #[test]

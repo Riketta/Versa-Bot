@@ -270,7 +270,10 @@ impl<B: crate::kernel::plugin_ports::EventBusPort> CommandHandler for ClientStat
         if services.guild_storage.is_none() {
             return reply_guild_only(services).await;
         }
-        services.chat_output.send(command_reply(self.engine.status_text())).await?;
+        services
+            .chat_output
+            .send(command_reply(self.engine.status_text(services.guild_storage.as_deref()).await))
+            .await?;
         Ok(())
     }
 }
