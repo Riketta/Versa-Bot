@@ -145,7 +145,11 @@ impl VisionService {
                 Some(description)
             }
             Err(err) => {
-                tracing::warn!(%err, "image recognition failed - recording undescribed");
+                tracing::warn!(
+                    kind = ?err.failure_kind(),
+                    %err,
+                    "image recognition failed - recording undescribed"
+                );
                 None
             }
         }
@@ -285,6 +289,18 @@ pub(crate) enum VisionError {
     Encode(String),
     #[error(transparent)]
     Completion(#[from] super::completion_port::LlmError),
+}
+
+impl VisionError {
+    /// The provider failure kind when the error came from the completion
+    /// call, forwarded for operator logs - the error `Display` alone cannot
+    /// tell a timeout from a connect fault (see [`LlmError::failure_kind`]).
+    pub(crate) fn failure_kind(&self) -> Option<super::completion_port::RequestFailureKind> {
+        match self {
+            Self::Completion(err) => err.failure_kind(),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

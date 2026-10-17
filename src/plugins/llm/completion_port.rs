@@ -229,6 +229,18 @@ pub enum LlmError {
 }
 
 impl LlmError {
+    /// The coarse failure kind, when the error came from a provider request.
+    /// Operator-side diagnostics: the error `Display` quotes only the reqwest
+    /// detail (whose wording is identical for timeouts and connect faults),
+    /// so logs need the kind alongside to tell them apart.
+    #[must_use]
+    pub fn failure_kind(&self) -> Option<RequestFailureKind> {
+        match self {
+            Self::Request { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
     /// Guild-presentable classification for service-channel embeds: names
     /// what happened without quoting the endpoint's response body, which can
     /// carry operator-domain detail (account/project identifiers). The full
@@ -403,5 +415,24 @@ mod tests {
             assert!(!message.contains("secret-org"), "{kind:?}: {message}");
             assert!(!message.contains("401"), "{kind:?}: {message}");
         }
+    }
+
+    /// `failure_kind` exposes the request kind for operator logs (the error
+    /// `Display` alone cannot tell a timeout from a connect fault) and is
+    /// absent for errors that never reached a provider request.
+    #[test]
+    fn failure_kind_is_the_request_kind_when_present() {
+        let request = |kind| LlmError::Request { kind, detail: "x".to_owned() };
+        assert_eq!(
+            request(RequestFailureKind::Timeout).failure_kind(),
+            Some(RequestFailureKind::Timeout)
+        );
+        assert_eq!(
+            request(RequestFailureKind::Transport).failure_kind(),
+            Some(RequestFailureKind::Transport)
+        );
+        assert_eq!(LlmError::EmptyResponse.failure_kind(), None);
+        assert_eq!(LlmError::InvalidModelRef("ghost/m".to_owned()).failure_kind(), None);
+        assert_eq!(LlmError::UnknownProvider("ghost".to_owned()).failure_kind(), None);
     }
 }

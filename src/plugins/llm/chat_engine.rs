@@ -243,6 +243,7 @@ fn live_outcome(
         Err(err) if reveal.message.is_some() => {
             tracing::warn!(
                 channel = reveal.channel_id,
+                kind = ?err.failure_kind(),
                 %err,
                 "stream failed after content was revealed"
             );
@@ -999,6 +1000,7 @@ impl ChatEngine {
         tracing::error!(
             channel = origin.channel_id.get(),
             model = %config.model,
+            kind = ?err.failure_kind(),
             %err,
             "LLM completion failed - no generated reply"
         );
