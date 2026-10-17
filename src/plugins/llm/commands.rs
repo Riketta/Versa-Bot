@@ -31,22 +31,16 @@ use super::usage_total::Dimension;
 use super::vision::DEFAULT_IMAGE_PROMPT;
 
 /// Recognized `/llm_set` keys, in display order (grouped: identity and
-/// delivery mode, sampling, capture/context, compaction, images, reactions,
-/// chime-ins, delivery). Doubles as the Discord choices dropdown for the `key`
-/// argument - the list is exactly Discord's 25-choice cap. The chat model is
-/// deliberately NOT a key: like the channel prompts (own command
-/// `/llm_set_prompt`), it has a dedicated command (`/llm_assign`), and a
-/// 26th key would have to drop the dropdown entirely.
+/// delivery mode, capture/context, compaction, images, reactions,
+/// chime-ins, delivery). Doubles as the Discord choices dropdown for the
+/// `key` argument. The provider sampling knobs are NOT keys - they moved
+/// to the dedicated `/llm_sampling` command (the largest coherent group,
+/// and this list has to stay under Discord's 25-choice cap; 19 of 25
+/// used today).
 pub(super) const SET_KEYS: &[&str] = &[
+    "model",
     "reasoning_effort",
     "streaming",
-    "temperature",
-    "top_p",
-    "top_k",
-    "min_p",
-    "frequency_penalty",
-    "presence_penalty",
-    "max_tokens",
     "capture",
     "context_messages",
     "context_tokens",
@@ -63,6 +57,19 @@ pub(super) const SET_KEYS: &[&str] = &[
     "chime_react_chance",
     "chime_cooldown",
     "split_length",
+];
+
+/// The provider sampling knobs - `/llm_sampling`'s arguments, in display
+/// order (the `/llm_dump` sampling block matches). Excluded from
+/// [`SET_KEYS`] to keep that dropdown under Discord's 25-choice cap.
+pub(super) const SAMPLING_KEYS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "max_tokens",
 ];
 
 /// Loads the channel's config for mutation, replying (and returning `None`)
@@ -141,6 +148,10 @@ fn apply_set(
         return result;
     }
     match key {
+        "model" if !cleared && !value.is_empty() => {
+            config.model = value.to_string();
+            Ok(format!("`model` set to `{value}`."))
+        }
         "reasoning_effort" => {
             if cleared {
                 config.params.reasoning_effort = None;
@@ -193,20 +204,22 @@ fn apply_set(
             }
             Ok(reply)
         }
-        "context_messages" => {
-            Err("`context_messages` cannot be cleared - assign a value or use `/llm_unassign`."
-                .to_owned())
+        "model" | "context_messages" => {
+            Err(format!("`{key}` cannot be cleared - assign a value or use `/llm_unassign`."))
         }
         other => Err(unknown_key_reply(other)),
     }
 }
 
-/// Usage reply for an unrecognized `/llm_set`/`/llm_get` key. The chat model
-/// is deliberately absent from the key set (Discord caps dropdowns at 25 and
-/// the assignment has its own command), so the reply points there.
+/// Usage reply for an unrecognized `/llm_set`/`/llm_get` key. Sampling
+/// knobs redirect to their own command; everything else lists the legal
+/// set and mentions the same move.
 fn unknown_key_reply(key: &str) -> String {
+    if SAMPLING_KEYS.contains(&key) {
+        return format!("`{key}` is a sampling knob - set it via `/llm_sampling`.");
+    }
     format!(
-        "Unknown key `{key}`. Keys: {}. The chat model is `/llm_assign`'s job.",
+        "Unknown key `{key}`. Keys: {}. Sampling knobs live in `/llm_sampling`.",
         SET_KEYS.join(", ")
     )
 }
@@ -260,8 +273,52 @@ fn apply_flag(
     }
 }
 
-/// Numeric settings: sampling floats, token counts, depth, budget, chance.
-/// `None` = the key is not numeric (caller continues matching).
+/// Applies one `/llm_sampling` mutation - the provider sampling knobs that
+/// left the `/llm_set` key set (the list must stay under Discord's
+/// 25-choice cap). Same grammar as the old `/llm_set` numeric keys:
+/// clear-words reset to the provider default, finite floats store,
+/// `max_tokens` takes a whole number.
+fn apply_sampling(config: &mut ChannelConfig, key: &str, value: &str) -> Result<String, String> {
+    let cleared = matches!(value, "clear" | "none" | "default");
+    match key {
+        "temperature" | "top_p" | "top_k" | "min_p" | "frequency_penalty" | "presence_penalty" => {
+            if cleared {
+                set_float(config, key, None);
+                return Ok(format!("`{key}` cleared (provider default)."));
+            }
+            match value.parse::<f64>() {
+                // NaN/infinity would serialize as JSON null (breaking the
+                // provider request and silently vanishing on reload) -
+                // reject instead of storing a silently broken value.
+                Ok(parsed) if parsed.is_finite() => {
+                    set_float(config, key, Some(parsed));
+                    Ok(format!("`{key}` set to {parsed}."))
+                }
+                _ => Err(format!("`{key}` expects a finite number, got `{value}`.")),
+            }
+        }
+        "max_tokens" => {
+            if cleared {
+                config.params.max_tokens = None;
+                return Ok(format!("`{key}` cleared (provider default)."));
+            }
+            match value.parse::<u32>() {
+                Ok(parsed) => {
+                    config.params.max_tokens = Some(parsed);
+                    Ok(format!("`{key}` set to {parsed}."))
+                }
+                Err(_) => Err(format!("`{key}` expects a whole number, got `{value}`.")),
+            }
+        }
+        other => Err(format!(
+            "Unknown sampling key `{other}`. Sampling keys: {}.",
+            SAMPLING_KEYS.join(", ")
+        )),
+    }
+}
+
+/// Numeric settings: depth, budget, chance, size. `None` = the key is not
+/// numeric (caller continues matching).
 fn apply_numeric(
     config: &mut ChannelConfig,
     key: &str,
@@ -270,35 +327,6 @@ fn apply_numeric(
     image_max_side_cap: u32,
 ) -> Option<Result<String, String>> {
     match key {
-        "temperature" | "top_p" | "top_k" | "min_p" | "frequency_penalty" | "presence_penalty" => {
-            if cleared {
-                set_float(config, key, None);
-                return Some(Ok(format!("`{key}` cleared (provider default).")));
-            }
-            match value.parse::<f64>() {
-                // NaN/infinity would serialize as JSON null (breaking the
-                // provider request and silently vanishing on reload) -
-                // reject instead of storing a silently broken value.
-                Ok(parsed) if parsed.is_finite() => {
-                    set_float(config, key, Some(parsed));
-                    Some(Ok(format!("`{key}` set to {parsed}.")))
-                }
-                _ => Some(Err(format!("`{key}` expects a finite number, got `{value}`."))),
-            }
-        }
-        "max_tokens" => {
-            if cleared {
-                config.params.max_tokens = None;
-                return Some(Ok(format!("`{key}` cleared (provider default).")));
-            }
-            match value.parse::<u32>() {
-                Ok(parsed) => {
-                    config.params.max_tokens = Some(parsed);
-                    Some(Ok(format!("`{key}` set to {parsed}.")))
-                }
-                Err(_) => Some(Err(format!("`{key}` expects a whole number, got `{value}`."))),
-            }
-        }
         "context_messages" => {
             if cleared {
                 return Some(Err(format!(
@@ -1840,10 +1868,9 @@ impl CommandHandler for SetLlmHandler {
             return Ok(());
         };
         // Same registry boundary as `/llm_assign`: only declared models are
-        // legal - image and compaction refs alike (the chat model cannot
-        // arrive here anymore; it has no key). Clear-words are not
-        // assignments - `apply_set` answers them with its own usage.
-        if matches!(key, "image_model" | "compaction_model")
+        // legal - chat, image, AND compaction refs alike. Clear-words are
+        // not assignments - `apply_set` answers them with its own usage.
+        if matches!(key, "model" | "image_model" | "compaction_model")
             && !matches!(value, "clear" | "none" | "default")
             && let Err(reply) = validate_model_ref(self.engine.settings(), value)
         {
@@ -1867,6 +1894,81 @@ impl CommandHandler for SetLlmHandler {
                 services.chat_output.send(command_reply(usage)).await?;
             }
         }
+        Ok(())
+    }
+}
+
+/// `/llm_sampling`: the provider sampling knobs (`temperature`, `top_p`,
+/// `top_k`, `min_p`, `frequency_penalty`, `presence_penalty`,
+/// `max_tokens`) as one dedicated command - the largest coherent group,
+/// moved out of `/llm_set` to keep its dropdown under Discord's
+/// 25-choice cap. Every knob is an optional argument, so one invocation
+/// can tune several at once; a bare invocation shows the current values;
+/// clear-words reset to the provider default; a batch is atomic - one
+/// malformed value rejects the whole invocation unsaved.
+pub(super) struct SamplingLlmHandler {
+    locks: Arc<ChannelLocks>,
+    engine: Arc<ChatEngine>,
+}
+
+impl SamplingLlmHandler {
+    pub(super) fn new(locks: Arc<ChannelLocks>, engine: Arc<ChatEngine>) -> Self {
+        Self { locks, engine }
+    }
+}
+
+#[async_trait]
+impl CommandHandler for SamplingLlmHandler {
+    async fn invoke(
+        &self,
+        event: &RequestContext,
+        args: &CommandArgs,
+        services: &KernelServices,
+    ) -> anyhow::Result<()> {
+        // Same per-channel serialization as /llm_set: the batch rewrites
+        // the config, an in-flight engine run must not straddle it.
+        let channel = self.locks.lock_for(services.platform_info.slug(), &event.origin);
+        let _channel = channel.lock().await;
+        let Some(mut config) =
+            load_assigned_config(event, services, self.engine.settings().min_split_length).await?
+        else {
+            return Ok(());
+        };
+        // Fixed order (SAMPLING_KEYS, not argument order) keeps the reply
+        // stable regardless of how the user ordered the arguments.
+        let provided: Vec<(&str, &str)> = SAMPLING_KEYS
+            .iter()
+            .filter_map(|key| args.get(key).map(|value| (*key, value)))
+            .collect();
+        if provided.is_empty() {
+            let lines: Vec<String> = SAMPLING_KEYS
+                .iter()
+                .map(|key| {
+                    let value = current_value(&config, key, self.engine.settings())
+                        .unwrap_or_else(|| "?".to_owned());
+                    format!("`{key}`: {value}")
+                })
+                .collect();
+            services
+                .chat_output
+                .send(command_reply(format!("Sampling settings:\n{}", lines.join("\n"))))
+                .await?;
+            return Ok(());
+        }
+        // Atomic batch: one malformed value answers usage and saves
+        // nothing - a mixed set/clear call cannot half-apply.
+        let mut messages = Vec::with_capacity(provided.len());
+        for (key, value) in provided {
+            match apply_sampling(&mut config, key, value) {
+                Ok(message) => messages.push(message),
+                Err(usage) => {
+                    services.chat_output.send(command_reply(usage)).await?;
+                    return Ok(());
+                }
+            }
+        }
+        save_config(event, services, config).await?;
+        services.chat_output.send(command_reply(messages.join("\n"))).await?;
         Ok(())
     }
 }
@@ -2115,14 +2217,12 @@ impl CommandHandler for GetLlmHandler {
                     services.chat_output.send(command_reply(unknown_key_reply(key))).await?;
                 }
             },
-            // No key: every setting, one line each - the model first (it is
-            // not a `/llm_set` key, but it is the assignment worth seeing).
-            // Long free-text values render as shapes - the full text is one
-            // `/llm_get key` away.
+            // No key: every setting, one line each - the model leads
+            // `SET_KEYS`. Long free-text values render as shapes - the full
+            // text is one `/llm_get key` away.
             None => {
-                let lines: Vec<String> = ["model"]
-                    .into_iter()
-                    .chain(SET_KEYS.iter().copied())
+                let lines: Vec<String> = SET_KEYS
+                    .iter()
                     .map(|key| {
                         let value = current_value(&config, key, self.engine.settings())
                             .unwrap_or_else(|| "?".to_owned());
@@ -2139,7 +2239,8 @@ impl CommandHandler for GetLlmHandler {
     }
 }
 
-/// `/llm_dump`: every `/llm_set` key with its effective value at once, in
+/// `/llm_dump`: every setting (`/llm_set` keys and `/llm_sampling` knobs)
+/// with its effective value at once, in
 /// one copy-pasteable code fence. Read-only sibling of `/llm_get` - same
 /// tier, same value renderer, one document read, no channel lock. Lines
 /// whose value differs from a fresh `/llm_assign` are marked `*` (one
@@ -2207,12 +2308,12 @@ enum DumpItem {
 
 /// `/llm_dump` display order, grouped: identity and delivery mode, sampling,
 /// capture/context, compaction, images, reactions, chime-ins, delivery. The
-/// model leads (it is the assignment, not a `/llm_set` key). The three
+/// model leads (the assignment; also `/llm_set`'s first key). The three
 /// prompts ride with their feature - set-or-not and size only; the text is
 /// one `/llm_set_prompt kind` away. Every key appears exactly once - the
-/// `dump_layout_covers_the_key_set` test pins parity with `SET_KEYS` (plus
-/// the model), so a key added there without a layout entry fails a test
-/// instead of silently vanishing from the dump.
+/// `dump_layout_covers_the_key_set` test pins parity with `SET_KEYS` plus
+/// `SAMPLING_KEYS`, so a key added to either without a layout entry fails a
+/// test instead of silently vanishing from the dump.
 const DUMP_LAYOUT: &[DumpItem] = &[
     DumpItem::Key("model"),
     DumpItem::Key("reasoning_effort"),
@@ -2981,23 +3082,17 @@ mod tests {
     fn float_params_set_and_clear() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        let message =
-            apply_set(&mut config, "temperature", "0.7", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
-                .expect("set expected");
+        let message = apply_sampling(&mut config, "temperature", "0.7").expect("set expected");
         assert!(message.contains("0.7"));
         assert_eq!(config.params.temperature, Some(0.7));
 
-        apply_set(&mut config, "top_k", "40", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
-            .expect("set expected");
+        apply_sampling(&mut config, "top_k", "40").expect("set expected");
         assert_eq!(config.params.top_k, Some(40.0));
 
-        apply_set(&mut config, "temperature", "clear", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
-            .expect("clear expected");
+        apply_sampling(&mut config, "temperature", "clear").expect("clear expected");
         assert_eq!(config.params.temperature, None);
 
-        assert!(
-            apply_set(&mut config, "top_p", "abc", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP).is_err()
-        );
+        assert!(apply_sampling(&mut config, "top_p", "abc").is_err());
     }
 
     #[test]
@@ -3270,15 +3365,7 @@ mod tests {
         )
         .unwrap_err();
 
-        apply_set(
-            &mut config,
-            "max_tokens",
-            "not-a-number",
-            PLATFORM_LIMIT,
-            CHUNK_FLOOR,
-            IMAGE_CAP,
-        )
-        .unwrap_err();
+        apply_sampling(&mut config, "max_tokens", "not-a-number").unwrap_err();
 
         // A zero budget would keep only the newest turn - rejected like
         // `context_messages` 0, not accepted as "no budget".
@@ -3384,18 +3471,7 @@ mod tests {
             apply_set(&mut config, "vibes", "maximum", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
                 .unwrap_err();
         assert!(unknown.contains("Unknown key"));
-        // The model is not a key at all - the reply points at `/llm_assign`.
-        let model = apply_set(
-            &mut config,
-            "model",
-            "zai/glm-5.3-flash",
-            PLATFORM_LIMIT,
-            CHUNK_FLOOR,
-            IMAGE_CAP,
-        )
-        .unwrap_err();
-        assert!(model.contains("Unknown key"), "unexpected: {model}");
-        assert!(model.contains("/llm_assign"), "unexpected: {model}");
+        assert!(unknown.contains("/llm_sampling"), "unexpected: {unknown}");
         assert_eq!(config.model, "m", "the failed set must not mutate");
         assert!(
             apply_set(
@@ -3409,6 +3485,67 @@ mod tests {
             .unwrap_err()
             .contains("cannot be cleared")
         );
+    }
+
+    /// `model` is `/llm_set`'s first key: a declared ref swaps the channel's
+    /// chat model while keeping every other knob; clear-words are refused -
+    /// the assignment (a FRESH config) is `/llm_assign`'s job.
+    #[test]
+    fn model_key_swaps_the_model_and_cannot_be_cleared() {
+        let mut config = ChannelConfig::assigned("local/gemma".to_owned());
+        config.params.temperature = Some(0.7);
+
+        let set = apply_set(
+            &mut config,
+            "model",
+            "zai/glm-5.3-flash",
+            PLATFORM_LIMIT,
+            CHUNK_FLOOR,
+            IMAGE_CAP,
+        )
+        .expect("model swap expected");
+        assert!(set.contains("`model` set to `zai/glm-5.3-flash`"));
+        assert_eq!(config.model, "zai/glm-5.3-flash");
+        assert_eq!(config.params.temperature, Some(0.7), "tuning must survive the swap");
+
+        let cleared =
+            apply_set(&mut config, "model", "clear", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
+                .unwrap_err();
+        assert!(cleared.contains("cannot be cleared"), "unexpected: {cleared}");
+        assert!(cleared.contains("/llm_unassign"), "unexpected: {cleared}");
+    }
+
+    /// The `/llm_sampling` grammar: floats and the token cap set and clear,
+    /// garbage is rejected with the sampling key list.
+    #[test]
+    fn sampling_grammar_sets_clears_and_rejects() {
+        let mut config = ChannelConfig::assigned("m".to_owned());
+
+        assert_eq!(
+            apply_sampling(&mut config, "temperature", "0.7").expect("set expected"),
+            "`temperature` set to 0.7."
+        );
+        assert_eq!(config.params.temperature, Some(0.7));
+        assert_eq!(
+            apply_sampling(&mut config, "temperature", "clear").expect("clear expected"),
+            "`temperature` cleared (provider default)."
+        );
+        assert_eq!(config.params.temperature, None);
+
+        assert_eq!(
+            apply_sampling(&mut config, "max_tokens", "512").expect("cap expected"),
+            "`max_tokens` set to 512."
+        );
+        assert_eq!(config.params.max_tokens, Some(512));
+        assert_eq!(
+            apply_sampling(&mut config, "max_tokens", "default").expect("clear expected"),
+            "`max_tokens` cleared (provider default)."
+        );
+        assert_eq!(config.params.max_tokens, None);
+
+        let unknown = apply_sampling(&mut config, "vibes", "maximum").unwrap_err();
+        assert!(unknown.contains("Unknown sampling key"), "unexpected: {unknown}");
+        assert!(unknown.contains("top_p"), "unexpected: {unknown}");
     }
 
     /// A recognized flag key with a bad value answers usage - it must not
@@ -3495,9 +3632,10 @@ mod tests {
         assert_eq!(current_value(&config, "split_length", &settings).as_deref(), Some("500"));
     }
 
-    /// The dump layout and the `/llm_set` key set must stay in sync: every
-    /// key exactly once, no extras - a key added to `SET_KEYS` without a
-    /// `DUMP_LAYOUT` entry would silently vanish from `/llm_dump`.
+    /// The dump layout and the settable key surface must stay in sync:
+    /// every key exactly once, no extras - a key added to `SET_KEYS` or
+    /// `SAMPLING_KEYS` without a `DUMP_LAYOUT` entry would silently vanish
+    /// from `/llm_dump`.
     #[test]
     fn dump_layout_covers_the_key_set() {
         let mut dumped: Vec<&str> = DUMP_LAYOUT
@@ -3508,10 +3646,8 @@ mod tests {
             })
             .collect();
         dumped.sort_unstable();
-        // The model leads the dump but is not a `/llm_set` key - the
-        // assignment has its own command.
         let mut expected =
-            ["model"].iter().copied().chain(SET_KEYS.iter().copied()).collect::<Vec<_>>();
+            SET_KEYS.iter().copied().chain(SAMPLING_KEYS.iter().copied()).collect::<Vec<_>>();
         expected.sort_unstable();
         assert_eq!(dumped, expected);
     }
@@ -3653,17 +3789,9 @@ mod tests {
     fn float_keys_reject_non_finite_values() {
         let mut config = ChannelConfig::assigned("m".to_owned());
 
-        assert!(
-            apply_set(&mut config, "temperature", "NaN", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
-                .is_err()
-        );
-        assert!(
-            apply_set(&mut config, "top_p", "inf", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP).is_err()
-        );
-        assert!(
-            apply_set(&mut config, "min_p", "-inf", PLATFORM_LIMIT, CHUNK_FLOOR, IMAGE_CAP)
-                .is_err()
-        );
+        assert!(apply_sampling(&mut config, "temperature", "NaN").is_err());
+        assert!(apply_sampling(&mut config, "top_p", "inf").is_err());
+        assert!(apply_sampling(&mut config, "min_p", "-inf").is_err());
         assert_eq!(config.params.temperature, None, "nothing may be stored");
 
         // NaN would clamp to NaN, not to the range bounds; the default stays.

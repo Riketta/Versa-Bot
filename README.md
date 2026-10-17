@@ -852,8 +852,9 @@ plugin](#authorization-auth-plugin)).
 | `/llm_models` | user | list the declared models - the legal assignment set, with declared capabilities (reasoning, context window) |
 | `/llm_unassign` | moderator | remove the bot from this channel (history is kept) |
 | `/llm_set_prompt kind:<kind> prompt:<text>` | moderator | set a channel prompt - `kind` is `system` (persona), `compaction` (summary instruction) or `image` (recognition instruction); `clear` falls back to the plugin default; attach `file` instead of `prompt` for long prompts (Discord CDN only, capped by `[llm] max_prompt_file_bytes`, 128 KiB default); omitting both arguments shows the current value |
-| `/llm_set key:<key> value:<value>` | moderator | tune one channel setting (table below) |
-| `/llm_copy_settings channel:<#channel>` | moderator | preset copy: the source channel's customized settings (its `/llm_set` keys and prompt overrides that differ from defaults, plus the model) are applied to this channel; settings the source leaves at default keep this channel's values; history is untouched |
+| `/llm_set key:<key> value:<value>` | moderator | tune one channel setting (table below) - includes the chat model (`model` swaps it and keeps the tuning; `/llm_assign` assigns fresh) |
+| `/llm_sampling [temperature:<n>] [top_p:<n>] [top_k:<n>] [min_p:<n>] [frequency_penalty:<n>] [presence_penalty:<n>] [max_tokens:<n>]` | moderator | show (omit all arguments) or tune the sampling knobs; `clear` = provider default; several knobs apply in one invocation, atomically |
+| `/llm_copy_settings channel:<#channel>` | moderator | preset copy: the source channel's customized settings (its `/llm_set` keys, `/llm_sampling` knobs and prompt overrides that differ from defaults, plus the model) are applied to this channel; settings the source leaves at default keep this channel's values; history is untouched |
 | `/llm_get key:<key>` | moderator | show a setting's current value (defaults render as the effective value, long text truncated); omit `key` to list every setting |
 | `/llm_dump` | moderator | dump every setting at once in one copy-pasteable code fence (`key = value`, effective values); lines that differ from a fresh `/llm_assign` carry a `*` marker; prompts are not dumped at all - only set-or-not and size, the text is one argument-free `/llm_set_prompt kind` away |
 | `/llm_cutoff` | moderator | start a fresh conversation: summary cleared, cutoff moved past all records - stored history is kept |
@@ -867,25 +868,22 @@ plugin](#authorization-auth-plugin)).
 | `/llm_admin_clear` | moderator | stop service notices |
 
 **`/llm_set` keys.** Every key takes one value; `clear`, `none` or
-`default` as the value resets the key to its default - the one key
-without a default (`context_messages`) refuses and points at
+`default` as the value resets the key to its default - the one keys
+without a default (`model`, `context_messages`) refuse and point at
 `/llm_unassign`. On/off keys accept `on`/`off` (also
 `true`/`yes`/`1` and `false`/`no`/`0`). Invalid values are answered
-with usage and never saved. `/llm_get` reads the same keys back (and
-lists the model too). The chat model is deliberately not a key here -
-Discord caps command dropdowns at 25 choices, and the model has its
-own command, `/llm_assign`. The same holds for the three channel
-prompts (system persona, compaction and image instructions): they have
-their own command, `/llm_set_prompt`, which also reads them back and
-accepts uploaded files for long texts.
+with usage and never saved. `/llm_get` reads the same keys back. The
+provider sampling knobs live in their own command, `/llm_sampling`,
+and the three channel prompts (system persona, compaction and image
+instructions) in `/llm_set_prompt`, which also reads them back and
+accepts uploaded files for long texts - both moves keep the `/llm_set`
+dropdown under Discord's 25-choice cap.
 
 | Key | Values | Default | Meaning |
 |---|---|---|---|
-| `model` | declared model ref | set by `/llm_assign` | the channel's chat model - not a `/llm_set` key (the assignment has its own command); shown by `/llm_get` and `/llm_dump` for the full picture |
+| `model` | declared model ref | set by `/llm_assign` | the channel's chat model - `/llm_set model` swaps it and keeps every other knob; `/llm_assign` starts a fresh assignment (tuning reset) |
 | `reasoning_effort` | free string, or `off` | `min` | reasoning hint, sent only when the model declares `reasoning = true`. Any other value is sent as-is to effort-style providers (Z.ai GLM: `min`/`low`/`high`/`max`) and enables thinking on switch-style ones. `off` renders an explicit disable on switch-style providers (GLM-4.5-5.2); effort-style endpoints have no off wire value, so their default applies - on Z.ai GLM that default is `max`, and GLM-5.3 thinks forcibly regardless, so throttle it with `min` (the default) or `low`. `clear` sends nothing at all |
 | `streaming` | on / off | off | stream the answer live from the provider (SSE): the message appears with the first tokens and is edited at `stream_interval_ms` |
-| `temperature` `top_p` `top_k` `min_p` `frequency_penalty` `presence_penalty` | finite number | not sent | sampling knobs, one per key - tune per-channel tone (an educational channel can run low temperature, an entertainment one high); cleared = not sent |
-| `max_tokens` | whole number | not sent | completion size cap |
 | `capture` | `bot_related` or `all_messages` | `all_messages` | what enters the channel's history: everything, or only messages mentioning or replying the bot (`bot_related` - chime-ins then have almost no material) |
 | `context_messages` | whole number >= 1 | 100 | live-window size in messages; reaching it triggers compaction |
 | `context_tokens` | whole number of tokens | auto | prompt-side token budget. Auto = the model's declared `context_window` minus the completion reserve and a margin, active once the endpoint has reported its first usage (before that, count-only filling by `context_messages`) |
@@ -902,6 +900,14 @@ accepts uploaded files for long texts.
 | `chime_react_chance` | 0-100 (clamped) | 10 | percent chance for a silent react (emoji only, no reply) on a captured non-trigger message; independent of `chime_reply_chance`; needs `react` on |
 | `chime_cooldown` | whole seconds | 5 | minimum seconds between chime-ins - the reply and silent-react rolls each keep their own tracker behind it; 0 = none |
 | `split_length` | `min_split_length` (default 100) up to the platform's message limit | `max_message_length` | per-channel reply-splitting limit; smaller chunks would flood the channel |
+
+**`/llm_sampling` knobs.** `temperature`, `top_p`, `top_k`, `min_p`,
+`frequency_penalty` and `presence_penalty` take a finite number,
+`max_tokens` a whole number - `clear` resets each to the provider
+default (not sent). Tune per-channel tone (an educational channel can
+run low temperature, an entertainment one high); `/llm_dump` shows them
+in the sampling block, `/llm_copy_settings` copies them like any other
+setting.
 
 **Token usage tracking.** Every LLM call counts toward plugin-global
 totals: chat answers, silent-react chimes, compaction summaries and image

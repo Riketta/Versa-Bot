@@ -23,8 +23,8 @@ use super::commands::{
     AssignLlmHandler, AssignServiceChannelHandler, ClearServiceChannelHandler,
     CopySettingsLlmHandler, CutoffLlmHandler, CutoffUndoLlmHandler, DumpLlmHandler,
     EmojiWhitelistLlmHandler, ForgetLlmHandler, GetLlmHandler, GlobalUsageLlmHandler,
-    ModelsLlmHandler, SET_KEYS, SetLlmHandler, SetPromptLlmHandler, StatusLlmHandler,
-    UnassignLlmHandler, UsageLlmHandler, model_choices,
+    ModelsLlmHandler, SET_KEYS, SamplingLlmHandler, SetLlmHandler, SetPromptLlmHandler,
+    StatusLlmHandler, UnassignLlmHandler, UsageLlmHandler, model_choices,
 };
 use super::conversation::{ConversationRecord, RecordRole};
 use super::model::{
@@ -584,6 +584,75 @@ impl PluginPort for LlmPlugin {
                 AccessTier::Moderator,
             ),
             Arc::new(SetLlmHandler::new(Arc::clone(&self.channel_locks), Arc::clone(&self.engine))),
+        );
+        self.registry.register(
+            self.descriptor(
+                "llm_sampling",
+                "Show or tune this channel's sampling knobs: temperature, top_p, top_k, min_p, penalties, token cap",
+                vec![
+                    ArgDescriptor {
+                        name: "temperature".to_owned(),
+                        description: "Sampling temperature (finite number); `clear` = provider default"
+                            .to_owned(),
+                        required: false,
+                        kind: ArgKind::String,
+                        choices: None,
+                    },
+                    ArgDescriptor {
+                        name: "top_p".to_owned(),
+                        description: "Nucleus sampling threshold (finite number); `clear` = provider default"
+                            .to_owned(),
+                        required: false,
+                        kind: ArgKind::String,
+                        choices: None,
+                    },
+                    ArgDescriptor {
+                        name: "top_k".to_owned(),
+                        description: "Top-K sampling (finite number); `clear` = provider default"
+                            .to_owned(),
+                        required: false,
+                        kind: ArgKind::String,
+                        choices: None,
+                    },
+                    ArgDescriptor {
+                        name: "min_p".to_owned(),
+                        description: "Min-P sampling floor (finite number); `clear` = provider default"
+                            .to_owned(),
+                        required: false,
+                        kind: ArgKind::String,
+                        choices: None,
+                    },
+                    ArgDescriptor {
+                        name: "frequency_penalty".to_owned(),
+                        description: "Frequency penalty (finite number); `clear` = provider default"
+                            .to_owned(),
+                        required: false,
+                        kind: ArgKind::String,
+                        choices: None,
+                    },
+                    ArgDescriptor {
+                        name: "presence_penalty".to_owned(),
+                        description: "Presence penalty (finite number); `clear` = provider default"
+                            .to_owned(),
+                        required: false,
+                        kind: ArgKind::String,
+                        choices: None,
+                    },
+                    ArgDescriptor {
+                        name: "max_tokens".to_owned(),
+                        description: "Cap on one reply's tokens (whole number); `clear` = provider default"
+                            .to_owned(),
+                        required: false,
+                        kind: ArgKind::String,
+                        choices: None,
+                    },
+                ],
+                AccessTier::Moderator,
+            ),
+            Arc::new(SamplingLlmHandler::new(
+                Arc::clone(&self.channel_locks),
+                Arc::clone(&self.engine),
+            )),
         );
         self.registry.register(
             self.descriptor(
@@ -1563,6 +1632,7 @@ mod tests {
                 "llm_forget",
                 "llm_get",
                 "llm_models",
+                "llm_sampling",
                 "llm_set",
                 "llm_set_prompt",
                 "llm_status",
@@ -1881,13 +1951,10 @@ mod tests {
             )
             .await
             .expect("assign expected to succeed");
-        SetLlmHandler::new(ChannelLocks::new(), Arc::clone(&fixture.engine))
+        SamplingLlmHandler::new(ChannelLocks::new(), Arc::clone(&fixture.engine))
             .invoke(
                 &command_event(Some(1)),
-                &CommandArgs(vec![
-                    ("key".to_owned(), "temperature".to_owned()),
-                    ("value".to_owned(), "0.7".to_owned()),
-                ]),
+                &CommandArgs(vec![("temperature".to_owned(), "0.7".to_owned())]),
                 &fixture.services,
             )
             .await
@@ -2127,6 +2194,94 @@ mod tests {
             .expect("config expected");
         // The rejected set must not have touched the stored model.
         assert_eq!(raw.get("model").and_then(|v| v.as_str()), Some("local/gemma"));
+    }
+
+    /// `/llm_sampling`: a bare invocation lists the knobs; a batch sets and
+    /// clears in one save; one malformed value rejects the whole batch -
+    /// the valid part is not saved either.
+    #[tokio::test]
+    async fn sampling_command_shows_sets_and_rejects_batches_atomically() {
+        let (plugin, fixture) = fixture();
+        plugin.init().expect("init expected to succeed");
+        seed_config_in(&fixture.storage);
+        let handler = SamplingLlmHandler::new(ChannelLocks::new(), Arc::clone(&fixture.engine));
+
+        // Bare invocation: every knob with its current value.
+        handler
+            .invoke(&command_event(Some(1)), &CommandArgs::default(), &fixture.services)
+            .await
+            .expect("show expected to be handled");
+        let reply = fixture.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("Sampling settings:"), "unexpected: {reply}");
+        assert!(
+            reply.contains("`temperature`: not sent (provider default)"),
+            "unexpected: {reply}"
+        );
+        assert!(reply.contains("`max_tokens`: not sent (provider default)"), "unexpected: {reply}");
+
+        // A mixed set/clear batch applies as one save.
+        handler
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![
+                    ("temperature".to_owned(), "0.7".to_owned()),
+                    ("max_tokens".to_owned(), "512".to_owned()),
+                    ("top_p".to_owned(), "clear".to_owned()),
+                ]),
+                &fixture.services,
+            )
+            .await
+            .expect("batch expected to be handled");
+        let reply = fixture.output.messages().last().expect("reply expected").clone();
+        assert!(reply.contains("`temperature` set to 0.7."), "unexpected: {reply}");
+        assert!(reply.contains("`max_tokens` set to 512."), "unexpected: {reply}");
+        assert!(reply.contains("`top_p` cleared (provider default)."), "unexpected: {reply}");
+        let params = |raw: serde_json::Value| {
+            raw.get("params")
+                .and_then(|params| params.get("temperature"))
+                .and_then(|value| value.as_f64())
+        };
+        let raw = fixture
+            .services
+            .guild_storage
+            .as_ref()
+            .expect("guild storage expected")
+            .get(NAMESPACE, &channel_config_key(2))
+            .await
+            .expect("config readable")
+            .expect("config expected");
+        assert_eq!(params(raw), Some(0.7));
+
+        // One malformed value rejects the whole batch unsaved.
+        handler
+            .invoke(
+                &command_event(Some(1)),
+                &CommandArgs(vec![
+                    ("temperature".to_owned(), "0.9".to_owned()),
+                    ("max_tokens".to_owned(), "not-a-number".to_owned()),
+                ]),
+                &fixture.services,
+            )
+            .await
+            .expect("rejected batch expected to be handled");
+        assert!(
+            fixture
+                .output
+                .messages()
+                .last()
+                .expect("reply expected")
+                .contains("expects a whole number")
+        );
+        let raw = fixture
+            .services
+            .guild_storage
+            .as_ref()
+            .expect("guild storage expected")
+            .get(NAMESPACE, &channel_config_key(2))
+            .await
+            .expect("config readable")
+            .expect("config expected");
+        assert_eq!(params(raw), Some(0.7), "the rejected batch must not save the valid part");
     }
 
     /// The model argument ships the declared refs as Discord choices - the
@@ -3042,8 +3197,8 @@ mod tests {
             .invoke(
                 &command_event(Some(1)),
                 &CommandArgs(vec![
-                    ("key".to_owned(), "temperature".to_owned()),
-                    ("value".to_owned(), "0.7".to_owned()),
+                    ("key".to_owned(), "context_tokens".to_owned()),
+                    ("value".to_owned(), "4096".to_owned()),
                 ]),
                 &fixture.services,
             )
@@ -3061,8 +3216,8 @@ mod tests {
             .expect("config expected");
         let config: ChannelConfig =
             serde_json::from_value(raw).expect("config expected to deserialize");
-        assert_eq!(config.params.temperature, Some(0.7));
-        assert!(fixture.output.messages().iter().any(|m| m.contains("`temperature` set")));
+        assert_eq!(config.context_tokens, Some(4096));
+        assert!(fixture.output.messages().iter().any(|m| m.contains("`context_tokens` set")));
     }
 
     #[tokio::test]
