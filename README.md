@@ -994,13 +994,16 @@ one would overflow, so every deal prints; nothing is cut. The champion
 itself going on sale is not store news and is skipped. The first
 successful poll after a restart is a catch-up (announcing what changed
 while the bot was down) or, with no stored state, a silent baseline.
-Delivery is at-most-once: a guild whose send fails gets a log line, not
-a replay - the poll state still advances so nothing is announced twice.
-`/lol_store_dump` shows the bot-global watcher state (there is one League
-client per bot), which may differ from what an individual guild received;
-`/lol_client_status` shows the same watcher state plus this guild's
-tracking setup (enabled, assigned channel, ping role) - announcements
-gate on both layers, so a guild that never ran `/lol_store_enable` and
+Each guild tracks its own announcement cursor: a failed send (or a guild
+configured later than another) replays that guild's missed delta on a
+later poll - guilds consume changes independently, and enabling tracking
+starts from the current store, not from a backlog. Personal watch pings
+stay best-effort. `/lol_store_dump` shows the bot-global watcher state
+(there is one League client per bot), which may differ from what an
+individual guild received; `/lol_client_status` shows the same watcher
+state, this guild's tracking setup (enabled, assigned channel, ping
+role), and the date each category last changed - announcements gate on
+both layers, so a guild that never ran `/lol_store_enable` and
 `/lol_store_assign` stays silent even with every announce flag on.
 The store data comes from the League client, which refreshes it lazily -
 when the bot reports a rotation overdue while its entries sit unchanged,
@@ -1029,7 +1032,7 @@ personal shop, not shareable store state.
 
 | Command | Tier | Effect |
 |---|---|---|
-| `/lol_client_status` | moderator | watcher health: client link, last poll, tracked counts, this guild's tracking setup (enabled, channel, ping role), announce flags (ephemeral) |
+| `/lol_client_status` | moderator | watcher health: client link, last poll, tracked counts, per-category last-change dates, this guild's tracking setup (enabled, channel, ping role), announce flags (ephemeral) |
 | `/lol_store_enable` | admin | enable store tracking for this guild |
 | `/lol_store_disable` | admin | disable store tracking for this guild (the channel binding is kept) |
 | `/lol_store_assign` | moderator | post store events in this channel (run it in the target channel) |

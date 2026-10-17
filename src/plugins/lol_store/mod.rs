@@ -12,6 +12,11 @@
 //! `/lol_store_enable` + `/lol_store_assign`. The poll cadence is
 //! startup-only; announce flags and watch caps hot-reload
 //! ([`EngineSettings`], [`StoreEngine::update_settings`]).
+//!
+//! Per-guild delivery: every guild consumes changes independently via its
+//! own feed cursor (the state as of its last successful delivery), so a
+//! failed send replays on the next poll and a late-enabled guild starts
+//! from the current store - no backlog, no cross-guild consumption.
 
 mod commands;
 mod diff;
@@ -1483,6 +1488,7 @@ mod tests {
                 rotations: None,
                 yourshop: None,
             },
+            changed_at: Default::default(),
         };
         plugin
             .plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG)

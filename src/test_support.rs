@@ -801,6 +801,82 @@ impl ChatOutputFactoryPort for FailingChatOutputFactory {
     }
 }
 
+/// Recording factory whose first `failures` `channel_output` handouts are
+/// outputs that fail without recording - fixture for the per-guild feed
+/// retry contract: the failed guild's cursor stays behind and its delta
+/// replays on a later poll, while other guilds consume the same change.
+pub struct FlakyRecordingFactory {
+    failures_left: AtomicUsize,
+    inner: ChannelRecordingFactory,
+}
+
+impl FlakyRecordingFactory {
+    #[must_use]
+    pub fn new(failures: usize) -> Self {
+        Self { failures_left: AtomicUsize::new(failures), inner: ChannelRecordingFactory::new() }
+    }
+
+    /// Every recorded (successful) targeted send, in dispatch order.
+    #[must_use]
+    pub fn targeted(&self) -> Vec<TargetedSend> {
+        self.inner.targeted()
+    }
+}
+
+struct FlakyGateOutput;
+
+#[async_trait]
+impl ChatOutputPort for FlakyGateOutput {
+    async fn send(&self, _message: OutboundMessage) -> Result<(), OutboundError> {
+        Err(OutboundError::Send("simulated flaky delivery failure".to_owned()))
+    }
+}
+
+#[async_trait]
+impl ChatOutputFactoryPort for FlakyRecordingFactory {
+    fn chat_output(&self, origin: &crate::kernel::models::Origin) -> Arc<dyn ChatOutputPort> {
+        self.inner.chat_output(origin)
+    }
+
+    fn start_typing(&self, _origin: &crate::kernel::models::Origin) -> ChatTypingGuard {
+        ChatTypingGuard::dead()
+    }
+
+    fn channel_output(
+        &self,
+        origin: &crate::kernel::models::Origin,
+        channel_id: crate::kernel::models::ChannelId,
+    ) -> Arc<dyn ChatOutputPort> {
+        // The engine hands out one output per send, so counting handouts
+        // counts sends.
+        if self
+            .failures_left
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+            .is_ok()
+        {
+            Arc::new(FlakyGateOutput)
+        } else {
+            self.inner.channel_output(origin, channel_id)
+        }
+    }
+
+    fn stream_output(
+        &self,
+        _origin: &crate::kernel::models::Origin,
+    ) -> Arc<dyn crate::kernel::spi_ports::ChatStreamPort> {
+        Arc::new(NoopChatStream) as Arc<dyn crate::kernel::spi_ports::ChatStreamPort>
+    }
+
+    fn message_link(
+        &self,
+        _origin: &crate::kernel::models::Origin,
+        _channel_id: crate::kernel::models::ChannelId,
+        _message_id: crate::kernel::models::MessageId,
+    ) -> Option<String> {
+        None
+    }
+}
+
 /// [`ChatOutputFactoryPort`] handing out the same [`RecordingChatOutput`] for
 /// every origin and channel - channel-agnostic, so assertions can stay flat.
 pub struct RecordingChatOutputFactory {

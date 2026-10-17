@@ -1,7 +1,11 @@
 //! The poll engine: one scheduler-driven tick fetches the four store
-//! sources, diffs against the last-seen state, and fans the delta out to
-//! every guild that enabled the tracker; watch subscriptions are matched
-//! against the same delta (independent of the announce flags).
+//! sources, merges them into the plugin-global last-seen state, and fans
+//! changes out per guild: each guild's feed is its own cursor (the state
+//! as of its last successful delivery, `feed_cursor` in guild storage)
+//! diffed against the snapshot, so a guild that missed a cycle - failed
+//! send, configured later than another - catches up independently, and a
+//! failed send retries next poll. Watch subscriptions match the same
+//! per-guild delta but stay best-effort (no retry, by contract).
 //!
 //! State layering: the live `last_seen` and the last raw snapshot are
 //! in-memory (one store per bot - the League client is local). Both are
@@ -16,7 +20,7 @@
 //! The per-guild record log receives every announcement and watch ping -
 //! user-facing history, never consulted for detection.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -55,6 +59,11 @@ pub const LAST_DUMP_KEY: &str = "last_dump";
 /// enabled guild). Migrated into [`STORE_DUMP_KEY`] on first boot and then
 /// deleted; never written again.
 pub const LAST_SEEN_KEY: &str = "last_seen";
+/// Per-guild announcement cursor: the compacted state as of the guild's
+/// last successful feed delivery. Absent or unreadable = silently re-seeded
+/// from the current store view (a cursor is a delivery bookmark, not truth
+/// - reseeding only ever skips backlog, never fabricates changes).
+pub const FEED_CURSOR_KEY: &str = "feed_cursor";
 /// Schema version of the [`STORE_DUMP_KEY`] document.
 pub(crate) const STORE_SCHEMA: u32 = 1;
 /// Days of store history retained by default (`history_days`).
@@ -108,6 +117,12 @@ pub(crate) struct PersistedStore {
     pub(crate) last_seen: LastSeen,
     #[serde(default)]
     pub(crate) snapshot: Snapshot,
+    /// Per-category last change (UTC unix; keys `sales`, `skins`, `mythic`,
+    /// `yourshop`) - the `/lol_client_status` "last change" line. Absent on
+    /// documents written before the field existed; a silent baseline (or a
+    /// migration adopt) records no entries.
+    #[serde(default)]
+    pub(crate) changed_at: BTreeMap<String, u64>,
 }
 
 /// Does the snapshot carry at least one fetched section? The restore and
@@ -125,6 +140,25 @@ pub(crate) fn has_store_data(snapshot: &Snapshot) -> bool {
 /// nothing there.
 fn has_renderable_data(snapshot: &Snapshot) -> bool {
     snapshot.sales.is_some() || snapshot.rotations.is_some() || snapshot.yourshop.is_some()
+}
+
+/// Which feed categories differ between two states - the changed-at keys
+/// (and the `/lol_client_status` "last change" entries, in this order).
+fn changed_categories(previous: &LastSeen, current: &LastSeen) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if previous.sales != current.sales {
+        changed.push("sales");
+    }
+    if previous.skins != current.skins {
+        changed.push("skins");
+    }
+    if previous.rotations != current.rotations {
+        changed.push("mythic");
+    }
+    if previous.yourshop != current.yourshop {
+        changed.push("yourshop");
+    }
+    changed
 }
 
 /// Per-guild config document shape.
@@ -197,6 +231,10 @@ pub struct StoreEngine<B: EventBusPort> {
     /// one WARN per distinct schedule value per process - the 5-minute poll
     /// must not repeat it, and a real rotation (new schedule value) re-arms.
     overdue_warned: Mutex<HashSet<(String, String)>>,
+    /// Per-category last change (UTC unix; keys `sales`, `skins`, `mythic`,
+    /// `yourshop`) - the `/lol_client_status` "last change" line. Persisted
+    /// in the store document; a silent baseline records no entries.
+    changed_at: Mutex<BTreeMap<String, u64>>,
 }
 
 impl<B: EventBusPort> StoreEngine<B> {
@@ -228,6 +266,7 @@ impl<B: EventBusPort> StoreEngine<B> {
             last_history_day: Mutex::new(None),
             last_announcement: Mutex::new(None),
             overdue_warned: Mutex::new(HashSet::new()),
+            changed_at: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -323,6 +362,7 @@ impl<B: EventBusPort> StoreEngine<B> {
                     self.cleanup_legacy_state().await;
                 }
                 *self.state.lock() = Some(Arc::new(persisted.last_seen));
+                *self.changed_at.lock() = persisted.changed_at;
                 {
                     let mut retained = self.last_snapshot.lock();
                     if retained.is_none() && has_store_data(&persisted.snapshot) {
@@ -432,47 +472,54 @@ impl<B: EventBusPort> StoreEngine<B> {
         });
         let changed = previous.as_ref().map(Arc::as_ref) != Some(current.as_ref());
 
-        // The full delta drives watches; the announce flags then strip the
-        // sections the operator disabled for the general feed - watches are
-        // personal and stay independent of those flags.
-        let delta = previous.as_ref().map(|previous| diff::compute(previous.as_ref(), &snapshot));
-        let full = delta.as_ref().filter(|delta| !delta.is_empty());
+        // Per-category change timestamps (the status "last change" line).
+        // A silent baseline records nothing - "never observed changing".
+        if let Some(previous) = previous.as_ref() {
+            let now = unix_now();
+            let mut changed_at = self.changed_at.lock();
+            for category in changed_categories(previous, &current) {
+                changed_at.insert(category.to_owned(), now);
+            }
+        }
 
         if previous.is_none() {
             tracing::debug!("first successful poll - recording silent baseline");
         }
 
-        // One discovery pass per cycle - but only when something needs it:
-        // the fan-out (delta found). Persistence no longer needs guilds -
-        // the store document and history digests live plugin-globally - so
-        // `list_guilds` runs only for announcements and watch pings.
-        let discovered = if full.is_some() { self.discover_guilds().await } else { Vec::new() };
+        // One discovery pass per cycle, every cycle: the per-guild feed
+        // cursors make even a quiet global cycle a delivery opportunity for
+        // a guild that lagged (failed send, configured later) - discovery
+        // can no longer be gated on a global delta.
+        let discovered = self.discover_guilds().await;
 
-        // Announce and notify before the state swap: formatting joins
-        // against the freshly retained catalog (the retention block above
-        // has already absorbed every changed section and bumped the
-        // generation, so the generation-keyed index cache builds from
-        // exactly the data `name_index(&snapshot)` would - without
-        // re-cloning the whole catalog per delta cycle).
-        if let Some(delta) = full {
-            tracing::debug!(
-                sales = delta.sales.len(),
-                skins = delta.skins.len(),
-                rotations = delta.rotations.len(),
-                yourshop = delta.yourshop.is_some(),
-                catchup,
-                "store delta detected"
-            );
+        // Per-guild fan-out: each guild's feed is its own cursor diffed
+        // against the snapshot, so guilds consume changes independently -
+        // one guild's failed send or late configuration no longer consumes
+        // another's delta, and a failed send retries next poll.
+        let mut feeds = 0usize;
+        for target in &discovered {
+            let Some(cursor) = self.load_cursor(&target.storage).await else {
+                let seeded = self.seed_cursor(&snapshot).await;
+                self.save_cursor(&target.storage, &seeded).await;
+                tracing::debug!(
+                    guild = target.guild_id.get(),
+                    "feed cursor seeded - the current store is the guild's silent baseline"
+                );
+                continue;
+            };
+            let lagged = previous.as_ref().is_some_and(|previous| previous.as_ref() != &cursor);
+            let delta = diff::compute(&cursor, &snapshot);
+            if delta.is_empty() {
+                continue;
+            }
             let index = self.cached_index().await.unwrap_or_else(|| {
                 // Unreachable after the retention block (it materializes a
                 // default snapshot), kept total for the same reason.
                 Arc::new(NameIndex::empty())
             });
-            // Every discovered guild enabled the tracker with a channel -
-            // announcements and watch pings see the same discovery snapshot.
-            let targets: Vec<&DiscoveredGuild> = discovered.iter().collect();
             // The general feed honors the announce flags (stripped copy);
-            // personal watches see the full delta below.
+            // the flags-off sections still advance the cursor - the operator
+            // disabled the category, so no backlog waits for a re-enable.
             let mut feed = delta.clone();
             let flags = self.settings.lock().flags;
             if !flags.sales {
@@ -487,22 +534,48 @@ impl<B: EventBusPort> StoreEngine<B> {
             if !flags.yourshop {
                 feed.yourshop = None;
             }
-            if !feed.is_empty() {
-                let pages = self.announce(&feed, &index, &targets, catchup).await;
-                // An empty render announces nothing - storing it would make
-                // `/lol_client_status` report a phantom announcement.
-                if !pages.is_empty() {
-                    *self.last_announcement.lock() = Some((Instant::now(), pages));
-                }
-            } else {
+            let delivered = if feed.is_empty() {
                 tracing::debug!(
+                    guild = target.guild_id.get(),
                     catchup,
-                    "delta found but announce flags strip every section - watch pings only"
+                    "feed empty after announce flags - the cursor still advances"
                 );
+                true
+            } else {
+                match self.announce_guild(&feed, &index, target, catchup, lagged).await {
+                    Some(pages) => {
+                        // An empty render announces nothing - storing it
+                        // would make `/lol_client_status` report a phantom
+                        // announcement.
+                        if !pages.is_empty() {
+                            *self.last_announcement.lock() = Some((Instant::now(), pages));
+                        }
+                        feeds += 1;
+                        true
+                    }
+                    None => {
+                        tracing::warn!(
+                            guild = target.guild_id.get(),
+                            "feed delivery failed - the guild's cursor stays behind and retries next poll"
+                        );
+                        false
+                    }
+                }
+            };
+            if delivered {
+                let advanced = diff::merge(&cursor, &snapshot);
+                self.save_cursor(&target.storage, &advanced).await;
             }
-            self.notify_subscriptions(delta, &index, &targets, catchup).await;
+            // Personal watches match the guild's own delta: a change that
+            // arrived while the guild's feed was failing still pings on the
+            // retry. Pings stay best-effort - a cursorless resend on the
+            // same retry tick can double-post a ping, a duplicate beats a
+            // permanent hole.
+            self.notify_subscriptions(&delta, &index, target, catchup).await;
         }
-        let delta_found = full.is_some();
+        if changed && discovered.is_empty() {
+            tracing::debug!("store changed but no guild is configured to track it");
+        }
 
         // Persist when anything the plugin-global document carries changed:
         // the compacted state (`changed`) or any raw section (`raw_changed`
@@ -548,7 +621,8 @@ impl<B: EventBusPort> StoreEngine<B> {
             sales = current.sales.len(),
             skins = current.skins.len(),
             rotations = current.rotations.len(),
-            delta_found,
+            changed,
+            feeds,
             persisted = changed || raw_changed,
             history = history_written,
             catchup,
@@ -556,21 +630,21 @@ impl<B: EventBusPort> StoreEngine<B> {
         );
     }
 
-    /// Formats and fans one delta out: per enabled guild - one embed per
-    /// page, record, bus event. Returns the rendered pages (for the status
-    /// memory); empty when nothing renders.
-    ///
-    /// Delivery is at-most-once by design: a guild whose send fails keeps
-    /// what landed, logs the miss, and gets no record - and the state swap
-    /// still advances, so the delta is not replayed next poll. Cosmetic
-    /// pings, not a delivery contract.
-    async fn announce(
+    /// Formats and delivers one guild's feed: one embed per page, record,
+    /// bus events. Returns the rendered pages on success, `None` when a
+    /// send failed - the caller leaves the guild's cursor behind, so the
+    /// delta replays on the next poll (at-least-once per guild; a send
+    /// that landed but whose cursor write failed can duplicate - both
+    /// writes are local storage ops, so the window is tiny). An empty
+    /// render counts as delivered - nothing to send.
+    async fn announce_guild(
         &self,
         delta: &StoreDelta,
         index: &NameIndex,
-        targets: &[&DiscoveredGuild],
+        target: &DiscoveredGuild,
         catchup: bool,
-    ) -> Vec<String> {
+        lagged: bool,
+    ) -> Option<Vec<String>> {
         if index.catalog.is_empty() {
             tracing::warn!(
                 "store catalog unavailable - sale names degrade to bare ids \
@@ -579,12 +653,7 @@ impl<B: EventBusPort> StoreEngine<B> {
         }
         let pages = announce_pages(delta, index, self.embed_budget());
         if pages.is_empty() {
-            return Vec::new();
-        }
-
-        if targets.is_empty() {
-            tracing::debug!("store updates found but no guild is tracking them");
-            return pages;
+            return Some(Vec::new());
         }
 
         let mut kinds: Vec<StoreEventKind> = Vec::new();
@@ -617,73 +686,65 @@ impl<B: EventBusPort> StoreEngine<B> {
         let at_unix = unix_now();
         let record_text = pages.join("\n\n");
 
-        let mut delivered_guilds = 0usize;
-        for target in targets {
-            let channel_id = target.channel;
-            let guild_id = target.guild_id;
-            let role_id = &target.role_id;
-            let origin = Origin {
-                guild_id: Some(guild_id),
-                channel_id,
-                user_id: UserId(0),
-                message_id: None,
-                reply_token: None,
+        let channel_id = target.channel;
+        let guild_id = target.guild_id;
+        let role_id = &target.role_id;
+        let origin = Origin {
+            guild_id: Some(guild_id),
+            channel_id,
+            user_id: UserId(0),
+            message_id: None,
+            reply_token: None,
+        };
+        // The role tag rides the CONTENT: Discord fires notifications
+        // from message content only, never from embeds. First page
+        // only - one event, one ping, not one per continuation.
+        let role_tag = role_id
+            .as_deref()
+            .and_then(|id| id.parse::<u64>().ok())
+            .map_or(String::new(), |id| format!("<@&{id}>"));
+        let output = self.factory.channel_output(&origin, channel_id);
+        for (n, embed) in embeds.iter().enumerate() {
+            let message = OutboundMessage {
+                content: if n == 0 { role_tag.clone() } else { String::new() },
+                embeds: vec![embed.clone()],
+                ..OutboundMessage::default()
             };
-            // The role tag rides the CONTENT: Discord fires notifications
-            // from message content only, never from embeds. First page
-            // only - one event, one ping, not one per continuation.
-            let role_tag = role_id
-                .as_deref()
-                .and_then(|id| id.parse::<u64>().ok())
-                .map_or(String::new(), |id| format!("<@&{id}>"));
-            let output = self.factory.channel_output(&origin, channel_id);
-            let mut delivered = true;
-            for (n, embed) in embeds.iter().enumerate() {
-                let message = OutboundMessage {
-                    content: if n == 0 { role_tag.clone() } else { String::new() },
-                    embeds: vec![embed.clone()],
-                    ..OutboundMessage::default()
-                };
-                if let Err(err) = output.send(message).await {
-                    tracing::warn!(%err, guild = guild_id.get(), "failed to deliver store announcement");
-                    delivered = false;
-                    break;
-                }
-            }
-            if !delivered {
-                continue;
-            }
-            delivered_guilds += 1;
-            if let Err(err) = target.storage
-                .append(
-                    NAMESPACE,
-                    serde_json::json!({ "kind": "announcement", "text": record_text, "at_unix": at_unix }),
-                )
-                .await
-            {
-                tracing::warn!(%err, guild = guild_id.get(), "failed to record store announcement");
-            }
-            for kind in &kinds {
-                self.bus.publish(LolStoreAnnounced { guild_id, kind: *kind });
+            if let Err(err) = output.send(message).await {
+                tracing::warn!(%err, guild = guild_id.get(), "failed to deliver store announcement");
+                return None;
             }
         }
+        if let Err(err) = target.storage
+            .append(
+                NAMESPACE,
+                serde_json::json!({ "kind": "announcement", "text": record_text, "at_unix": at_unix }),
+            )
+            .await
+        {
+            tracing::warn!(%err, guild = guild_id.get(), "failed to record store announcement");
+        }
+        for kind in &kinds {
+            self.bus.publish(LolStoreAnnounced { guild_id, kind: *kind });
+        }
 
-        // Audit-grade and honest: how many guilds actually got it, and
-        // whether this was a live hit or a boot catch-up for a change that
-        // happened while the bot could not observe the client.
+        // Audit-grade and honest: whether this was a live hit, a boot
+        // catch-up for a change that happened while the bot could not
+        // observe the client, or a retry for a guild that lagged behind
+        // its own cursor.
         tracing::info!(
             catchup,
+            lagged,
             sales = delta.sales.len(),
             skins = delta.skins.len(),
             rotations = delta.rotations.len(),
             yourshop = delta.yourshop.is_some(),
-            guilds = targets.len(),
-            delivered = delivered_guilds,
+            guild = guild_id.get(),
             pages = total,
             kinds = ?kinds.iter().map(|kind| kind.as_str()).collect::<Vec<_>>(),
-            "store announcements delivered"
+            "store feed delivered"
         );
-        pages
+        Some(pages)
     }
 
     /// Catalog + champion joins, with a lazily loaded champion name table
@@ -744,87 +805,91 @@ impl<B: EventBusPort> StoreEngine<B> {
         NameIndex::new(catalog, champions)
     }
 
-    /// Watch notifications: per enabled guild, match the FULL delta (the
+    /// Watch notifications for one guild: match the FULL delta (the
     /// announce flags govern the general feed, not personal watches)
     /// against the guild's watch document and ping the watchers in the
     /// assigned channel - tags ride the content, embeds never notify.
-    /// At-most-once like announcements: a failed send is a log line.
+    /// Best-effort by contract: a failed send is a log line, no cursor
+    /// governs the ping (a retry tick can resend it - a duplicate beats a
+    /// permanent hole).
     async fn notify_subscriptions(
         &self,
         delta: &StoreDelta,
         index: &NameIndex,
-        targets: &[&DiscoveredGuild],
+        target: &DiscoveredGuild,
         catchup: bool,
     ) {
-        if targets.is_empty() {
-            return;
-        }
-        let embed_budget = self.embed_budget();
-        let tag_budget = watch::tag_budget(self.platform.message_limit());
-        for target in targets {
-            let channel_id = target.channel;
-            let guild_id = target.guild_id;
-            let storage = &target.storage;
-            let doc = match storage.get(NAMESPACE, watch::WATCH_KEY).await {
-                Ok(Some(raw)) => match serde_json::from_value::<WatchDoc>(raw) {
-                    Ok(doc) => doc,
-                    Err(err) => {
-                        tracing::warn!(%err, guild = guild_id.get(), "watch doc unreadable - guild skipped this cycle");
-                        continue;
-                    }
-                },
-                Ok(None) => continue,
+        let channel_id = target.channel;
+        let guild_id = target.guild_id;
+        let storage = &target.storage;
+        let doc = match storage.get(NAMESPACE, watch::WATCH_KEY).await {
+            Ok(Some(raw)) => match serde_json::from_value::<WatchDoc>(raw) {
+                Ok(doc) => doc,
                 Err(err) => {
                     tracing::warn!(%err, guild = guild_id.get(), "watch doc unreadable - guild skipped this cycle");
-                    continue;
+                    return;
                 }
-            };
-            let Some(notification) =
-                watch::build_notification(&doc, delta, index, embed_budget, tag_budget)
-            else {
-                continue;
-            };
-            let origin = Origin {
-                guild_id: Some(guild_id),
-                channel_id,
-                user_id: UserId(0),
-                message_id: None,
-                reply_token: None,
-            };
-            let message = OutboundMessage {
-                content: notification.tags,
-                embeds: vec![Embed {
-                    title: "Store watches".to_owned(),
-                    description: notification.text,
-                }],
-                ..OutboundMessage::default()
-            };
-            let output = self.factory.channel_output(&origin, channel_id);
-            if let Err(err) = output.send(message).await {
-                tracing::warn!(%err, guild = guild_id.get(), "failed to deliver store watch notification");
-                continue;
+            },
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(%err, guild = guild_id.get(), "watch doc unreadable - guild skipped this cycle");
+                return;
             }
-            let at_unix = unix_now();
-            if let Err(err) = storage
-                .append(
-                    NAMESPACE,
-                    serde_json::json!({
-                        "kind": "watch_notification",
-                        "watchers": notification.watchers,
-                        "at_unix": at_unix
-                    }),
-                )
-                .await
-            {
-                tracing::warn!(%err, guild = guild_id.get(), "failed to record store watch notification");
-            }
-            tracing::info!(
-                guild = guild_id.get(),
-                watchers = notification.watchers,
-                catchup,
-                "store watch notification delivered"
-            );
+        };
+        let Some(notification) = watch::build_notification(
+            &doc,
+            delta,
+            index,
+            self.embed_budget(),
+            self.watch_tag_budget(),
+        ) else {
+            return;
+        };
+        let origin = Origin {
+            guild_id: Some(guild_id),
+            channel_id,
+            user_id: UserId(0),
+            message_id: None,
+            reply_token: None,
+        };
+        let message = OutboundMessage {
+            content: notification.tags,
+            embeds: vec![Embed {
+                title: "Store watches".to_owned(),
+                description: notification.text,
+            }],
+            ..OutboundMessage::default()
+        };
+        let output = self.factory.channel_output(&origin, channel_id);
+        if let Err(err) = output.send(message).await {
+            tracing::warn!(%err, guild = guild_id.get(), "failed to deliver store watch notification");
+            return;
         }
+        let at_unix = unix_now();
+        if let Err(err) = storage
+            .append(
+                NAMESPACE,
+                serde_json::json!({
+                    "kind": "watch_notification",
+                    "watchers": notification.watchers,
+                    "at_unix": at_unix
+                }),
+            )
+            .await
+        {
+            tracing::warn!(%err, guild = guild_id.get(), "failed to record store watch notification");
+        }
+        tracing::info!(
+            guild = guild_id.get(),
+            watchers = notification.watchers,
+            catchup,
+            "store watch notification delivered"
+        );
+    }
+
+    /// Tag budget for watch pings, derived from the outbound message cap.
+    fn watch_tag_budget(&self) -> usize {
+        watch::tag_budget(self.platform.message_limit())
     }
 
     /// Name search over the last good store snapshot - the resolution
@@ -1019,6 +1084,7 @@ impl<B: EventBusPort> StoreEngine<B> {
                 saved_at_unix: unix_now(),
                 last_seen: legacy,
                 snapshot: Snapshot::default(),
+                changed_at: BTreeMap::new(),
             },
             true,
         ))
@@ -1102,16 +1168,71 @@ impl<B: EventBusPort> StoreEngine<B> {
         }
     }
 
+    /// Reads the guild's feed cursor. `None` = never seeded or unreadable
+    /// (the caller re-seeds silently - a cursor is a delivery bookmark,
+    /// not truth).
+    async fn load_cursor(&self, storage: &Arc<dyn GuildStorage>) -> Option<LastSeen> {
+        match storage.get(NAMESPACE, FEED_CURSOR_KEY).await {
+            Ok(Some(raw)) => match serde_json::from_value::<LastSeen>(raw) {
+                Ok(cursor) => Some(cursor),
+                Err(err) => {
+                    tracing::warn!(%err, "feed cursor unreadable - re-seeding the guild silently");
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!(%err, "feed cursor read failed - re-seeding the guild silently");
+                None
+            }
+        }
+    }
+
+    /// Seeds a fresh cursor from the best store view available: this
+    /// cycle's arrived sections overlaid on the retained snapshot. A
+    /// mid-boot seed must not lock half-empty sections in as the baseline
+    /// (the next poll would then announce every current sale as new).
+    async fn seed_cursor(&self, snapshot: &Snapshot) -> LastSeen {
+        let mut effective = self.last_snapshot.lock().clone().unwrap_or_default();
+        if snapshot.sales.is_some() {
+            effective.sales = snapshot.sales.clone();
+        }
+        if snapshot.catalog.is_some() {
+            effective.catalog = snapshot.catalog.clone();
+        }
+        if snapshot.rotations.is_some() {
+            effective.rotations = snapshot.rotations.clone();
+        }
+        if snapshot.yourshop.is_some() {
+            effective.yourshop = snapshot.yourshop.clone();
+        }
+        diff::merge(&LastSeen::default(), &effective)
+    }
+
+    /// Persists the guild's advanced cursor. A failure is a log line - the
+    /// doc stays behind and the guild sees a replay next poll (at-least-
+    /// once; a duplicate announcement beats a permanent hole).
+    async fn save_cursor(&self, storage: &Arc<dyn GuildStorage>, cursor: &LastSeen) {
+        let Ok(value) = serde_json::to_value(cursor) else {
+            tracing::warn!("feed cursor failed to serialize - advance skipped");
+            return;
+        };
+        if let Err(err) = storage.set(NAMESPACE, FEED_CURSOR_KEY, value).await {
+            tracing::warn!(%err, "failed to save the feed cursor - the guild may see a replay");
+        }
+    }
+
     /// Writes the plugin-global store document: the compacted state plus
     /// the retained raw snapshot in one value. A failure is a log line -
     /// the in-memory state still advanced, so the next change rewrites
-    /// everything (bounded by at-most-once delivery, like the announces).
+    /// everything.
     async fn persist_store(&self, state: &LastSeen) {
         let doc = PersistedStore {
             schema: STORE_SCHEMA,
             saved_at_unix: unix_now(),
             last_seen: state.clone(),
             snapshot: self.last_snapshot.lock().clone().unwrap_or_default(),
+            changed_at: self.changed_at.lock().clone(),
         };
         let Ok(value) = serde_json::to_value(&doc) else {
             tracing::warn!("store document failed to serialize - persistence skipped");
@@ -1235,6 +1356,20 @@ impl<B: EventBusPort> StoreEngine<B> {
                     lines.push(format!("Your Shop: {yourshop}"));
                 }
                 None => lines.push("Store state: not captured yet".to_owned()),
+            }
+            let changed_at = self.changed_at.lock().clone();
+            if changed_at.is_empty() {
+                lines.push("Last change: none observed yet".to_owned());
+            } else {
+                let parts: Vec<String> = ["sales", "skins", "mythic", "yourshop"]
+                    .into_iter()
+                    .filter_map(|category| {
+                        changed_at
+                            .get(category)
+                            .map(|at| format!("{category} {}", history::day_key(*at)))
+                    })
+                    .collect();
+                lines.push(format!("Last change: {}", parts.join(", ")));
             }
             lines
         };
@@ -1491,7 +1626,7 @@ mod tests {
         SaleInfo, StoreEntry, YourShopStatus,
     };
     use crate::test_support::{
-        ChannelRecordingFactory, FailingChatOutputFactory, InMemoryPluginStorage, InMemoryStorage,
+        ChannelRecordingFactory, FlakyRecordingFactory, InMemoryPluginStorage, InMemoryStorage,
         RecordingChatOutput, RecordingChatOutputFactory,
     };
     use parking_lot::Mutex as PLMutex;
@@ -2904,19 +3039,21 @@ mod tests {
         assert!(targeted.last().expect("ping").text.contains("<@111>"));
     }
 
-    /// A failed announcement send is a log line: no record, no bus event -
-    /// but the state still advances, so nothing replays next tick.
+    /// A failed feed send is a log line: no record, no bus event - and the
+    /// guild's cursor stays behind, so the same delta replays on the next
+    /// poll (at-least-once per guild).
     #[tokio::test]
-    async fn failed_announcement_delivery_does_not_record_or_replay() {
+    async fn failed_feed_delivery_replays_on_the_next_poll() {
         let storage = Arc::new(InMemoryStorage::new());
         let lcu = FakeLcu::online();
         *lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        let factory = Arc::new(FlakyRecordingFactory::new(1));
         let bus = RecorderBus::default();
         let engine = Arc::new(StoreEngine::new(
             lcu.clone(),
             Arc::clone(&storage) as Arc<dyn StoragePort>,
             plugin_store(),
-            Arc::new(FailingChatOutputFactory) as Arc<dyn ChatOutputFactoryPort>,
+            Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
             bus.clone(),
             crate::test_support::test_platform_info(),
             EngineSettings {
@@ -2928,7 +3065,7 @@ mod tests {
             },
         ));
         enable_guild(&storage, GUILD, Some("55")).await;
-        engine.tick().await; // baseline
+        engine.tick().await; // baseline (cursor seed - no send)
 
         *lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
         engine.tick().await; // delivery fails
@@ -2937,26 +3074,36 @@ mod tests {
         let records = scoped.list_last(NAMESPACE, 10).await.expect("records read expected");
         assert!(records.is_empty(), "no record on failed delivery: {records:?}");
         assert!(bus.log().is_empty(), "no bus event on failed delivery");
+        assert!(factory.targeted().is_empty(), "the failed send records nothing");
 
-        // The state advanced: replaying the same store is silent.
+        // The cursor stayed behind: the same delta replays and lands.
         engine.tick().await;
-        assert!(bus.log().is_empty(), "no replay after the failed send");
+        let delivered = factory.targeted();
+        assert_eq!(delivered.len(), 1, "the replay lands exactly once: {delivered:?}");
+        let records = scoped.list_last(NAMESPACE, 10).await.expect("records read expected");
+        assert_eq!(records.len(), 1, "the replay is recorded");
+        assert_eq!(bus.log(), vec![("lol_store.announced", GUILD, "sales")]);
+
+        // A further poll is quiet again - no repeat once the cursor moved.
+        engine.tick().await;
+        assert_eq!(factory.targeted().len(), 1, "no replay after the cursor advanced");
     }
 
-    /// Same contract for watch pings: a failed notification send records
-    /// nothing and never replays (the announcement side fails with it here,
-    /// which the assertions cover just the same).
+    /// Watch pings ride the same retry: a failed notification records
+    /// nothing, and the guild's lagging cursor re-fires it together with
+    /// the feed on recovery.
     #[tokio::test]
-    async fn failed_watch_delivery_is_also_at_most_once() {
+    async fn failed_watch_delivery_replays_with_the_feed() {
         let storage = Arc::new(InMemoryStorage::new());
         let lcu = FakeLcu::online();
         *lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        let factory = Arc::new(FlakyRecordingFactory::new(2));
         let bus = RecorderBus::default();
         let engine = Arc::new(StoreEngine::new(
             lcu.clone(),
             Arc::clone(&storage) as Arc<dyn StoragePort>,
             plugin_store(),
-            Arc::new(FailingChatOutputFactory) as Arc<dyn ChatOutputFactoryPort>,
+            Arc::clone(&factory) as Arc<dyn ChatOutputFactoryPort>,
             bus.clone(),
             crate::test_support::test_platform_info(),
             EngineSettings {
@@ -2969,10 +3116,10 @@ mod tests {
         ));
         enable_guild(&storage, GUILD, Some("55")).await;
         seed_watch(&storage, GUILD, skin_target_value(1031), "sale").await;
-        engine.tick().await; // baseline
+        engine.tick().await; // baseline (seed)
 
         *lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
-        engine.tick().await; // both sends fail
+        engine.tick().await; // feed + ping both fail
 
         let scoped = storage.guild_scoped("test", GuildId(GUILD));
         let records = scoped.list_last(NAMESPACE, 10).await.expect("records read expected");
@@ -2980,7 +3127,160 @@ mod tests {
         assert!(bus.log().is_empty());
 
         engine.tick().await;
-        assert!(bus.log().is_empty(), "no replay after the failed sends");
+        let records = scoped.list_last(NAMESPACE, 10).await.expect("records read expected");
+        let kinds: Vec<&str> = records
+            .iter()
+            .filter_map(|record| record.payload.get("kind").and_then(|kind| kind.as_str()))
+            .collect();
+        assert!(
+            kinds.contains(&"announcement") && kinds.contains(&"watch_notification"),
+            "both the feed and the ping replay: {kinds:?}"
+        );
+        assert_eq!(bus.log(), vec![("lol_store.announced", GUILD, "sales")]);
+    }
+
+    /// A guild configured after changes already happened starts from the
+    /// current store: the seed is a silent baseline, and only later changes
+    /// announce - no backlog replay.
+    #[tokio::test]
+    async fn a_late_enabled_guild_baselines_silently() {
+        let f = fixture(FakeLcu::online()).await;
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        *f.lcu.catalog.lock() =
+            Some(vec![skin_item(1031, 975), skin_item_named(1032, 975, "Dynasty Ahri")]);
+        f.engine.tick().await; // no guild configured yet
+        assert!(f.output.messages().is_empty());
+
+        enable_guild(&f.storage, GUILD, Some("55")).await;
+        f.engine.tick().await; // seed tick: the current store is the baseline
+        assert!(
+            f.output.messages().is_empty(),
+            "no backlog for a late guild: {:?}",
+            f.output.messages()
+        );
+
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031), skin_sale(2, 1032)]);
+        f.engine.tick().await;
+        let messages = f.output.messages();
+        assert_eq!(messages.len(), 1, "only the post-enable change: {messages:?}");
+        let first = messages.first().expect("announcement expected");
+        assert!(first.contains("Dynasty Ahri"), "{messages:?}");
+        assert!(!first.contains("Foxfire"), "no pre-enable replay: {messages:?}");
+    }
+
+    /// Announce flags strip the general feed but the cursor still advances:
+    /// re-enabling a category does not flood the guild with the changes the
+    /// flag suppressed.
+    #[tokio::test]
+    async fn flag_stripped_sections_still_advance_the_cursor() {
+        let f = fixture_with_settings(
+            FakeLcu::online(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags { sales: false, ..AnnounceFlags::all_on() },
+                watch_user_cap: watch::DEFAULT_USER_CAP,
+                watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
+            },
+        )
+        .await;
+        enable_guild(&f.storage, GUILD, Some("55")).await;
+        f.engine.tick().await; // seed
+
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        f.engine.tick().await; // sales flag off - nothing announces
+        assert!(f.output.messages().is_empty());
+
+        f.engine.update_settings(EngineSettings {
+            poll: Duration::from_secs(60),
+            flags: AnnounceFlags::all_on(),
+            watch_user_cap: watch::DEFAULT_USER_CAP,
+            watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+            history_days: DEFAULT_HISTORY_DAYS,
+        });
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031), skin_sale(2, 1032)]);
+        *f.lcu.catalog.lock() =
+            Some(vec![skin_item(1031, 975), skin_item_named(1032, 975, "Dynasty Ahri")]);
+        f.engine.tick().await;
+        let messages = f.output.messages();
+        assert_eq!(messages.len(), 1, "only the post-re-enable sale: {messages:?}");
+        let first = messages.first().expect("announcement expected");
+        assert!(first.contains("Dynasty Ahri"), "{messages:?}");
+        assert!(!first.contains("Foxfire"), "no backlog from the flag-off window");
+    }
+
+    /// The feed cursor is per-guild persistent state: after a restart, a
+    /// guild re-announces only what happened since its last delivery - not
+    /// its whole history again.
+    #[tokio::test]
+    async fn feed_cursor_survives_a_restart() {
+        let f = fixture(FakeLcu::online()).await;
+        enable_guild(&f.storage, GUILD, Some("55")).await;
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        f.engine.tick().await; // seed
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        f.engine.tick().await; // sale 1 delivered
+        assert_eq!(f.output.messages().len(), 1);
+
+        // Restart over the same storage: the persisted cursor keeps sale 1
+        // consumed, so a change-free poll stays silent.
+        let lcu2 = FakeLcu::online();
+        *lcu2.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        *lcu2.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        let output2 = RecordingChatOutput::new();
+        let engine2 = Arc::new(StoreEngine::new(
+            lcu2.clone(),
+            Arc::clone(&f.storage) as Arc<dyn StoragePort>,
+            f.plugin.plugin_scoped(crate::test_support::TEST_PLATFORM_SLUG),
+            RecordingChatOutputFactory::new(Arc::clone(&output2)).boxed(),
+            RecorderBus::default(),
+            crate::test_support::test_platform_info(),
+            EngineSettings {
+                poll: Duration::from_secs(60),
+                flags: AnnounceFlags::all_on(),
+                watch_user_cap: watch::DEFAULT_USER_CAP,
+                watch_guild_cap: watch::DEFAULT_GUILD_CAP,
+                history_days: DEFAULT_HISTORY_DAYS,
+            },
+        ));
+        engine2.tick().await;
+        assert!(output2.messages().is_empty(), "no replay after the restart");
+        // The per-category change stamps survive the restart too.
+        let status = engine2.status_text(None).await;
+        assert!(status.contains("Last change: sales 20"), "{status}");
+
+        *lcu2.sales.lock() = Some(vec![skin_sale(1, 1031), skin_sale(2, 1032)]);
+        *lcu2.catalog.lock() =
+            Some(vec![skin_item(1031, 975), skin_item_named(1032, 975, "Dynasty Ahri")]);
+        engine2.tick().await;
+        let messages = output2.messages();
+        assert_eq!(messages.len(), 1, "only the new sale announces: {messages:?}");
+        assert!(
+            messages.first().expect("announcement expected").contains("Dynasty Ahri"),
+            "{messages:?}"
+        );
+    }
+
+    /// `/lol_client_status` carries the per-category last-change line; a
+    /// category never observed changing is absent from it.
+    #[tokio::test]
+    async fn status_shows_the_last_change_per_category() {
+        let f = fixture(FakeLcu::online()).await;
+        *f.lcu.catalog.lock() = Some(vec![skin_item(1031, 975)]);
+        f.engine.tick().await; // baseline: nothing observed changing
+        assert!(
+            f.engine.status_text(None).await.contains("Last change: none observed yet"),
+            "{}",
+            f.engine.status_text(None).await
+        );
+
+        *f.lcu.sales.lock() = Some(vec![skin_sale(1, 1031)]);
+        f.engine.tick().await;
+        let status = f.engine.status_text(None).await;
+        assert!(status.contains("Last change: sales 20"), "{status}");
+        assert!(!status.contains(", mythic"), "unchanged categories stay absent: {status}");
+        assert!(!status.contains(", skins"), "{status}");
     }
 
     /// Two guilds track the same store: each gets its own announcement in
@@ -3019,12 +3319,15 @@ mod tests {
 
         let targeted = factory.targeted();
         // 2 announcements + one ping (guild 700's watch; 701 watches a
-        // different skin).
+        // different skin). The per-guild loop interleaves: 700's feed +
+        // ping, then 701's feed.
         assert_eq!(targeted.len(), 3, "targeted sends: {targeted:?}");
-        let ping = targeted.last().expect("ping expected");
+        let ping = targeted
+            .iter()
+            .find(|send| send.text.contains("<@111>"))
+            .expect("guild 700's watch ping expected");
         assert_eq!(ping.guild, 700);
         assert_eq!(ping.channel, 55);
-        assert!(ping.text.contains("<@111>"));
         assert!(
             targeted.iter().all(|send| send.guild != 701 || !send.text.contains("<@")),
             "guild 701's feed never carries another guild's pings: {targeted:?}"
